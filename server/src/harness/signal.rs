@@ -139,7 +139,8 @@ mod tests {
 
     #[test]
     fn loads_bundled_lexicon_file() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/signal-lexicon.json");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/signal-lexicon.json");
         let n = LexiconNormalizer::from_path(&path).expect("bundled lexicon loads");
         assert!(n
             .normalize("変色して色味がおかしい")

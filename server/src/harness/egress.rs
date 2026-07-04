@@ -97,7 +97,11 @@ mod tests {
 
     #[test]
     fn explicit_ng_word_blocks() {
-        match egress_gate("この商品で必ず治りますのでご安心ください", &operator(), &ng()) {
+        match egress_gate(
+            "この商品で必ず治りますのでご安心ください",
+            &operator(),
+            &ng(),
+        ) {
             EgressVerdict::Block { term } => assert_eq!(term, "必ず治ります"),
             other => panic!("expected block, got {other:?}"),
         }
@@ -123,7 +127,11 @@ mod tests {
     #[test]
     fn clean_draft_passes() {
         assert!(matches!(
-            egress_gate("保存方法は直射日光を避けて常温で保管してください", &operator(), &ng()),
+            egress_gate(
+                "保存方法は直射日光を避けて常温で保管してください",
+                &operator(),
+                &ng()
+            ),
             EgressVerdict::Pass
         ));
     }
@@ -135,13 +143,20 @@ mod tests {
             egress_gate("治る", &operator(), &ng()),
             EgressVerdict::Abstain { .. }
         ));
-        assert!(matches!(egress_gate("", &operator(), &ng()), EgressVerdict::Pass));
+        assert!(matches!(
+            egress_gate("", &operator(), &ng()),
+            EgressVerdict::Pass
+        ));
     }
 
     #[test]
     fn verdict_is_channel_invariant() {
         // 判定水準はチャネルで変えない（フェーズ不変条件）
-        for channel in [EmitChannel::Operator, EmitChannel::CustomerChat, EmitChannel::CustomerVoice] {
+        for channel in [
+            EmitChannel::Operator,
+            EmitChannel::CustomerChat,
+            EmitChannel::CustomerVoice,
+        ] {
             let ctx = EmitContext { channel };
             assert!(matches!(
                 egress_gate("必ず治ります", &ctx, &ng()),

@@ -54,13 +54,20 @@ pub fn escalation_rule_from_attributes(attrs: &HashMap<String, String>) -> Resul
     })
 }
 
-pub fn prohibited_domain_from_attributes(attrs: &HashMap<String, String>) -> Result<ProhibitedDomain> {
+pub fn prohibited_domain_from_attributes(
+    attrs: &HashMap<String, String>,
+) -> Result<ProhibitedDomain> {
     Ok(ProhibitedDomain {
         id: attrs
             .get("domain_id")
             .cloned()
             .ok_or_else(|| anyhow!("prohibited_domain missing domain_id"))?,
-        domain_signals: csv_signals(attrs.get("domain_signals").map(String::as_str).unwrap_or("")),
+        domain_signals: csv_signals(
+            attrs
+                .get("domain_signals")
+                .map(String::as_str)
+                .unwrap_or(""),
+        ),
         text_patterns: csv_list(attrs.get("pattern").map(String::as_str).unwrap_or("")),
         route: attrs
             .get("route")
@@ -93,7 +100,11 @@ pub struct NewKnownResolution {
 
 /// KR 1 件をグラフ表現（KR ノード + Signal ノード + HAS_SIGNAL / BECAUSE 辺）に組み立てる。
 /// signal_set を JSON 属性に畳まない（I2）。予約フィールドは空で持たせる（S1-3）。
-pub fn build_known_resolution_graph(schema: &str, kr_id: &str, kr: &NewKnownResolution) -> GraphBuild {
+pub fn build_known_resolution_graph(
+    schema: &str,
+    kr_id: &str,
+    kr: &NewKnownResolution,
+) -> GraphBuild {
     let kr_node_id = harness_node_id(schema, "KnownResolution", kr_id);
     let mut nodes = vec![GraphNode {
         id: kr_node_id.clone(),
@@ -118,7 +129,10 @@ pub fn build_known_resolution_graph(schema: &str, kr_id: &str, kr: &NewKnownReso
             ("binding".to_string(), "advisory".to_string()),
             ("direction".to_string(), String::new()),
             ("route".to_string(), String::new()),
-            ("registration_trigger".to_string(), "single_ruling".to_string()),
+            (
+                "registration_trigger".to_string(),
+                "single_ruling".to_string(),
+            ),
             ("knowledge_class".to_string(), "commercial".to_string()),
             ("outcome_ref".to_string(), String::new()),
             ("search_text_ja".to_string(), kr.answer.clone()),
@@ -196,11 +210,19 @@ impl KnowledgeStore {
             .nodes
             .iter()
             .filter(|n| n.node_type == "Signal")
-            .filter_map(|n| n.attributes.get("value").map(|v| (n.node_id.clone(), v.clone())))
+            .filter_map(|n| {
+                n.attributes
+                    .get("value")
+                    .map(|v| (n.node_id.clone(), v.clone()))
+            })
             .collect();
         // KR node_id -> SignalSet
         let mut kr_signals: HashMap<String, SignalSet> = HashMap::new();
-        for edge in snapshot.edges.iter().filter(|e| e.edge_type == "HAS_SIGNAL") {
+        for edge in snapshot
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "HAS_SIGNAL")
+        {
             if let Some(value) = signal_values.get(&edge.to_id) {
                 kr_signals
                     .entry(edge.from_id.clone())
@@ -247,7 +269,11 @@ impl KnowledgeStore {
             .collect()
     }
 
-    pub async fn insert_known_resolution(&self, schema: &str, kr: &NewKnownResolution) -> Result<String> {
+    pub async fn insert_known_resolution(
+        &self,
+        schema: &str,
+        kr: &NewKnownResolution,
+    ) -> Result<String> {
         let kr_id = format!("kr-{}", uuid::Uuid::new_v4());
         let build = build_known_resolution_graph(schema, &kr_id, kr);
         self.client.upsert_graph_low_level(build).await?;
@@ -279,7 +305,11 @@ impl KnowledgeStore {
             .nodes
             .iter()
             .filter(|n| n.node_type == "Signal")
-            .filter_map(|n| n.attributes.get("value").map(|v| (n.node_id.clone(), v.clone())))
+            .filter_map(|n| {
+                n.attributes
+                    .get("value")
+                    .map(|v| (n.node_id.clone(), v.clone()))
+            })
             .collect();
         Ok(snapshot
             .edges
@@ -290,7 +320,12 @@ impl KnowledgeStore {
     }
 
     /// 会話層: 今ターンの signal を support_case に加算する（Signal ノード + HAS_SIGNAL 辺 upsert）。
-    pub async fn append_case_signals(&self, schema: &str, case_id: &str, signals: &SignalSet) -> Result<()> {
+    pub async fn append_case_signals(
+        &self,
+        schema: &str,
+        case_id: &str,
+        signals: &SignalSet,
+    ) -> Result<()> {
         if signals.is_empty() {
             return Ok(());
         }
@@ -378,7 +413,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn attrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -392,17 +430,20 @@ mod tests {
         .expect("parses");
         assert_eq!(rule.id, "r1");
         assert!(rule.condition.contains(&Signal::new("skin_irritation")));
-        assert!(rule.condition.contains(&Signal::new("continue_use_question")));
+        assert!(rule
+            .condition
+            .contains(&Signal::new("continue_use_question")));
         assert_eq!(rule.route, "dermatology_liaison");
         assert_eq!(rule.binding, Binding::Mandatory);
     }
 
     #[test]
     fn escalation_rule_missing_route_is_error() {
-        assert!(
-            escalation_rule_from_attributes(&attrs(&[("rule_id", "r1"), ("condition", "mold")]))
-                .is_err()
-        );
+        assert!(escalation_rule_from_attributes(&attrs(&[
+            ("rule_id", "r1"),
+            ("condition", "mold")
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -442,11 +483,37 @@ mod tests {
             .expect("kr node");
         assert!(kr_node.attributes.iter().all(|(k, _)| k != "signal_set"));
         // Signal ノード 2 個 + HAS_SIGNAL 辺 2 本 + BECAUSE 辺 1 本
-        assert_eq!(build.nodes.iter().filter(|n| n.node_type == "Signal").count(), 2);
-        assert_eq!(build.edges.iter().filter(|e| e.edge_type == "HAS_SIGNAL").count(), 2);
-        assert_eq!(build.edges.iter().filter(|e| e.edge_type == "BECAUSE").count(), 1);
+        assert_eq!(
+            build
+                .nodes
+                .iter()
+                .filter(|n| n.node_type == "Signal")
+                .count(),
+            2
+        );
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "HAS_SIGNAL")
+                .count(),
+            2
+        );
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "BECAUSE")
+                .count(),
+            1
+        );
         // 予約フィールドが空でも存在する（S1-8 条件 6）
-        for key in ["binding", "registration_trigger", "knowledge_class", "outcome_ref"] {
+        for key in [
+            "binding",
+            "registration_trigger",
+            "knowledge_class",
+            "outcome_ref",
+        ] {
             assert!(
                 kr_node.attributes.iter().any(|(k, _)| k == key),
                 "missing reserved {key}"

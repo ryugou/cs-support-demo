@@ -72,7 +72,13 @@ async fn main() -> Result<()> {
         let tools = tools.clone();
         let harness = harness.clone();
         let mcp = StreamableHttpService::new(
-            move || Ok(CsSupportRmcpServer::new(schema.clone(), tools.clone(), harness.clone())),
+            move || {
+                Ok(CsSupportRmcpServer::new(
+                    schema.clone(),
+                    tools.clone(),
+                    harness.clone(),
+                ))
+            },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts()),
         );

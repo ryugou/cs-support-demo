@@ -21,7 +21,9 @@ pub fn regrade(
     thresholds: &GradingThresholds,
 ) -> Grade {
     // 降格条件を先に評価する（安全側優先）
-    if matches!(current, Grade::AutoAnswerAudited) && rejection_count >= thresholds.demote_rejections {
+    if matches!(current, Grade::AutoAnswerAudited)
+        && rejection_count >= thresholds.demote_rejections
+    {
         return Grade::Demoted;
     }
     if matches!(current, Grade::Demoted) {
@@ -60,25 +62,37 @@ mod tests {
     #[test]
     fn promotes_when_all_conditions_met() {
         // 承認 3・承認者 2 名・却下率 0 → 自動回答(事後監査)へ格上げ
-        assert_eq!(regrade(Grade::ApprovalRequired, 3, 0, 2, &t()), Grade::AutoAnswerAudited);
+        assert_eq!(
+            regrade(Grade::ApprovalRequired, 3, 0, 2, &t()),
+            Grade::AutoAnswerAudited
+        );
     }
 
     #[test]
     fn does_not_promote_on_single_approver() {
         // 承認者多様性が閾値未満なら量が積もっても昇格しない
-        assert_eq!(regrade(Grade::ApprovalRequired, 10, 0, 1, &t()), Grade::ApprovalRequired);
+        assert_eq!(
+            regrade(Grade::ApprovalRequired, 10, 0, 1, &t()),
+            Grade::ApprovalRequired
+        );
     }
 
     #[test]
     fn does_not_promote_on_high_rejection_rate() {
         // 承認 3・却下 1 → 却下率 0.25 > 0.2 で昇格しない
-        assert_eq!(regrade(Grade::ApprovalRequired, 3, 1, 2, &t()), Grade::ApprovalRequired);
+        assert_eq!(
+            regrade(Grade::ApprovalRequired, 3, 1, 2, &t()),
+            Grade::ApprovalRequired
+        );
     }
 
     #[test]
     fn demotes_promoted_resolution_on_rejections() {
         // 一方通行にしない: 格上げ済みでも却下が閾値に達したら戻す
-        assert_eq!(regrade(Grade::AutoAnswerAudited, 5, 2, 3, &t()), Grade::Demoted);
+        assert_eq!(
+            regrade(Grade::AutoAnswerAudited, 5, 2, 3, &t()),
+            Grade::Demoted
+        );
     }
 
     #[test]

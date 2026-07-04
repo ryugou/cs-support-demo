@@ -46,7 +46,11 @@ pub struct Authenticator {
 }
 
 impl Authenticator {
-    pub fn new(secret: Option<Vec<u8>>, actors: &[ActorConfig], default_actor: Option<String>) -> Self {
+    pub fn new(
+        secret: Option<Vec<u8>>,
+        actors: &[ActorConfig],
+        default_actor: Option<String>,
+    ) -> Self {
         Self {
             decoding_key: secret.map(|s| DecodingKey::from_secret(&s)),
             actors: actors.iter().map(|a| (a.sub.clone(), a.clone())).collect(),
@@ -71,7 +75,10 @@ impl Authenticator {
                 let sub = self.default_actor.as_deref().ok_or_else(|| {
                     anyhow!("jwt secret is not configured and no default_actor is set")
                 })?;
-                tracing::warn!(sub, "jwt secret not configured; falling back to default_actor (dev only)");
+                tracing::warn!(
+                    sub,
+                    "jwt secret not configured; falling back to default_actor (dev only)"
+                );
                 self.lookup(sub)
             }
         }
@@ -114,7 +121,12 @@ mod tests {
             exp,
             iss: "test".to_string(),
         };
-        encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET)).unwrap()
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(SECRET),
+        )
+        .unwrap()
     }
 
     #[test]

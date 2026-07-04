@@ -350,7 +350,11 @@ impl CsSupportRmcpServer {
             .map_err(to_error)?;
         Ok(Json(EvaluateAnswerabilityResponse {
             decision: outcome.decision,
-            signals: outcome.signals.iter().map(|s| s.as_str().to_string()).collect(),
+            signals: outcome
+                .signals
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
             accumulated_signals: outcome
                 .accumulated_signals
                 .iter()
@@ -387,7 +391,11 @@ impl CsSupportRmcpServer {
                     "applicable".to_string(),
                     Some(KnownResolutionView {
                         kr_id: kr.id.clone(),
-                        signals: kr.signal_set.iter().map(|s| s.as_str().to_string()).collect(),
+                        signals: kr
+                            .signal_set
+                            .iter()
+                            .map(|s| s.as_str().to_string())
+                            .collect(),
                         answer: kr.answer.clone(),
                         applicability: kr.applicability.clone(),
                         grade: grade_label(kr.grade).to_string(),
@@ -405,7 +413,10 @@ impl CsSupportRmcpServer {
             match_kind,
             resolution,
             leftover_signals: leftover,
-            question_signals: question_signals.iter().map(|s| s.as_str().to_string()).collect(),
+            question_signals: question_signals
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
         }))
     }
 
@@ -442,7 +453,11 @@ impl CsSupportRmcpServer {
                 (score > 0.3).then_some(PastCaseHit { case, score })
             })
             .collect();
-        cases.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        cases.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         cases.truncate(req.top_k.unwrap_or(5).max(1) as usize);
         Ok(Json(SearchPastCasesResponse { cases }))
     }
@@ -488,7 +503,10 @@ impl CsSupportRmcpServer {
                 &attempt_id,
                 vec![
                     ("attempt_id".to_string(), attempt_id.clone()),
-                    ("case_id".to_string(), req.case_id.clone().unwrap_or_default()),
+                    (
+                        "case_id".to_string(),
+                        req.case_id.clone().unwrap_or_default(),
+                    ),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
                     ("draft".to_string(), req.draft.clone()),
@@ -522,7 +540,8 @@ impl CsSupportRmcpServer {
     ) -> Result<Json<RecordAnswerOutcomeResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
         let store = self.harness.store().map_err(to_error)?;
-        if !["resolved", "unresolved", "re_inquiry", "wrong_answer"].contains(&req.outcome.as_str()) {
+        if !["resolved", "unresolved", "re_inquiry", "wrong_answer"].contains(&req.outcome.as_str())
+        {
             return Err(ErrorData::invalid_params(
                 format!("unknown outcome: {}", req.outcome),
                 None,
@@ -537,7 +556,10 @@ impl CsSupportRmcpServer {
                 vec![
                     ("attempt_id".to_string(), req.attempt_id.clone()),
                     ("outcome".to_string(), req.outcome.clone()),
-                    ("outcome_note".to_string(), req.note.clone().unwrap_or_default()),
+                    (
+                        "outcome_note".to_string(),
+                        req.note.clone().unwrap_or_default(),
+                    ),
                 ],
             )
             .await
@@ -689,7 +711,10 @@ impl CsSupportRmcpServer {
                 &feedback_id,
                 vec![
                     ("feedback_id".to_string(), feedback_id.clone()),
-                    ("attempt_id".to_string(), req.attempt_id.clone().unwrap_or_default()),
+                    (
+                        "attempt_id".to_string(),
+                        req.attempt_id.clone().unwrap_or_default(),
+                    ),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
                     ("feedback_source".to_string(), req.feedback_source.clone()),
@@ -787,7 +812,8 @@ impl CsSupportRmcpServer {
             crate::harness::authn::Role::Supervisor | crate::harness::authn::Role::Admin
         ) {
             return Err(ErrorData::invalid_request(
-                "permission_denied: add_known_resolution requires supervisor or admin role".to_string(),
+                "permission_denied: add_known_resolution requires supervisor or admin role"
+                    .to_string(),
                 None,
             ));
         }

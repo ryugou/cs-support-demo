@@ -205,7 +205,8 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
 mod tests {
     use super::*;
     use crate::harness::rules::{
-        Binding, EscalationRule, Grade, KnownResolution, ProhibitedDomain, RootCause, SourceAuthority,
+        Binding, EscalationRule, Grade, KnownResolution, ProhibitedDomain, RootCause,
+        SourceAuthority,
     };
     use crate::harness::signal::{Signal, SignalSet};
 
@@ -307,8 +308,12 @@ mod tests {
     #[test]
     fn threshold_is_monotonic_staircase() {
         let t = thresholds();
-        assert!(answerability_threshold(&t, Stakes::Low) < answerability_threshold(&t, Stakes::Mid));
-        assert!(answerability_threshold(&t, Stakes::Mid) < answerability_threshold(&t, Stakes::High));
+        assert!(
+            answerability_threshold(&t, Stakes::Low) < answerability_threshold(&t, Stakes::Mid)
+        );
+        assert!(
+            answerability_threshold(&t, Stakes::Mid) < answerability_threshold(&t, Stakes::High)
+        );
     }
 
     // --- evidence_sufficient（数でなく直接性・missing を返す純関数）---
@@ -324,7 +329,10 @@ mod tests {
             }
             Sufficiency::Sufficient => panic!("expected insufficient"),
         }
-        assert!(matches!(evidence_sufficient(0.8, Some(0.9)), Sufficiency::Sufficient));
+        assert!(matches!(
+            evidence_sufficient(0.8, Some(0.9)),
+            Sufficiency::Sufficient
+        ));
         assert!(matches!(
             evidence_sufficient(0.8, None),
             Sufficiency::Insufficient { .. }
@@ -345,7 +353,16 @@ mod tests {
         }];
         let resolutions = vec![kr("kr1", &["post_ingestion_symptom"])];
         let q = signals(&["post_ingestion_symptom"]);
-        let d = decide(&input(&q, &rules, &[], &resolutions, Some(1.0), calm(), &thresholds(), &[]));
+        let d = decide(&input(
+            &q,
+            &rules,
+            &[],
+            &resolutions,
+            Some(1.0),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
         match d {
             AnswerDecision::Escalate {
                 layer,
@@ -374,9 +391,20 @@ mod tests {
         }];
         let resolutions = vec![kr("kr1", &["skin_irritation"])];
         let q = signals(&["skin_irritation"]);
-        let d = decide(&input(&q, &[], &domains, &resolutions, Some(1.0), calm(), &thresholds(), &[]));
+        let d = decide(&input(
+            &q,
+            &[],
+            &domains,
+            &resolutions,
+            Some(1.0),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
         match d {
-            AnswerDecision::Escalate { layer, route_to, .. } => {
+            AnswerDecision::Escalate {
+                layer, route_to, ..
+            } => {
                 assert_eq!(layer, 2);
                 assert_eq!(route_to, "derm_liaison");
             }
@@ -388,7 +416,16 @@ mod tests {
     fn layer3_reuses_known_resolution() {
         let resolutions = vec![kr("kr1", &["discoloration"])];
         let q = signals(&["discoloration"]);
-        let d = decide(&input(&q, &[], &[], &resolutions, None, calm(), &thresholds(), &[]));
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &resolutions,
+            None,
+            calm(),
+            &thresholds(),
+            &[],
+        ));
         match d {
             AnswerDecision::Allowed {
                 source,
@@ -406,7 +443,16 @@ mod tests {
     fn layer3_added_signal_escalates_with_unknown_added_signal() {
         let resolutions = vec![kr("kr1", &["discoloration"])];
         let q = signals(&["discoloration", "mold"]);
-        let d = decide(&input(&q, &[], &[], &resolutions, Some(0.1), calm(), &thresholds(), &[]));
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &resolutions,
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
         match d {
             AnswerDecision::Escalate {
                 layer,
@@ -426,7 +472,16 @@ mod tests {
     fn layer3_direct_manual_answers() {
         let q = SignalSet::new();
         let sections = vec!["doc-1#storage".to_string()];
-        let d = decide(&input(&q, &[], &[], &[], Some(0.95), calm(), &thresholds(), &sections));
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &thresholds(),
+            &sections,
+        ));
         match d {
             AnswerDecision::Allowed {
                 source,
@@ -449,7 +504,16 @@ mod tests {
             ng_near_hit: true,
             hazard_signal_count: 0,
         };
-        let d = decide(&input(&q, &[], &[], &[], Some(0.9), high, &thresholds(), &[]));
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.9),
+            high,
+            &thresholds(),
+            &[],
+        ));
         match d {
             AnswerDecision::Escalate {
                 layer,
@@ -464,7 +528,16 @@ mod tests {
             other => panic!("expected high-stakes escalate, got {other:?}"),
         }
         // 同じ根拠でも low stakes なら答えられる（実用性のダイヤル）
-        let d2 = decide(&input(&q, &[], &[], &[], Some(0.9), calm(), &thresholds(), &[]));
+        let d2 = decide(&input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.9),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
         assert!(matches!(d2, AnswerDecision::Allowed { .. }));
     }
 
@@ -472,8 +545,26 @@ mod tests {
     fn decide_is_deterministic() {
         let resolutions = vec![kr("kr1", &["discoloration"])];
         let q = signals(&["discoloration"]);
-        let a = decide(&input(&q, &[], &[], &resolutions, Some(0.5), calm(), &thresholds(), &[]));
-        let b = decide(&input(&q, &[], &[], &resolutions, Some(0.5), calm(), &thresholds(), &[]));
+        let a = decide(&input(
+            &q,
+            &[],
+            &[],
+            &resolutions,
+            Some(0.5),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        let b = decide(&input(
+            &q,
+            &[],
+            &[],
+            &resolutions,
+            Some(0.5),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
             serde_json::to_string(&b).unwrap()

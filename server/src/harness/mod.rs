@@ -55,7 +55,11 @@ pub struct EvaluationOutcome {
 }
 
 impl Harness {
-    pub fn build(config: &AppConfig, client: Arc<VegapunkClient>, config_dir: &Path) -> Result<Self> {
+    pub fn build(
+        config: &AppConfig,
+        client: Arc<VegapunkClient>,
+        config_dir: &Path,
+    ) -> Result<Self> {
         let resolve_path = |p: &str| {
             let path = Path::new(p);
             if path.is_absolute() {
@@ -113,7 +117,11 @@ impl Harness {
     }
 
     /// S1-1 パイプライン前半: [認証] → [(A) 権限]。全 tool がここを通る。
-    pub fn begin(&self, authorization: Option<&str>, project_schema: &str) -> Result<RequestContext> {
+    pub fn begin(
+        &self,
+        authorization: Option<&str>,
+        project_schema: &str,
+    ) -> Result<RequestContext> {
         let actor = self.authenticator.authenticate(authorization)?;
         let access = scope::resolve_scope(&actor, project_schema)?;
         Ok(RequestContext {
@@ -141,7 +149,9 @@ impl Harness {
         let rules = knowledge.load_escalation_rules(&ctx.schema).await?;
         let domains = knowledge.load_prohibited_domains(&ctx.schema).await?;
         let resolutions = knowledge.load_known_resolutions(&ctx.schema).await?;
-        let hits = tools.search_manual(&ctx.schema, question, product_key, 5).await?;
+        let hits = tools
+            .search_manual(&ctx.schema, question, product_key, 5)
+            .await?;
         // [正規化] 決定論 lexicon（S1-11）。今ターン分。
         let signals = self.normalizer.normalize(question);
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
@@ -182,7 +192,8 @@ impl Harness {
         let stakes_input = decision::StakesInput {
             mandatory_domain_near: domains.iter().any(|d| {
                 d.binding == rules::Binding::Mandatory
-                    && rules::match_layer2(std::slice::from_ref(d), &accumulated, question).is_some()
+                    && rules::match_layer2(std::slice::from_ref(d), &accumulated, question)
+                        .is_some()
             }),
             ng_near_hit: self.ng.near_hit(question),
             hazard_signal_count: accumulated
@@ -216,16 +227,22 @@ impl Harness {
         );
         // [記録] WORM（S1-8 条件 8）
         let (decision_label, route) = match &decision_result {
-            decision::AnswerDecision::Allowed { source, .. } => (format!("allowed:{source:?}"), None),
-            decision::AnswerDecision::Escalate { layer, route_to, .. } => {
-                (format!("escalate:layer{layer}"), Some(route_to.clone()))
+            decision::AnswerDecision::Allowed { source, .. } => {
+                (format!("allowed:{source:?}"), None)
             }
+            decision::AnswerDecision::Escalate {
+                layer, route_to, ..
+            } => (format!("escalate:layer{layer}"), Some(route_to.clone())),
         };
         let mut retrieved_node_ids: Vec<String> = hits
             .iter()
             .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
             .collect();
-        retrieved_node_ids.push(knowledge::harness_node_id(&ctx.schema, "support_case", &case_id));
+        retrieved_node_ids.push(knowledge::harness_node_id(
+            &ctx.schema,
+            "support_case",
+            &case_id,
+        ));
         let audit_event_id = self.worm.append(audit::AuditDraft {
             request_id: ctx.request_id.clone(),
             schema: ctx.schema.clone(),
@@ -254,7 +271,9 @@ impl Harness {
         corrected_answer: &str,
         tools: &ToolService,
     ) -> Result<rules::RootCause> {
-        let hits = tools.search_manual(&ctx.schema, corrected_answer, None, 3).await?;
+        let hits = tools
+            .search_manual(&ctx.schema, corrected_answer, None, 3)
+            .await?;
         let found = hits
             .first()
             .map(|h| h.score >= self.thresholds.mid)
@@ -267,7 +286,11 @@ impl Harness {
     }
 
     /// 検索改善キューへの追記（retrieval_miss の受け皿。known_resolution を増やさない）。
-    pub fn enqueue_search_improvement(&self, ctx: &RequestContext, corrected_answer: &str) -> Result<()> {
+    pub fn enqueue_search_improvement(
+        &self,
+        ctx: &RequestContext,
+        corrected_answer: &str,
+    ) -> Result<()> {
         if let Some(parent) = self.queue_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -304,9 +327,12 @@ mod tests {
                 }],
                 Some("op-001".to_string()),
             ),
-            normalizer: Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap()),
+            normalizer: Arc::new(
+                signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap(),
+            ),
             lexicon: Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap()),
-            ng: egress::NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).unwrap(),
+            ng: egress::NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#)
+                .unwrap(),
             worm: audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap(),
             knowledge: None,
             thresholds: decision::Thresholds {

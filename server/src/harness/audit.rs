@@ -64,7 +64,11 @@ impl WormAuditLog {
                 .and_then(|line| {
                     serde_json::from_str::<serde_json::Value>(&line)
                         .ok()
-                        .and_then(|v| v.get("hash").and_then(|h| h.as_str()).map(ToString::to_string))
+                        .and_then(|v| {
+                            v.get("hash")
+                                .and_then(|h| h.as_str())
+                                .map(ToString::to_string)
+                        })
                 })
                 .unwrap_or_else(genesis_hash),
             Err(_) => genesis_hash(),

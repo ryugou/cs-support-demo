@@ -90,7 +90,9 @@ async fn main() -> Result<()> {
                 ("route".to_string(), rule.route.clone()),
                 (
                     "binding".to_string(),
-                    rule.binding.clone().unwrap_or_else(|| "advisory".to_string()),
+                    rule.binding
+                        .clone()
+                        .unwrap_or_else(|| "advisory".to_string()),
                 ),
             ],
         });
@@ -101,12 +103,18 @@ async fn main() -> Result<()> {
             node_type: "ProhibitedDomain".to_string(),
             attributes: vec![
                 ("domain_id".to_string(), domain.domain_id.clone()),
-                ("domain_signals".to_string(), domain.domain_signals.join(",")),
+                (
+                    "domain_signals".to_string(),
+                    domain.domain_signals.join(","),
+                ),
                 ("pattern".to_string(), domain.pattern.join(",")),
                 ("route".to_string(), domain.route.clone()),
                 (
                     "binding".to_string(),
-                    domain.binding.clone().unwrap_or_else(|| "mandatory".to_string()),
+                    domain
+                        .binding
+                        .clone()
+                        .unwrap_or_else(|| "mandatory".to_string()),
                 ),
             ],
         });

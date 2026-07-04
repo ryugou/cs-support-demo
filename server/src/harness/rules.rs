@@ -79,7 +79,10 @@ impl KnownResolution {
 }
 
 /// 第1層照合: rule.condition ⊆ question のとき確定ルーティング。空条件はマッチしない。
-pub fn match_layer1<'a>(rules: &'a [EscalationRule], question: &SignalSet) -> Option<&'a EscalationRule> {
+pub fn match_layer1<'a>(
+    rules: &'a [EscalationRule],
+    question: &SignalSet,
+) -> Option<&'a EscalationRule> {
     rules
         .iter()
         .find(|rule| !rule.condition.is_empty() && rule.condition.is_subset(question))
@@ -105,7 +108,9 @@ pub fn match_layer2<'a>(
 pub enum KrMatch<'a> {
     Applicable(&'a KnownResolution),
     /// 既存ルールの subset は一致したが、未知の追加 signal が残った（＝学習の入口）。
-    BlockedByAddedSignal { leftover: SignalSet },
+    BlockedByAddedSignal {
+        leftover: SignalSet,
+    },
     None,
 }
 
@@ -183,7 +188,11 @@ mod tests {
             owner: None,
             binding: Binding::Mandatory,
         }];
-        assert!(match_layer1(&rules, &signals(&["post_ingestion_symptom", "discoloration"])).is_some());
+        assert!(match_layer1(
+            &rules,
+            &signals(&["post_ingestion_symptom", "discoloration"])
+        )
+        .is_some());
         assert!(match_layer1(&rules, &signals(&["discoloration"])).is_none());
     }
 
@@ -210,7 +219,9 @@ mod tests {
             route: "derm_liaison".to_string(),
             binding: Binding::Mandatory,
         }];
-        assert!(match_layer2(&domains, &signals(&["skin_irritation"]), "肌がピリピリする").is_some());
+        assert!(
+            match_layer2(&domains, &signals(&["skin_irritation"]), "肌がピリピリする").is_some()
+        );
         assert!(match_layer2(&domains, &signals(&["expiry_question"]), "賞味期限は").is_none());
     }
 
@@ -231,7 +242,11 @@ mod tests {
 
     #[test]
     fn kr_exact_match_applies() {
-        let resolutions = vec![kr("kr1", &["discoloration"], "自然変色なので問題ありません")];
+        let resolutions = vec![kr(
+            "kr1",
+            &["discoloration"],
+            "自然変色なので問題ありません",
+        )];
         match match_known_resolution(&resolutions, &signals(&["discoloration"])) {
             KrMatch::Applicable(found) => assert_eq!(found.id, "kr1"),
             other => panic!("expected Applicable, got {other:?}"),
@@ -241,7 +256,11 @@ mod tests {
     #[test]
     fn kr_added_signal_blocks_reuse() {
         // 大前提: 「変色 + カビ」は「変色」ルールの射程外。必ずエスカレーション（S1-3）。
-        let resolutions = vec![kr("kr1", &["discoloration"], "自然変色なので問題ありません")];
+        let resolutions = vec![kr(
+            "kr1",
+            &["discoloration"],
+            "自然変色なので問題ありません",
+        )];
         match match_known_resolution(&resolutions, &signals(&["discoloration", "mold"])) {
             KrMatch::BlockedByAddedSignal { leftover } => {
                 assert!(leftover.contains(&Signal::new("mold")));
@@ -255,7 +274,11 @@ mod tests {
         // 進化: 「変色 + カビ → 廃棄」専用ルールが追加されたら、そちらが優先で適用される。
         let resolutions = vec![
             kr("kr1", &["discoloration"], "自然変色なので問題ありません"),
-            kr("kr2", &["discoloration", "mold"], "カビの可能性があるため廃棄してください"),
+            kr(
+                "kr2",
+                &["discoloration", "mold"],
+                "カビの可能性があるため廃棄してください",
+            ),
         ];
         match match_known_resolution(&resolutions, &signals(&["discoloration", "mold"])) {
             KrMatch::Applicable(found) => assert_eq!(found.id, "kr2"),
