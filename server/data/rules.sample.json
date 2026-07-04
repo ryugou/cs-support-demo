@@ -1,0 +1,34 @@
+{
+  "escalation_rules": [
+    {
+      "rule_id": "health-food-abnormal-ingestion",
+      "condition": ["post_ingestion_symptom"],
+      "owner": "safety",
+      "route": "safety_team",
+      "binding": "mandatory"
+    },
+    {
+      "rule_id": "cosmetic-skin-reaction-continue",
+      "condition": ["skin_irritation", "continue_use_question"],
+      "owner": "quality",
+      "route": "dermatology_liaison",
+      "binding": "mandatory"
+    }
+  ],
+  "prohibited_domains": [
+    {
+      "domain_id": "health-judgement",
+      "domain_signals": ["post_ingestion_symptom", "dosage_for_condition", "allergy_concern"],
+      "pattern": ["飲み合わせ", "持病があって", "医師に相談すべき"],
+      "route": "medical_escalation_desk",
+      "binding": "mandatory"
+    },
+    {
+      "domain_id": "body-symptom",
+      "domain_signals": ["skin_irritation"],
+      "pattern": ["肌に異常", "体調が悪"],
+      "route": "safety_team",
+      "binding": "mandatory"
+    }
+  ]
+}

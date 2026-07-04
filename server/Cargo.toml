@@ -44,3 +44,7 @@ path = "src/bin/ingest_demo.rs"
 [[bin]]
 name = "verify_demo"
 path = "src/bin/verify_demo.rs"
+
+[[bin]]
+name = "ingest_rules"
+path = "src/bin/ingest_rules.rs"

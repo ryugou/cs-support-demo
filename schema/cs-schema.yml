@@ -49,6 +49,97 @@ nodes:
       value_en: { type: string, required: true }
       value_ja: { type: string }
       search_text_ja: { type: string }
+  # --- Production CS MCP Step 1 (additive only, spec S1-2 / S1-3) ---
+  KnownResolution:
+    attributes:
+      kr_id: { type: string, required: true }
+      answer_text: { type: string, required: true }
+      applicability: { type: string }
+      grade: { type: string }
+      status: { type: string }
+      source_authority: { type: string }
+      approval_count: { type: int }
+      rejection_count: { type: int }
+      approver_set: { type: string }
+      origin: { type: string }
+      created_by: { type: string }
+      verified_at: { type: string }
+      # CIS 互換の予約フィールド（Step 1 は空、将来 CIRG が書く。別紙 §3.2）
+      error_axis: { type: string }
+      root_cause: { type: string }
+      owner: { type: string }
+      binding: { type: string }
+      direction: { type: string }
+      route: { type: string }
+      registration_trigger: { type: string }
+      knowledge_class: { type: string }
+      outcome_ref: { type: string }
+      search_text_ja: { type: string }
+  Signal:
+    attributes:
+      value: { type: string, required: true }
+  EscalationRule:
+    attributes:
+      rule_id: { type: string, required: true }
+      condition: { type: string, required: true }   # カンマ区切りの signal 値
+      owner: { type: string }
+      sensitivity: { type: string }
+      route: { type: string, required: true }
+      binding: { type: string }
+  ProhibitedDomain:
+    attributes:
+      domain_id: { type: string, required: true }
+      pattern: { type: string, required: true }     # カンマ区切りの raw text パターン
+      domain_signals: { type: string }              # カンマ区切りの signal 値
+      route: { type: string, required: true }
+      binding: { type: string }
+  support_case:
+    attributes:
+      case_id: { type: string, required: true }
+      request_id: { type: string }
+      actor: { type: string }
+      question: { type: string }
+      product_key: { type: string }
+      created_at: { type: string }
+  answer_attempt:
+    attributes:
+      attempt_id: { type: string, required: true }
+      case_id: { type: string }
+      request_id: { type: string }
+      actor: { type: string }
+      draft: { type: string }
+      decision: { type: string }
+      egress_verdict: { type: string }
+      audit_event_id: { type: string }
+      outcome: { type: string }
+      outcome_note: { type: string }
+      created_at: { type: string }
+  answer_evidence:
+    attributes:
+      evidence_id: { type: string, required: true }
+      attempt_id: { type: string }
+      section_key: { type: string }
+      kind: { type: string }
+  operator_feedback:
+    attributes:
+      feedback_id: { type: string, required: true }
+      attempt_id: { type: string }
+      request_id: { type: string }
+      actor: { type: string }
+      feedback_source: { type: string }
+      corrected_answer: { type: string }
+      routing: { type: string }
+      created_at: { type: string }
+  escalation_event:
+    attributes:
+      escalation_id: { type: string, required: true }
+      request_id: { type: string }
+      actor: { type: string }
+      layer: { type: int }
+      reason: { type: string }
+      route_to: { type: string }
+      question: { type: string }
+      created_at: { type: string }
 
 edges:
   HAS_DOCUMENT: { from: product, to: document }
@@ -56,6 +147,9 @@ edges:
   REFERENCES: { from: section, to: section }
   HAS_SPEC: { from: product, to: spec }
   DEFINED_IN: { from: spec, to: section }
+  # support_case を from に含めるのは会話層の累積 signal 集合をグラフで持つため（S1-11 追記 3）
+  HAS_SIGNAL: { from: [KnownResolution, support_case], to: Signal }
+  BECAUSE: { from: KnownResolution, to: section }
 
 traceable_pairs:
   - claim: section
@@ -64,3 +158,6 @@ traceable_pairs:
   - claim: spec
     evidence: section
     edge: DEFINED_IN
+  - claim: KnownResolution
+    evidence: section
+    edge: BECAUSE

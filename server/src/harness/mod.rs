@@ -4,6 +4,7 @@ pub mod correction;
 pub mod decision;
 pub mod egress;
 pub mod grading;
+pub mod knowledge;
 pub mod rules;
 pub mod scope;
 pub mod signal;
