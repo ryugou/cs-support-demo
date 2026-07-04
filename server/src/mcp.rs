@@ -449,7 +449,7 @@ fn candidate_from_node(query: &str, node: NodeResult) -> Option<ProductCandidate
     })
 }
 
-fn semantic_overlap_score(query: &str, text: &str) -> f32 {
+pub(crate) fn semantic_overlap_score(query: &str, text: &str) -> f32 {
     let q = normalize_key(query);
     let t = normalize_key(text);
     if q.is_empty() || t.is_empty() {
@@ -459,7 +459,7 @@ fn semantic_overlap_score(query: &str, text: &str) -> f32 {
     matched as f32 / q.chars().count().max(1) as f32 * 0.6
 }
 
-fn section_score(query_norm: &str, query_raw: &str, text: &str) -> f32 {
+pub(crate) fn section_score(query_norm: &str, query_raw: &str, text: &str) -> f32 {
     if query_raw.trim().is_empty() {
         return 0.0;
     }

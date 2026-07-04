@@ -80,7 +80,9 @@ pub struct HarnessConfig {
     pub signal_lexicon_path: String,
     #[serde(default = "default_ng_path")]
     pub ng_dictionary_path: String,
-    /// escalate_unless_answerable / answer_unless_blocked
+    /// 企業ごとの既定方針（spec「企業ごとの既定方針」の予約）。
+    /// escalate_unless_answerable / answer_unless_blocked。
+    /// Step 1 では未使用: 実用性のダイヤルは [harness.thresholds] で表現する。
     #[serde(default = "default_policy")]
     pub policy: String,
     #[serde(default)]

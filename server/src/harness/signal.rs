@@ -46,8 +46,15 @@ struct LexiconFile {
     signals: Vec<LexiconEntry>,
 }
 
+/// ロード時に正規化済みの照合エントリ（hot path で normalize_key を再計算しない）。
+struct CompiledEntry {
+    signal: String,
+    normalized_forms: Vec<String>,
+}
+
 pub struct LexiconNormalizer {
-    entries: Vec<LexiconEntry>,
+    entries: Vec<CompiledEntry>,
+    classes: std::collections::HashMap<String, SignalClass>,
 }
 
 impl LexiconNormalizer {
@@ -59,16 +66,29 @@ impl LexiconNormalizer {
 
     pub fn from_json(body: &str) -> Result<Self> {
         let file: LexiconFile = serde_json::from_str(body).context("parse signal lexicon json")?;
-        Ok(Self {
-            entries: file.signals,
-        })
+        let classes = file
+            .signals
+            .iter()
+            .map(|entry| (entry.signal.clone(), entry.class))
+            .collect();
+        let entries = file
+            .signals
+            .into_iter()
+            .map(|entry| CompiledEntry {
+                signal: entry.signal,
+                normalized_forms: entry
+                    .surface_forms
+                    .iter()
+                    .map(|form| normalize_key(form))
+                    .filter(|form| !form.is_empty())
+                    .collect(),
+            })
+            .collect();
+        Ok(Self { entries, classes })
     }
 
     pub fn class_of(&self, signal: &Signal) -> Option<SignalClass> {
-        self.entries
-            .iter()
-            .find(|entry| entry.signal == signal.as_str())
-            .map(|entry| entry.class)
+        self.classes.get(signal.as_str()).copied()
     }
 }
 
@@ -78,10 +98,10 @@ impl SignalNormalizer for LexiconNormalizer {
         self.entries
             .iter()
             .filter(|entry| {
-                entry.surface_forms.iter().any(|form| {
-                    let form_norm = normalize_key(form);
-                    !form_norm.is_empty() && normalized.contains(&form_norm)
-                })
+                entry
+                    .normalized_forms
+                    .iter()
+                    .any(|form| normalized.contains(form))
             })
             .map(|entry| Signal::new(&entry.signal))
             .collect()

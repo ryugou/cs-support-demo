@@ -17,6 +17,26 @@ pub enum Grade {
     Demoted,
 }
 
+impl Grade {
+    /// 永続属性・監査ラベルの正本表現（serde の snake_case 名と一致させる）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Grade::ApprovalRequired => "approval_required",
+            Grade::AutoAnswerAudited => "auto_answer_audited",
+            Grade::Demoted => "demoted",
+        }
+    }
+
+    /// 属性文字列からの復元。未知値は最保守の approval_required に倒す。
+    pub fn parse_label(value: &str) -> Grade {
+        match value {
+            "auto_answer_audited" => Grade::AutoAnswerAudited,
+            "demoted" => Grade::Demoted,
+            _ => Grade::ApprovalRequired,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceAuthority {
@@ -29,6 +49,15 @@ pub enum SourceAuthority {
 pub enum RootCause {
     KnowledgeError,
     RetrievalMiss,
+}
+
+impl RootCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RootCause::KnowledgeError => "knowledge_error",
+            RootCause::RetrievalMiss => "retrieval_miss",
+        }
+    }
 }
 
 /// 第1層: 明示エスカレーションルール（具体条件 → 固有ルーティング）。学習・メモ化しない。
@@ -97,10 +126,10 @@ pub fn match_layer2<'a>(
     let raw_norm = normalize_key(raw_text);
     domains.iter().find(|domain| {
         domain.domain_signals.iter().any(|s| question.contains(s))
-            || domain.text_patterns.iter().any(|pattern| {
-                let p = normalize_key(pattern);
-                !p.is_empty() && raw_norm.contains(&p)
-            })
+            || domain
+                .text_patterns
+                .iter()
+                .any(|pattern| crate::resolve::norm_contains(&raw_norm, pattern))
     })
 }
 

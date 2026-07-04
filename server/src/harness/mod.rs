@@ -90,17 +90,8 @@ impl Harness {
             ng: egress::NgDictionary::from_path(&resolve_path(&config.harness.ng_dictionary_path))?,
             worm: audit::WormAuditLog::open(&resolve_path(&config.harness.audit_log_path))?,
             knowledge: Some(knowledge::KnowledgeStore::new(client)),
-            thresholds: decision::Thresholds {
-                low: config.harness.thresholds.low,
-                mid: config.harness.thresholds.mid,
-                high: config.harness.thresholds.high,
-            },
-            grading: grading::GradingThresholds {
-                promote_approvals: config.harness.grading.promote_approvals,
-                promote_approvers: config.harness.grading.promote_approvers,
-                promote_max_rejection_rate: config.harness.grading.promote_max_rejection_rate,
-                demote_rejections: config.harness.grading.demote_rejections,
-            },
+            thresholds: (&config.harness.thresholds).into(),
+            grading: (&config.harness.grading).into(),
             queue_path: resolve_path(&config.harness.search_improvement_queue_path),
         })
     }
@@ -114,6 +105,124 @@ impl Harness {
     /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
     pub fn store(&self) -> Result<&knowledge::KnowledgeStore> {
         self.knowledge()
+    }
+
+    /// 監査イベントの共通入口。ctx 由来の provenance フィールドをここで一元的に埋める。
+    pub fn audit(
+        &self,
+        ctx: &RequestContext,
+        decision: impl Into<String>,
+        route: Option<String>,
+        governing_norm_ids: Vec<String>,
+    ) -> Result<String> {
+        self.audit_with_nodes(ctx, decision, route, governing_norm_ids, Vec::new())
+    }
+
+    pub fn audit_with_nodes(
+        &self,
+        ctx: &RequestContext,
+        decision: impl Into<String>,
+        route: Option<String>,
+        governing_norm_ids: Vec<String>,
+        retrieved_node_ids: Vec<String>,
+    ) -> Result<String> {
+        self.worm.append(audit::AuditDraft {
+            request_id: ctx.request_id.clone(),
+            schema: ctx.schema.clone(),
+            actor: ctx.actor.sub.clone(),
+            used_scope: ctx.scope.clone(),
+            retrieved_node_ids,
+            decision: decision.into(),
+            route,
+            governing_norm_ids,
+        })
+    }
+
+    /// grade 運用（遵守事項 3）: outcome を承認/却下に写像し、regrade 純関数で
+    /// 昇格・降格を判定して永続化する。格付けが変わった場合のみ Some を返す。
+    pub async fn apply_answer_outcome(
+        &self,
+        ctx: &RequestContext,
+        kr_id: &str,
+        outcome: grading::AnswerOutcome,
+    ) -> Result<Option<rules::Grade>> {
+        let store = self.knowledge()?;
+        let resolutions = store.load_known_resolutions(&ctx.schema).await?;
+        let kr = resolutions
+            .iter()
+            .find(|kr| kr.id == kr_id)
+            .ok_or_else(|| anyhow!("known_resolution not found: {kr_id}"))?;
+        let mut approval_count = kr.approval_count;
+        let mut rejection_count = kr.rejection_count;
+        let mut approver_set = kr.approver_set.clone();
+        match outcome {
+            grading::AnswerOutcome::Resolved => {
+                approval_count += 1;
+                if !approver_set.contains(&ctx.actor.sub) {
+                    approver_set.push(ctx.actor.sub.clone());
+                }
+            }
+            grading::AnswerOutcome::WrongAnswer => rejection_count += 1,
+            grading::AnswerOutcome::Unresolved | grading::AnswerOutcome::ReInquiry => {}
+        }
+        let regraded = grading::regrade(
+            kr.grade,
+            approval_count,
+            rejection_count,
+            approver_set.len(),
+            &self.grading,
+        );
+        store
+            .update_known_resolution_grade(
+                &ctx.schema,
+                kr_id,
+                approval_count,
+                rejection_count,
+                &approver_set,
+                regraded,
+            )
+            .await?;
+        Ok((regraded != kr.grade).then_some(regraded))
+    }
+
+    /// add_known_resolution の admission 判定（S1-5 / GMR の進化の入口）。
+    /// 役割・語彙・NG 語のガードをここで一元化し、通過時は signal 集合を返す。
+    pub fn admit_known_resolution(
+        &self,
+        ctx: &RequestContext,
+        signals: &[String],
+        answer: &str,
+    ) -> Result<signal::SignalSet> {
+        // authoritative の担い手のみ（supervisor / admin）
+        if !matches!(ctx.actor.role, authn::Role::Supervisor | authn::Role::Admin) {
+            anyhow::bail!(
+                "permission_denied: add_known_resolution requires supervisor or admin role"
+            );
+        }
+        // 語彙外 signal は照合不能なので拒否
+        if signals.is_empty() {
+            anyhow::bail!("signals must not be empty");
+        }
+        let mut set = signal::SignalSet::new();
+        for value in signals {
+            let sig = signal::Signal::new(value);
+            if self.lexicon.class_of(&sig).is_none() {
+                anyhow::bail!("unknown signal (not in vocabulary): {value}");
+            }
+            set.insert(sig);
+        }
+        // NG 語を含む知識は登録させない（egress と同じ辞書）。
+        // binding は build_known_resolution_graph が advisory 固定で書く（mandatory は自動で書けない）。
+        if let egress::EgressVerdict::Block { term } = egress::egress_gate(
+            answer,
+            &egress::EmitContext {
+                channel: egress::EmitChannel::Operator,
+            },
+            &self.ng,
+        ) {
+            anyhow::bail!("answer contains blocked term: {term}");
+        }
+        Ok(set)
     }
 
     /// S1-1 パイプライン前半: [認証] → [(A) 権限]。全 tool がここを通る。
@@ -145,13 +254,14 @@ impl Harness {
         tools: &ToolService,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
-        // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）
-        let rules = knowledge.load_escalation_rules(&ctx.schema).await?;
-        let domains = knowledge.load_prohibited_domains(&ctx.schema).await?;
-        let resolutions = knowledge.load_known_resolutions(&ctx.schema).await?;
-        let hits = tools
-            .search_manual(&ctx.schema, question, product_key, 5)
-            .await?;
+        // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
+        // 4 つの読み取りは互いに独立なので並列に発行する（レイテンシ = max(RTT)）。
+        let (rules, domains, resolutions, hits) = tokio::try_join!(
+            knowledge.load_escalation_rules(&ctx.schema),
+            knowledge.load_prohibited_domains(&ctx.schema),
+            knowledge.load_known_resolutions(&ctx.schema),
+            tools.search_manual(&ctx.schema, question, product_key, 5),
+        )?;
         // [正規化] 決定論 lexicon（S1-11）。今ターン分。
         let signals = self.normalizer.normalize(question);
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
@@ -188,13 +298,16 @@ impl Harness {
         knowledge
             .append_case_signals(&ctx.schema, &case_id, &new_signals)
             .await?;
-        // stakes 入力の決定論算出（累積集合に対して）
+        // stakes 入力の決定論算出（累積集合に対して）。
+        // mandatory 領域だけに絞って match_layer2 を 1 回呼ぶ（質問文の再正規化を N 回しない）。
+        let mandatory_domains: Vec<rules::ProhibitedDomain> = domains
+            .iter()
+            .filter(|d| d.binding == rules::Binding::Mandatory)
+            .cloned()
+            .collect();
         let stakes_input = decision::StakesInput {
-            mandatory_domain_near: domains.iter().any(|d| {
-                d.binding == rules::Binding::Mandatory
-                    && rules::match_layer2(std::slice::from_ref(d), &accumulated, question)
-                        .is_some()
-            }),
+            mandatory_domain_near: rules::match_layer2(&mandatory_domains, &accumulated, question)
+                .is_some(),
             ng_near_hit: self.ng.near_hit(question),
             hazard_signal_count: accumulated
                 .iter()
@@ -243,16 +356,8 @@ impl Harness {
             "support_case",
             &case_id,
         ));
-        let audit_event_id = self.worm.append(audit::AuditDraft {
-            request_id: ctx.request_id.clone(),
-            schema: ctx.schema.clone(),
-            actor: ctx.actor.sub.clone(),
-            used_scope: ctx.scope.clone(),
-            retrieved_node_ids,
-            decision: decision_label,
-            route,
-            governing_norm_ids: Vec::new(),
-        })?;
+        let audit_event_id =
+            self.audit_with_nodes(ctx, decision_label, route, Vec::new(), retrieved_node_ids)?;
         Ok(EvaluationOutcome {
             decision: decision_result,
             signals,

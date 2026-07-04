@@ -42,6 +42,16 @@ pub struct Thresholds {
     pub high: f32,
 }
 
+impl From<&crate::config::ThresholdsConfig> for Thresholds {
+    fn from(config: &crate::config::ThresholdsConfig) -> Self {
+        Self {
+            low: config.low,
+            mid: config.mid,
+            high: config.high,
+        }
+    }
+}
+
 /// S1-6: 3 段の階段関数。第3層の可否比較は「threshold を受け取って比較」のみ。
 pub fn answerability_threshold(thresholds: &Thresholds, stakes: Stakes) -> f32 {
     match stakes {

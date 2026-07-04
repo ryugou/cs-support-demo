@@ -2,15 +2,13 @@ use crate::{
     harness::{
         correction::{correction_intake, CorrectionRouting},
         egress::{egress_gate, EgressVerdict, EmitChannel, EmitContext},
-        grading::regrade,
+        grading::AnswerOutcome,
         knowledge::{NewKnownResolution, PastCase},
-        rules::{Grade, KrMatch, RootCause, SourceAuthority},
-        signal::Signal,
+        rules::{KrMatch, SourceAuthority},
         Harness, RequestContext,
     },
     mcp::ToolService,
     model::{ProductCandidate, ProductView, SectionHit, SectionView},
-    resolve::normalize_key,
 };
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -153,7 +151,7 @@ pub struct RecordAnswerAttemptResponse {
 pub struct RecordAnswerOutcomeRequest {
     pub attempt_id: String,
     /// resolved / unresolved / re_inquiry / wrong_answer
-    pub outcome: String,
+    pub outcome: AnswerOutcome,
     /// この応答が known_resolution 由来だった場合に渡す（承認/却下カウントと格付けを更新）
     pub known_resolution_id: Option<String>,
     pub note: Option<String>,
@@ -215,14 +213,6 @@ pub struct AddKnownResolutionRequest {
 pub struct AddKnownResolutionResponse {
     pub kr_id: String,
     pub audit_event_id: String,
-}
-
-fn grade_label(grade: Grade) -> &'static str {
-    match grade {
-        Grade::ApprovalRequired => "approval_required",
-        Grade::AutoAnswerAudited => "auto_answer_audited",
-        Grade::Demoted => "demoted",
-    }
 }
 
 fn operator_emit_context() -> EmitContext {
@@ -398,7 +388,7 @@ impl CsSupportRmcpServer {
                             .collect(),
                         answer: kr.answer.clone(),
                         applicability: kr.applicability.clone(),
-                        grade: grade_label(kr.grade).to_string(),
+                        grade: kr.grade.as_str().to_string(),
                     }),
                     Vec::new(),
                 ),
@@ -431,34 +421,17 @@ impl CsSupportRmcpServer {
     ) -> Result<Json<SearchPastCasesResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
         let store = self.harness.store().map_err(to_error)?;
-        let query_norm = normalize_key(&req.query_ja);
-        let mut cases: Vec<PastCaseHit> = store
-            .load_cases(&ctx.schema, 500)
+        let cases = store
+            .search_cases(
+                &ctx.schema,
+                &req.query_ja,
+                req.top_k.unwrap_or(5).max(1) as usize,
+            )
             .await
             .map_err(to_error)?
             .into_iter()
-            .filter_map(|case| {
-                let text_norm = normalize_key(&case.question);
-                let score = if !query_norm.is_empty() && text_norm.contains(&query_norm) {
-                    1.0
-                } else {
-                    let q_chars: Vec<char> = query_norm.chars().collect();
-                    if q_chars.is_empty() {
-                        0.0
-                    } else {
-                        let matched = q_chars.iter().filter(|ch| text_norm.contains(**ch)).count();
-                        matched as f32 / q_chars.len() as f32 * 0.6
-                    }
-                };
-                (score > 0.3).then_some(PastCaseHit { case, score })
-            })
+            .map(|(case, score)| PastCaseHit { case, score })
             .collect();
-        cases.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        cases.truncate(req.top_k.unwrap_or(5).max(1) as usize);
         Ok(Json(SearchPastCasesResponse { cases }))
     }
 
@@ -476,24 +449,14 @@ impl CsSupportRmcpServer {
         // 出口ゲート（S1-4）。AI 製・人間製を問わず全 outbound がここを通る。
         let verdict = egress_gate(&req.draft, &operator_emit_context(), &self.harness.ng);
         let emit_allowed = matches!(verdict, EgressVerdict::Pass);
-        let verdict_label = match &verdict {
-            EgressVerdict::Pass => "pass".to_string(),
-            EgressVerdict::Block { .. } => "block".to_string(),
-            EgressVerdict::Abstain { .. } => "abstain".to_string(),
-        };
         let audit_event_id = self
             .harness
-            .worm
-            .append(crate::harness::audit::AuditDraft {
-                request_id: ctx.request_id.clone(),
-                schema: ctx.schema.clone(),
-                actor: ctx.actor.sub.clone(),
-                used_scope: ctx.scope.clone(),
-                retrieved_node_ids: Vec::new(),
-                decision: format!("egress:{verdict_label}"),
-                route: None,
-                governing_norm_ids: Vec::new(),
-            })
+            .audit(
+                &ctx,
+                format!("egress:{}", verdict.label()),
+                None,
+                Vec::new(),
+            )
             .map_err(to_error)?;
         let attempt_id = format!("attempt-{}", uuid::Uuid::new_v4());
         store
@@ -514,7 +477,7 @@ impl CsSupportRmcpServer {
                         "decision".to_string(),
                         req.evaluation_request_id.clone().unwrap_or_default(),
                     ),
-                    ("egress_verdict".to_string(), verdict_label),
+                    ("egress_verdict".to_string(), verdict.label().to_string()),
                     ("audit_event_id".to_string(), audit_event_id.clone()),
                     ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),
                 ],
@@ -540,14 +503,7 @@ impl CsSupportRmcpServer {
     ) -> Result<Json<RecordAnswerOutcomeResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
         let store = self.harness.store().map_err(to_error)?;
-        if !["resolved", "unresolved", "re_inquiry", "wrong_answer"].contains(&req.outcome.as_str())
-        {
-            return Err(ErrorData::invalid_params(
-                format!("unknown outcome: {}", req.outcome),
-                None,
-            ));
-        }
-        // attempt へ outcome を追記（upsert merge）
+        // attempt へ outcome を追記（upsert merge）。outcome は型付き enum（deserialize で検証済み）。
         store
             .record(
                 &ctx.schema,
@@ -555,7 +511,7 @@ impl CsSupportRmcpServer {
                 &req.attempt_id,
                 vec![
                     ("attempt_id".to_string(), req.attempt_id.clone()),
-                    ("outcome".to_string(), req.outcome.clone()),
+                    ("outcome".to_string(), req.outcome.as_str().to_string()),
                     (
                         "outcome_note".to_string(),
                         req.note.clone().unwrap_or_default(),
@@ -564,73 +520,25 @@ impl CsSupportRmcpServer {
             )
             .await
             .map_err(to_error)?;
-        // grade 運用（遵守事項 3）: 承認/却下の写像 → regrade 純関数 → 永続化
+        // grade 運用（遵守事項 3）は Harness に委譲（判定を handler に直書きしない）
         let mut new_grade: Option<String> = None;
         let mut governing_norm_ids = Vec::new();
         if let Some(kr_id) = &req.known_resolution_id {
-            let resolutions = store
-                .load_known_resolutions(&ctx.schema)
+            new_grade = self
+                .harness
+                .apply_answer_outcome(&ctx, kr_id, req.outcome)
                 .await
-                .map_err(to_error)?;
-            let kr = resolutions
-                .iter()
-                .find(|kr| &kr.id == kr_id)
-                .ok_or_else(|| {
-                    ErrorData::invalid_params(format!("known_resolution not found: {kr_id}"), None)
-                })?;
-            let mut approval_count = kr.approval_count;
-            let mut rejection_count = kr.rejection_count;
-            let mut approver_set = kr.approver_set.clone();
-            match req.outcome.as_str() {
-                "resolved" => {
-                    approval_count += 1;
-                    if !approver_set.contains(&ctx.actor.sub) {
-                        approver_set.push(ctx.actor.sub.clone());
-                    }
-                }
-                "wrong_answer" => rejection_count += 1,
-                _ => {}
-            }
-            let regraded = regrade(
-                kr.grade,
-                approval_count,
-                rejection_count,
-                approver_set.len(),
-                &self.harness.grading,
-            );
-            store
-                .update_known_resolution_grade(
-                    &ctx.schema,
-                    kr_id,
-                    approval_count,
-                    rejection_count,
-                    &approver_set,
-                    regraded,
-                )
-                .await
-                .map_err(to_error)?;
-            if regraded != kr.grade {
-                new_grade = Some(grade_label(regraded).to_string());
-            }
+                .map_err(|err| ErrorData::invalid_params(err.to_string(), None))?
+                .map(|grade| grade.as_str().to_string());
             governing_norm_ids.push(kr_id.clone());
         }
         let decision = match &new_grade {
-            Some(grade) => format!("outcome:{} regrade:{grade}", req.outcome),
-            None => format!("outcome:{}", req.outcome),
+            Some(grade) => format!("outcome:{} regrade:{grade}", req.outcome.as_str()),
+            None => format!("outcome:{}", req.outcome.as_str()),
         };
         let audit_event_id = self
             .harness
-            .worm
-            .append(crate::harness::audit::AuditDraft {
-                request_id: ctx.request_id.clone(),
-                schema: ctx.schema.clone(),
-                actor: ctx.actor.sub.clone(),
-                used_scope: ctx.scope.clone(),
-                retrieved_node_ids: Vec::new(),
-                decision,
-                route: None,
-                governing_norm_ids,
-            })
+            .audit(&ctx, decision, None, governing_norm_ids)
             .map_err(to_error)?;
         Ok(Json(RecordAnswerOutcomeResponse {
             grade: new_grade,
@@ -662,17 +570,7 @@ impl CsSupportRmcpServer {
         if authority == SourceAuthority::NonAuthoritative {
             let audit_event_id = self
                 .harness
-                .worm
-                .append(crate::harness::audit::AuditDraft {
-                    request_id: ctx.request_id.clone(),
-                    schema: ctx.schema.clone(),
-                    actor: ctx.actor.sub.clone(),
-                    used_scope: ctx.scope.clone(),
-                    retrieved_node_ids: Vec::new(),
-                    decision: "correction:conversation_only".to_string(),
-                    route: None,
-                    governing_norm_ids: Vec::new(),
-                })
+                .audit(&ctx, "correction:conversation_only", None, Vec::new())
                 .map_err(to_error)?;
             return Ok(Json(RecordOperatorFeedbackResponse {
                 routing: CorrectionRouting::ConversationOnly,
@@ -693,15 +591,6 @@ impl CsSupportRmcpServer {
                 .enqueue_search_improvement(&ctx, &req.corrected_answer)
                 .map_err(to_error)?;
         }
-        let routing_label = match routing {
-            CorrectionRouting::ConversationOnly => "conversation_only",
-            CorrectionRouting::SearchImprovementQueue => "search_improvement_queue",
-            CorrectionRouting::KnownResolutionCandidate => "known_resolution_candidate",
-        };
-        let root_cause_label = match root_cause {
-            RootCause::RetrievalMiss => "retrieval_miss",
-            RootCause::KnowledgeError => "knowledge_error",
-        };
         let store = self.harness.store().map_err(to_error)?;
         let feedback_id = format!("fb-{}", uuid::Uuid::new_v4());
         store
@@ -719,7 +608,7 @@ impl CsSupportRmcpServer {
                     ("actor".to_string(), ctx.actor.sub.clone()),
                     ("feedback_source".to_string(), req.feedback_source.clone()),
                     ("corrected_answer".to_string(), req.corrected_answer.clone()),
-                    ("routing".to_string(), routing_label.to_string()),
+                    ("routing".to_string(), routing.as_str().to_string()),
                     ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),
                 ],
             )
@@ -727,21 +616,20 @@ impl CsSupportRmcpServer {
             .map_err(to_error)?;
         let audit_event_id = self
             .harness
-            .worm
-            .append(crate::harness::audit::AuditDraft {
-                request_id: ctx.request_id.clone(),
-                schema: ctx.schema.clone(),
-                actor: ctx.actor.sub.clone(),
-                used_scope: ctx.scope.clone(),
-                retrieved_node_ids: Vec::new(),
-                decision: format!("correction:{routing_label} root_cause:{root_cause_label}"),
-                route: None,
-                governing_norm_ids: Vec::new(),
-            })
+            .audit(
+                &ctx,
+                format!(
+                    "correction:{} root_cause:{}",
+                    routing.as_str(),
+                    root_cause.as_str()
+                ),
+                None,
+                Vec::new(),
+            )
             .map_err(to_error)?;
         Ok(Json(RecordOperatorFeedbackResponse {
             routing,
-            root_cause: Some(root_cause_label.to_string()),
+            root_cause: Some(root_cause.as_str().to_string()),
             audit_event_id,
         }))
     }
@@ -778,17 +666,12 @@ impl CsSupportRmcpServer {
             .map_err(to_error)?;
         let audit_event_id = self
             .harness
-            .worm
-            .append(crate::harness::audit::AuditDraft {
-                request_id: ctx.request_id.clone(),
-                schema: ctx.schema.clone(),
-                actor: ctx.actor.sub.clone(),
-                used_scope: ctx.scope.clone(),
-                retrieved_node_ids: Vec::new(),
-                decision: "escalation_event".to_string(),
-                route: Some(req.route_to.clone()),
-                governing_norm_ids: vec![escalation_id.clone()],
-            })
+            .audit(
+                &ctx,
+                "escalation_event",
+                Some(req.route_to.clone()),
+                vec![escalation_id.clone()],
+            )
             .map_err(to_error)?;
         Ok(Json(CreateEscalationEventResponse {
             escalation_id,
@@ -806,43 +689,14 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<AddKnownResolutionRequest>,
     ) -> Result<Json<AddKnownResolutionResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        // ガード 1: authoritative の担い手（supervisor / admin）のみ
-        if !matches!(
-            ctx.actor.role,
-            crate::harness::authn::Role::Supervisor | crate::harness::authn::Role::Admin
-        ) {
-            return Err(ErrorData::invalid_request(
-                "permission_denied: add_known_resolution requires supervisor or admin role"
-                    .to_string(),
-                None,
-            ));
-        }
-        // ガード 2: 語彙外 signal は照合不能なので拒否
-        if req.signals.is_empty() {
-            return Err(ErrorData::invalid_params("signals must not be empty", None));
-        }
-        for value in &req.signals {
-            if self.harness.lexicon.class_of(&Signal::new(value)).is_none() {
-                return Err(ErrorData::invalid_params(
-                    format!("unknown signal (not in vocabulary): {value}"),
-                    None,
-                ));
-            }
-        }
-        // ガード 3: NG 語を含む知識は登録させない（egress と同じ辞書）
-        if let EgressVerdict::Block { term } =
-            egress_gate(&req.answer, &operator_emit_context(), &self.harness.ng)
-        {
-            return Err(ErrorData::invalid_params(
-                format!("answer contains blocked term: {term}"),
-                None,
-            ));
-        }
-        // ガード 4: binding は常に advisory で書く（mandatory は自動で書けない。S1-5 不変条件）
-        // build_known_resolution_graph が advisory 固定で組み立てる。
+        // admission 判定（役割・語彙・NG 語）は Harness に一元化されている
+        let signal_set = self
+            .harness
+            .admit_known_resolution(&ctx, &req.signals, &req.answer)
+            .map_err(|err| ErrorData::invalid_request(err.to_string(), None))?;
         let store = self.harness.store().map_err(to_error)?;
         let new_kr = NewKnownResolution {
-            signal_set: req.signals.iter().map(Signal::new).collect(),
+            signal_set,
             applicability: req.applicability.clone(),
             answer: req.answer.clone(),
             origin: req
@@ -859,17 +713,7 @@ impl CsSupportRmcpServer {
             .map_err(to_error)?;
         let audit_event_id = self
             .harness
-            .worm
-            .append(crate::harness::audit::AuditDraft {
-                request_id: ctx.request_id.clone(),
-                schema: ctx.schema.clone(),
-                actor: ctx.actor.sub.clone(),
-                used_scope: ctx.scope.clone(),
-                retrieved_node_ids: Vec::new(),
-                decision: "kr_insert".to_string(),
-                route: None,
-                governing_norm_ids: vec![kr_id.clone()],
-            })
+            .audit(&ctx, "kr_insert", None, vec![kr_id.clone()])
             .map_err(to_error)?;
         Ok(Json(AddKnownResolutionResponse {
             kr_id,

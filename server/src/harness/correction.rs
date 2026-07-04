@@ -12,6 +12,17 @@ pub enum CorrectionRouting {
     KnownResolutionCandidate,
 }
 
+impl CorrectionRouting {
+    /// 監査・永続属性用の正本ラベル（serde の snake_case 名と一致させる）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CorrectionRouting::ConversationOnly => "conversation_only",
+            CorrectionRouting::SearchImprovementQueue => "search_improvement_queue",
+            CorrectionRouting::KnownResolutionCandidate => "known_resolution_candidate",
+        }
+    }
+}
+
 /// 訂正インテーク（S1-5）。CIRG 6 判定のうち Step 1 は source_authority / root_cause の 2 軸。
 /// 将来の判定軸（error_axis / binding / direction / owner / route）はこの関数に足す。入口の位置は変えない。
 pub fn correction_intake(authority: SourceAuthority, root_cause: RootCause) -> CorrectionRouting {

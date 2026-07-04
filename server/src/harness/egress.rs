@@ -27,10 +27,7 @@ impl NgDictionary {
         self.block_terms
             .iter()
             .chain(self.abstain_terms.iter())
-            .any(|term| {
-                let t = normalize_key(term);
-                !t.is_empty() && norm.contains(&t)
-            })
+            .any(|term| crate::resolve::norm_contains(&norm, term))
     }
 }
 
@@ -57,6 +54,17 @@ pub enum EgressVerdict {
     Abstain { term: String },
 }
 
+impl EgressVerdict {
+    /// 監査・永続属性用の正本ラベル（serde の tag 名と一致させる）。
+    pub fn label(&self) -> &'static str {
+        match self {
+            EgressVerdict::Pass => "pass",
+            EgressVerdict::Block { .. } => "block",
+            EgressVerdict::Abstain { .. } => "abstain",
+        }
+    }
+}
+
 /// 出口ゲート（S1-4）。AI 製・人間製を問わず全 outbound がここを通る（egress 位置固定）。
 /// `text` は任意の断片（全文でも文単位でも可。入力単位を固定しない = 遵守事項 2）。
 /// Step 1 の判定は channel 非依存（水準はチャネルで変えない）。ctx は将来の
@@ -64,10 +72,7 @@ pub enum EgressVerdict {
 /// 将来 C′（含意判定）+ Ψ に中身が差し替わっても、この関数境界は不変。
 pub fn egress_gate(text: &str, _ctx: &EmitContext, ng: &NgDictionary) -> EgressVerdict {
     let norm = normalize_key(text);
-    let contains = |term: &String| {
-        let t = normalize_key(term);
-        !t.is_empty() && norm.contains(&t)
-    };
+    let contains = |term: &String| crate::resolve::norm_contains(&norm, term);
     if let Some(term) = ng.block_terms.iter().find(|t| contains(t)) {
         return EgressVerdict::Block { term: term.clone() };
     }

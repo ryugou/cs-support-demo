@@ -13,21 +13,32 @@ pub fn harness_node_id(schema: &str, kind: &str, key: &str) -> String {
     format!("{}{kind}:{key}", schema_generation_prefix(schema))
 }
 
-fn csv_signals(value: &str) -> SignalSet {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(Signal::new)
-        .collect()
-}
-
 fn csv_list(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string)
+        .collect()
+}
+
+fn csv_signals(value: &str) -> SignalSet {
+    csv_list(value).into_iter().map(Signal::new).collect()
+}
+
+/// snapshot から Signal ノードの node_id → value 索引を作る（HAS_SIGNAL 復元の共通部品）。
+fn signal_value_index(
+    snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+) -> HashMap<String, String> {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "Signal")
+        .filter_map(|n| {
+            n.attributes
+                .get("value")
+                .map(|v| (n.node_id.clone(), v.clone()))
+        })
         .collect()
 }
 
@@ -113,7 +124,10 @@ pub fn build_known_resolution_graph(
             ("kr_id".to_string(), kr_id.to_string()),
             ("answer_text".to_string(), kr.answer.clone()),
             ("applicability".to_string(), kr.applicability.clone()),
-            ("grade".to_string(), "approval_required".to_string()),
+            (
+                "grade".to_string(),
+                Grade::ApprovalRequired.as_str().to_string(),
+            ),
             ("status".to_string(), "active".to_string()),
             ("source_authority".to_string(), "authoritative".to_string()),
             ("root_cause".to_string(), "knowledge_error".to_string()),
@@ -205,17 +219,7 @@ impl KnowledgeStore {
             return Ok(Vec::new());
         }
         let snapshot = self.client.graph_snapshot(schema, 5000).await?;
-        // node_id -> Signal.value
-        let signal_values: HashMap<String, String> = snapshot
-            .nodes
-            .iter()
-            .filter(|n| n.node_type == "Signal")
-            .filter_map(|n| {
-                n.attributes
-                    .get("value")
-                    .map(|v| (n.node_id.clone(), v.clone()))
-            })
-            .collect();
+        let signal_values = signal_value_index(&snapshot);
         // KR node_id -> SignalSet
         let mut kr_signals: HashMap<String, SignalSet> = HashMap::new();
         for edge in snapshot
@@ -251,11 +255,7 @@ impl KnowledgeStore {
                         "retrieval_miss" => RootCause::RetrievalMiss,
                         _ => RootCause::KnowledgeError,
                     },
-                    grade: match get("grade").as_str() {
-                        "auto_answer_audited" => Grade::AutoAnswerAudited,
-                        "demoted" => Grade::Demoted,
-                        _ => Grade::ApprovalRequired,
-                    },
+                    grade: Grade::parse_label(&get("grade")),
                     approval_count: get("approval_count").parse().unwrap_or(0),
                     rejection_count: get("rejection_count").parse().unwrap_or(0),
                     approver_set: csv_list(&get("approver_set")),
@@ -301,16 +301,7 @@ impl KnowledgeStore {
     pub async fn load_case_signals(&self, schema: &str, case_id: &str) -> Result<SignalSet> {
         let case_node_id = harness_node_id(schema, "support_case", case_id);
         let snapshot = self.client.graph_snapshot(schema, 5000).await?;
-        let signal_values: HashMap<String, String> = snapshot
-            .nodes
-            .iter()
-            .filter(|n| n.node_type == "Signal")
-            .filter_map(|n| {
-                n.attributes
-                    .get("value")
-                    .map(|v| (n.node_id.clone(), v.clone()))
-            })
-            .collect();
+        let signal_values = signal_value_index(&snapshot);
         Ok(snapshot
             .edges
             .iter()
@@ -373,6 +364,28 @@ impl KnowledgeStore {
             .collect())
     }
 
+    /// 過去事例を日本語クエリで検索する（scoring は mcp.rs の共有関数を再利用）。
+    pub async fn search_cases(
+        &self,
+        schema: &str,
+        query_ja: &str,
+        top_k: usize,
+    ) -> Result<Vec<(PastCase, f32)>> {
+        let query_norm = crate::resolve::normalize_key(query_ja);
+        let mut hits: Vec<(PastCase, f32)> = self
+            .load_cases(schema, 500)
+            .await?
+            .into_iter()
+            .filter_map(|case| {
+                let score = crate::mcp::section_score(&query_norm, query_ja, &case.question);
+                (score > 0.3).then_some((case, score))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(top_k.max(1));
+        Ok(hits)
+    }
+
     /// grade 運用: 承認/却下カウントと格付けを KnownResolution ノードに反映する（遵守事項 3）。
     pub async fn update_known_resolution_grade(
         &self,
@@ -383,11 +396,6 @@ impl KnowledgeStore {
         approver_set: &[String],
         grade: Grade,
     ) -> Result<()> {
-        let grade_value = match grade {
-            Grade::ApprovalRequired => "approval_required",
-            Grade::AutoAnswerAudited => "auto_answer_audited",
-            Grade::Demoted => "demoted",
-        };
         // upsert merge を前提に該当属性のみ送る。全属性置換だった場合は Task 14 の
         // 実機検証で判明するため、そのときは query_nodes で現属性を読み全属性を再送する。
         let node = GraphNode {
@@ -398,7 +406,7 @@ impl KnowledgeStore {
                 ("approval_count".to_string(), approval_count.to_string()),
                 ("rejection_count".to_string(), rejection_count.to_string()),
                 ("approver_set".to_string(), approver_set.join(",")),
-                ("grade".to_string(), grade_value.to_string()),
+                ("grade".to_string(), grade.as_str().to_string()),
             ],
         };
         self.client.upsert_nodes(vec![node]).await?;

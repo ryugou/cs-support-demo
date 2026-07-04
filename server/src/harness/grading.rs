@@ -1,5 +1,26 @@
 use crate::harness::rules::Grade;
 
+/// 応答の結果（record_answer_outcome の閉じた語彙）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerOutcome {
+    Resolved,
+    Unresolved,
+    ReInquiry,
+    WrongAnswer,
+}
+
+impl AnswerOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnswerOutcome::Resolved => "resolved",
+            AnswerOutcome::Unresolved => "unresolved",
+            AnswerOutcome::ReInquiry => "re_inquiry",
+            AnswerOutcome::WrongAnswer => "wrong_answer",
+        }
+    }
+}
+
 /// 昇格・降格しきい値（S1-11 追記 4）。具体値は未決のため config [harness.grading] で注入。
 #[derive(Debug, Clone)]
 pub struct GradingThresholds {
@@ -7,6 +28,17 @@ pub struct GradingThresholds {
     pub promote_approvers: u32,
     pub promote_max_rejection_rate: f32,
     pub demote_rejections: u32,
+}
+
+impl From<&crate::config::GradingConfig> for GradingThresholds {
+    fn from(config: &crate::config::GradingConfig) -> Self {
+        Self {
+            promote_approvals: config.promote_approvals,
+            promote_approvers: config.promote_approvers,
+            promote_max_rejection_rate: config.promote_max_rejection_rate,
+            demote_rejections: config.demote_rejections,
+        }
+    }
 }
 
 /// grade の昇格・降格判定（決定論・純関数）。
