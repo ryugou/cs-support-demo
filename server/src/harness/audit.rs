@@ -1,0 +1,226 @@
+use crate::harness::scope::AccessScope;
+use anyhow::{Context, Result};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// 監査イベントの入力（Harness が組み立てる）。
+#[derive(Debug, Clone)]
+pub struct AuditDraft {
+    pub request_id: String,
+    pub schema: String,
+    pub actor: String,
+    pub used_scope: AccessScope,
+    pub retrieved_node_ids: Vec<String>,
+    pub decision: String,
+    pub route: Option<String>,
+    pub governing_norm_ids: Vec<String>,
+}
+
+/// WORM に書かれる 1 行（I5: provenance キー付き構造化レコード）。
+#[derive(Debug, Serialize)]
+struct AuditEvent<'a> {
+    event_id: &'a str,
+    timestamp: &'a str,
+    request_id: &'a str,
+    schema: &'a str,
+    /// PunkRecord generation。Step 1 では node_id に gen prefix が含まれるため None。
+    generation: Option<i64>,
+    actor: &'a str,
+    used_scope: &'a AccessScope,
+    retrieved_node_ids: &'a [String],
+    decision: &'a str,
+    route: Option<&'a str>,
+    governing_norm_ids: &'a [String],
+    /// 将来 A / traceable_pairs へ結線するための予約（駆動は後段）。
+    graph_provenance_linked: bool,
+    prev_hash: &'a str,
+    hash: &'a str,
+}
+
+/// 別建て WORM ストア（S1-2 / S1-8 条件 8）。append-only JSONL + hash chain。
+/// 削除・更新 API は存在しない。
+pub struct WormAuditLog {
+    path: PathBuf,
+    state: Mutex<(File, String)>, // (append-only file, prev_hash)
+}
+
+impl WormAuditLog {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create audit dir {}", parent.display()))?;
+        }
+        // 既存ログの末尾から hash chain を復元する
+        let prev_hash = match File::open(path) {
+            Ok(existing) => BufReader::new(existing)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|line| !line.trim().is_empty())
+                .last()
+                .and_then(|line| {
+                    serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|v| v.get("hash").and_then(|h| h.as_str()).map(ToString::to_string))
+                })
+                .unwrap_or_else(genesis_hash),
+            Err(_) => genesis_hash(),
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open audit log {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            state: Mutex::new((file, prev_hash)),
+        })
+    }
+
+    /// イベントを追記し event_id を返す。
+    pub fn append(&self, draft: AuditDraft) -> Result<String> {
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audit log mutex poisoned"))?;
+        let (file, prev_hash) = &mut *guard;
+        // hash = SHA256(prev_hash + 本文 JSON) — 改竄検知用チェーン
+        let payload = serde_json::json!({
+            "event_id": event_id,
+            "timestamp": timestamp,
+            "request_id": draft.request_id,
+            "schema": draft.schema,
+            "generation": serde_json::Value::Null,
+            "actor": draft.actor,
+            "used_scope": draft.used_scope,
+            "retrieved_node_ids": draft.retrieved_node_ids,
+            "decision": draft.decision,
+            "route": draft.route,
+            "governing_norm_ids": draft.governing_norm_ids,
+            "graph_provenance_linked": false,
+        });
+        let payload_text = serde_json::to_string(&payload)?;
+        let mut hasher = Sha256::new();
+        hasher.update(prev_hash.as_bytes());
+        hasher.update(payload_text.as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        let event = AuditEvent {
+            event_id: &event_id,
+            timestamp: &timestamp,
+            request_id: &draft.request_id,
+            schema: &draft.schema,
+            generation: None,
+            actor: &draft.actor,
+            used_scope: &draft.used_scope,
+            retrieved_node_ids: &draft.retrieved_node_ids,
+            decision: &draft.decision,
+            route: draft.route.as_deref(),
+            governing_norm_ids: &draft.governing_norm_ids,
+            graph_provenance_linked: false,
+            prev_hash,
+            hash: &hash,
+        };
+        let line = serde_json::to_string(&event)?;
+        writeln!(file, "{line}")
+            .with_context(|| format!("append audit log {}", self.path.display()))?;
+        file.flush().context("flush audit log")?;
+        *prev_hash = hash;
+        Ok(event_id)
+    }
+}
+
+fn genesis_hash() -> String {
+    format!("{:x}", Sha256::digest(b"cs-support-mcp-worm-genesis"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::scope::AccessScope;
+
+    fn scope() -> AccessScope {
+        AccessScope {
+            allowed_schemas: vec!["sivira-cs-demo".to_string()],
+            max_sensitivity: None,
+            label_allowlist: None,
+        }
+    }
+
+    fn draft(request_id: &str, decision: &str) -> AuditDraft {
+        AuditDraft {
+            request_id: request_id.to_string(),
+            schema: "sivira-cs-demo".to_string(),
+            actor: "op-001".to_string(),
+            used_scope: scope(),
+            retrieved_node_ids: vec!["sivira-cs-demo#gen1/section:doc-1#storage".to_string()],
+            decision: decision.to_string(),
+            route: None,
+            governing_norm_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn append_writes_provenance_keyed_jsonl_with_hash_chain() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let log = WormAuditLog::open(&path).expect("open worm log");
+        let id1 = log.append(draft("req-1", "allowed")).expect("append 1");
+        let id2 = log.append(draft("req-2", "escalate")).expect("append 2");
+        assert_ne!(id1, id2);
+
+        let body = std::fs::read_to_string(&path).expect("read log");
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is json"))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        // provenance キーが構造化されている（I5、opaque blob でない）
+        for line in &lines {
+            for key in [
+                "event_id",
+                "timestamp",
+                "request_id",
+                "schema",
+                "actor",
+                "used_scope",
+                "retrieved_node_ids",
+                "decision",
+                "governing_norm_ids",
+                "graph_provenance_linked",
+                "prev_hash",
+                "hash",
+            ] {
+                assert!(line.get(key).is_some(), "missing key {key}");
+            }
+        }
+        // hash chain: 2 行目の prev_hash は 1 行目の hash
+        assert_eq!(lines[1]["prev_hash"], lines[0]["hash"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reopen_continues_hash_chain() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let first_hash;
+        {
+            let log = WormAuditLog::open(&path).expect("open");
+            log.append(draft("req-1", "allowed")).expect("append");
+            let body = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+            first_hash = v["hash"].as_str().unwrap().to_string();
+        }
+        // 再オープン（プロセス再起動相当）でもチェーンが繋がる
+        let log = WormAuditLog::open(&path).expect("reopen");
+        log.append(draft("req-2", "escalate")).expect("append");
+        let body = std::fs::read_to_string(&path).unwrap();
+        let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(last["prev_hash"].as_str().unwrap(), first_hash);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

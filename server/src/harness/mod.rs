@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod authn;
 pub mod correction;
 pub mod decision;
