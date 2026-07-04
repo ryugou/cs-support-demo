@@ -790,6 +790,12 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
    - N / M / r / K の具体値は S1-9 のとおり未決のため config（`[harness.grading]`）で注入し、初期値は N=3, M=2, r=0.2, K=2 の仮置きとする。**業務確認で確定させること。**
    - Step 1 の利用者は担当者のため、`auto_answer_audited` でも応答セマンティクスは変わらない（担当者に直接応答）。grade は Step 2 の「顧客直に即答してよいか」の判定材料として蓄積する。
 
+### 実装状況（2026-07-04）
+
+- MCP 側 Step 1（Harness / 3 層判定 / 会話層 / egress / correction / grade / WORM / 12 tool / 加算スキーマ / ingest_rules CLI）を `feat/production-cs-mcp-step1` ブランチに実装済み。ユニットテスト 59 本・fmt・check 通過。
+- 加算スキーマ更新と第1層ルール 2 件・第2層領域 2 件は `vegapunk.local` の `sivira-cs-demo` に投入済み（純加算）。
+- **S1-8 Done 条件の実機 E2E 突合は保留中**: vegapunk / PunkRecord 側の Step 1 追加機能が実装完了していないため。バックエンド側完了後に Task 14（受け入れ検証）を再開する。
+
 ---
 
 # フェーズロードマップ — Step 2（顧客直チャットボット）/ Step 3（音声対応）への前方互換
