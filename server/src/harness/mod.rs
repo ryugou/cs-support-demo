@@ -1,5 +1,7 @@
 pub mod authn;
+pub mod correction;
 pub mod decision;
+pub mod egress;
 pub mod grading;
 pub mod rules;
 pub mod scope;
