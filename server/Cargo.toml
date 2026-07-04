@@ -1,0 +1,43 @@
+[package]
+name = "cs-support-mcp"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+clap = { version = "4", features = ["derive", "env"] }
+http = "1"
+prost = "0.13"
+rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server", "transport-io", "macros"] }
+rustls = "0.23"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+toml = "0.8"
+tonic = { version = "0.12", features = ["transport"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[[bin]]
+name = "cs-support-mcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "ingest_demo"
+path = "src/bin/ingest_demo.rs"
+
+[[bin]]
+name = "verify_demo"
+path = "src/bin/verify_demo.rs"

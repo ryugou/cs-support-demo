@@ -1,0 +1,6 @@
+bind_addr = "0.0.0.0:8080"
+vegapunk_endpoint = "http://vegapunk-server:50051"
+
+[[projects]]
+project_id = "sivira-cs-demo"
+schema = "sivira-cs-demo"

@@ -1,0 +1,8 @@
+server/target/
+target/
+.git/
+.DS_Store
+server/certs/
+*.pem
+*.key
+*.crt

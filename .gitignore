@@ -1,0 +1,3 @@
+/server/target/
+/server/certs/*.pem
+.DS_Store

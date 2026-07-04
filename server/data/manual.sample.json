@@ -1,0 +1,403 @@
+{
+  "products": [
+    {
+      "product_key": "SVR-HB100",
+      "name_en": "Sivira HomeBridge Mini",
+      "name_ja": "シビラ ホームブリッジ ミニ",
+      "model": "HB-100",
+      "status": "active",
+      "description_en": "Compact smart-home hub for Matter accessories, Thread border routing, and local automations.",
+      "description_ja": "Matter対応アクセサリ、Threadボーダールーター、ローカル自動化に対応した小型スマートホームハブです。",
+      "documents": [
+        {
+          "doc_id": "svr-hb100-user-guide",
+          "title_en": "HomeBridge Mini User Guide",
+          "title_ja": "ホームブリッジ ミニ ユーザーガイド",
+          "version": "1.5",
+          "source_url": "s3://sivira-demo/manuals/hb100/user-guide-v1.5.md",
+          "origin_lang": "en",
+          "sections": [
+            {
+              "anchor": "overview",
+              "order": 1,
+              "level": 1,
+              "title_en": "Product overview",
+              "title_ja": "製品概要",
+              "body_en": "HomeBridge Mini connects Matter accessories to the Sivira Home app and acts as a Thread border router for low-power sensors. The hub processes local automations even when the internet connection is temporarily unavailable.",
+              "body_ja": "ホームブリッジ ミニはMatter対応アクセサリをシビラホームアプリに接続し、省電力センサー向けのThreadボーダールーターとして動作します。インターネット接続が一時的に利用できない場合でも、ハブはローカル自動化を処理します。",
+              "children": [
+                {
+                  "anchor": "led-status",
+                  "order": 1,
+                  "level": 2,
+                  "title_en": "Status LED meanings",
+                  "title_ja": "ステータスLEDの意味",
+                  "body_en": "Pulsing blue means the hub is in pairing mode. Solid white means the hub is online and ready. Amber flashes indicate a network error, and three rapid amber flashes after a long button press indicate factory reset.",
+                  "body_ja": "青色のゆっくり点滅はハブがペアリングモードであることを示します。白色点灯はオンラインで使用可能な状態です。オレンジ色の点滅はネットワークエラーを示し、長押し後にオレンジ色で3回速く点滅した場合は工場出荷時リセットを示します。"
+                }
+              ]
+            },
+            {
+              "anchor": "setup",
+              "order": 2,
+              "level": 1,
+              "title_en": "Initial setup",
+              "title_ja": "初期設定",
+              "body_en": "Connect the USB-C power cable, wait until the status LED pulses blue, then open the Sivira Home app. Keep the hub within 5 meters of the Wi-Fi router during setup. The hub supports only 2.4 GHz Wi-Fi networks.",
+              "body_ja": "USB-C電源ケーブルを接続し、ステータスLEDが青くゆっくり点滅するまで待ってから、シビラホームアプリを開きます。設定中はハブをWi-Fiルーターから5メートル以内に置いてください。ハブは2.4 GHz Wi-Fiネットワークのみに対応しています。",
+              "children": [
+                {
+                  "anchor": "pairing-mode",
+                  "order": 1,
+                  "level": 2,
+                  "title_en": "Pairing mode",
+                  "title_ja": "ペアリングモード",
+                  "body_en": "If the LED is solid white, press the reset pinhole for 3 seconds. Release it when the LED starts pulsing blue. Do not hold for more than 10 seconds unless you want to factory reset the hub.",
+                  "body_ja": "LEDが白色点灯している場合は、リセット穴を3秒押します。LEDが青くゆっくり点滅し始めたら離してください。初期化したい場合を除き、10秒以上押し続けないでください。"
+                },
+                {
+                  "anchor": "app-account",
+                  "order": 2,
+                  "level": 2,
+                  "title_en": "App account requirements",
+                  "title_ja": "アプリアカウント要件",
+                  "body_en": "Use Sivira Home app version 4.8 or later. The phone must have Bluetooth enabled during setup because the app uses Bluetooth to transfer the Wi-Fi credentials securely to the hub.",
+                  "body_ja": "シビラホームアプリのバージョン4.8以降を使用してください。アプリはBluetoothを使ってWi-Fi認証情報を安全にハブへ転送するため、設定中はスマートフォンのBluetoothを有効にする必要があります。"
+                }
+              ]
+            },
+            {
+              "anchor": "thread-range",
+              "order": 3,
+              "level": 1,
+              "title_en": "Thread range and placement",
+              "title_ja": "Thread通信範囲と設置場所",
+              "body_en": "For stable Thread routing, place the hub in an open area away from metal shelves, microwave ovens, and large aquariums. A single interior wall is usually acceptable; reinforced concrete walls may require an additional Thread router.",
+              "body_ja": "安定したThreadルーティングのため、金属棚、電子レンジ、大型水槽から離れた開けた場所に設置してください。通常の室内壁1枚程度なら問題ありませんが、鉄筋コンクリート壁では追加のThreadルーターが必要になる場合があります。"
+            },
+            {
+              "anchor": "matter-accessories",
+              "order": 4,
+              "level": 1,
+              "title_en": "Adding Matter accessories",
+              "title_ja": "Matterアクセサリの追加",
+              "body_en": "To add a Matter accessory, tap Add device in the Sivira Home app and scan the Matter QR code. Keep the accessory powered on and within 3 meters of the HomeBridge Mini until the app confirms that commissioning is complete.",
+              "body_ja": "Matterアクセサリを追加するには、シビラホームアプリでデバイス追加をタップし、Matter QRコードを読み取ります。アプリがコミッショニング完了を表示するまで、アクセサリの電源を入れたままホームブリッジ ミニから3メートル以内に置いてください。"
+            },
+            {
+              "anchor": "local-automations",
+              "order": 5,
+              "level": 1,
+              "title_en": "Local automations",
+              "title_ja": "ローカル自動化",
+              "body_en": "Automations that use only paired Matter or Thread devices can run locally on the hub. Cloud-only services, push notifications, and remote access require an internet connection.",
+              "body_ja": "ペアリング済みのMatterまたはThreadデバイスだけを使う自動化は、ハブ上でローカル実行できます。クラウド専用サービス、プッシュ通知、外出先からのアクセスにはインターネット接続が必要です。"
+            },
+            {
+              "anchor": "network-troubleshooting",
+              "order": 6,
+              "level": 1,
+              "title_en": "Network troubleshooting",
+              "title_ja": "ネットワークのトラブルシューティング",
+              "body_en": "If the LED flashes amber, confirm that the router is broadcasting a 2.4 GHz SSID and that client isolation is disabled. Restart the router first, then power cycle the hub by unplugging the USB-C cable for 10 seconds.",
+              "body_ja": "LEDがオレンジ色に点滅する場合は、ルーターが2.4 GHz SSIDを配信しており、クライアント分離が無効であることを確認してください。先にルーターを再起動し、その後USB-Cケーブルを10秒抜いてハブの電源を入れ直します。",
+              "references": ["svr-hb100-user-guide#led-status", "svr-hb100-user-guide#setup"]
+            },
+            {
+              "anchor": "factory-reset",
+              "order": 7,
+              "level": 1,
+              "title_en": "Factory reset",
+              "title_ja": "工場出荷時リセット",
+              "body_en": "Hold the reset pinhole for 12 seconds until the LED flashes amber three times. Factory reset removes Wi-Fi credentials, Matter fabrics, paired Thread devices, and all local automations.",
+              "body_ja": "LEDがオレンジ色で3回点滅するまで、リセット穴を12秒押し続けます。工場出荷時リセットを行うと、Wi-Fi認証情報、Matterファブリック、ペアリング済みThreadデバイス、すべてのローカル自動化が削除されます。",
+              "references": ["svr-hb100-user-guide#pairing-mode"]
+            }
+          ],
+          "specs": [
+            {
+              "key_slug": "supported-wifi",
+              "key_en": "Supported Wi-Fi",
+              "key_ja": "対応Wi-Fi",
+              "value_en": "2.4 GHz 802.11 b/g/n",
+              "value_ja": "2.4 GHz 802.11 b/g/n",
+              "defined_in": "svr-hb100-user-guide#setup"
+            },
+            {
+              "key_slug": "power",
+              "key_en": "Power input",
+              "key_ja": "電源入力",
+              "value_en": "USB-C, 5V/1A",
+              "value_ja": "USB-C、5V/1A",
+              "defined_in": "svr-hb100-user-guide#setup"
+            },
+            {
+              "key_slug": "app-version",
+              "key_en": "Required app version",
+              "key_ja": "必要なアプリバージョン",
+              "value_en": "Sivira Home 4.8 or later",
+              "value_ja": "シビラホーム 4.8以降",
+              "defined_in": "svr-hb100-user-guide#app-account"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "product_key": "SVR-CM240",
+      "name_en": "Sivira CoolMist 240",
+      "name_ja": "シビラ クールミスト 240",
+      "model": "CM-240",
+      "status": "active",
+      "description_en": "Ultrasonic humidifier with removable tank, child lock, and weekly descaling guidance.",
+      "description_ja": "取り外し式給水タンク、チャイルドロック、週次の除石灰ガイドを備えた超音波式加湿器です。",
+      "documents": [
+        {
+          "doc_id": "svr-cm240-care-guide",
+          "title_en": "CoolMist 240 Care Guide",
+          "title_ja": "クールミスト 240 お手入れガイド",
+          "version": "2.2",
+          "source_url": "s3://sivira-demo/manuals/cm240/care-guide-v2.2.md",
+          "origin_lang": "en",
+          "sections": [
+            {
+              "anchor": "overview",
+              "order": 1,
+              "level": 1,
+              "title_en": "Product overview",
+              "title_ja": "製品概要",
+              "body_en": "CoolMist 240 is an ultrasonic humidifier designed for bedrooms and small living rooms. It uses a removable 2.4 L water tank, a quiet night mode, and an automatic shutoff sensor when the tank is empty.",
+              "body_ja": "クールミスト 240は寝室や小さめのリビング向けに設計された超音波式加湿器です。取り外し式の2.4 L給水タンク、静かなナイトモード、タンクが空になったときの自動停止センサーを備えています。"
+            },
+            {
+              "anchor": "daily-refill",
+              "order": 2,
+              "level": 1,
+              "title_en": "Daily refill",
+              "title_ja": "毎日の給水",
+              "body_en": "Lift the water tank straight up, fill it with clean tap water, and firmly close the cap. Do not add aroma oil, detergent, mineral water, or hot water to the tank.",
+              "body_ja": "給水タンクをまっすぐ持ち上げ、清潔な水道水を入れてキャップをしっかり閉めます。タンクにアロマオイル、洗剤、ミネラルウォーター、熱湯を入れないでください。",
+              "children": [
+                {
+                  "anchor": "tank-cap",
+                  "order": 1,
+                  "level": 2,
+                  "title_en": "Tank cap check",
+                  "title_ja": "タンクキャップの確認",
+                  "body_en": "After refilling, turn the tank upside down for 5 seconds over a sink. If water drips from the cap, remove the cap, check that the silicone gasket is seated flat, and tighten it again.",
+                  "body_ja": "給水後、シンクの上でタンクを逆さにして5秒確認します。キャップから水が垂れる場合は、キャップを外し、シリコンパッキンが平らに収まっていることを確認して締め直してください。"
+                }
+              ]
+            },
+            {
+              "anchor": "mist-output",
+              "order": 3,
+              "level": 1,
+              "title_en": "Mist output settings",
+              "title_ja": "ミスト量の設定",
+              "body_en": "Press the mist button to cycle through low, medium, and high output. Use low output for rooms smaller than 8 square meters or when condensation appears on windows.",
+              "body_ja": "ミストボタンを押すと、弱・中・強の順にミスト量が切り替わります。8平方メートル未満の部屋や窓に結露が出る場合は、弱運転を使用してください。"
+            },
+            {
+              "anchor": "weekly-descaling",
+              "order": 4,
+              "level": 1,
+              "title_en": "Weekly descaling",
+              "title_ja": "週1回の除石灰",
+              "body_en": "Once a week, soak the base tray with citric acid solution for 20 minutes, then rinse with clean water. Descaling prevents weak mist output and white powder around the unit.",
+              "body_ja": "週に1回、本体トレイをクエン酸水に20分浸したあと、清潔な水ですすぎます。除石灰により、ミストが弱くなる症状や本体周辺の白い粉を防げます。",
+              "children": [
+                {
+                  "anchor": "white-powder",
+                  "order": 1,
+                  "level": 2,
+                  "title_en": "White powder around the unit",
+                  "title_ja": "本体周辺の白い粉",
+                  "body_en": "White powder is usually mineral residue from hard tap water. It is not smoke or mold. Clean the base tray, wipe nearby surfaces with a damp cloth, and consider using filtered water if the residue returns quickly.",
+                  "body_ja": "白い粉は通常、硬度の高い水道水に含まれるミネラル残留物です。煙やカビではありません。本体トレイを清掃し、周囲を湿った布で拭き、すぐ再発する場合は浄水の使用を検討してください。"
+                }
+              ]
+            },
+            {
+              "anchor": "child-lock",
+              "order": 5,
+              "level": 1,
+              "title_en": "Child lock",
+              "title_ja": "チャイルドロック",
+              "body_en": "Press and hold the mist button and timer button together for 2 seconds. The lock icon turns on and all touch buttons are disabled except the power button.",
+              "body_ja": "ミストボタンとタイマーボタンを同時に2秒長押しします。ロックアイコンが点灯し、電源ボタン以外のタッチボタンが無効になります。"
+            },
+            {
+              "anchor": "odor",
+              "order": 6,
+              "level": 1,
+              "title_en": "Odor after storage",
+              "title_ja": "保管後のにおい",
+              "body_en": "If the unit smells after long storage, empty the tank, clean the tank and base tray, and run the humidifier with fresh water for 10 minutes. Do not use alcohol, bleach, or abrasive cleaners.",
+              "body_ja": "長期保管後ににおいがする場合は、タンクを空にし、給水タンクと本体トレイを清掃してから、新しい水で10分運転します。アルコール、漂白剤、研磨剤入りクリーナーは使用しないでください。",
+              "references": ["svr-cm240-care-guide#weekly-descaling"]
+            },
+            {
+              "anchor": "storage",
+              "order": 7,
+              "level": 1,
+              "title_en": "Seasonal storage",
+              "title_ja": "季節保管",
+              "body_en": "Before storing the humidifier, drain all water, descale the base tray, wipe the tank dry, and leave the tank cap open for one day. Store the unit in a dry place away from direct sunlight.",
+              "body_ja": "加湿器を保管する前に、すべての水を抜き、本体トレイを除石灰し、タンクを乾拭きして、タンクキャップを開けたまま1日置きます。直射日光を避け、乾燥した場所で保管してください。",
+              "references": ["svr-cm240-care-guide#weekly-descaling"]
+            }
+          ],
+          "specs": [
+            {
+              "key_slug": "tank-capacity",
+              "key_en": "Water tank capacity",
+              "key_ja": "給水タンク容量",
+              "value_en": "2.4 L",
+              "value_ja": "2.4 L",
+              "defined_in": "svr-cm240-care-guide#overview"
+            },
+            {
+              "key_slug": "room-size",
+              "key_en": "Recommended room size",
+              "key_ja": "推奨適用畳数",
+              "value_en": "Up to 14 m2",
+              "value_ja": "最大14平方メートル",
+              "defined_in": "svr-cm240-care-guide#mist-output"
+            },
+            {
+              "key_slug": "safety-shutoff",
+              "key_en": "Empty tank shutoff",
+              "key_ja": "空だき防止",
+              "value_en": "Automatic stop when the tank is empty",
+              "value_ja": "タンクが空になると自動停止",
+              "defined_in": "svr-cm240-care-guide#overview"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "product_key": "SVR-AD20",
+      "name_en": "Sivira AirDock 20W",
+      "name_ja": "シビラ エアドック 20W",
+      "model": "AD-20",
+      "status": "active",
+      "description_en": "Magnetic wireless charging stand for phones and earbuds with foreign object detection.",
+      "description_ja": "異物検知に対応した、スマートフォンとイヤホン用のマグネット式ワイヤレス充電スタンドです。",
+      "documents": [
+        {
+          "doc_id": "svr-ad20-safety-guide",
+          "title_en": "AirDock 20W Safety Guide",
+          "title_ja": "エアドック 20W 安全ガイド",
+          "version": "1.3",
+          "source_url": "s3://sivira-demo/manuals/ad20/safety-guide-v1.3.md",
+          "origin_lang": "en",
+          "sections": [
+            {
+              "anchor": "overview",
+              "order": 1,
+              "level": 1,
+              "title_en": "Product overview",
+              "title_ja": "製品概要",
+              "body_en": "AirDock 20W is a magnetic wireless charging stand for compatible phones and earbuds. The phone pad provides up to 15W wireless output, and the lower pad provides up to 5W for earbuds cases.",
+              "body_ja": "エアドック 20Wは、対応スマートフォンとイヤホンケース向けのマグネット式ワイヤレス充電スタンドです。スマートフォン側パッドは最大15W、下部パッドはイヤホンケース向けに最大5Wのワイヤレス出力を提供します。"
+            },
+            {
+              "anchor": "alignment",
+              "order": 2,
+              "level": 1,
+              "title_en": "Charging alignment",
+              "title_ja": "充電位置合わせ",
+              "body_en": "Center the phone on the magnetic ring. If the status light blinks red, remove the phone, check for cards or metal objects, and place it again.",
+              "body_ja": "スマートフォンをマグネットリングの中央に合わせます。ステータスライトが赤く点滅する場合は、スマートフォンを外し、カードや金属片がないか確認してから置き直してください。",
+              "children": [
+                {
+                  "anchor": "case-compatibility",
+                  "order": 1,
+                  "level": 2,
+                  "title_en": "Phone case compatibility",
+                  "title_ja": "スマートフォンケースの互換性",
+                  "body_en": "Use a magnetic charging compatible case no thicker than 3 mm. Wallet cases, ring holders, metal plates, and thick rugged cases can prevent charging or trigger foreign object detection.",
+                  "body_ja": "厚さ3 mm以下のマグネット充電対応ケースを使用してください。手帳型ケース、リングホルダー、金属プレート、厚い耐衝撃ケースは、充電を妨げたり異物検知を作動させたりする場合があります。"
+                }
+              ]
+            },
+            {
+              "anchor": "adapter",
+              "order": 3,
+              "level": 1,
+              "title_en": "Power adapter",
+              "title_ja": "電源アダプター",
+              "body_en": "Use a USB-C PD adapter rated 20W or higher. Using a 5W adapter may cause slow charging or repeated start-stop charging.",
+              "body_ja": "20W以上のUSB-C PDアダプターを使用してください。5Wアダプターを使うと、充電が遅くなったり、充電開始と停止を繰り返したりする場合があります。"
+            },
+            {
+              "anchor": "foreign-object-detection",
+              "order": 4,
+              "level": 1,
+              "title_en": "Foreign object detection",
+              "title_ja": "異物検知",
+              "body_en": "When the charger detects a coin, key, transit card, or other metal object between the phone and the pad, it stops charging and blinks red. Remove the object and wait 5 seconds before placing the phone back on the stand.",
+              "body_ja": "充電器がスマートフォンとパッドの間にある硬貨、鍵、交通系カード、その他の金属物を検知すると、充電を停止して赤く点滅します。異物を取り除き、5秒待ってからスマートフォンをスタンドに戻してください。",
+              "references": ["svr-ad20-safety-guide#alignment"]
+            },
+            {
+              "anchor": "heat",
+              "order": 5,
+              "level": 1,
+              "title_en": "Heat during charging",
+              "title_ja": "充電中の発熱",
+              "body_en": "The phone and stand may become warm during fast wireless charging. If the phone displays a temperature warning, remove it from the stand and let it cool before charging again.",
+              "body_ja": "高速ワイヤレス充電中は、スマートフォンとスタンドが温かくなる場合があります。スマートフォンに温度警告が表示された場合は、スタンドから外し、冷ましてから再度充電してください。"
+            },
+            {
+              "anchor": "earbud-pad",
+              "order": 6,
+              "level": 1,
+              "title_en": "Earbud charging pad",
+              "title_ja": "イヤホン充電パッド",
+              "body_en": "Place the earbuds case flat on the lower pad with the status light facing forward. If the case does not start charging, rotate it 180 degrees and confirm that the case supports Qi wireless charging.",
+              "body_ja": "イヤホンケースを下部パッドに平らに置き、ステータスライトを前面に向けます。充電が始まらない場合は、ケースを180度回転させ、ケースがQiワイヤレス充電に対応していることを確認してください。"
+            },
+            {
+              "anchor": "cleaning",
+              "order": 7,
+              "level": 1,
+              "title_en": "Cleaning and cable care",
+              "title_ja": "清掃とケーブルの取り扱い",
+              "body_en": "Unplug the USB-C cable before cleaning. Wipe the charging pads with a soft dry cloth. Do not use alcohol, sprays, or abrasive cleaners, and do not bend the cable sharply near the connector.",
+              "body_ja": "清掃前にUSB-Cケーブルを抜いてください。充電パッドは柔らかい乾いた布で拭きます。アルコール、スプレー、研磨剤入りクリーナーは使用せず、コネクタ付近でケーブルを強く折り曲げないでください。"
+            }
+          ],
+          "specs": [
+            {
+              "key_slug": "max-output",
+              "key_en": "Maximum wireless output",
+              "key_ja": "最大ワイヤレス出力",
+              "value_en": "15W phone pad, 5W earbud pad",
+              "value_ja": "スマートフォン側15W、イヤホン側5W",
+              "defined_in": "svr-ad20-safety-guide#overview"
+            },
+            {
+              "key_slug": "adapter-requirement",
+              "key_en": "Power adapter requirement",
+              "key_ja": "電源アダプター要件",
+              "value_en": "USB-C PD 20W or higher",
+              "value_ja": "USB-C PD 20W以上",
+              "defined_in": "svr-ad20-safety-guide#adapter"
+            },
+            {
+              "key_slug": "case-thickness",
+              "key_en": "Maximum compatible case thickness",
+              "key_ja": "対応ケース厚",
+              "value_en": "3 mm or less",
+              "value_ja": "3 mm以下",
+              "defined_in": "svr-ad20-safety-guide#case-compatibility"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

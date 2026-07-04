@@ -1,0 +1,901 @@
+syntax = "proto3";
+package graphrag;
+
+// =============================================================================
+// Conventions
+// =============================================================================
+//
+// schema field:
+//   The implicit "default schema" concept (config.schema.default) has been
+//   removed. The `schema` field is REQUIRED on all RPCs that operate on
+//   schema-scoped data. Empty string is rejected with INVALID_ARGUMENT.
+//
+// auth:
+//   RPCs are tagged with `// requires auth: <role>` comments. Roles:
+//     - read:  read-only access (Search, Get*, List*, GetMaintenanceMode, ...)
+//     - write: ingest / mutate own data (Ingest*, Feedback, ResolveMatch)
+//     - admin: schema lifecycle / destructive ops / maintenance mode
+//   The current Bearer-token auth mode treats all authenticated callers as
+//   admin. JWT mode (when enabled) enforces the role distinction.
+//
+// =============================================================================
+
+service GraphRAGEngine {
+  // High-level API
+  rpc Ingest(IngestRequest) returns (IngestResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Graph API — direct node/edge/vector operations
+  rpc UpsertNodes(UpsertNodesRequest) returns (UpsertNodesResponse);
+  rpc UpsertEdges(UpsertEdgesRequest) returns (UpsertEdgesResponse);
+  rpc UpsertVectors(UpsertVectorsRequest) returns (UpsertVectorsResponse);
+  rpc DeleteNodes(DeleteNodesRequest) returns (DeleteNodesResponse);       // requires auth: admin
+  rpc DeleteEdges(DeleteEdgesRequest) returns (DeleteEdgesResponse);       // requires auth: admin
+  rpc DeleteVectors(DeleteVectorsRequest) returns (DeleteVectorsResponse); // requires auth: admin
+  // Atomic graph write: nodes + edges + vectors in one RPC. On vector
+  // failure, nodes/edges are rolled back (best-effort).
+  rpc UpsertGraph(UpsertGraphRequest) returns (UpsertGraphResponse);       // requires auth: write
+
+  // Admin (Phase 1b - returns UNIMPLEMENTED in 1a)
+  rpc Merge(MergeRequest) returns (MergeResponse);
+  rpc Rebuild(RebuildRequest) returns (RebuildResponse);
+  rpc Backup(BackupRequest) returns (BackupResponse);
+  rpc Migrate(MigrateRequest) returns (MigrateResponse);
+
+  // Feedback (Phase 2a)
+  rpc Feedback(FeedbackRequest) returns (FeedbackResponse);
+
+  // Matching review (Phase 2b)
+  rpc GetNeedsReview(GetNeedsReviewRequest) returns (GetNeedsReviewResponse);
+  rpc ResolveMatch(ResolveMatchRequest) returns (ResolveMatchResponse);
+
+  // Job status (Phase 2c)
+  rpc GetJobStatus(GetJobStatusRequest) returns (GetJobStatusResponse);
+  rpc GetIngestStatus(GetIngestStatusRequest) returns (GetIngestStatusResponse);
+
+  // Raw text ingestion (Phase 2c)
+  rpc IngestRaw(IngestRawRequest) returns (IngestRawResponse);
+
+  // File-based ingestion (Phase 2c)
+  rpc IngestFile(IngestFileRequest) returns (IngestFileResponse);
+
+  // Schema lifecycle (Phase 2c)
+  rpc DeleteSchema(DeleteSchemaRequest) returns (DeleteSchemaResponse);
+  rpc Reingest(ReingestRequest) returns (ReingestResponse);
+
+  // Prompt improvement (Phase 3)
+  rpc ImprovePrompts(ImprovePromptsRequest) returns (ImprovePromptsResponse);
+
+  // Schema CRUD
+  rpc CreateSchema(CreateSchemaRequest) returns (CreateSchemaResponse);  // requires auth: admin
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);            // requires auth: read
+  rpc ListSchemas(ListSchemasRequest) returns (ListSchemasResponse);      // requires auth: read
+  rpc UpdateSchema(UpdateSchemaRequest) returns (UpdateSchemaResponse);   // requires auth: admin
+  rpc ListSchemaTemplates(ListSchemaTemplatesRequest) returns (ListSchemaTemplatesResponse);  // requires auth: read
+  // Track the destructive rebuild started by UpdateSchema. Use with the job_id
+  // returned in UpdateSchemaResponse. requires auth: admin
+  rpc GetSchemaMigrationStatus(GetSchemaMigrationStatusRequest) returns (GetSchemaMigrationStatusResponse);
+
+  // Raw message lifecycle
+  rpc PurgeRawMessages(PurgeRawMessagesRequest) returns (PurgeRawMessagesResponse);  // requires auth: admin
+
+  // Maintenance mode
+  rpc SetMaintenanceMode(SetMaintenanceModeRequest) returns (MaintenanceModeResponse);  // requires auth: admin
+  rpc GetMaintenanceMode(GetMaintenanceModeRequest) returns (MaintenanceModeResponse);  // requires auth: read
+
+  // Admin API (v0.2.0) — see docs/specs/admin-api-design.md
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);                              // requires auth: read
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);                              // requires auth: read
+  rpc GetEvaluationHistory(GetEvaluationHistoryRequest) returns (GetEvaluationHistoryResponse);  // requires auth: read
+  rpc ListRecentSearches(ListRecentSearchesRequest) returns (ListRecentSearchesResponse);        // requires auth: read
+  rpc GetVectors(GetVectorsRequest) returns (GetVectorsResponse);                        // requires auth: read
+  rpc GetTraceableChain(GetTraceableChainRequest) returns (GetTraceableChainResponse);   // requires auth: read
+  rpc GetGraphSnapshot(GetGraphSnapshotRequest) returns (GetGraphSnapshotResponse);      // requires auth: read
+
+  // Structured query API — attribute-based node lookup (complements vector-similarity Search)
+  rpc QueryNodes(QueryNodesRequest) returns (QueryNodesResponse);                        // requires auth: read
+
+  // Embedding-as-a-service — expose the configured embedder so external clients
+  // (e.g. UpsertVectors users) can generate vectors aligned with vegapunk's model.
+  rpc Embed(EmbedRequest) returns (EmbedResponse);                                       // requires auth: read
+}
+
+// ── Ingest ────────────────────────────────────────────────────────────────
+
+message MessageMetadata {
+  string source_type = 1;
+  string author = 2;
+  optional string author_id = 3;
+  string channel = 4;
+  optional string channel_id = 5;
+  optional string thread_id = 6;
+  string timestamp = 7;  // RFC3339 format required (e.g. "2026-03-01T10:00:00+09:00")
+}
+
+message IngestMessage {
+  optional string id = 1;
+  string text = 2;
+  MessageMetadata metadata = 3;
+}
+
+message IngestRequest {
+  repeated IngestMessage messages = 1;
+  string schema = 2;  // Schema name (required)
+}
+
+message IngestResponse {
+  int32 ingested_count = 1;
+  optional string job_id = 2;
+  string ingest_id = 3;
+}
+
+// ── Search ────────────────────────────────────────────────────────────────
+
+message SearchFilter {
+  optional string after = 1;   // RFC3339 format required
+  optional string before = 2;  // RFC3339 format required
+  optional string source_type = 3;
+}
+
+message SearchRequest {
+  string text = 1;
+  optional SearchFilter filter = 2;
+  optional int32 depth = 3;
+  optional int32 top_k = 4;
+  optional string format = 5;
+  optional string mode = 6;  // "local" | "global" | "hybrid". Default: "local"
+  string schema = 7;  // Schema name (required)
+  // Paging: offset + limit enables result pagination.
+  // Internally fetches max(top_k, offset+limit) results, so large offsets
+  // increase retrieval cost. Use top_k/max_top_k config to bound this.
+  optional int32 offset = 8;  // Paging offset (default 0)
+  optional int32 limit = 9;   // Paging limit (default = top_k)
+  // Weight for structural (Node2Vec) scores in search ranking.
+  // 0.0 = text-only (default behavior), 1.0 = structural-only. Default: config value (0.3).
+  // When > 0, SearchResultItem.score becomes a normalized blend (0-1 scale)
+  // rather than raw text similarity. Use for ordering only.
+  optional float structural_weight = 10;
+}
+
+message SearchResultItem {
+  string type = 1;
+  optional string id = 2;
+  optional string text = 3;
+  // Score: similarity ranking value. When structural_weight > 0, this is a
+  // normalized blend of text and structural similarity (0-1 scale, not raw
+  // embedding distance). Use for ordering only, not as absolute similarity.
+  optional float score = 4;
+  optional string person = 5;
+  optional string timestamp = 6;
+  optional string summary = 7;
+  optional string channel = 8;
+  optional string decided_at = 9;
+  repeated string rationales = 10;
+}
+
+message SimilarPattern {
+  string source_project = 1;                // Detected source project (channel)
+  repeated SearchResultItem nodes = 2;      // Decision + Rationale set
+  float structural_similarity = 3;          // Structural similarity score
+}
+
+enum ReadinessState {
+  READINESS_STATE_UNSPECIFIED = 0;
+  READINESS_STATE_READY = 1;
+  READINESS_STATE_NOT_READY = 2;
+  READINESS_STATE_BUILDING = 3;
+  READINESS_STATE_STALE = 4;
+  READINESS_STATE_FAILED = 5;
+  READINESS_STATE_DISABLED = 6;
+}
+
+enum SearchComponent {
+  SEARCH_COMPONENT_UNSPECIFIED = 0;
+  SEARCH_COMPONENT_LOCAL = 1;
+  SEARCH_COMPONENT_GLOBAL = 2;
+  SEARCH_COMPONENT_COMMUNITY_SUMMARY = 3;
+  SEARCH_COMPONENT_STRUCTURAL_VECTORS = 4;
+  SEARCH_COMPONENT_SIMILAR_PATTERNS = 5;
+}
+
+enum SearchDegradedReason {
+  SEARCH_DEGRADED_REASON_UNSPECIFIED = 0;
+  SEARCH_DEGRADED_REASON_NOT_READY = 1;
+  SEARCH_DEGRADED_REASON_BUILDING = 2;
+  SEARCH_DEGRADED_REASON_STALE = 3;
+  SEARCH_DEGRADED_REASON_FAILED = 4;
+  SEARCH_DEGRADED_REASON_FALLBACK_TO_LOCAL = 5;
+}
+
+message ComponentReadiness {
+  ReadinessState state = 1;
+  string reason = 2;
+  uint64 revision = 3;
+  int64 ready_at_ms = 4;
+}
+
+message SearchReadiness {
+  ComponentReadiness local = 1;
+  ComponentReadiness global = 2;
+  ComponentReadiness community_summary = 3;
+  ComponentReadiness structural_vectors = 4;
+  ComponentReadiness similar_patterns = 5;
+}
+
+message SearchDegradation {
+  SearchComponent component = 1;
+  SearchDegradedReason reason = 2;
+  string message = 3;
+}
+
+message SearchExecution {
+  string requested_mode = 1;
+  string effective_mode = 2;
+  bool degraded = 3;
+  repeated SearchDegradation degradations = 4;
+  SearchReadiness readiness = 5;
+}
+
+message SearchResponse {
+  repeated SearchResultItem results = 1;
+  string search_id = 2;
+  int32 total_count = 3;  // Total count before offset/limit slicing
+  repeated SimilarPattern similar_patterns = 4;  // Phase 3: cross-project pattern detection
+  SearchExecution execution = 5;
+}
+
+// ── Feedback ──────────────────────────────────────────────────────────────
+
+message FeedbackRequest {
+  string search_id = 1;
+  int32 rating = 2;       // 1-5 scale (1=lowest, 5=highest)
+  string comment = 3;     // optional
+}
+
+message FeedbackResponse {}
+
+// ── Graph API ─────────────────────────────────────────────────────────────
+
+message NodeAttribute {
+  string key = 1;
+  string value = 2;
+}
+
+message Node {
+  string id = 1;
+  string type = 2;
+  repeated NodeAttribute attributes = 3;
+}
+
+message UpsertNodesRequest {
+  repeated Node nodes = 1;
+}
+
+message UpsertNodesResponse {
+  int32 upserted_count = 1;
+}
+
+message Edge {
+  string from_id = 1;
+  string to_id = 2;
+  string type = 3;
+  repeated NodeAttribute attributes = 4;
+}
+
+message UpsertEdgesRequest {
+  repeated Edge edges = 1;
+}
+
+message UpsertEdgesResponse {
+  int32 upserted_count = 1;
+}
+
+message VectorEntry {
+  string id = 1;
+  repeated float vector = 2;
+  map<string, string> metadata = 3;
+}
+
+message UpsertVectorsRequest {
+  repeated VectorEntry vectors = 1;
+}
+
+message UpsertVectorsResponse {
+  int32 upserted_count = 1;
+}
+
+message UpsertGraphRequest {
+  repeated Node nodes = 1;
+  repeated Edge edges = 2;
+  repeated VectorEntry vectors = 3;
+}
+
+message UpsertGraphResponse {
+  int32 upserted_nodes = 1;
+  int32 upserted_edges = 2;
+  int32 upserted_vectors = 3;
+}
+
+// DeleteNodes removes nodes by ID. Does NOT cascade to edges or vectors;
+// use DeleteEdges / DeleteVectors separately to clean up associated data.
+message DeleteNodesRequest {
+  repeated string ids = 1;
+}
+
+message DeleteNodesResponse {
+  // Number of IDs submitted (idempotent — includes non-existent IDs).
+  int32 deleted_count = 1;
+}
+
+message DeleteEdgeIdentifier {
+  string from_id = 1;
+  string to_id = 2;
+  string type = 3;
+}
+
+message DeleteEdgesRequest {
+  repeated DeleteEdgeIdentifier edges = 1;
+}
+
+message DeleteEdgesResponse {
+  // Number of edge triples submitted (idempotent — includes non-existent edges).
+  int32 deleted_count = 1;
+}
+
+message DeleteVectorsRequest {
+  // Vector IDs to delete (same IDs used in UpsertVectors).
+  repeated string ids = 1;
+}
+
+message DeleteVectorsResponse {
+  // Number of vectors actually removed (0 if IDs did not exist).
+  int32 deleted_count = 1;
+}
+
+// ── Admin (Phase 1b stubs) ────────────────────────────────────────────────
+
+message MergeRequest {
+  string schema = 1;  // Schema name (required)
+}
+message MergeResponse {}
+message RebuildRequest {}
+message RebuildResponse {}
+message BackupRequest { string output_path = 1; }
+message BackupResponse {}
+message MigrateRequest { string schema = 1; bool dry_run = 2; }
+message MigrateResponse {}
+
+// ── Matching review (Phase 2b) ───────────────────────────────────────────
+
+message GetNeedsReviewRequest {
+  string schema = 1;            // Schema name (required)
+  optional string node_type = 2;
+}
+
+message NeedsReviewItem {
+  string node_id = 1;
+  string node_type = 2;
+  string name = 3;
+  repeated string candidates = 4;
+}
+
+message GetNeedsReviewResponse {
+  repeated NeedsReviewItem items = 1;
+}
+
+message ResolveMatchRequest {
+  string node_id = 1;
+  optional string match_to = 2;  // If empty/absent, mark as "no match" (new entity)
+}
+
+message ResolveMatchResponse {}
+
+// ── Job status (Phase 2c) ───────────────────────────────────────────────
+
+message GetJobStatusRequest {
+  string msg_id = 1;
+}
+
+message JobStatusItem {
+  string job_type = 1;
+  string status = 2;
+  optional string error = 3;
+  optional string created_at = 4;
+  optional string completed_at = 5;
+}
+
+message GetJobStatusResponse {
+  string msg_id = 1;
+  repeated JobStatusItem jobs = 2;
+  string overall_status = 3;  // "pending" | "processing" | "completed" | "failed"
+}
+
+message GetIngestStatusRequest {
+  string ingest_id = 1;
+}
+
+message GetIngestStatusResponse {
+  string ingest_id = 1;
+  string schema = 2;
+  string source = 3;          // "ingest" | "ingest_raw" | "ingest_file"
+  string status = 4;          // accepted | ingesting | extracting | merge_pending | merge_queued | merging | merged | failed
+  int32 total_messages = 5;
+  int32 processed_messages = 6;
+  int32 total_jobs = 7;
+  int32 completed_jobs = 8;
+  int32 failed_jobs = 9;
+  string merge_status = 10;   // pending | queued | running | merged | disabled | failed
+  uint64 merge_revision = 11;
+  int64 created_at_ms = 12;
+  int64 updated_at_ms = 13;
+  optional int64 finished_at_ms = 14;
+  optional string error = 15;
+  int32 pending_jobs = 16;
+  int32 running_jobs = 17;
+}
+
+// ── IngestRaw (Phase 2c) ───────────────────────────────────────────────
+
+message IngestRawMetadata {
+  string source_type = 1;
+  optional string author = 2;
+  optional string channel = 3;
+  optional string timestamp = 4;   // RFC3339. If omitted, use server time
+}
+
+message IngestRawRequest {
+  string text = 1;
+  IngestRawMetadata metadata = 2;
+  string schema = 3;  // Schema name (required)
+}
+
+message IngestRawResponse {
+  int32 chunk_count = 1;
+  repeated string msg_ids = 2;
+  string ingest_id = 3;
+}
+
+// ── IngestFile (Phase 2c) ──────────────────────────────────────────────
+//
+// Fully async: returns job_id immediately. Use GetJobStatus with the
+// returned job_id to track the ingest_file job progress. Once the
+// ingest_file job completes, each chunk gets its own msg_id with
+// entity_extraction jobs — those can also be tracked via GetJobStatus.
+// Supported formats: txt, md, html/htm. PDF is planned for a future release.
+
+message IngestFileRequest {
+  string file_path = 1;           // Server-local file path
+  string schema = 2;              // Schema name (required)
+  optional IngestRawMetadata metadata = 3;
+}
+
+message IngestFileResponse {
+  string job_id = 1;              // Use with GetJobStatus to track progress
+  string ingest_id = 2;
+}
+
+// ── DeleteSchema + Reingest (Phase 2c) ───────────────────────────────────
+
+message DeleteSchemaRequest {
+  string schema = 1;
+  bool confirm = 2;             // false = dry run (show impact only)
+  bool purge_raw_messages = 3;  // If true, also delete raw_messages (irreversible)
+}
+
+message DeleteSchemaResponse {
+  int32 deleted_nodes = 1;
+  int32 deleted_edges = 2;
+  int32 deleted_vectors = 3;
+  int32 deleted_cross_schema_edges = 4;
+  bool dry_run = 5;
+  int32 raw_messages_count = 6;     // Number of raw_messages affected (counted regardless of purge_raw_messages)
+  int32 deleted_raw_messages = 7;   // Number of raw_messages actually deleted (>0 only when purge_raw_messages=true and confirm=true)
+}
+
+message ReingestRequest {
+  string schema = 1;
+}
+
+message ReingestResponse {
+  int32 message_count = 1;
+}
+
+// ── ImprovePrompts (Phase 3) ───────────────────────────────────────────
+
+message ImprovePromptsRequest {
+  bool dry_run = 1;   // If true, only analyze without applying changes
+}
+
+message ImprovePromptsResponse {
+  bool applied = 1;                   // Whether improvements were actually applied
+  int32 feedback_count = 2;           // Number of feedback entries analyzed
+  string reason = 3;                  // Explanation (e.g., "threshold not met", "applied 2 improvements")
+}
+
+// ── Schema CRUD ──────────────────────────────────────────────────────────
+
+message CreateSchemaRequest {
+  string name = 1;
+  // Source must be one of yaml or template (exactly one).
+  // - yaml: caller provides the full YAML body (used by admin dashboards
+  //   that load a template, let the user edit, then submit).
+  // - template: caller provides a template name; vegapunk copies the
+  //   corresponding template YAML (convenience for direct gRPC users).
+  oneof source {
+    string schema_yaml = 2;
+    string template = 3;
+  }
+}
+
+message CreateSchemaResponse {
+  string name = 1;
+}
+
+message GetSchemaRequest {
+  string name = 1;
+}
+
+message GetSchemaResponse {
+  string name = 1;
+  string schema_yaml = 2;
+  uint32 version = 3;
+  string description = 4;
+}
+
+message ListSchemasRequest {}
+
+message SchemaListItem {
+  string name = 1;
+  uint32 version = 2;
+  string description = 3;
+  string schema_yaml = 4;  // Full YAML body
+}
+
+message ListSchemasResponse {
+  repeated SchemaListItem schemas = 1;
+}
+
+message UpdateSchemaRequest {
+  string name = 1;
+  string schema_yaml = 2;
+  bool dry_run = 3;  // If true, validate and return diff without applying
+}
+
+// SchemaDiff lists added/removed node and edge types between current and new schema.
+message SchemaDiff {
+  repeated string added_nodes = 1;
+  repeated string removed_nodes = 2;
+  repeated string added_edges = 3;
+  repeated string removed_edges = 4;
+}
+
+message UpdateSchemaResponse {
+  string name = 1;
+  bool dry_run = 2;
+  bool is_additive = 3;       // True if no node/edge types are removed
+  SchemaDiff diff = 4;
+  // Set only when dry_run=false AND is_additive=false: the destructive
+  // rebuild flow has been queued. Use GetSchemaMigrationStatus(job_id) to
+  // track progress.
+  optional string job_id = 5;
+}
+
+// ── GetSchemaMigrationStatus ─────────────────────────────────────────────
+
+message GetSchemaMigrationStatusRequest {
+  string job_id = 1;
+}
+
+message GetSchemaMigrationStatusResponse {
+  // "pending" | "running" | "completed" | "failed"
+  string status = 1;
+  // Set when status == "failed". Empty/absent otherwise.
+  optional string error = 2;
+}
+
+// ── ListSchemaTemplates ──────────────────────────────────────────────────
+
+message ListSchemaTemplatesRequest {}
+
+message SchemaTemplate {
+  string name = 1;        // e.g. "discussion", "review"
+  string schema_yaml = 2; // Full template YAML body
+  string description = 3; // Empty if the template has no description
+}
+
+message ListSchemaTemplatesResponse {
+  repeated SchemaTemplate templates = 1;
+}
+
+// ── PurgeRawMessages ─────────────────────────────────────────────────────
+
+message PurgeRawMessagesRequest {
+  string schema = 1;
+  bool confirm = 2;  // false = dry run (return count only)
+}
+
+message PurgeRawMessagesResponse {
+  string schema = 1;       // Echo of the target schema for traceability
+  int32 deleted_count = 2;
+  bool dry_run = 3;
+}
+
+// ── Maintenance mode ─────────────────────────────────────────────────────
+
+message SetMaintenanceModeRequest {
+  bool enabled = 1;
+}
+
+message GetMaintenanceModeRequest {}
+
+message MaintenanceModeResponse {
+  bool enabled = 1;
+}
+
+// =============================================================================
+// Admin API (v0.2.0)
+// =============================================================================
+//
+// See `vegapunk/docs/specs/admin-api-design.md` for the full design.
+//
+// Goal: unblock vegapunk-admin Phase 1 / Phase 2 / Phase 3 pages by providing
+// typed gRPC access to job queue, stats, evaluation history, search history,
+// vector data, traceable chains, and graph snapshots.
+//
+// Time representation: all timestamps in new Admin API messages are epoch ms
+// (int64). Existing RPCs that use RFC3339 strings are unchanged.
+//
+// Role: all new Admin API RPCs are `read`.
+// =============================================================================
+
+// ── ListJobs ─────────────────────────────────────────────────────────────
+
+message ListJobsRequest {
+  optional string status = 1;      // "pending" | "running" | "completed" | "dead_letter". empty = all
+  optional int64 since_ms = 2;     // epoch ms. unset = no lower bound
+  optional int64 until_ms = 3;     // epoch ms. unset = no upper bound
+  optional int32 offset = 4;       // default 0
+  optional int32 limit = 5;        // default 50, max 500
+  optional string job_type = 6;    // "entity_extraction" | "merge" | ... empty = all
+}
+
+message ListJobsResponse {
+  repeated JobInfo jobs = 1;       // sorted by created_at DESC
+  int32 total_count = 2;           // COUNT(*) after filters, before pagination
+}
+
+message JobInfo {
+  string job_id = 1;
+  string job_type = 2;             // "entity_extraction", "data_matching", "merge", ...
+  string status = 3;
+  optional string error = 4;
+  int64 created_at = 5;            // epoch ms
+  optional int64 completed_at = 6; // epoch ms
+  optional string msg_id = 7;
+  int32 retry_count = 8;
+}
+
+// ── GetStats ─────────────────────────────────────────────────────────────
+
+message GetStatsRequest {
+  optional string schema = 1;      // empty = cross-schema total (admin Dashboard default)
+  optional string node_type = 2;   // filter node_count by type (e.g. "Message", "Decision")
+  repeated AttributeFilter filters = 3;  // filter node_count by attribute conditions (AND-combined)
+}
+
+message GetStatsResponse {
+  int64 node_count = 1;
+  int64 edge_count = 2;
+  int64 vector_count = 3;
+  int64 community_count = 4;
+}
+
+// ── GetEvaluationHistory ─────────────────────────────────────────────────
+
+message GetEvaluationHistoryRequest {
+  optional int64 since_ms = 1;     // epoch ms
+  optional int64 until_ms = 2;     // epoch ms
+  optional int32 offset = 3;       // default 0
+  optional int32 limit = 4;        // default 100, max 1000
+}
+
+message GetEvaluationHistoryResponse {
+  repeated EvaluationRecord records = 1;  // sorted by timestamp DESC
+  int32 total_count = 2;
+}
+
+message EvaluationRecord {
+  string search_id = 1;
+  double comprehensiveness = 2;
+  double diversity = 3;
+  double empowerment = 4;
+  double traceability = 5;
+  string source = 6;               // "user" | "llm"
+  string model = 7;
+  int64 timestamp = 8;             // epoch ms
+}
+
+// ── ListRecentSearches ───────────────────────────────────────────────────
+//
+// Returns recent `Search` RPC invocations, optionally joined with feedback
+// submitted via the `Feedback` RPC. Used by the Feedback page to let users
+// pick a recent search to rate. Uses timestamp-cursor pagination (before_ms)
+// instead of offset for stable results under concurrent inserts.
+//
+// NOTE: the original vegapunk-admin spec uses RFC3339 strings; we convert
+// to epoch ms here for consistency with the rest of the Admin API. Field
+// names are renamed with `_ms` suffix. See admin-api-design.md §4 for the
+// discrepancy notes. (Confirmed by admin side on 2026-04-08.)
+
+message ListRecentSearchesRequest {
+  optional int32 limit = 1;            // 1..100, default 20
+  optional int64 before_ms = 2;        // epoch ms; return entries strictly older than this
+  optional string schema = 3;          // exact match filter
+  optional int64 since_ms = 4;         // epoch ms, inclusive
+  optional int64 until_ms = 5;         // epoch ms, exclusive
+  optional string query_contains = 6;  // case-insensitive substring filter on query
+}
+
+message ListRecentSearchesResponse {
+  repeated SearchHistoryItem searches = 1;  // sorted by timestamp DESC
+  optional int64 next_before_ms = 2;        // pass as next page's before_ms; unset on last page
+}
+
+message SearchHistoryItem {
+  string search_id = 1;
+  string query = 2;
+  string mode = 3;                     // "local" | "global" | "hybrid"
+  string schema = 4;
+  int64 timestamp = 5;                 // epoch ms (search execution time)
+  int32 result_count = 6;
+  optional FeedbackSummary feedback = 7;
+}
+
+message FeedbackSummary {
+  int32 rating = 1;                    // 1..5
+  string comment = 2;                  // may be empty
+  int64 submitted_at = 3;              // epoch ms
+}
+
+// ── GetVectors ───────────────────────────────────────────────────────────
+
+message GetVectorsRequest {
+  optional string schema = 1;      // empty = default schema only (no cross-schema merge)
+  optional int32 offset = 2;       // default 0
+  optional int32 limit = 3;        // default 500, max 2000
+  bool include_vector = 4;         // true: include raw vector values. default false (metadata only)
+}
+
+message GetVectorsResponse {
+  repeated VectorRecord records = 1;
+  int32 total_count = 2;
+  int32 dimension = 3;             // embedding dimension
+}
+
+message VectorRecord {
+  string node_id = 1;
+  string text = 2;                 // source text (may be truncated)
+  string source_type = 3;
+  int64 timestamp = 4;             // epoch ms
+  repeated float vector = 5;       // populated only when include_vector=true
+}
+
+// ── GetTraceableChain ────────────────────────────────────────────────────
+
+message GetTraceableChainRequest {
+  string node_id = 1;
+  optional string schema = 2;      // empty = default schema
+  optional int32 max_depth = 3;    // default 5, max 10
+}
+
+message GetTraceableChainResponse {
+  repeated ChainLink links = 1;
+}
+
+message ChainLink {
+  string node_id = 1;
+  string node_type = 2;
+  string display_text = 3;         // key_attr value (display text)
+  optional string edge_type = 4;   // edge type traversed to reach this node; unset for root
+  int32 depth = 5;
+  optional int64 timestamp = 6;    // epoch ms (if node has a timestamp attribute)
+}
+
+// ── GetGraphSnapshot ─────────────────────────────────────────────────────
+//
+// Returns a node+edge snapshot of a single schema for the admin Graph View
+// (Cytoscape.js). Promoted from Phase 3 to v0.2.0 on 2026-04-08 because the
+// admin-side Cytoscape renderer is already complete (vegapunk-admin PR #9)
+// and blocked waiting on this RPC.
+
+message GetGraphSnapshotRequest {
+  string schema = 1;               // REQUIRED. cross-schema snapshot is not supported
+  optional int32 max_nodes = 2;    // default 1000, max 5000
+  repeated string node_types = 3;  // filter by node type. empty = all types
+  optional int32 min_degree = 4;   // 0 = no filter. used for noise reduction
+}
+
+message GetGraphSnapshotResponse {
+  repeated GraphNode nodes = 1;
+  repeated GraphEdge edges = 2;
+  bool truncated = 3;              // true if max_nodes was hit and sampling occurred
+  int32 total_node_count = 4;      // total filtered node count before truncation
+}
+
+message GraphNode {
+  string node_id = 1;
+  string node_type = 2;
+  string display_text = 3;               // key_attr value
+  int32 degree = 4;                      // node degree (in + out)
+  optional int32 community = 5;          // community id from Leiden detection, if assigned
+  map<string, string> attributes = 6;    // node metadata (property graph attributes)
+  // NOTE: x/y layout coordinates are intentionally omitted. vegapunk has no
+  // server-side layout engine. Add as optional fields in a future PR if a
+  // layout engine is introduced (backward compatible).
+}
+
+message GraphEdge {
+  string edge_id = 1;                    // unique edge identifier
+  string from_id = 2;
+  string to_id = 3;
+  string edge_type = 4;
+}
+
+// ── QueryNodes ──────────────────────────────────────────────────────────
+//
+// Attribute-based structured query for graph nodes. Complements the
+// vector-similarity Search RPC with exact-match / range filters, sorting,
+// paging, and optional 1-hop edge traversal.
+//
+// Use cases:
+//   - "Channel C123 の最新 Message を 1 件取得"
+//   - "Person X が SAID した Message 一覧 (newest first)"
+//   - "2026年4月以降の Decision 一覧"
+
+message QueryNodesRequest {
+  string schema = 1;                          // required
+  string node_type = 2;                       // required: "Message", "Person", "Decision", etc.
+  repeated AttributeFilter filters = 3;       // AND-combined attribute conditions
+  optional string sort_by = 4;                // attribute name to sort by (e.g. "timestamp")
+  optional string sort_order = 5;             // "asc" | "desc" (default: "desc")
+  optional int32 limit = 6;                   // default 50, max 1000
+  optional int32 offset = 7;                  // default 0
+  optional EdgeTraversal traverse = 8;        // optional 1-hop edge traversal
+}
+
+// Shared by QueryNodesRequest and GetStatsRequest.
+message AttributeFilter {
+  string key = 1;                             // attribute name (e.g. "timestamp", "channel_id")
+  string op = 2;                              // "eq" | "gt" | "gte" | "lt" | "lte"
+  string value = 3;                           // comparison value (string; numeric inferred at runtime)
+}
+
+// 1-hop edge traversal: "from source_node_id, follow edge_type in direction"
+message EdgeTraversal {
+  string edge_type = 1;                       // "SAID", "IN_THREAD", "IN_CHANNEL", etc.
+  string direction = 2;                       // "outgoing" | "incoming"
+  string source_node_id = 3;                  // origin node ID
+}
+
+message QueryNodesResponse {
+  repeated NodeResult nodes = 1;
+  int32 total_count = 2;                      // post-filter, pre-pagination total
+}
+
+message NodeResult {
+  string node_id = 1;
+  string node_type = 2;
+  map<string, string> attributes = 3;
+}
+
+// ── Embed (Embedding-as-a-service) ──────────────────────────────────────
+
+message EmbedRequest {
+  string text = 1;                // Text to embed (required, non-empty)
+}
+
+message EmbedResponse {
+  repeated float vector = 1;      // Embedding vector
+  int32 dimension = 2;            // Vector dimension (convenience; == len(vector))
+  string model = 3;               // Model name from config (for client-side verification)
+}

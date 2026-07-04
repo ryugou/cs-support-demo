@@ -1,0 +1,66 @@
+name: sivira-cs-demo
+version: 1
+min_compatible: 1
+description: "SIVIRA customer support demo schema for product manuals, document sections, and specifications."
+
+nodes:
+  product:
+    attributes:
+      product_key: { type: string, required: true }
+      name_en: { type: string, required: true }
+      name_ja: { type: string, required: true }
+      model: { type: string }
+      status: { type: string }
+      description_en: { type: string }
+      description_ja: { type: string }
+      search_text_ja: { type: string }
+  document:
+    attributes:
+      doc_id: { type: string, required: true }
+      product_key: { type: string, required: true }
+      title_en: { type: string, required: true }
+      title_ja: { type: string, required: true }
+      version: { type: string, required: true }
+      source_url: { type: string }
+      origin_lang: { type: string }
+      search_text_ja: { type: string }
+  section:
+    attributes:
+      section_key: { type: string, required: true }
+      doc_id: { type: string, required: true }
+      product_key: { type: string, required: true }
+      order: { type: int, required: true }
+      level: { type: int, required: true }
+      title_en: { type: string, required: true }
+      title_ja: { type: string, required: true }
+      body_en: { type: string }
+      body_ja: { type: string }
+      en_hash: { type: string, required: true }
+      translated_from_hash: { type: string }
+      translation_status: { type: string }
+      anchor: { type: string }
+      search_text_ja: { type: string }
+  spec:
+    attributes:
+      spec_key: { type: string, required: true }
+      product_key: { type: string, required: true }
+      key_en: { type: string, required: true }
+      key_ja: { type: string, required: true }
+      value_en: { type: string, required: true }
+      value_ja: { type: string }
+      search_text_ja: { type: string }
+
+edges:
+  HAS_DOCUMENT: { from: product, to: document }
+  CONTAINS: { from: [document, section], to: section }
+  REFERENCES: { from: section, to: section }
+  HAS_SPEC: { from: product, to: spec }
+  DEFINED_IN: { from: spec, to: section }
+
+traceable_pairs:
+  - claim: section
+    evidence: section
+    edge: REFERENCES
+  - claim: spec
+    evidence: section
+    edge: DEFINED_IN

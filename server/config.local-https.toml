@@ -1,0 +1,8 @@
+bind_addr = "127.0.0.1:3443"
+tls_cert_path = "certs/cert.pem"
+tls_key_path = "certs/key.pem"
+vegapunk_endpoint = "http://vegapunk.local:6840"
+
+[[projects]]
+project_id = "sivira-cs-demo"
+schema = "sivira-cs-demo"
