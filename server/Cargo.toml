@@ -9,7 +9,9 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+jsonwebtoken = "9"
 http = "1"
 prost = "0.13"
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server", "transport-io", "macros"] }
@@ -26,6 +28,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod harness;
 pub mod ingest;
 pub mod mcp;
 pub mod model;
