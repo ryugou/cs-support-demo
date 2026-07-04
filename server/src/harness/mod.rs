@@ -84,7 +84,8 @@ impl Harness {
                 secret,
                 &config.actors,
                 config.auth.default_actor.clone(),
-            ),
+            )
+            .with_issuer(config.auth.jwt_issuer.clone()),
             normalizer: lexicon.clone(),
             lexicon,
             ng: egress::NgDictionary::from_path(&resolve_path(&config.harness.ng_dictionary_path))?,

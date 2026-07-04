@@ -21,6 +21,8 @@ pub struct AppConfig {
 pub struct AuthConfig {
     /// HS256 共有鍵ファイルパス。env CS_SUPPORT_JWT_SECRET_FILE で上書き可。
     pub jwt_secret_file: Option<String>,
+    /// 設定時は JWT の iss をこの値と照合する（未設定時は存在のみ要求）。
+    pub jwt_issuer: Option<String>,
     /// JWT 未設定時の dev 専用フォールバック actor（sub）。
     pub default_actor: Option<String>,
 }

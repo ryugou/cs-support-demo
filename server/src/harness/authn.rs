@@ -43,6 +43,7 @@ pub struct Authenticator {
     decoding_key: Option<DecodingKey>,
     actors: HashMap<String, ActorConfig>,
     default_actor: Option<String>,
+    issuer: Option<String>,
 }
 
 impl Authenticator {
@@ -55,7 +56,14 @@ impl Authenticator {
             decoding_key: secret.map(|s| DecodingKey::from_secret(&s)),
             actors: actors.iter().map(|a| (a.sub.clone(), a.clone())).collect(),
             default_actor,
+            issuer: None,
         }
+    }
+
+    /// 設定時は JWT の iss をこの値と照合する（未設定時は存在のみ要求）。
+    pub fn with_issuer(mut self, issuer: Option<String>) -> Self {
+        self.issuer = issuer;
+        self
     }
 
     /// Authorization ヘッダから actor を確定する（S1-1 の [認証]）。
@@ -67,6 +75,9 @@ impl Authenticator {
                     .ok_or_else(|| anyhow!("authorization header is not a bearer token"))?;
                 let mut validation = Validation::new(Algorithm::HS256);
                 validation.set_required_spec_claims(&["exp", "sub", "iss"]);
+                if let Some(issuer) = &self.issuer {
+                    validation.set_issuer(&[issuer]);
+                }
                 let data = decode::<Claims>(token, key, &validation).context("invalid jwt")?;
                 self.lookup(&data.claims.sub)
             }
@@ -166,6 +177,21 @@ mod tests {
     fn tampered_jwt_is_rejected() {
         let auth = Authenticator::new(Some(b"other-secret".to_vec()), &actors(), None);
         assert!(auth
+            .authenticate(Some(&format!("Bearer {}", token("op-001", 3600))))
+            .is_err());
+    }
+
+    #[test]
+    fn issuer_is_pinned_when_configured() {
+        // token(iss="test") に対して issuer を照合する
+        let auth = Authenticator::new(Some(SECRET.to_vec()), &actors(), None)
+            .with_issuer(Some("test".to_string()));
+        assert!(auth
+            .authenticate(Some(&format!("Bearer {}", token("op-001", 3600))))
+            .is_ok());
+        let wrong = Authenticator::new(Some(SECRET.to_vec()), &actors(), None)
+            .with_issuer(Some("expected-issuer".to_string()));
+        assert!(wrong
             .authenticate(Some(&format!("Bearer {}", token("op-001", 3600))))
             .is_err());
     }

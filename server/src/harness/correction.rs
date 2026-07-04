@@ -1,6 +1,32 @@
 use crate::harness::rules::{RootCause, SourceAuthority};
 use serde::Serialize;
 
+/// フィードバックの発生源（record_operator_feedback の閉じた語彙）。
+/// customer は「顧客の『違う』の中継」であり、authn 済み担当者経由でも non_authoritative 扱い。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackSource {
+    Operator,
+    Customer,
+}
+
+impl FeedbackSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeedbackSource::Operator => "operator",
+            FeedbackSource::Customer => "customer",
+        }
+    }
+
+    /// source_authority への写像（S1-5: principal 種別は authn 由来 + 中継元区分）。
+    pub fn authority(self) -> SourceAuthority {
+        match self {
+            FeedbackSource::Operator => SourceAuthority::Authoritative,
+            FeedbackSource::Customer => SourceAuthority::NonAuthoritative,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CorrectionRouting {

@@ -1,6 +1,6 @@
 use crate::{
     harness::{
-        correction::{correction_intake, CorrectionRouting},
+        correction::{correction_intake, CorrectionRouting, FeedbackSource},
         egress::{egress_gate, EgressVerdict, EmitChannel, EmitContext},
         grading::AnswerOutcome,
         knowledge::{NewKnownResolution, PastCase},
@@ -167,8 +167,8 @@ pub struct RecordAnswerOutcomeResponse {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecordOperatorFeedbackRequest {
     pub attempt_id: Option<String>,
-    /// "operator"（担当者自身の訂正）か "customer"（顧客からの「違う」の中継）
-    pub feedback_source: String,
+    /// operator（担当者自身の訂正）か customer（顧客からの「違う」の中継）
+    pub feedback_source: FeedbackSource,
     pub corrected_answer: String,
     pub note: Option<String>,
 }
@@ -556,16 +556,7 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<RecordOperatorFeedbackRequest>,
     ) -> Result<Json<RecordOperatorFeedbackResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let authority = match req.feedback_source.as_str() {
-            "customer" => SourceAuthority::NonAuthoritative,
-            "operator" => SourceAuthority::Authoritative,
-            other => {
-                return Err(ErrorData::invalid_params(
-                    format!("unknown feedback_source: {other}"),
-                    None,
-                ))
-            }
-        };
+        let authority = req.feedback_source.authority();
         // non_authoritative: 永続層に一切書かない（S1-5 不変条件・最優先）。WORM のみ。
         if authority == SourceAuthority::NonAuthoritative {
             let audit_event_id = self
@@ -606,7 +597,10 @@ impl CsSupportRmcpServer {
                     ),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
-                    ("feedback_source".to_string(), req.feedback_source.clone()),
+                    (
+                        "feedback_source".to_string(),
+                        req.feedback_source.as_str().to_string(),
+                    ),
                     ("corrected_answer".to_string(), req.corrected_answer.clone()),
                     ("routing".to_string(), routing.as_str().to_string()),
                     ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),
