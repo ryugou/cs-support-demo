@@ -70,6 +70,16 @@ pub fn prohibited_domain_from_attributes(attrs: &HashMap<String, String>) -> Res
     })
 }
 
+/// 過去事例の論理ビュー（search_past_cases 用）。
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+pub struct PastCase {
+    pub case_id: String,
+    pub question: String,
+    pub product_key: String,
+    pub actor: String,
+    pub created_at: String,
+}
+
 /// 担当者が追加する新ルール（add_known_resolution / correction_intake の出口）。
 #[derive(Debug, Clone)]
 pub struct NewKnownResolution {
@@ -305,6 +315,27 @@ impl KnowledgeStore {
             .upsert_graph_low_level(GraphBuild { nodes, edges })
             .await?;
         Ok(())
+    }
+
+    /// 過去事例（support_case）を読み出す。scope は schema 引数で強制済み。
+    pub async fn load_cases(&self, schema: &str, limit: i32) -> Result<Vec<PastCase>> {
+        Ok(self
+            .client
+            .query_nodes(schema, "support_case", Vec::new(), limit)
+            .await
+            .context("load support cases")?
+            .into_iter()
+            .filter_map(|node| {
+                let attrs = node.attributes;
+                Some(PastCase {
+                    case_id: attrs.get("case_id")?.clone(),
+                    question: attrs.get("question").cloned().unwrap_or_default(),
+                    product_key: attrs.get("product_key").cloned().unwrap_or_default(),
+                    actor: attrs.get("actor").cloned().unwrap_or_default(),
+                    created_at: attrs.get("created_at").cloned().unwrap_or_default(),
+                })
+            })
+            .collect())
     }
 
     /// grade 運用: 承認/却下カウントと格付けを KnownResolution ノードに反映する（遵守事項 3）。

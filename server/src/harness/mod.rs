@@ -107,6 +107,11 @@ impl Harness {
             .ok_or_else(|| anyhow!("knowledge store is not configured"))
     }
 
+    /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
+    pub fn store(&self) -> Result<&knowledge::KnowledgeStore> {
+        self.knowledge()
+    }
+
     /// S1-1 パイプライン前半: [認証] → [(A) 権限]。全 tool がここを通る。
     pub fn begin(&self, authorization: Option<&str>, project_schema: &str) -> Result<RequestContext> {
         let actor = self.authenticator.authenticate(authorization)?;
