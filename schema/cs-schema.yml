@@ -118,8 +118,8 @@ nodes:
       audit_event_id: { type: string }
       outcome: { type: string }
       outcome_note: { type: string }
-      # grade 更新の完了フラグ（outcome 記録後の部分失敗からの再開用）
-      grade_applied: { type: string }
+      # outcome を確定した actor（承認者多様性の導出元）
+      outcome_actor: { type: string }
       created_at: { type: string }
   answer_evidence:
     attributes:

@@ -154,7 +154,9 @@ impl Harness {
         outcome: grading::AnswerOutcome,
         note: Option<&str>,
     ) -> Result<(Option<rules::Grade>, Option<String>)> {
-        // read-modify-write の lost update を防ぐ（プロセス内直列化。backend atomic は TODO）
+        // プロセス内直列化（backend atomic は TODO）。ただし正しさはロックに依存しない:
+        // カウントは attempt 群からの再計算（導出）なので、再送・部分失敗のどこから
+        // やり直しても同じ結果になる（増分方式の多重加算・欠落の両方が構造的に消える）。
         let _guard = self.grade_lock.lock().await;
         let store = self.knowledge()?;
         let attempt = store
@@ -166,23 +168,15 @@ impl Harness {
             .get("known_resolution_id")
             .filter(|kr_id| !kr_id.is_empty())
             .cloned();
-        // outcome は write-once。ただし「outcome 記録後・grade 更新前」の部分失敗からは
-        // 同一 outcome の再送で grade 更新だけを再開できる（grade_applied フラグで判別）。
-        let recorded_outcome = attempt.get("outcome").filter(|o| !o.is_empty());
-        let grade_applied = attempt.get("grade_applied").map(String::as_str) == Some("true");
-        if let Some(recorded) = recorded_outcome {
-            if grade_applied {
-                return Err(anyhow!(
-                    "outcome already recorded for attempt {attempt_id}; outcomes are write-once"
-                ));
-            }
+        // outcome は write-once。同一 outcome の再送のみ冪等に受理する
+        // （部分失敗後の再開経路。導出方式なので再計算しても増えない）。
+        if let Some(recorded) = attempt.get("outcome").filter(|o| !o.is_empty()) {
             if recorded != outcome.as_str() {
                 return Err(anyhow!(
                     "outcome {recorded} is already recorded for attempt {attempt_id}; \
-                     resend must use the same outcome to resume the pending grade update"
+                     outcomes are write-once"
                 ));
             }
-            // 再開経路: outcome は記録済みなので grade 更新のみ行う
         } else {
             store
                 .record(
@@ -192,6 +186,7 @@ impl Harness {
                     vec![
                         ("attempt_id".to_string(), attempt_id.to_string()),
                         ("outcome".to_string(), outcome.as_str().to_string()),
+                        ("outcome_actor".to_string(), ctx.actor.sub.clone()),
                         (
                             "outcome_note".to_string(),
                             note.unwrap_or_default().to_string(),
@@ -201,31 +196,19 @@ impl Harness {
                 .await?;
         }
         let new_grade = match &kr_id {
-            Some(kr_id) => self.apply_outcome_to_grade(ctx, kr_id, outcome).await?,
+            Some(kr_id) => self.recompute_grade(ctx, kr_id).await?,
             None => None,
         };
-        // grade 更新まで完了してから write-once を確定する
-        store
-            .record(
-                &ctx.schema,
-                "answer_attempt",
-                attempt_id,
-                vec![
-                    ("attempt_id".to_string(), attempt_id.to_string()),
-                    ("grade_applied".to_string(), "true".to_string()),
-                ],
-            )
-            .await?;
         Ok((new_grade, kr_id))
     }
 
-    /// outcome を承認/却下に写像し、regrade 純関数で昇格・降格を判定して永続化する。
-    /// 格付けが変わった場合のみ Some を返す。呼び出し元が grade_lock を保持していること。
-    async fn apply_outcome_to_grade(
+    /// KR の承認/却下カウント・承認者集合を attempt 群から導出し直し、regrade 純関数で
+    /// 昇格・降格を判定して永続化する。格付けが変わった場合のみ Some を返す。
+    /// 導出＝再計算なので何度呼んでも同じ結果（冪等）。呼び出し元が grade_lock を保持していること。
+    async fn recompute_grade(
         &self,
         ctx: &RequestContext,
         kr_id: &str,
-        outcome: grading::AnswerOutcome,
     ) -> Result<Option<rules::Grade>> {
         let store = self.knowledge()?;
         let resolutions = store.load_known_resolutions(&ctx.schema).await?;
@@ -233,19 +216,9 @@ impl Harness {
             .iter()
             .find(|kr| kr.id == kr_id)
             .ok_or_else(|| anyhow!("known_resolution not found: {kr_id}"))?;
-        let mut approval_count = kr.approval_count;
-        let mut rejection_count = kr.rejection_count;
-        let mut approver_set = kr.approver_set.clone();
-        match outcome {
-            grading::AnswerOutcome::Resolved => {
-                approval_count += 1;
-                if !approver_set.contains(&ctx.actor.sub) {
-                    approver_set.push(ctx.actor.sub.clone());
-                }
-            }
-            grading::AnswerOutcome::WrongAnswer => rejection_count += 1,
-            grading::AnswerOutcome::Unresolved | grading::AnswerOutcome::ReInquiry => {}
-        }
+        let attempts = store.load_attempts_for_kr(&ctx.schema, kr_id).await?;
+        let (approval_count, rejection_count, approver_set) =
+            grading::derive_outcome_counts(&attempts);
         let regraded = grading::regrade(
             kr.grade,
             approval_count,

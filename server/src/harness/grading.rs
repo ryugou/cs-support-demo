@@ -21,6 +21,33 @@ impl AnswerOutcome {
     }
 }
 
+/// attempt 群（outcome / outcome_actor 属性）から承認・却下カウントと承認者集合を導出する
+/// 純関数。増分更新でなく毎回の再計算にすることで、outcome 記録の再送・部分失敗に対して
+/// 構成上冪等になる（同じ attempt 群からは必ず同じカウントが出る）。
+pub fn derive_outcome_counts(
+    attempts: &[std::collections::HashMap<String, String>],
+) -> (u32, u32, Vec<String>) {
+    let mut approval_count = 0u32;
+    let mut rejection_count = 0u32;
+    let mut approver_set: Vec<String> = Vec::new();
+    for attempt in attempts {
+        match attempt.get("outcome").map(String::as_str) {
+            Some("resolved") => {
+                approval_count += 1;
+                if let Some(actor) = attempt.get("outcome_actor").filter(|a| !a.is_empty()) {
+                    if !approver_set.contains(actor) {
+                        approver_set.push(actor.clone());
+                    }
+                }
+            }
+            Some("wrong_answer") => rejection_count += 1,
+            _ => {}
+        }
+    }
+    approver_set.sort();
+    (approval_count, rejection_count, approver_set)
+}
+
 /// 昇格・降格しきい値（S1-11 追記 4）。具体値は未決のため config [harness.grading] で注入。
 #[derive(Debug, Clone)]
 pub struct GradingThresholds {
@@ -131,6 +158,36 @@ mod tests {
     fn demoted_stays_until_repromoted() {
         // 降格中は昇格条件を満たし直すまで approval_required 相当として扱う
         assert_eq!(regrade(Grade::Demoted, 3, 1, 2, &t()), Grade::Demoted);
+    }
+
+    #[test]
+    fn derive_outcome_counts_is_idempotent_over_attempts() {
+        use std::collections::HashMap;
+        let attempt = |outcome: &str, actor: &str| -> HashMap<String, String> {
+            [
+                ("outcome".to_string(), outcome.to_string()),
+                ("outcome_actor".to_string(), actor.to_string()),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let attempts = vec![
+            attempt("resolved", "op-001"),
+            attempt("resolved", "sup-001"),
+            attempt("resolved", "op-001"), // 同一承認者は多様性に重複計上しない
+            attempt("wrong_answer", "op-002"),
+            attempt("unresolved", "op-003"), // カウント対象外
+            attempt("", ""),                 // outcome 未確定はカウント対象外
+        ];
+        let (approvals, rejections, approvers) = derive_outcome_counts(&attempts);
+        assert_eq!(approvals, 3);
+        assert_eq!(rejections, 1);
+        assert_eq!(approvers, vec!["op-001".to_string(), "sup-001".to_string()]);
+        // 同じ入力からは必ず同じ導出結果（再送・再計算しても増えない）
+        assert_eq!(
+            derive_outcome_counts(&attempts),
+            (approvals, rejections, approvers)
+        );
     }
 
     #[test]

@@ -406,6 +406,27 @@ impl KnowledgeStore {
             .map(|node| node.attributes))
     }
 
+    /// 指定 KR に紐づく answer_attempt を全件読む（grade カウントの導出元）。
+    pub async fn load_attempts_for_kr(
+        &self,
+        schema: &str,
+        kr_id: &str,
+    ) -> Result<Vec<HashMap<String, String>>> {
+        Ok(self
+            .client
+            .query_nodes(
+                schema,
+                "answer_attempt",
+                vec![("known_resolution_id", "eq", kr_id)],
+                1000,
+            )
+            .await
+            .context("load attempts for known resolution")?
+            .into_iter()
+            .map(|node| node.attributes)
+            .collect())
+    }
+
     /// answer_attempt を 1 件読む（outcome / feedback の provenance 検証用）。
     pub async fn load_attempt(
         &self,
