@@ -151,11 +151,10 @@ pub struct RecordAnswerAttemptResponse {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecordAnswerOutcomeRequest {
+    /// record_answer_attempt が返した attempt_id（存在検証される）
     pub attempt_id: String,
     /// resolved / unresolved / re_inquiry / wrong_answer
     pub outcome: AnswerOutcome,
-    /// この応答が known_resolution 由来だった場合に渡す（承認/却下カウントと格付けを更新）
-    pub known_resolution_id: Option<String>,
     pub note: Option<String>,
 }
 
@@ -521,7 +520,9 @@ impl CsSupportRmcpServer {
         let store = self.harness.store().map_err(to_error)?;
         // 入口強制: 3 層判定（evaluate_answerability）の Allowed 判定に紐づかない draft は
         // emit 候補にしない（判定バイパスの封鎖）。サーバ側の判定記録と突合する。
-        self.harness
+        // 判定が KR 由来なら kr_id をサーバ記録から引き継ぐ（client 申告を使わない）。
+        let lineage_kr_id = self
+            .harness
             .verify_answer_lineage(&ctx, &req.case_id, &req.evaluation_request_id)
             .await
             .map_err(|err| ErrorData::invalid_request(err.to_string(), None))?;
@@ -550,6 +551,10 @@ impl CsSupportRmcpServer {
                     ("actor".to_string(), ctx.actor.sub.clone()),
                     ("draft".to_string(), req.draft.clone()),
                     ("decision".to_string(), req.evaluation_request_id.clone()),
+                    (
+                        "known_resolution_id".to_string(),
+                        lineage_kr_id.unwrap_or_default(),
+                    ),
                     ("egress_verdict".to_string(), verdict.label().to_string()),
                     ("audit_event_id".to_string(), audit_event_id.clone()),
                     ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),
@@ -576,6 +581,15 @@ impl CsSupportRmcpServer {
     ) -> Result<Json<RecordAnswerOutcomeResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
         let store = self.harness.store().map_err(to_error)?;
+        // attempt の存在を検証し、KR 紐づけはサーバ記録（attempt 作成時に lineage から
+        // 引き継いだ known_resolution_id）を使う。client 申告で格付けを汚染させない。
+        let attempt = store
+            .load_attempt(&ctx.schema, &req.attempt_id)
+            .await
+            .map_err(to_error)?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(format!("unknown attempt_id: {}", req.attempt_id), None)
+            })?;
         // attempt へ outcome を追記（upsert merge）。outcome は型付き enum（deserialize で検証済み）。
         store
             .record(
@@ -596,7 +610,10 @@ impl CsSupportRmcpServer {
         // grade 運用（遵守事項 3）は Harness に委譲（判定を handler に直書きしない）
         let mut new_grade: Option<String> = None;
         let mut governing_norm_ids = Vec::new();
-        if let Some(kr_id) = &req.known_resolution_id {
+        if let Some(kr_id) = attempt
+            .get("known_resolution_id")
+            .filter(|kr_id| !kr_id.is_empty())
+        {
             new_grade = self
                 .harness
                 .apply_answer_outcome(&ctx, kr_id, req.outcome)
@@ -642,6 +659,17 @@ impl CsSupportRmcpServer {
                 audit_event_id,
             }));
         }
+        let store = self.harness.store().map_err(to_error)?;
+        // attempt_id が渡された場合は実在を検証する（provenance を偽装させない）
+        if let Some(attempt_id) = &req.attempt_id {
+            store
+                .load_attempt(&ctx.schema, attempt_id)
+                .await
+                .map_err(to_error)?
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(format!("unknown attempt_id: {attempt_id}"), None)
+                })?;
+        }
         // authoritative: root_cause を再検索で切り分け（S1-5）
         let root_cause = self
             .harness
@@ -655,7 +683,6 @@ impl CsSupportRmcpServer {
                 .enqueue_search_improvement(&ctx, &req.corrected_answer)
                 .map_err(to_error)?;
         }
-        let store = self.harness.store().map_err(to_error)?;
         let feedback_id = format!("fb-{}", uuid::Uuid::new_v4());
         store
             .record(
@@ -712,6 +739,18 @@ impl CsSupportRmcpServer {
     ) -> Result<Json<CreateEscalationEventResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
         let store = self.harness.store().map_err(to_error)?;
+        // case_id が渡された場合は実在を検証する（存在しない case への紐づけを拒否）。
+        // 最新判定が Allowed でもエスカレーション記録は拒否しない: エスカレーションは
+        // 常に安全側の行為であり、担当者の予防的エスカレーションを塞がない。
+        if let Some(case_id) = &req.case_id {
+            store
+                .load_case(&ctx.schema, case_id)
+                .await
+                .map_err(to_error)?
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(format!("unknown case_id: {case_id}"), None)
+                })?;
+        }
         let escalation_id = format!("esc-{}", uuid::Uuid::new_v4());
         store
             .record(
@@ -720,6 +759,10 @@ impl CsSupportRmcpServer {
                 &escalation_id,
                 vec![
                     ("escalation_id".to_string(), escalation_id.clone()),
+                    (
+                        "case_id".to_string(),
+                        req.case_id.clone().unwrap_or_default(),
+                    ),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
                     ("layer".to_string(), req.layer.to_string()),

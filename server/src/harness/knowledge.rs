@@ -406,6 +406,27 @@ impl KnowledgeStore {
             .map(|node| node.attributes))
     }
 
+    /// answer_attempt を 1 件読む（outcome / feedback の provenance 検証用）。
+    pub async fn load_attempt(
+        &self,
+        schema: &str,
+        attempt_id: &str,
+    ) -> Result<Option<HashMap<String, String>>> {
+        Ok(self
+            .client
+            .query_nodes(
+                schema,
+                "answer_attempt",
+                vec![("attempt_id", "eq", attempt_id)],
+                1,
+            )
+            .await
+            .context("load answer attempt")?
+            .into_iter()
+            .next()
+            .map(|node| node.attributes))
+    }
+
     /// 過去事例を日本語クエリで検索する（scoring は mcp.rs の共有関数を再利用）。
     pub async fn search_cases(
         &self,

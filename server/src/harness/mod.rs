@@ -352,10 +352,14 @@ impl Harness {
             }
         );
         // [記録] 判定結果を case に永続化する（record_answer_attempt の lineage 検証の根拠。
-        // client の自己申告でなくサーバ側の記録と突合するため）。
-        let case_decision = match &decision_result {
-            decision::AnswerDecision::Allowed { .. } => "allowed",
-            decision::AnswerDecision::Escalate { .. } => "escalate",
+        // client の自己申告でなくサーバ側の記録と突合するため）。KR 由来の回答なら
+        // その kr_id もサーバ記録として残す（outcome 記録が client 申告に依存しないため）。
+        let (case_decision, case_kr_id) = match &decision_result {
+            decision::AnswerDecision::Allowed {
+                known_resolution_id,
+                ..
+            } => ("allowed", known_resolution_id.clone().unwrap_or_default()),
+            decision::AnswerDecision::Escalate { .. } => ("escalate", String::new()),
         };
         knowledge
             .record(
@@ -366,6 +370,7 @@ impl Harness {
                     ("case_id".to_string(), case_id.clone()),
                     ("last_request_id".to_string(), ctx.request_id.clone()),
                     ("last_decision".to_string(), case_decision.to_string()),
+                    ("last_kr_id".to_string(), case_kr_id),
                 ],
             )
             .await?;
@@ -403,12 +408,13 @@ impl Harness {
     /// record_answer_attempt の入口強制（S1-1 の短絡順序を emit 側でも閉じる）:
     /// draft は「同一 case の最新 evaluate_answerability が Allowed」の場合のみ emit 候補になる。
     /// 判定はサーバが case に永続化した記録と突合する（client の自己申告を信用しない）。
+    /// 通過時は、その判定が KR 由来なら kr_id を返す（attempt へのサーバ側引き継ぎ用）。
     pub async fn verify_answer_lineage(
         &self,
         ctx: &RequestContext,
         case_id: &str,
         evaluation_request_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let attrs = self
             .knowledge()?
             .load_case(&ctx.schema, case_id)
@@ -425,7 +431,10 @@ impl Harness {
             ));
         }
         match attrs.get("last_decision").map(String::as_str) {
-            Some("allowed") => Ok(()),
+            Some("allowed") => Ok(attrs
+                .get("last_kr_id")
+                .filter(|kr_id| !kr_id.is_empty())
+                .cloned()),
             Some("escalate") => Err(anyhow!(
                 "the latest evaluation of case {case_id} was an escalation; \
                  drafts may only be attached as reference, not emitted"

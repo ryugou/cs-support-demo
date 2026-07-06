@@ -104,6 +104,7 @@ nodes:
       # 最新の evaluate_answerability の判定記録（record_answer_attempt の lineage 検証用）
       last_request_id: { type: string }
       last_decision: { type: string }
+      last_kr_id: { type: string }
   answer_attempt:
     attributes:
       attempt_id: { type: string, required: true }
@@ -112,6 +113,7 @@ nodes:
       actor: { type: string }
       draft: { type: string }
       decision: { type: string }
+      known_resolution_id: { type: string }
       egress_verdict: { type: string }
       audit_event_id: { type: string }
       outcome: { type: string }
@@ -136,6 +138,7 @@ nodes:
   escalation_event:
     attributes:
       escalation_id: { type: string, required: true }
+      case_id: { type: string }
       request_id: { type: string }
       actor: { type: string }
       layer: { type: int }
