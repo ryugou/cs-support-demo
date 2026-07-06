@@ -101,6 +101,9 @@ nodes:
       question: { type: string }
       product_key: { type: string }
       created_at: { type: string }
+      # 最新の evaluate_answerability の判定記録（record_answer_attempt の lineage 検証用）
+      last_request_id: { type: string }
+      last_decision: { type: string }
   answer_attempt:
     attributes:
       attempt_id: { type: string, required: true }

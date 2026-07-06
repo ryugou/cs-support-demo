@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -54,24 +54,15 @@ impl WormAuditLog {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create audit dir {}", parent.display()))?;
         }
-        // 既存ログの末尾から hash chain を復元する
-        let prev_hash = match File::open(path) {
-            Ok(existing) => BufReader::new(existing)
-                .lines()
-                .map_while(Result::ok)
-                .filter(|line| !line.trim().is_empty())
-                .last()
-                .and_then(|line| {
-                    serde_json::from_str::<serde_json::Value>(&line)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("hash")
-                                .and_then(|h| h.as_str())
-                                .map(ToString::to_string)
-                        })
-                })
-                .unwrap_or_else(genesis_hash),
-            Err(_) => genesis_hash(),
+        // 既存ログは全行の hash chain を検証してから継続する（fail closed）。
+        // 破損・改ざん・切り詰めを黙って新チェーンで上書きしない。
+        let prev_hash = match std::fs::read_to_string(path) {
+            Ok(body) => verify_chain(&body)
+                .with_context(|| format!("audit log {} failed integrity check", path.display()))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => genesis_hash(),
+            Err(err) => {
+                return Err(err).with_context(|| format!("read audit log {}", path.display()))
+            }
         };
         let file = OpenOptions::new()
             .create(true)
@@ -142,6 +133,46 @@ fn genesis_hash() -> String {
     format!("{:x}", Sha256::digest(b"cs-support-mcp-worm-genesis"))
 }
 
+/// 既存ログ全行の hash chain を検証し、最後の hash を返す（空なら genesis）。
+/// 1 行でも JSON 不正・チェーン断絶・hash 不一致があれば Err（fail closed）。
+fn verify_chain(body: &str) -> Result<String> {
+    let mut prev = genesis_hash();
+    for (index, line) in body.lines().enumerate() {
+        let line_no = index + 1;
+        if line.trim().is_empty() {
+            anyhow::bail!("line {line_no}: empty line in append-only log");
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("line {line_no}: not valid json"))?;
+        let serde_json::Value::Object(mut map) = value else {
+            anyhow::bail!("line {line_no}: not a json object");
+        };
+        let line_prev = map
+            .remove("prev_hash")
+            .and_then(|v| v.as_str().map(ToString::to_string))
+            .ok_or_else(|| anyhow::anyhow!("line {line_no}: missing prev_hash"))?;
+        let line_hash = map
+            .remove("hash")
+            .and_then(|v| v.as_str().map(ToString::to_string))
+            .ok_or_else(|| anyhow::anyhow!("line {line_no}: missing hash"))?;
+        if line_prev != prev {
+            anyhow::bail!("line {line_no}: hash chain is broken (prev_hash mismatch)");
+        }
+        // append 時の payload は serde_json::Value（キーはソート済み）を to_string したもの。
+        // 行からも同じ正規形（prev_hash / hash を除いた sorted-key JSON）を再構成して照合する。
+        let payload_text = serde_json::to_string(&serde_json::Value::Object(map))?;
+        let mut hasher = Sha256::new();
+        hasher.update(prev.as_bytes());
+        hasher.update(payload_text.as_bytes());
+        let expected = format!("{:x}", hasher.finalize());
+        if expected != line_hash {
+            anyhow::bail!("line {line_no}: hash mismatch (tampered or corrupted)");
+        }
+        prev = line_hash;
+    }
+    Ok(prev)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +235,40 @@ mod tests {
         }
         // hash chain: 2 行目の prev_hash は 1 行目の hash
         assert_eq!(lines[1]["prev_hash"], lines[0]["hash"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_rejects_tampered_log() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        {
+            let log = WormAuditLog::open(&path).expect("open");
+            log.append(draft("req-1", "allowed")).expect("append 1");
+            log.append(draft("req-2", "escalate")).expect("append 2");
+        }
+        // 1 行目の decision を書き換える（改ざん）→ 再オープンは失敗する
+        let body = std::fs::read_to_string(&path).unwrap();
+        let tampered = body.replacen("\"decision\":\"allowed\"", "\"decision\":\"denied!\"", 1);
+        assert_ne!(body, tampered, "tamper must change the file");
+        std::fs::write(&path, tampered).unwrap();
+        assert!(WormAuditLog::open(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_rejects_corrupted_tail() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        {
+            let log = WormAuditLog::open(&path).expect("open");
+            log.append(draft("req-1", "allowed")).expect("append");
+        }
+        // 途中で切れた行（クラッシュ・破損相当）→ genesis に黙って戻らず失敗する
+        let mut body = std::fs::read_to_string(&path).unwrap();
+        body.push_str("{\"broken\":");
+        std::fs::write(&path, body).unwrap();
+        assert!(WormAuditLog::open(&path).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

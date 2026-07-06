@@ -128,13 +128,15 @@ pub struct SearchPastCasesResponse {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecordAnswerAttemptRequest {
-    pub case_id: Option<String>,
+    /// evaluate_answerability が返した case_id（必須）
+    pub case_id: String,
     /// 顧客に出す予定の draft 全文。AI 草案・担当者修正文の区別なく必ずここを通す。
     pub draft: String,
     pub question: String,
     pub product_key: Option<String>,
-    /// 判定済み evaluate_answerability の request_id（lineage 接続用、任意）
-    pub evaluation_request_id: Option<String>,
+    /// 同一 case に対する evaluate_answerability の request_id（必須）。
+    /// サーバ側の判定記録と突合され、最新判定が Allowed の場合のみ emit 候補になる。
+    pub evaluation_request_id: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -254,11 +256,20 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<ResolveProductRequest>,
     ) -> Result<Json<ResolveProductResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        self.tools
+        let candidates = self
+            .tools
             .resolve_product(&ctx.schema, &req.text)
             .await
-            .map(|candidates| Json(ResolveProductResponse { candidates }))
-            .map_err(to_error)
+            .map_err(to_error)?;
+        // 誰が・いつ・どの scope で・何を検索したかを残す（spec 課題2 Harness の責務）
+        let retrieved = candidates
+            .iter()
+            .map(|c| crate::ingest::product_node_id(&ctx.schema, &c.product_key))
+            .collect();
+        self.harness
+            .audit_with_nodes(&ctx, "read:resolve_product", None, Vec::new(), retrieved)
+            .map_err(to_error)?;
+        Ok(Json(ResolveProductResponse { candidates }))
     }
 
     #[tool(
@@ -271,7 +282,8 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<SearchManualRequest>,
     ) -> Result<Json<SearchManualResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        self.tools
+        let hits = self
+            .tools
             .search_manual(
                 &ctx.schema,
                 &req.query_ja,
@@ -279,8 +291,15 @@ impl CsSupportRmcpServer {
                 req.top_k.unwrap_or(5),
             )
             .await
-            .map(|hits| Json(SearchManualResponse { hits }))
-            .map_err(to_error)
+            .map_err(to_error)?;
+        let retrieved = hits
+            .iter()
+            .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
+            .collect();
+        self.harness
+            .audit_with_nodes(&ctx, "read:search_manual", None, Vec::new(), retrieved)
+            .map_err(to_error)?;
+        Ok(Json(SearchManualResponse { hits }))
     }
 
     #[tool(
@@ -293,11 +312,24 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<GetSectionRequest>,
     ) -> Result<Json<SectionView>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        self.tools
+        let view = self
+            .tools
             .get_section(&ctx.schema, &req.section_key)
             .await
-            .map(Json)
-            .map_err(to_error)
+            .map_err(to_error)?;
+        self.harness
+            .audit_with_nodes(
+                &ctx,
+                "read:get_section",
+                None,
+                Vec::new(),
+                vec![crate::ingest::section_node_id(
+                    &ctx.schema,
+                    &req.section_key,
+                )],
+            )
+            .map_err(to_error)?;
+        Ok(Json(view))
     }
 
     #[tool(
@@ -310,11 +342,24 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<GetProductRequest>,
     ) -> Result<Json<ProductView>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        self.tools
+        let view = self
+            .tools
             .get_product(&ctx.schema, &req.product_key)
             .await
-            .map(Json)
-            .map_err(to_error)
+            .map_err(to_error)?;
+        self.harness
+            .audit_with_nodes(
+                &ctx,
+                "read:get_product",
+                None,
+                Vec::new(),
+                vec![crate::ingest::product_node_id(
+                    &ctx.schema,
+                    &req.product_key,
+                )],
+            )
+            .map_err(to_error)?;
+        Ok(Json(view))
     }
 
     #[tool(
@@ -399,6 +444,21 @@ impl CsSupportRmcpServer {
                 ),
                 KrMatch::None => ("none".to_string(), None, Vec::new()),
             };
+        let retrieved = resolution
+            .iter()
+            .map(|r| {
+                crate::harness::knowledge::harness_node_id(&ctx.schema, "KnownResolution", &r.kr_id)
+            })
+            .collect();
+        self.harness
+            .audit_with_nodes(
+                &ctx,
+                format!("read:search_known_resolutions:{match_kind}"),
+                None,
+                Vec::new(),
+                retrieved,
+            )
+            .map_err(to_error)?;
         Ok(Json(SearchKnownResolutionsResponse {
             match_kind,
             resolution,
@@ -431,7 +491,20 @@ impl CsSupportRmcpServer {
             .map_err(to_error)?
             .into_iter()
             .map(|(case, score)| PastCaseHit { case, score })
+            .collect::<Vec<_>>();
+        let retrieved = cases
+            .iter()
+            .map(|hit| {
+                crate::harness::knowledge::harness_node_id(
+                    &ctx.schema,
+                    "support_case",
+                    &hit.case.case_id,
+                )
+            })
             .collect();
+        self.harness
+            .audit_with_nodes(&ctx, "read:search_past_cases", None, Vec::new(), retrieved)
+            .map_err(to_error)?;
         Ok(Json(SearchPastCasesResponse { cases }))
     }
 
@@ -446,6 +519,12 @@ impl CsSupportRmcpServer {
     ) -> Result<Json<RecordAnswerAttemptResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
         let store = self.harness.store().map_err(to_error)?;
+        // 入口強制: 3 層判定（evaluate_answerability）の Allowed 判定に紐づかない draft は
+        // emit 候補にしない（判定バイパスの封鎖）。サーバ側の判定記録と突合する。
+        self.harness
+            .verify_answer_lineage(&ctx, &req.case_id, &req.evaluation_request_id)
+            .await
+            .map_err(|err| ErrorData::invalid_request(err.to_string(), None))?;
         // 出口ゲート（S1-4）。AI 製・人間製を問わず全 outbound がここを通る。
         let verdict = egress_gate(&req.draft, &operator_emit_context(), &self.harness.ng);
         let emit_allowed = matches!(verdict, EgressVerdict::Pass);
@@ -466,17 +545,11 @@ impl CsSupportRmcpServer {
                 &attempt_id,
                 vec![
                     ("attempt_id".to_string(), attempt_id.clone()),
-                    (
-                        "case_id".to_string(),
-                        req.case_id.clone().unwrap_or_default(),
-                    ),
+                    ("case_id".to_string(), req.case_id.clone()),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
                     ("draft".to_string(), req.draft.clone()),
-                    (
-                        "decision".to_string(),
-                        req.evaluation_request_id.clone().unwrap_or_default(),
-                    ),
+                    ("decision".to_string(), req.evaluation_request_id.clone()),
                     ("egress_verdict".to_string(), verdict.label().to_string()),
                     ("audit_event_id".to_string(), audit_event_id.clone()),
                     ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),

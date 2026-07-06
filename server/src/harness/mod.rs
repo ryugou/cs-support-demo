@@ -30,6 +30,9 @@ pub struct Harness {
     pub thresholds: decision::Thresholds,
     pub grading: grading::GradingThresholds,
     pub queue_path: PathBuf,
+    /// grade 更新（read-modify-write）のプロセス内直列化。単一インスタンス運用が前提。
+    // TODO: bind to vegapunk atomic increment/CAS — backend 側の原子更新が使えるようになったら置き換える。
+    pub grade_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +97,7 @@ impl Harness {
             thresholds: (&config.harness.thresholds).into(),
             grading: (&config.harness.grading).into(),
             queue_path: resolve_path(&config.harness.search_improvement_queue_path),
+            grade_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -147,6 +151,8 @@ impl Harness {
         kr_id: &str,
         outcome: grading::AnswerOutcome,
     ) -> Result<Option<rules::Grade>> {
+        // read-modify-write の lost update を防ぐ（プロセス内直列化。backend atomic は TODO）
+        let _guard = self.grade_lock.lock().await;
         let store = self.knowledge()?;
         let resolutions = store.load_known_resolutions(&ctx.schema).await?;
         let kr = resolutions
@@ -266,11 +272,17 @@ impl Harness {
         // [正規化] 決定論 lexicon（S1-11）。今ターン分。
         let signals = self.normalizer.normalize(question);
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
+        // 既存 case_id は存在を検証する（未知の id への orphan edge 追加を防ぐ）。
         let (case_id, prior_signals) = match case_id {
-            Some(id) => (
-                id.to_string(),
-                knowledge.load_case_signals(&ctx.schema, id).await?,
-            ),
+            Some(id) => {
+                if knowledge.load_case(&ctx.schema, id).await?.is_none() {
+                    return Err(anyhow!("unknown case_id: {id}"));
+                }
+                (
+                    id.to_string(),
+                    knowledge.load_case_signals(&ctx.schema, id).await?,
+                )
+            }
             None => {
                 let new_id = format!("case-{}", uuid::Uuid::new_v4());
                 knowledge
@@ -339,6 +351,24 @@ impl Harness {
                 ..
             }
         );
+        // [記録] 判定結果を case に永続化する（record_answer_attempt の lineage 検証の根拠。
+        // client の自己申告でなくサーバ側の記録と突合するため）。
+        let case_decision = match &decision_result {
+            decision::AnswerDecision::Allowed { .. } => "allowed",
+            decision::AnswerDecision::Escalate { .. } => "escalate",
+        };
+        knowledge
+            .record(
+                &ctx.schema,
+                "support_case",
+                &case_id,
+                vec![
+                    ("case_id".to_string(), case_id.clone()),
+                    ("last_request_id".to_string(), ctx.request_id.clone()),
+                    ("last_decision".to_string(), case_decision.to_string()),
+                ],
+            )
+            .await?;
         // [記録] WORM（S1-8 条件 8）
         let (decision_label, route) = match &decision_result {
             decision::AnswerDecision::Allowed { source, .. } => {
@@ -368,6 +398,42 @@ impl Harness {
             hits,
             audit_event_id,
         })
+    }
+
+    /// record_answer_attempt の入口強制（S1-1 の短絡順序を emit 側でも閉じる）:
+    /// draft は「同一 case の最新 evaluate_answerability が Allowed」の場合のみ emit 候補になる。
+    /// 判定はサーバが case に永続化した記録と突合する（client の自己申告を信用しない）。
+    pub async fn verify_answer_lineage(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+        evaluation_request_id: &str,
+    ) -> Result<()> {
+        let attrs = self
+            .knowledge()?
+            .load_case(&ctx.schema, case_id)
+            .await?
+            .ok_or_else(|| anyhow!("unknown case_id: {case_id}"))?;
+        let last_request_id = attrs
+            .get("last_request_id")
+            .map(String::as_str)
+            .unwrap_or("");
+        if last_request_id != evaluation_request_id {
+            return Err(anyhow!(
+                "evaluation_request_id does not match the latest evaluation of case {case_id}; \
+                 call evaluate_answerability first and use its request_id"
+            ));
+        }
+        match attrs.get("last_decision").map(String::as_str) {
+            Some("allowed") => Ok(()),
+            Some("escalate") => Err(anyhow!(
+                "the latest evaluation of case {case_id} was an escalation; \
+                 drafts may only be attached as reference, not emitted"
+            )),
+            _ => Err(anyhow!(
+                "case {case_id} has no recorded evaluation; call evaluate_answerability first"
+            )),
+        }
     }
 
     /// 訂正時の root_cause 切り分け（S1-5）: 正しい根拠がグラフ内に存在したかを再検索で判定。
@@ -453,6 +519,7 @@ mod tests {
                 demote_rejections: 2,
             },
             queue_path: dir.join("queue.jsonl"),
+            grade_lock: tokio::sync::Mutex::new(()),
         }
     }
 

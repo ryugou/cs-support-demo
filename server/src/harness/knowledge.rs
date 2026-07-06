@@ -26,6 +26,24 @@ fn csv_signals(value: &str) -> SignalSet {
     csv_list(value).into_iter().map(Signal::new).collect()
 }
 
+/// graph_snapshot に渡す上限。到達＝切り詰めの可能性があり、HAS_SIGNAL 辺の欠落は
+/// 照合の誤判定（fail open）につながるため、到達時はエラーにする（fail closed）。
+// TODO: bind to vegapunk traversal API — snapshot 全取得でなく
+// KnownResolution/support_case -> HAS_SIGNAL -> Signal の隣接取得に置き換える。
+const SNAPSHOT_MAX_NODES: i32 = 5000;
+
+fn guard_snapshot_complete(
+    snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+) -> Result<()> {
+    if snapshot.nodes.len() >= SNAPSHOT_MAX_NODES as usize {
+        anyhow::bail!(
+            "graph snapshot reached the {SNAPSHOT_MAX_NODES}-node limit; signal edges may be \
+             truncated, refusing to match on incomplete data"
+        );
+    }
+    Ok(())
+}
+
 /// snapshot から Signal ノードの node_id → value 索引を作る（HAS_SIGNAL 復元の共通部品）。
 fn signal_value_index(
     snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
@@ -218,7 +236,11 @@ impl KnowledgeStore {
         if kr_nodes.is_empty() {
             return Ok(Vec::new());
         }
-        let snapshot = self.client.graph_snapshot(schema, 5000).await?;
+        let snapshot = self
+            .client
+            .graph_snapshot(schema, SNAPSHOT_MAX_NODES)
+            .await?;
+        guard_snapshot_complete(&snapshot)?;
         let signal_values = signal_value_index(&snapshot);
         // KR node_id -> SignalSet
         let mut kr_signals: HashMap<String, SignalSet> = HashMap::new();
@@ -300,7 +322,11 @@ impl KnowledgeStore {
     /// 会話層: support_case の累積 signal 集合を HAS_SIGNAL 辺から復元する（S1-11 追記 3）。
     pub async fn load_case_signals(&self, schema: &str, case_id: &str) -> Result<SignalSet> {
         let case_node_id = harness_node_id(schema, "support_case", case_id);
-        let snapshot = self.client.graph_snapshot(schema, 5000).await?;
+        let snapshot = self
+            .client
+            .graph_snapshot(schema, SNAPSHOT_MAX_NODES)
+            .await?;
+        guard_snapshot_complete(&snapshot)?;
         let signal_values = signal_value_index(&snapshot);
         Ok(snapshot
             .edges
@@ -362,6 +388,22 @@ impl KnowledgeStore {
                 })
             })
             .collect())
+    }
+
+    /// support_case を 1 件読む（存在検証・lineage 検証用）。
+    pub async fn load_case(
+        &self,
+        schema: &str,
+        case_id: &str,
+    ) -> Result<Option<HashMap<String, String>>> {
+        Ok(self
+            .client
+            .query_nodes(schema, "support_case", vec![("case_id", "eq", case_id)], 1)
+            .await
+            .context("load support case")?
+            .into_iter()
+            .next()
+            .map(|node| node.attributes))
     }
 
     /// 過去事例を日本語クエリで検索する（scoring は mcp.rs の共有関数を再利用）。
