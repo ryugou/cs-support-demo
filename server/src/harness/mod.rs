@@ -74,7 +74,12 @@ impl Harness {
             Some(path) => {
                 let raw = std::fs::read_to_string(resolve_path(path))
                     .with_context(|| format!("read jwt secret file {path}"))?;
-                Some(raw.trim().as_bytes().to_vec())
+                let trimmed = raw.trim();
+                // 空鍵は実質的な認証無効化になるため、設定ミスとして起動失敗（fail closed）
+                if trimmed.is_empty() {
+                    return Err(anyhow!("jwt secret file {path} is empty"));
+                }
+                Some(trimmed.as_bytes().to_vec())
             }
             None => None,
         };

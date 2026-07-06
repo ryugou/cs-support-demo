@@ -74,16 +74,27 @@ impl LexiconNormalizer {
         let entries = file
             .signals
             .into_iter()
-            .map(|entry| CompiledEntry {
-                signal: entry.signal,
-                normalized_forms: entry
+            .map(|entry| {
+                let normalized_forms: Vec<String> = entry
                     .surface_forms
                     .iter()
                     .map(|form| normalize_key(form))
                     .filter(|form| !form.is_empty())
-                    .collect(),
+                    .collect();
+                // 有効な surface form が 1 つも無い signal は「存在するのに決して
+                // 抽出されない」サイレント never-match になるため、ロード時に拒否する。
+                if normalized_forms.is_empty() {
+                    anyhow::bail!(
+                        "signal {} has no usable surface forms after normalization",
+                        entry.signal
+                    );
+                }
+                Ok(CompiledEntry {
+                    signal: entry.signal,
+                    normalized_forms,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self { entries, classes })
     }
 
@@ -155,6 +166,17 @@ mod tests {
             Some(SignalClass::Context)
         );
         assert_eq!(n.class_of(&Signal::new("unknown")), None);
+    }
+
+    #[test]
+    fn rejects_signal_with_no_usable_surface_forms() {
+        // 記号のみ（正規化で空になる）の signal はサイレント never-match になるため拒否
+        let result = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "broken", "class": "hazard", "surface_forms": ["!!!", "…"] }
+            ] }"#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
