@@ -3,12 +3,18 @@ use axum::{routing::get, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use cs_support_mcp::{
-    config::AppConfig, mcp::ToolService, rmcp_server::CsSupportRmcpServer, vegapunk::VegapunkClient,
+    config::AppConfig, harness::Harness, mcp::ToolService, rmcp_server::CsSupportRmcpServer,
+    vegapunk::VegapunkClient,
 };
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{transport::io::stdio, ServiceExt};
-use std::{env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tower_http::trace::TraceLayer;
 
 #[derive(Debug, Parser)]
@@ -33,14 +39,22 @@ async fn main() -> Result<()> {
     let bearer_token = read_bearer_token(&args)?;
     let vegapunk = VegapunkClient::connect_lazy(&config.vegapunk_endpoint, &bearer_token)
         .context("configure vegapunk client")?;
-    let tools = ToolService::new(vegapunk);
+    let tools = ToolService::new(vegapunk.clone());
+    let config_dir = args
+        .config
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let harness = Arc::new(
+        Harness::build(&config, Arc::new(vegapunk), &config_dir).context("build harness")?,
+    );
 
     if args.stdio {
         let project = config
             .projects
             .first()
             .ok_or_else(|| anyhow!("no project configured"))?;
-        let service = CsSupportRmcpServer::new(project.schema.clone(), tools)
+        let service = CsSupportRmcpServer::new(project.schema.clone(), tools, harness.clone())
             .serve(stdio())
             .await?;
         service.waiting().await?;
@@ -56,8 +70,15 @@ async fn main() -> Result<()> {
     for project in config.projects.iter() {
         let schema = project.schema.clone();
         let tools = tools.clone();
+        let harness = harness.clone();
         let mcp = StreamableHttpService::new(
-            move || Ok(CsSupportRmcpServer::new(schema.clone(), tools.clone())),
+            move || {
+                Ok(CsSupportRmcpServer::new(
+                    schema.clone(),
+                    tools.clone(),
+                    harness.clone(),
+                ))
+            },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts()),
         );

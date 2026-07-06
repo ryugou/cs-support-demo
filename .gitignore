@@ -1,3 +1,4 @@
 /server/target/
 /server/certs/*.pem
 .DS_Store
+server/data/audit/

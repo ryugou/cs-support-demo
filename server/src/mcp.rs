@@ -44,6 +44,21 @@ impl ToolService {
         product_key: Option<&str>,
         top_k: i32,
     ) -> Result<Vec<SectionHit>> {
+        let snapshot = self.client.graph_snapshot(schema, 5000).await?;
+        self.search_manual_with_snapshot(schema, query_ja, product_key, top_k, snapshot)
+            .await
+    }
+
+    /// 取得済み snapshot を使う変種（Harness::evaluate が 1 リクエスト中の snapshot を共有する用）。
+    /// snapshot は move で受ける（通常経路は所有物を渡すため clone なし。共有元だけが clone する）。
+    pub async fn search_manual_with_snapshot(
+        &self,
+        schema: &str,
+        query_ja: &str,
+        product_key: Option<&str>,
+        top_k: i32,
+        snapshot: crate::proto::graphrag::GetGraphSnapshotResponse,
+    ) -> Result<Vec<SectionHit>> {
         let filters = product_key
             .map(|key| vec![("product_key", "eq", key)])
             .unwrap_or_default();
@@ -51,7 +66,6 @@ impl ToolService {
             .client
             .query_nodes(schema, "section", filters, 1000)
             .await?;
-        let snapshot = self.client.graph_snapshot(schema, 5000).await?;
         let graph = SnapshotIndex::new(snapshot.nodes, snapshot.edges);
         let query_norm = normalize_key(query_ja);
 
@@ -449,7 +463,7 @@ fn candidate_from_node(query: &str, node: NodeResult) -> Option<ProductCandidate
     })
 }
 
-fn semantic_overlap_score(query: &str, text: &str) -> f32 {
+pub(crate) fn semantic_overlap_score(query: &str, text: &str) -> f32 {
     let q = normalize_key(query);
     let t = normalize_key(text);
     if q.is_empty() || t.is_empty() {
@@ -459,7 +473,7 @@ fn semantic_overlap_score(query: &str, text: &str) -> f32 {
     matched as f32 / q.chars().count().max(1) as f32 * 0.6
 }
 
-fn section_score(query_norm: &str, query_raw: &str, text: &str) -> f32 {
+pub(crate) fn section_score(query_norm: &str, query_raw: &str, text: &str) -> f32 {
     if query_raw.trim().is_empty() {
         return 0.0;
     }

@@ -1,0 +1,16 @@
+{
+  "signals": [
+    { "signal": "discoloration", "class": "hazard", "surface_forms": ["変色", "色が変わ", "色味がおかし", "茶色くな", "黒ずん"] },
+    { "signal": "mold", "class": "hazard", "surface_forms": ["カビ", "かび", "白い綿", "ふわふわした付着"] },
+    { "signal": "foreign_substance", "class": "hazard", "surface_forms": ["異物", "虫が入", "髪の毛が入", "破片"] },
+    { "signal": "odor_abnormality", "class": "hazard", "surface_forms": ["異臭", "変な匂い", "変なにおい", "酸っぱい匂い"] },
+    { "signal": "post_ingestion_symptom", "class": "hazard", "surface_forms": ["食べたら", "飲んだら気分", "腹痛", "吐き気", "下痢"] },
+    { "signal": "skin_irritation", "class": "hazard", "surface_forms": ["ピリピリ", "かぶれ", "赤み", "かゆみ", "湿疹", "ヒリヒリ"] },
+    { "signal": "allergy_concern", "class": "hazard", "surface_forms": ["アレルギー", "アレルゲン"] },
+    { "signal": "efficacy_claim", "class": "hazard", "surface_forms": ["効果", "効能", "治る", "痩せ", "改善します"] },
+    { "signal": "dosage_for_condition", "class": "hazard", "surface_forms": ["妊娠中", "授乳中", "持病", "服薬中", "子供に飲ませ"] },
+    { "signal": "continue_use_question", "class": "context", "surface_forms": ["使い続けて", "続けて大丈夫", "食べてもいい", "飲んでもいい"] },
+    { "signal": "expiry_question", "class": "context", "surface_forms": ["賞味期限", "消費期限", "保存方法", "開封後"] },
+    { "signal": "refund_request", "class": "context", "surface_forms": ["返金", "返品", "交換して"] }
+  ]
+}

@@ -8,6 +8,12 @@ pub fn normalize_key(input: &str) -> String {
         .collect()
 }
 
+/// needle を正規化してから、正規化済み haystack に部分一致するか（空 needle は不一致）。
+pub fn norm_contains(haystack_norm: &str, needle_raw: &str) -> bool {
+    let needle = normalize_key(needle_raw);
+    !needle.is_empty() && haystack_norm.contains(&needle)
+}
+
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
