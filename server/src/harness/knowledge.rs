@@ -471,6 +471,8 @@ impl KnowledgeStore {
     }
 
     /// grade 運用: 承認/却下カウントと格付けを KnownResolution ノードに反映する（遵守事項 3）。
+    /// read-merge-write: 既存属性を読み出して重ねるため、UpsertNodes が
+    /// merge / 全属性置換のどちらのセマンティクスでも既存属性（answer_text 等）を失わない。
     pub async fn update_known_resolution_grade(
         &self,
         schema: &str,
@@ -480,18 +482,26 @@ impl KnowledgeStore {
         approver_set: &[String],
         grade: Grade,
     ) -> Result<()> {
-        // upsert merge を前提に該当属性のみ送る。全属性置換だった場合は Task 14 の
-        // 実機検証で判明するため、そのときは query_nodes で現属性を読み全属性を再送する。
+        let mut merged: HashMap<String, String> = self
+            .client
+            .query_nodes(schema, "KnownResolution", vec![("kr_id", "eq", kr_id)], 1)
+            .await
+            .context("load known resolution for grade update")?
+            .into_iter()
+            .next()
+            .map(|node| node.attributes)
+            .ok_or_else(|| anyhow!("known_resolution not found: {kr_id}"))?;
+        merged.extend([
+            ("kr_id".to_string(), kr_id.to_string()),
+            ("approval_count".to_string(), approval_count.to_string()),
+            ("rejection_count".to_string(), rejection_count.to_string()),
+            ("approver_set".to_string(), approver_set.join(",")),
+            ("grade".to_string(), grade.as_str().to_string()),
+        ]);
         let node = GraphNode {
             id: harness_node_id(schema, "KnownResolution", kr_id),
             node_type: "KnownResolution".to_string(),
-            attributes: vec![
-                ("kr_id".to_string(), kr_id.to_string()),
-                ("approval_count".to_string(), approval_count.to_string()),
-                ("rejection_count".to_string(), rejection_count.to_string()),
-                ("approver_set".to_string(), approver_set.join(",")),
-                ("grade".to_string(), grade.as_str().to_string()),
-            ],
+            attributes: merged.into_iter().collect(),
         };
         self.client.upsert_nodes(vec![node]).await?;
         Ok(())

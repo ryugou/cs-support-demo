@@ -186,20 +186,22 @@ impl Harness {
                 ));
             }
         } else {
+            // read-merge-write: 既存属性（draft / case_id / known_resolution_id 等）を
+            // ベースに outcome を重ねて全属性を再送する（全属性置換セマンティクスでも安全）。
+            let mut merged = attempt.clone();
+            merged.insert("attempt_id".to_string(), attempt_id.to_string());
+            merged.insert("outcome".to_string(), outcome.as_str().to_string());
+            merged.insert("outcome_actor".to_string(), ctx.actor.sub.clone());
+            merged.insert(
+                "outcome_note".to_string(),
+                note.unwrap_or_default().to_string(),
+            );
             store
                 .record(
                     &ctx.schema,
                     "answer_attempt",
                     attempt_id,
-                    vec![
-                        ("attempt_id".to_string(), attempt_id.to_string()),
-                        ("outcome".to_string(), outcome.as_str().to_string()),
-                        ("outcome_actor".to_string(), ctx.actor.sub.clone()),
-                        (
-                            "outcome_note".to_string(),
-                            note.unwrap_or_default().to_string(),
-                        ),
-                    ],
+                    merged.into_iter().collect(),
                 )
                 .await?;
         }
@@ -328,37 +330,44 @@ impl Harness {
         let signals = self.normalizer.normalize(question);
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
         // 既存 case_id は存在を検証する（未知の id への orphan edge 追加を防ぐ）。
-        let (case_id, prior_signals) = match case_id {
+        // case の全属性を手元に保持し、後段の判定記録は read-merge-write で全属性を再送する
+        // （UpsertNodes が全属性置換セマンティクスでも既存属性を失わない）。
+        let (case_id, prior_signals, mut case_attrs) = match case_id {
             Some(id) => {
-                if knowledge.load_case(&ctx.schema, id).await?.is_none() {
-                    return Err(anyhow!("unknown case_id: {id}"));
-                }
+                let attrs = knowledge
+                    .load_case(&ctx.schema, id)
+                    .await?
+                    .ok_or_else(|| anyhow!("unknown case_id: {id}"))?;
                 (
                     id.to_string(),
                     knowledge.load_case_signals(&ctx.schema, id).await?,
+                    attrs,
                 )
             }
             None => {
                 let new_id = format!("case-{}", uuid::Uuid::new_v4());
+                let attrs: std::collections::HashMap<String, String> = [
+                    ("case_id".to_string(), new_id.clone()),
+                    ("request_id".to_string(), ctx.request_id.clone()),
+                    ("actor".to_string(), ctx.actor.sub.clone()),
+                    ("question".to_string(), question.to_string()),
+                    (
+                        "product_key".to_string(),
+                        product_key.unwrap_or_default().to_string(),
+                    ),
+                    ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),
+                ]
+                .into_iter()
+                .collect();
                 knowledge
                     .record(
                         &ctx.schema,
                         "support_case",
                         &new_id,
-                        vec![
-                            ("case_id".to_string(), new_id.clone()),
-                            ("request_id".to_string(), ctx.request_id.clone()),
-                            ("actor".to_string(), ctx.actor.sub.clone()),
-                            ("question".to_string(), question.to_string()),
-                            (
-                                "product_key".to_string(),
-                                product_key.unwrap_or_default().to_string(),
-                            ),
-                            ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),
-                        ],
+                        attrs.clone().into_iter().collect(),
                     )
                     .await?;
-                (new_id, signal::SignalSet::new())
+                (new_id, signal::SignalSet::new(), attrs)
             }
         };
         let accumulated: signal::SignalSet = prior_signals.union(&signals).cloned().collect();
@@ -416,17 +425,16 @@ impl Harness {
             } => ("allowed", known_resolution_id.clone().unwrap_or_default()),
             decision::AnswerDecision::Escalate { .. } => ("escalate", String::new()),
         };
+        case_attrs.insert("case_id".to_string(), case_id.clone());
+        case_attrs.insert("last_request_id".to_string(), ctx.request_id.clone());
+        case_attrs.insert("last_decision".to_string(), case_decision.to_string());
+        case_attrs.insert("last_kr_id".to_string(), case_kr_id);
         knowledge
             .record(
                 &ctx.schema,
                 "support_case",
                 &case_id,
-                vec![
-                    ("case_id".to_string(), case_id.clone()),
-                    ("last_request_id".to_string(), ctx.request_id.clone()),
-                    ("last_decision".to_string(), case_decision.to_string()),
-                    ("last_kr_id".to_string(), case_kr_id),
-                ],
+                case_attrs.into_iter().collect(),
             )
             .await?;
         // [記録] WORM（S1-8 条件 8）
