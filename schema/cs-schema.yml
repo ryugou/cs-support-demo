@@ -112,7 +112,8 @@ nodes:
       request_id: { type: string }
       actor: { type: string }
       draft: { type: string }
-      decision: { type: string }
+      decision: { type: string }   # 予約（未使用）。削除は非加算になるため残置
+      evaluation_request_id: { type: string }
       known_resolution_id: { type: string }
       egress_verdict: { type: string }
       audit_event_id: { type: string }

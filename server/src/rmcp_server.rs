@@ -557,7 +557,10 @@ impl CsSupportRmcpServer {
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
                     ("draft".to_string(), req.draft.clone()),
-                    ("decision".to_string(), req.evaluation_request_id.clone()),
+                    (
+                        "evaluation_request_id".to_string(),
+                        req.evaluation_request_id.clone(),
+                    ),
                     (
                         "known_resolution_id".to_string(),
                         lineage_kr_id.unwrap_or_default(),

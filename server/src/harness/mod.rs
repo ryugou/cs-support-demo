@@ -319,12 +319,16 @@ impl Harness {
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
-        // 4 つの読み取りは互いに独立なので並列に発行する（レイテンシ = max(RTT)）。
-        let (rules, domains, resolutions, hits) = tokio::try_join!(
+        // 独立な読み取りは並列に発行し、graph snapshot は 1 回だけ取得して
+        // KR 復元・マニュアル検索・case signal 復元で共有する（重複取得を避ける）。
+        let (rules, domains, snapshot) = tokio::try_join!(
             knowledge.load_escalation_rules(&ctx.schema),
             knowledge.load_prohibited_domains(&ctx.schema),
-            knowledge.load_known_resolutions(&ctx.schema),
-            tools.search_manual(&ctx.schema, question, product_key, 5),
+            knowledge.fetch_snapshot(&ctx.schema),
+        )?;
+        let (resolutions, hits) = tokio::try_join!(
+            knowledge.load_known_resolutions_with(&ctx.schema, &snapshot),
+            tools.search_manual_with_snapshot(&ctx.schema, question, product_key, 5, &snapshot),
         )?;
         // [正規化] 決定論 lexicon（S1-11）。今ターン分。
         let signals = self.normalizer.normalize(question);
@@ -340,7 +344,7 @@ impl Harness {
                     .ok_or_else(|| anyhow!("unknown case_id: {id}"))?;
                 (
                     id.to_string(),
-                    knowledge.load_case_signals(&ctx.schema, id).await?,
+                    knowledge::case_signals_from_snapshot(&ctx.schema, id, &snapshot),
                     attrs,
                 )
             }

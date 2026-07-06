@@ -56,8 +56,9 @@ impl WormAuditLog {
         }
         // 既存ログは全行の hash chain を検証してから継続する（fail closed）。
         // 破損・改ざん・切り詰めを黙って新チェーンで上書きしない。
-        let prev_hash = match std::fs::read_to_string(path) {
-            Ok(body) => verify_chain(&body)
+        // ログは長期運用で巨大化し得るため、一括読み込みでなく 1 行ずつストリーム検証する。
+        let prev_hash = match File::open(path) {
+            Ok(existing) => verify_chain(std::io::BufReader::new(existing))
                 .with_context(|| format!("audit log {} failed integrity check", path.display()))?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => genesis_hash(),
             Err(err) => {
@@ -133,12 +134,14 @@ fn genesis_hash() -> String {
     format!("{:x}", Sha256::digest(b"cs-support-mcp-worm-genesis"))
 }
 
-/// 既存ログ全行の hash chain を検証し、最後の hash を返す（空なら genesis）。
+/// 既存ログ全行の hash chain をストリームで検証し、最後の hash を返す（空なら genesis）。
 /// 1 行でも JSON 不正・チェーン断絶・hash 不一致があれば Err（fail closed）。
-fn verify_chain(body: &str) -> Result<String> {
+fn verify_chain(reader: impl std::io::BufRead) -> Result<String> {
     let mut prev = genesis_hash();
-    for (index, line) in body.lines().enumerate() {
+    for (index, line) in reader.lines().enumerate() {
         let line_no = index + 1;
+        let line = line.with_context(|| format!("line {line_no}: read failed"))?;
+        let line = line.as_str();
         if line.trim().is_empty() {
             anyhow::bail!("line {line_no}: empty line in append-only log");
         }

@@ -44,6 +44,22 @@ fn guard_snapshot_complete(
     Ok(())
 }
 
+/// 取得済み snapshot から support_case の累積 signal 集合を復元する（純関数・追加 RPC なし）。
+pub fn case_signals_from_snapshot(
+    schema: &str,
+    case_id: &str,
+    snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+) -> SignalSet {
+    let case_node_id = harness_node_id(schema, "support_case", case_id);
+    let signal_values = signal_value_index(snapshot);
+    snapshot
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "HAS_SIGNAL" && e.from_id == case_node_id)
+        .filter_map(|e| signal_values.get(&e.to_id).map(Signal::new))
+        .collect()
+}
+
 /// snapshot から Signal ノードの node_id → value 索引を作る（HAS_SIGNAL 復元の共通部品）。
 fn signal_value_index(
     snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
@@ -68,41 +84,66 @@ fn parse_binding(value: Option<&String>) -> Binding {
 }
 
 pub fn escalation_rule_from_attributes(attrs: &HashMap<String, String>) -> Result<EscalationRule> {
+    let id = attrs
+        .get("rule_id")
+        .cloned()
+        .ok_or_else(|| anyhow!("escalation_rule missing rule_id"))?;
+    // condition は required（schema）。欠落・空を空集合に落とすと第1層がサイレントに
+    // 無効化される（fail open）ため、設定ミスとしてエラーにする（fail closed）。
+    let condition = csv_signals(
+        attrs
+            .get("condition")
+            .ok_or_else(|| anyhow!("escalation_rule {id} missing condition"))?,
+    );
+    if condition.is_empty() {
+        return Err(anyhow!("escalation_rule {id} has an empty condition"));
+    }
     Ok(EscalationRule {
-        id: attrs
-            .get("rule_id")
-            .cloned()
-            .ok_or_else(|| anyhow!("escalation_rule missing rule_id"))?,
-        condition: csv_signals(attrs.get("condition").map(String::as_str).unwrap_or("")),
         route: attrs
             .get("route")
             .cloned()
-            .ok_or_else(|| anyhow!("escalation_rule missing route"))?,
+            .ok_or_else(|| anyhow!("escalation_rule {id} missing route"))?,
         owner: attrs.get("owner").cloned().filter(|v| !v.is_empty()),
         binding: parse_binding(attrs.get("binding")),
+        id,
+        condition,
     })
 }
 
 pub fn prohibited_domain_from_attributes(
     attrs: &HashMap<String, String>,
 ) -> Result<ProhibitedDomain> {
+    let id = attrs
+        .get("domain_id")
+        .cloned()
+        .ok_or_else(|| anyhow!("prohibited_domain missing domain_id"))?;
+    // pattern は required（schema）。欠落を空リストに落とすと禁止領域が素通りする
+    // （fail open）ため、設定ミスとしてエラーにする（fail closed）。
+    let text_patterns = csv_list(
+        attrs
+            .get("pattern")
+            .ok_or_else(|| anyhow!("prohibited_domain {id} missing pattern"))?,
+    );
+    let domain_signals = csv_signals(
+        attrs
+            .get("domain_signals")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    if text_patterns.is_empty() && domain_signals.is_empty() {
+        return Err(anyhow!(
+            "prohibited_domain {id} has neither text patterns nor domain signals"
+        ));
+    }
     Ok(ProhibitedDomain {
-        id: attrs
-            .get("domain_id")
-            .cloned()
-            .ok_or_else(|| anyhow!("prohibited_domain missing domain_id"))?,
-        domain_signals: csv_signals(
-            attrs
-                .get("domain_signals")
-                .map(String::as_str)
-                .unwrap_or(""),
-        ),
-        text_patterns: csv_list(attrs.get("pattern").map(String::as_str).unwrap_or("")),
         route: attrs
             .get("route")
             .cloned()
-            .ok_or_else(|| anyhow!("prohibited_domain missing route"))?,
+            .ok_or_else(|| anyhow!("prohibited_domain {id} missing route"))?,
         binding: parse_binding(attrs.get("binding")),
+        id,
+        domain_signals,
+        text_patterns,
     })
 }
 
@@ -226,8 +267,33 @@ impl KnowledgeStore {
             .collect()
     }
 
+    /// 完全性ガード付きで graph snapshot を 1 回取得する。
+    /// evaluate のように複数箇所で snapshot が要る場合はこれを 1 回呼んで共有する
+    /// （1 リクエスト中の重複取得を避ける）。
+    pub async fn fetch_snapshot(
+        &self,
+        schema: &str,
+    ) -> Result<crate::proto::graphrag::GetGraphSnapshotResponse> {
+        let snapshot = self
+            .client
+            .graph_snapshot(schema, SNAPSHOT_MAX_NODES)
+            .await?;
+        guard_snapshot_complete(&snapshot)?;
+        Ok(snapshot)
+    }
+
     /// KnownResolution を Signal ノード経由で復元する（HAS_SIGNAL 辺の走査）。
     pub async fn load_known_resolutions(&self, schema: &str) -> Result<Vec<KnownResolution>> {
+        let snapshot = self.fetch_snapshot(schema).await?;
+        self.load_known_resolutions_with(schema, &snapshot).await
+    }
+
+    /// 取得済み snapshot を使う変種（evaluate の hot path 用）。
+    pub async fn load_known_resolutions_with(
+        &self,
+        schema: &str,
+        snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+    ) -> Result<Vec<KnownResolution>> {
         let kr_nodes = self
             .client
             .query_nodes(schema, "KnownResolution", Vec::new(), 1000)
@@ -236,12 +302,7 @@ impl KnowledgeStore {
         if kr_nodes.is_empty() {
             return Ok(Vec::new());
         }
-        let snapshot = self
-            .client
-            .graph_snapshot(schema, SNAPSHOT_MAX_NODES)
-            .await?;
-        guard_snapshot_complete(&snapshot)?;
-        let signal_values = signal_value_index(&snapshot);
+        let signal_values = signal_value_index(snapshot);
         // KR node_id -> SignalSet
         let mut kr_signals: HashMap<String, SignalSet> = HashMap::new();
         for edge in snapshot
@@ -321,19 +382,8 @@ impl KnowledgeStore {
 
     /// 会話層: support_case の累積 signal 集合を HAS_SIGNAL 辺から復元する（S1-11 追記 3）。
     pub async fn load_case_signals(&self, schema: &str, case_id: &str) -> Result<SignalSet> {
-        let case_node_id = harness_node_id(schema, "support_case", case_id);
-        let snapshot = self
-            .client
-            .graph_snapshot(schema, SNAPSHOT_MAX_NODES)
-            .await?;
-        guard_snapshot_complete(&snapshot)?;
-        let signal_values = signal_value_index(&snapshot);
-        Ok(snapshot
-            .edges
-            .iter()
-            .filter(|e| e.edge_type == "HAS_SIGNAL" && e.from_id == case_node_id)
-            .filter_map(|e| signal_values.get(&e.to_id).map(Signal::new))
-            .collect())
+        let snapshot = self.fetch_snapshot(schema).await?;
+        Ok(case_signals_from_snapshot(schema, case_id, &snapshot))
     }
 
     /// 会話層: 今ターンの signal を support_case に加算する（Signal ノード + HAS_SIGNAL 辺 upsert）。
