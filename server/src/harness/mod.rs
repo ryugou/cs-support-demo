@@ -514,18 +514,21 @@ impl Harness {
     }
 
     /// 検索改善キューへの追記（retrieval_miss の受け皿。known_resolution を増やさない）。
-    pub fn enqueue_search_improvement(
+    /// async ハンドラから呼ばれるため tokio::fs で非同期 I/O にする（ワーカーをブロックしない）。
+    pub async fn enqueue_search_improvement(
         &self,
         ctx: &RequestContext,
         corrected_answer: &str,
     ) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
         if let Some(parent) = self.queue_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.queue_path)?;
+            .open(&self.queue_path)
+            .await?;
         let entry = serde_json::json!({
             "request_id": ctx.request_id,
             "schema": ctx.schema,
@@ -533,7 +536,10 @@ impl Harness {
             "corrected_answer": corrected_answer,
             "queued_at": chrono::Utc::now().to_rfc3339(),
         });
-        writeln!(file, "{}", serde_json::to_string(&entry)?)?;
+        let mut line = serde_json::to_string(&entry)?;
+        line.push('\n');
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await?;
         Ok(())
     }
 }

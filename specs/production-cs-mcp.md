@@ -792,7 +792,7 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
 
 ### 実装状況（2026-07-04）
 
-- MCP 側 Step 1（Harness / 3 層判定 / 会話層 / egress / correction / grade / WORM / 12 tool / 加算スキーマ / ingest_rules CLI）を `feat/production-cs-mcp-step1` ブランチに実装済み。ユニットテスト 59 本・fmt・check 通過。
+- MCP 側 Step 1（Harness / 3 層判定 / 会話層 / egress / correction / grade / WORM / 12 tool / 加算スキーマ / ingest_rules CLI）を `feat/production-cs-mcp-step1` ブランチに実装済み。ユニットテスト全件・fmt・check 通過。
 - 加算スキーマ更新と第1層ルール 2 件・第2層領域 2 件は `vegapunk.local` の `sivira-cs-demo` に投入済み（純加算）。
 - **S1-8 Done 条件の実機 E2E 突合は保留中**: vegapunk / PunkRecord 側の Step 1 追加機能が実装完了していないため。バックエンド側完了後に Task 14（受け入れ検証）を再開する。
 

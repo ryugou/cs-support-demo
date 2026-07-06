@@ -572,7 +572,7 @@ impl CsSupportRmcpServer {
 
     #[tool(
         name = "record_answer_outcome",
-        description = "応答の結果（resolved / unresolved / re_inquiry / wrong_answer）を記録する。known_resolution 由来の応答なら known_resolution_id を渡すこと（承認/却下カウントと格付けが更新される）。"
+        description = "応答の結果（resolved / unresolved / re_inquiry / wrong_answer）を attempt_id に対して記録する。応答が known_resolution 由来かはサーバ記録から自動で判定され、該当時は承認/却下カウントと格付けが更新される。outcome は write-once（同一 outcome の再送のみ冪等に受理）。"
     )]
     async fn record_answer_outcome(
         &self,
@@ -648,6 +648,7 @@ impl CsSupportRmcpServer {
             // known_resolution を増やさず検索改善キューへ（S1-8 条件 4）
             self.harness
                 .enqueue_search_improvement(&ctx, &req.corrected_answer)
+                .await
                 .map_err(to_error)?;
         }
         let feedback_id = format!("fb-{}", uuid::Uuid::new_v4());
