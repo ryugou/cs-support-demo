@@ -128,12 +128,11 @@ pub struct SearchPastCasesResponse {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecordAnswerAttemptRequest {
-    /// evaluate_answerability が返した case_id（必須）
+    /// evaluate_answerability が返した case_id（必須）。質問文・product_key は
+    /// case 側に記録済みのためここでは受け取らない（API 最小化）。
     pub case_id: String,
     /// 顧客に出す予定の draft 全文。AI 草案・担当者修正文の区別なく必ずここを通す。
     pub draft: String,
-    pub question: String,
-    pub product_key: Option<String>,
     /// 同一 case に対する evaluate_answerability の request_id（必須）。
     /// サーバ側の判定記録と突合され、最新判定が Allowed の場合のみ emit 候補になる。
     pub evaluation_request_id: String,
@@ -719,6 +718,13 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<CreateEscalationEventRequest>,
     ) -> Result<Json<CreateEscalationEventResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
+        // layer は 3 層判定の定義域（1..=3）以外を永続化させない
+        if !(1..=3).contains(&req.layer) {
+            return Err(ErrorData::invalid_params(
+                format!("layer must be 1..=3, got {}", req.layer),
+                None,
+            ));
+        }
         let store = self.harness.store().map_err(to_error)?;
         // case_id が渡された場合は実在を検証する（存在しない case への紐づけを拒否）。
         // 最新判定が Allowed でもエスカレーション記録は拒否しない: エスカレーションは

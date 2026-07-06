@@ -45,18 +45,19 @@ impl ToolService {
         top_k: i32,
     ) -> Result<Vec<SectionHit>> {
         let snapshot = self.client.graph_snapshot(schema, 5000).await?;
-        self.search_manual_with_snapshot(schema, query_ja, product_key, top_k, &snapshot)
+        self.search_manual_with_snapshot(schema, query_ja, product_key, top_k, snapshot)
             .await
     }
 
     /// 取得済み snapshot を使う変種（Harness::evaluate が 1 リクエスト中の snapshot を共有する用）。
+    /// snapshot は move で受ける（通常経路は所有物を渡すため clone なし。共有元だけが clone する）。
     pub async fn search_manual_with_snapshot(
         &self,
         schema: &str,
         query_ja: &str,
         product_key: Option<&str>,
         top_k: i32,
-        snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+        snapshot: crate::proto::graphrag::GetGraphSnapshotResponse,
     ) -> Result<Vec<SectionHit>> {
         let filters = product_key
             .map(|key| vec![("product_key", "eq", key)])
@@ -65,7 +66,7 @@ impl ToolService {
             .client
             .query_nodes(schema, "section", filters, 1000)
             .await?;
-        let graph = SnapshotIndex::new(snapshot.nodes.clone(), snapshot.edges.clone());
+        let graph = SnapshotIndex::new(snapshot.nodes, snapshot.edges);
         let query_norm = normalize_key(query_ja);
 
         let mut hits = sections

@@ -338,7 +338,14 @@ impl Harness {
         )?;
         let (resolutions, hits) = tokio::try_join!(
             knowledge.load_known_resolutions_with(&ctx.schema, &snapshot),
-            tools.search_manual_with_snapshot(&ctx.schema, question, product_key, 5, &snapshot),
+            // search 側は snapshot を消費するため、共有元のここでだけ clone する
+            tools.search_manual_with_snapshot(
+                &ctx.schema,
+                question,
+                product_key,
+                5,
+                snapshot.clone()
+            ),
         )?;
         // [正規化] 決定論 lexicon（S1-11）。今ターン分。
         let signals = self.normalizer.normalize(question);
