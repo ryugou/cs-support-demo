@@ -299,6 +299,37 @@ impl Harness {
         Ok(set)
     }
 
+    /// 第1・2層ルールが参照する signal が語彙に存在することを検証する（fail closed）。
+    fn validate_rule_vocabulary(
+        &self,
+        rules: &[rules::EscalationRule],
+        domains: &[rules::ProhibitedDomain],
+    ) -> Result<()> {
+        for rule in rules {
+            for sig in &rule.condition {
+                if self.lexicon.class_of(sig).is_none() {
+                    return Err(anyhow!(
+                        "escalation_rule {} references a signal not in the vocabulary: {}",
+                        rule.id,
+                        sig.as_str()
+                    ));
+                }
+            }
+        }
+        for domain in domains {
+            for sig in &domain.domain_signals {
+                if self.lexicon.class_of(sig).is_none() {
+                    return Err(anyhow!(
+                        "prohibited_domain {} references a signal not in the vocabulary: {}",
+                        domain.id,
+                        sig.as_str()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// S1-1 パイプライン前半: [認証] → [(A) 権限]。全 tool がここを通る。
     pub fn begin(
         &self,
@@ -336,6 +367,9 @@ impl Harness {
             knowledge.load_prohibited_domains(&ctx.schema),
             knowledge.fetch_snapshot(&ctx.schema),
         )?;
+        // ルールの signal が語彙外だと「決してマッチしないルール」＝サイレントな
+        // fail open になるため、判定前に語彙と突合して fail closed にする。
+        self.validate_rule_vocabulary(&rules, &domains)?;
         let (resolutions, hits) = tokio::try_join!(
             knowledge.load_known_resolutions_with(&ctx.schema, &snapshot),
             // search 側は snapshot を消費するため、共有元のここでだけ clone する

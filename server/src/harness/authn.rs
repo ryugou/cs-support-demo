@@ -79,7 +79,17 @@ impl Authenticator {
                     validation.set_issuer(&[issuer]);
                 }
                 let data = decode::<Claims>(token, key, &validation).context("invalid jwt")?;
-                self.lookup(&data.claims.sub)
+                let actor = self.lookup(&data.claims.sub)?;
+                // 認可の正本は config の actor 表（サーバ導出）。token の role 主張が
+                // 登録と食い違う場合は fail closed で拒否する（黙って無視しない）。
+                let claimed: Role = data.claims.role.parse()?;
+                if claimed != actor.role {
+                    return Err(anyhow!(
+                        "jwt role claim does not match the registered actor role for {}",
+                        actor.sub
+                    ));
+                }
+                Ok(actor)
             }
             (Some(_), None) => Err(anyhow!("missing authorization header")),
             (None, _) => {
@@ -125,10 +135,14 @@ mod tests {
     }
 
     fn token(sub: &str, exp_offset_secs: i64) -> String {
+        token_with_role(sub, "operator", exp_offset_secs)
+    }
+
+    fn token_with_role(sub: &str, role: &str, exp_offset_secs: i64) -> String {
         let exp = (chrono::Utc::now().timestamp() + exp_offset_secs) as usize;
         let claims = Claims {
             sub: sub.to_string(),
-            role: "operator".to_string(),
+            role: role.to_string(),
             exp,
             iss: "test".to_string(),
         };
@@ -178,6 +192,25 @@ mod tests {
         let auth = Authenticator::new(Some(b"other-secret".to_vec()), &actors(), None);
         assert!(auth
             .authenticate(Some(&format!("Bearer {}", token("op-001", 3600))))
+            .is_err());
+    }
+
+    #[test]
+    fn role_claim_must_match_registered_role() {
+        let auth = Authenticator::new(Some(SECRET.to_vec()), &actors(), None);
+        // 登録は operator。token が supervisor を主張したら拒否（fail closed）
+        assert!(auth
+            .authenticate(Some(&format!(
+                "Bearer {}",
+                token_with_role("op-001", "supervisor", 3600)
+            )))
+            .is_err());
+        // 未知の role 文字列も拒否
+        assert!(auth
+            .authenticate(Some(&format!(
+                "Bearer {}",
+                token_with_role("op-001", "root", 3600)
+            )))
             .is_err());
     }
 
