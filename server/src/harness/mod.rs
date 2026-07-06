@@ -143,16 +143,65 @@ impl Harness {
         })
     }
 
-    /// grade 運用（遵守事項 3）: outcome を承認/却下に写像し、regrade 純関数で
-    /// 昇格・降格を判定して永続化する。格付けが変わった場合のみ Some を返す。
-    pub async fn apply_answer_outcome(
+    /// record_answer_outcome の本体（遵守事項 3）。attempt の存在検証 → outcome の
+    /// write-once 強制 → outcome 記録 → KR 紐づけ（サーバ記録）があれば grade 更新、を
+    /// grade_lock の同一クリティカルセクションで行う（重複加算・TOCTOU を封鎖）。
+    /// 戻り値: (格付けが変わった場合の新 grade, 対象 KR id)。
+    pub async fn record_answer_outcome(
+        &self,
+        ctx: &RequestContext,
+        attempt_id: &str,
+        outcome: grading::AnswerOutcome,
+        note: Option<&str>,
+    ) -> Result<(Option<rules::Grade>, Option<String>)> {
+        // read-modify-write の lost update を防ぐ（プロセス内直列化。backend atomic は TODO）
+        let _guard = self.grade_lock.lock().await;
+        let store = self.knowledge()?;
+        let attempt = store
+            .load_attempt(&ctx.schema, attempt_id)
+            .await?
+            .ok_or_else(|| anyhow!("unknown attempt_id: {attempt_id}"))?;
+        // outcome は write-once: 同一 attempt への再送で承認/却下カウントを多重加算させない
+        if attempt.get("outcome").is_some_and(|o| !o.is_empty()) {
+            return Err(anyhow!(
+                "outcome already recorded for attempt {attempt_id}; outcomes are write-once"
+            ));
+        }
+        store
+            .record(
+                &ctx.schema,
+                "answer_attempt",
+                attempt_id,
+                vec![
+                    ("attempt_id".to_string(), attempt_id.to_string()),
+                    ("outcome".to_string(), outcome.as_str().to_string()),
+                    (
+                        "outcome_note".to_string(),
+                        note.unwrap_or_default().to_string(),
+                    ),
+                ],
+            )
+            .await?;
+        // KR 紐づけはサーバ記録（attempt.known_resolution_id）のみを使う
+        let kr_id = attempt
+            .get("known_resolution_id")
+            .filter(|kr_id| !kr_id.is_empty())
+            .cloned();
+        let new_grade = match &kr_id {
+            Some(kr_id) => self.apply_outcome_to_grade(ctx, kr_id, outcome).await?,
+            None => None,
+        };
+        Ok((new_grade, kr_id))
+    }
+
+    /// outcome を承認/却下に写像し、regrade 純関数で昇格・降格を判定して永続化する。
+    /// 格付けが変わった場合のみ Some を返す。呼び出し元が grade_lock を保持していること。
+    async fn apply_outcome_to_grade(
         &self,
         ctx: &RequestContext,
         kr_id: &str,
         outcome: grading::AnswerOutcome,
     ) -> Result<Option<rules::Grade>> {
-        // read-modify-write の lost update を防ぐ（プロセス内直列化。backend atomic は TODO）
-        let _guard = self.grade_lock.lock().await;
         let store = self.knowledge()?;
         let resolutions = store.load_known_resolutions(&ctx.schema).await?;
         let kr = resolutions

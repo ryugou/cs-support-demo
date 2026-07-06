@@ -580,48 +580,15 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<RecordAnswerOutcomeRequest>,
     ) -> Result<Json<RecordAnswerOutcomeResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let store = self.harness.store().map_err(to_error)?;
-        // attempt の存在を検証し、KR 紐づけはサーバ記録（attempt 作成時に lineage から
-        // 引き継いだ known_resolution_id）を使う。client 申告で格付けを汚染させない。
-        let attempt = store
-            .load_attempt(&ctx.schema, &req.attempt_id)
+        // 存在検証・write-once 強制・KR 紐づけ（サーバ記録）・grade 更新は Harness が
+        // 単一クリティカルセクションで行う（判定を handler に直書きしない）。
+        let (regraded, kr_id) = self
+            .harness
+            .record_answer_outcome(&ctx, &req.attempt_id, req.outcome, req.note.as_deref())
             .await
-            .map_err(to_error)?
-            .ok_or_else(|| {
-                ErrorData::invalid_params(format!("unknown attempt_id: {}", req.attempt_id), None)
-            })?;
-        // attempt へ outcome を追記（upsert merge）。outcome は型付き enum（deserialize で検証済み）。
-        store
-            .record(
-                &ctx.schema,
-                "answer_attempt",
-                &req.attempt_id,
-                vec![
-                    ("attempt_id".to_string(), req.attempt_id.clone()),
-                    ("outcome".to_string(), req.outcome.as_str().to_string()),
-                    (
-                        "outcome_note".to_string(),
-                        req.note.clone().unwrap_or_default(),
-                    ),
-                ],
-            )
-            .await
-            .map_err(to_error)?;
-        // grade 運用（遵守事項 3）は Harness に委譲（判定を handler に直書きしない）
-        let mut new_grade: Option<String> = None;
-        let mut governing_norm_ids = Vec::new();
-        if let Some(kr_id) = attempt
-            .get("known_resolution_id")
-            .filter(|kr_id| !kr_id.is_empty())
-        {
-            new_grade = self
-                .harness
-                .apply_answer_outcome(&ctx, kr_id, req.outcome)
-                .await
-                .map_err(|err| ErrorData::invalid_params(err.to_string(), None))?
-                .map(|grade| grade.as_str().to_string());
-            governing_norm_ids.push(kr_id.clone());
-        }
+            .map_err(|err| ErrorData::invalid_params(err.to_string(), None))?;
+        let new_grade: Option<String> = regraded.map(|grade| grade.as_str().to_string());
+        let governing_norm_ids: Vec<String> = kr_id.into_iter().collect();
         let decision = match &new_grade {
             Some(grade) => format!("outcome:{} regrade:{grade}", req.outcome.as_str()),
             None => format!("outcome:{}", req.outcome.as_str()),
