@@ -275,16 +275,26 @@ impl Harness {
             }
             set.insert(sig);
         }
-        // NG 語を含む知識は登録させない（egress と同じ辞書）。
+        // egress を通らない回答文は知識として登録させない（登録しても emit 時に必ず
+        // block / abstain される＝危険なだけの知識になるため、入口で一貫して拒否する）。
         // binding は build_known_resolution_graph が advisory 固定で書く（mandatory は自動で書けない）。
-        if let egress::EgressVerdict::Block { term } = egress::egress_gate(
+        match egress::egress_gate(
             answer,
             &egress::EmitContext {
                 channel: egress::EmitChannel::Operator,
             },
             &self.ng,
         ) {
-            anyhow::bail!("answer contains blocked term: {term}");
+            egress::EgressVerdict::Block { term } => {
+                anyhow::bail!("answer contains blocked term: {term}")
+            }
+            egress::EgressVerdict::Abstain { term } => {
+                anyhow::bail!(
+                    "answer contains implied-efficacy term: {term}; \
+                     rephrase the answer so it passes the egress gate before registering"
+                )
+            }
+            egress::EgressVerdict::Pass => {}
         }
         Ok(set)
     }
@@ -441,7 +451,8 @@ impl Harness {
                 case_attrs.into_iter().collect(),
             )
             .await?;
-        // [記録] WORM（S1-8 条件 8）
+        // [記録] WORM（S1-8 条件 8）。KR 由来の許可はどの KR に基づいたかを
+        // governing_norm_ids / retrieved_node_ids に残す（監査ログ単体で lineage を追跡可能に）。
         let (decision_label, route) = match &decision_result {
             decision::AnswerDecision::Allowed { source, .. } => {
                 (format!("allowed:{source:?}"), None)
@@ -459,8 +470,27 @@ impl Harness {
             "support_case",
             &case_id,
         ));
+        let mut governing_norm_ids = Vec::new();
+        if let decision::AnswerDecision::Allowed {
+            known_resolution_id: Some(kr_id),
+            ..
+        } = &decision_result
+        {
+            retrieved_node_ids.push(knowledge::harness_node_id(
+                &ctx.schema,
+                "KnownResolution",
+                kr_id,
+            ));
+            governing_norm_ids.push(kr_id.clone());
+        }
         let audit_event_id = self
-            .audit_with_nodes(ctx, decision_label, route, Vec::new(), retrieved_node_ids)
+            .audit_with_nodes(
+                ctx,
+                decision_label,
+                route,
+                governing_norm_ids,
+                retrieved_node_ids,
+            )
             .await?;
         Ok(EvaluationOutcome {
             decision: decision_result,
