@@ -161,12 +161,50 @@ impl Harness {
             .load_attempt(&ctx.schema, attempt_id)
             .await?
             .ok_or_else(|| anyhow!("unknown attempt_id: {attempt_id}"))?;
-        // outcome は write-once: 同一 attempt への再送で承認/却下カウントを多重加算させない
-        if attempt.get("outcome").is_some_and(|o| !o.is_empty()) {
-            return Err(anyhow!(
-                "outcome already recorded for attempt {attempt_id}; outcomes are write-once"
-            ));
+        // KR 紐づけはサーバ記録（attempt.known_resolution_id）のみを使う
+        let kr_id = attempt
+            .get("known_resolution_id")
+            .filter(|kr_id| !kr_id.is_empty())
+            .cloned();
+        // outcome は write-once。ただし「outcome 記録後・grade 更新前」の部分失敗からは
+        // 同一 outcome の再送で grade 更新だけを再開できる（grade_applied フラグで判別）。
+        let recorded_outcome = attempt.get("outcome").filter(|o| !o.is_empty());
+        let grade_applied = attempt.get("grade_applied").map(String::as_str) == Some("true");
+        if let Some(recorded) = recorded_outcome {
+            if grade_applied {
+                return Err(anyhow!(
+                    "outcome already recorded for attempt {attempt_id}; outcomes are write-once"
+                ));
+            }
+            if recorded != outcome.as_str() {
+                return Err(anyhow!(
+                    "outcome {recorded} is already recorded for attempt {attempt_id}; \
+                     resend must use the same outcome to resume the pending grade update"
+                ));
+            }
+            // 再開経路: outcome は記録済みなので grade 更新のみ行う
+        } else {
+            store
+                .record(
+                    &ctx.schema,
+                    "answer_attempt",
+                    attempt_id,
+                    vec![
+                        ("attempt_id".to_string(), attempt_id.to_string()),
+                        ("outcome".to_string(), outcome.as_str().to_string()),
+                        (
+                            "outcome_note".to_string(),
+                            note.unwrap_or_default().to_string(),
+                        ),
+                    ],
+                )
+                .await?;
         }
+        let new_grade = match &kr_id {
+            Some(kr_id) => self.apply_outcome_to_grade(ctx, kr_id, outcome).await?,
+            None => None,
+        };
+        // grade 更新まで完了してから write-once を確定する
         store
             .record(
                 &ctx.schema,
@@ -174,23 +212,10 @@ impl Harness {
                 attempt_id,
                 vec![
                     ("attempt_id".to_string(), attempt_id.to_string()),
-                    ("outcome".to_string(), outcome.as_str().to_string()),
-                    (
-                        "outcome_note".to_string(),
-                        note.unwrap_or_default().to_string(),
-                    ),
+                    ("grade_applied".to_string(), "true".to_string()),
                 ],
             )
             .await?;
-        // KR 紐づけはサーバ記録（attempt.known_resolution_id）のみを使う
-        let kr_id = attempt
-            .get("known_resolution_id")
-            .filter(|kr_id| !kr_id.is_empty())
-            .cloned();
-        let new_grade = match &kr_id {
-            Some(kr_id) => self.apply_outcome_to_grade(ctx, kr_id, outcome).await?,
-            None => None,
-        };
         Ok((new_grade, kr_id))
     }
 

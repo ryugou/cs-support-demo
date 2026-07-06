@@ -118,6 +118,8 @@ nodes:
       audit_event_id: { type: string }
       outcome: { type: string }
       outcome_note: { type: string }
+      # grade 更新の完了フラグ（outcome 記録後の部分失敗からの再開用）
+      grade_applied: { type: string }
       created_at: { type: string }
   answer_evidence:
     attributes:
