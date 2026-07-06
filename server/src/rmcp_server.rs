@@ -267,6 +267,7 @@ impl CsSupportRmcpServer {
             .collect();
         self.harness
             .audit_with_nodes(&ctx, "read:resolve_product", None, Vec::new(), retrieved)
+            .await
             .map_err(to_error)?;
         Ok(Json(ResolveProductResponse { candidates }))
     }
@@ -297,6 +298,7 @@ impl CsSupportRmcpServer {
             .collect();
         self.harness
             .audit_with_nodes(&ctx, "read:search_manual", None, Vec::new(), retrieved)
+            .await
             .map_err(to_error)?;
         Ok(Json(SearchManualResponse { hits }))
     }
@@ -327,6 +329,7 @@ impl CsSupportRmcpServer {
                     &req.section_key,
                 )],
             )
+            .await
             .map_err(to_error)?;
         Ok(Json(view))
     }
@@ -357,6 +360,7 @@ impl CsSupportRmcpServer {
                     &req.product_key,
                 )],
             )
+            .await
             .map_err(to_error)?;
         Ok(Json(view))
     }
@@ -457,6 +461,7 @@ impl CsSupportRmcpServer {
                 Vec::new(),
                 retrieved,
             )
+            .await
             .map_err(to_error)?;
         Ok(Json(SearchKnownResolutionsResponse {
             match_kind,
@@ -503,6 +508,7 @@ impl CsSupportRmcpServer {
             .collect();
         self.harness
             .audit_with_nodes(&ctx, "read:search_past_cases", None, Vec::new(), retrieved)
+            .await
             .map_err(to_error)?;
         Ok(Json(SearchPastCasesResponse { cases }))
     }
@@ -537,6 +543,7 @@ impl CsSupportRmcpServer {
                 None,
                 Vec::new(),
             )
+            .await
             .map_err(to_error)?;
         let attempt_id = format!("attempt-{}", uuid::Uuid::new_v4());
         store
@@ -596,6 +603,7 @@ impl CsSupportRmcpServer {
         let audit_event_id = self
             .harness
             .audit(&ctx, decision, None, governing_norm_ids)
+            .await
             .map_err(to_error)?;
         Ok(Json(RecordAnswerOutcomeResponse {
             grade: new_grade,
@@ -619,6 +627,7 @@ impl CsSupportRmcpServer {
             let audit_event_id = self
                 .harness
                 .audit(&ctx, "correction:conversation_only", None, Vec::new())
+                .await
                 .map_err(to_error)?;
             return Ok(Json(RecordOperatorFeedbackResponse {
                 routing: CorrectionRouting::ConversationOnly,
@@ -688,6 +697,7 @@ impl CsSupportRmcpServer {
                 None,
                 Vec::new(),
             )
+            .await
             .map_err(to_error)?;
         Ok(Json(RecordOperatorFeedbackResponse {
             routing,
@@ -750,6 +760,7 @@ impl CsSupportRmcpServer {
                 Some(req.route_to.clone()),
                 vec![escalation_id.clone()],
             )
+            .await
             .map_err(to_error)?;
         Ok(Json(CreateEscalationEventResponse {
             escalation_id,
@@ -792,6 +803,7 @@ impl CsSupportRmcpServer {
         let audit_event_id = self
             .harness
             .audit(&ctx, "kr_insert", None, vec![kr_id.clone()])
+            .await
             .map_err(to_error)?;
         Ok(Json(AddKnownResolutionResponse {
             kr_id,

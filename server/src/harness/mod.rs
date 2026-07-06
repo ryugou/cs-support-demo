@@ -14,7 +14,6 @@ use crate::mcp::ToolService;
 use crate::model::SectionHit;
 use crate::vegapunk::VegapunkClient;
 use anyhow::{anyhow, Context, Result};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,7 +24,7 @@ pub struct Harness {
     pub normalizer: Arc<dyn signal::SignalNormalizer>,
     pub lexicon: Arc<signal::LexiconNormalizer>,
     pub ng: egress::NgDictionary,
-    pub worm: audit::WormAuditLog,
+    pub worm: Arc<audit::WormAuditLog>,
     pub knowledge: Option<knowledge::KnowledgeStore>,
     pub thresholds: decision::Thresholds,
     pub grading: grading::GradingThresholds,
@@ -92,7 +91,9 @@ impl Harness {
             normalizer: lexicon.clone(),
             lexicon,
             ng: egress::NgDictionary::from_path(&resolve_path(&config.harness.ng_dictionary_path))?,
-            worm: audit::WormAuditLog::open(&resolve_path(&config.harness.audit_log_path))?,
+            worm: Arc::new(audit::WormAuditLog::open(&resolve_path(
+                &config.harness.audit_log_path,
+            ))?),
             knowledge: Some(knowledge::KnowledgeStore::new(client)),
             thresholds: (&config.harness.thresholds).into(),
             grading: (&config.harness.grading).into(),
@@ -113,7 +114,7 @@ impl Harness {
     }
 
     /// 監査イベントの共通入口。ctx 由来の provenance フィールドをここで一元的に埋める。
-    pub fn audit(
+    pub async fn audit(
         &self,
         ctx: &RequestContext,
         decision: impl Into<String>,
@@ -121,9 +122,12 @@ impl Harness {
         governing_norm_ids: Vec<String>,
     ) -> Result<String> {
         self.audit_with_nodes(ctx, decision, route, governing_norm_ids, Vec::new())
+            .await
     }
 
-    pub fn audit_with_nodes(
+    /// WORM の同期ファイル書き込み（hash chain のため直列）は spawn_blocking で
+    /// async ワーカーから隔離する（tool handler をブロックしない）。
+    pub async fn audit_with_nodes(
         &self,
         ctx: &RequestContext,
         decision: impl Into<String>,
@@ -131,7 +135,7 @@ impl Harness {
         governing_norm_ids: Vec<String>,
         retrieved_node_ids: Vec<String>,
     ) -> Result<String> {
-        self.worm.append(audit::AuditDraft {
+        let draft = audit::AuditDraft {
             request_id: ctx.request_id.clone(),
             schema: ctx.schema.clone(),
             actor: ctx.actor.sub.clone(),
@@ -140,7 +144,11 @@ impl Harness {
             decision: decision.into(),
             route,
             governing_norm_ids,
-        })
+        };
+        let worm = self.worm.clone();
+        tokio::task::spawn_blocking(move || worm.append(draft))
+            .await
+            .context("join audit write task")?
     }
 
     /// record_answer_outcome の本体（遵守事項 3）。attempt の存在検証 → outcome の
@@ -439,8 +447,9 @@ impl Harness {
             "support_case",
             &case_id,
         ));
-        let audit_event_id =
-            self.audit_with_nodes(ctx, decision_label, route, Vec::new(), retrieved_node_ids)?;
+        let audit_event_id = self
+            .audit_with_nodes(ctx, decision_label, route, Vec::new(), retrieved_node_ids)
+            .await?;
         Ok(EvaluationOutcome {
             decision: decision_result,
             signals,
@@ -567,7 +576,7 @@ mod tests {
             lexicon: Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap()),
             ng: egress::NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#)
                 .unwrap(),
-            worm: audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap(),
+            worm: Arc::new(audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap()),
             knowledge: None,
             thresholds: decision::Thresholds {
                 low: 0.6,
