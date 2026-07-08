@@ -807,6 +807,11 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
   - ロードマップ遵守事項: マルチターン累積再判定（変色→+カビで unknown_added_signal 自動エスカレーション）、grade 昇格（resolved×3・承認者 2 名→auto_answer_audited）・降格（wrong_answer×2→demoted）、GMR 進化（例外ルール「変色+カビ→廃棄」追加で具体ルール優先）
 - 残: signal 語彙 / NG 辞書 / grading しきい値の業務レビューによる確定。UpsertNodes は read-merge-write 済みで merge/置換いずれのセマンティクスでも整合。
 
+### 本番運用時の課題（デモでは保留）
+
+- **JWT 認証の本番化（B6）**: デモ運用ではローカルは `[auth] default_actor` フォールバック、GCE も同様に緩めてよい。本番では `CS_SUPPORT_JWT_SECRET_FILE` を既存 stack の Secret Manager injection で渡し、`config.gce.toml` から `default_actor` を外して JWT 必須にする。actor 表（sub → role / allowed_schemas）の払い出し・失効運用も本番で確定する。
+- **デモ商材と signal 語彙のドメイン整合**: 現行サンプルマニュアルは `SVR-HB100`（スマートホームハブ＝電子機器）だが、signal 語彙初版は化粧品・健康食品向け。納品対象の商材を確定し、マニュアルと語彙のドメインを揃える（電子機器なら安全語彙を発熱・発火・感電系に作り直す）。
+
 ---
 
 # フェーズロードマップ — Step 2（顧客直チャットボット）/ Step 3（音声対応）への前方互換
