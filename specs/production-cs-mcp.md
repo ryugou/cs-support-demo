@@ -792,9 +792,20 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
 
 ### 実装状況（2026-07-04）
 
-- MCP 側 Step 1（Harness / 3 層判定 / 会話層 / egress / correction / grade / WORM / 12 tool / 加算スキーマ / ingest_rules CLI）を `feat/production-cs-mcp-step1` ブランチに実装済み。ユニットテスト全件・fmt・check 通過。
-- 加算スキーマ更新と第1層ルール 2 件・第2層領域 2 件は `vegapunk.local` の `sivira-cs-demo` に投入済み（純加算）。
-- **S1-8 Done 条件の実機 E2E 突合は保留中**: vegapunk / PunkRecord 側の Step 1 追加機能が実装完了していないため。バックエンド側完了後に Task 14（受け入れ検証）を再開する。
+- MCP 側 Step 1（Harness / 3 層判定 / 会話層 / egress / correction / grade / WORM / 12 tool / 加算スキーマ / ingest_rules CLI）を実装し `main` にマージ済み。ユニットテスト全件・fmt・check 通過。codex レビュー 6 ラウンド PASS、Copilot レビュー 8 ラウンド対応済み。
+- 加算スキーマ・第1層ルール 2 件・第2層領域 2 件・サンプルマニュアルを `vegapunk.local:6840`（gRPC）の `sivira-cs-demo` に投入済み（純加算）。
+- **S1-8 Done 条件の実機 E2E 突合: 完了（2026-07-08）**。稼働中の vegapunk gRPC backend + JWT 認証つきローカル MCP（`127.0.0.1:3443`）に対して全項目確認:
+  - 条件1 3 層短絡: 第1層（post_ingestion_symptom→safety_team / skin_irritation+continue_use_question→dermatology_liaison）・第2層（raw text「飲み合わせ」→medical_escalation_desk）・第3層で確定
+  - 条件2 egress: pass / block（必ず治ります）/ abstain（症状が改善）
+  - 条件3 non_authoritative 非永続: customer 訂正は conversation_only、operator_feedback ノードは operator 分のみ永続
+  - 条件4 retrieval_miss: 検索改善キューへ追記され known_resolution は増えない
+  - 条件5 stakes=high fail-open: 第2層に無い NG 近接語「治る」で threshold 0.95 に上がり escalate
+  - 条件6 予約フィールド: KR ノードに binding/registration_trigger/knowledge_class/outcome_ref/error_axis が存在
+  - 条件8 WORM: 38 イベント全行で provenance キー完備・hash chain INTACT・read tool 含む全 tool 記録・KR 由来 allowed に governing_norm_ids
+  - 条件9 認証/scope: 未登録 sub / role 不一致 / 署名改竄 / 期限切れ / ヘッダ無しを各理由で拒否、tool スキーマに scope 系フィールド漏れなし
+  - 条件10 グラフ格納: KR→HAS_SIGNAL→Signal、KR→BECAUSE→section、Signal 第一級ノード、KR に signal_set 属性なし（I2）
+  - ロードマップ遵守事項: マルチターン累積再判定（変色→+カビで unknown_added_signal 自動エスカレーション）、grade 昇格（resolved×3・承認者 2 名→auto_answer_audited）・降格（wrong_answer×2→demoted）、GMR 進化（例外ルール「変色+カビ→廃棄」追加で具体ルール優先）
+- 残: signal 語彙 / NG 辞書 / grading しきい値の業務レビューによる確定。UpsertNodes は read-merge-write 済みで merge/置換いずれのセマンティクスでも整合。
 
 ---
 
