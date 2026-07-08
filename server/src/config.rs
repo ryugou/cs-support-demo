@@ -91,6 +91,8 @@ pub struct HarnessConfig {
     pub thresholds: ThresholdsConfig,
     #[serde(default)]
     pub grading: GradingConfig,
+    #[serde(default = "default_escalation_route")]
+    pub default_escalation_route: String,
 }
 
 fn default_audit_log_path() -> String {
@@ -108,6 +110,9 @@ fn default_ng_path() -> String {
 fn default_policy() -> String {
     "escalate_unless_answerable".to_string()
 }
+fn default_escalation_route() -> String {
+    "triage".to_string()
+}
 
 impl Default for HarnessConfig {
     fn default() -> Self {
@@ -119,8 +124,17 @@ impl Default for HarnessConfig {
             policy: default_policy(),
             thresholds: ThresholdsConfig::default(),
             grading: GradingConfig::default(),
+            default_escalation_route: default_escalation_route(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualSchemaKind {
+    #[default]
+    LegacySection,
+    ManualV1,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +142,8 @@ pub struct ProjectConfig {
     pub project_id: String,
     pub schema: String,
     pub bearer_token: Option<String>,
+    #[serde(default)]
+    pub manual_schema: ManualSchemaKind,
 }
 
 impl AppConfig {
@@ -145,5 +161,42 @@ impl AppConfig {
             config.auth.jwt_secret_file = Some(path);
         }
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_defaults_to_legacy_section() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(cfg.projects[0].manual_schema, ManualSchemaKind::LegacySection));
+    }
+
+    #[test]
+    fn project_can_select_manual_v1() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "urtect"
+manual_schema = "manual_v1"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(matches!(cfg.projects[0].manual_schema, ManualSchemaKind::ManualV1));
+    }
+
+    #[test]
+    fn default_escalation_route_defaults_to_triage() {
+        assert_eq!(HarnessConfig::default().default_escalation_route, "triage");
     }
 }
