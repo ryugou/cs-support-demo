@@ -14,9 +14,11 @@ clap = { version = "4", features = ["derive", "env"] }
 jsonwebtoken = "9"
 http = "1"
 prost = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server", "transport-io", "macros"] }
 rustls = "0.23"
 schemars = "1"
+scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -28,6 +30,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-normalization = "0.1"
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
@@ -48,3 +51,7 @@ path = "src/bin/verify_demo.rs"
 [[bin]]
 name = "ingest_rules"
 path = "src/bin/ingest_rules.rs"
+
+[[bin]]
+name = "ingest_urtect"
+path = "src/bin/ingest_urtect.rs"
