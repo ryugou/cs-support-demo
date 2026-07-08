@@ -76,7 +76,10 @@ pub fn build_section_graph(
             ("body".to_string(), s.body.clone()),
             ("source_url".to_string(), s.source_url.clone()),
             ("breadcrumb".to_string(), s.breadcrumb.clone()),
-            ("section_no".to_string(), s.section_no.clone().unwrap_or_default()),
+            (
+                "section_no".to_string(),
+                s.section_no.clone().unwrap_or_default(),
+            ),
             ("order".to_string(), s.order.to_string()),
             ("source_lang".to_string(), "ja".to_string()),
             ("content_hash".to_string(), content_hash_hex.to_string()),
@@ -143,19 +146,63 @@ mod tests {
     #[test]
     fn section_graph_builds_manual_section_and_edges() {
         let build = build_section_graph("urtect", "doc-manual", &sample(), "abc123");
-        let sec = build.nodes.iter().find(|n| n.node_type == "ManualSection").unwrap();
+        let sec = build
+            .nodes
+            .iter()
+            .find(|n| n.node_type == "ManualSection")
+            .unwrap();
         // body は属性、source_url / order / content_hash が入る。翻訳予約は空
-        assert!(sec.attributes.iter().any(|(k, v)| k == "source_url" && v == "https://x/1-4/sd"));
-        assert!(sec.attributes.iter().any(|(k, v)| k == "content_hash" && v == "abc123"));
-        assert!(sec.attributes.iter().any(|(k, v)| k == "order" && v == "12"));
-        assert!(sec.attributes.iter().any(|(k, v)| k == "source_lang" && v == "ja"));
+        assert!(sec
+            .attributes
+            .iter()
+            .any(|(k, v)| k == "source_url" && v == "https://x/1-4/sd"));
+        assert!(sec
+            .attributes
+            .iter()
+            .any(|(k, v)| k == "content_hash" && v == "abc123"));
+        assert!(sec
+            .attributes
+            .iter()
+            .any(|(k, v)| k == "order" && v == "12"));
+        assert!(sec
+            .attributes
+            .iter()
+            .any(|(k, v)| k == "source_lang" && v == "ja"));
         assert!(sec.attributes.iter().any(|(k, _)| k == "body_original") == false); // 純予約は書かない
-        // 辺: PARENT_OF（親）/ DESCRIBES（Product）/ MENTIONS_SIGNAL（Signal）
-        assert_eq!(build.edges.iter().filter(|e| e.edge_type == "PARENT_OF").count(), 1);
-        assert_eq!(build.edges.iter().filter(|e| e.edge_type == "DESCRIBES").count(), 1);
-        assert_eq!(build.edges.iter().filter(|e| e.edge_type == "MENTIONS_SIGNAL").count(), 1);
+                                                                                    // 辺: PARENT_OF（親）/ DESCRIBES（Product）/ MENTIONS_SIGNAL（Signal）
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "PARENT_OF")
+                .count(),
+            1
+        );
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "DESCRIBES")
+                .count(),
+            1
+        );
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "MENTIONS_SIGNAL")
+                .count(),
+            1
+        );
         // Signal ノードも作る（第一級ノード・I2）
-        assert_eq!(build.nodes.iter().filter(|n| n.node_type == "Signal").count(), 1);
+        assert_eq!(
+            build
+                .nodes
+                .iter()
+                .filter(|n| n.node_type == "Signal")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -163,7 +210,14 @@ mod tests {
         let mut s = sample();
         s.parent_slug = None;
         let build = build_section_graph("urtect", "doc-manual", &s, "h");
-        assert_eq!(build.edges.iter().filter(|e| e.edge_type == "PARENT_OF").count(), 0);
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "PARENT_OF")
+                .count(),
+            0
+        );
     }
 
     #[test]

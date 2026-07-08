@@ -178,7 +178,10 @@ project_id = "p"
 schema = "s"
 "#;
         let cfg: AppConfig = toml::from_str(toml).unwrap();
-        assert!(matches!(cfg.projects[0].manual_schema, ManualSchemaKind::LegacySection));
+        assert!(matches!(
+            cfg.projects[0].manual_schema,
+            ManualSchemaKind::LegacySection
+        ));
     }
 
     #[test]
@@ -192,7 +195,10 @@ schema = "urtect"
 manual_schema = "manual_v1"
 "#;
         let cfg: AppConfig = toml::from_str(toml).unwrap();
-        assert!(matches!(cfg.projects[0].manual_schema, ManualSchemaKind::ManualV1));
+        assert!(matches!(
+            cfg.projects[0].manual_schema,
+            ManualSchemaKind::ManualV1
+        ));
     }
 
     #[test]
