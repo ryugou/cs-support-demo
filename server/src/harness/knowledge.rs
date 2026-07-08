@@ -165,7 +165,10 @@ pub struct NewKnownResolution {
     pub answer: String,
     pub origin: String,
     pub created_by: String,
-    pub rationale_section_keys: Vec<String>,
+    /// 担当者の判断理由（任意）。BECAUSE → Rationale で残す
+    pub rationale_text: Option<String>,
+    /// マニュアル出典 section（BASED_ON → ManualSection で結線）
+    pub manual_section_keys: Vec<String>,
 }
 
 /// KR 1 件をグラフ表現（KR ノード + Signal ノード + HAS_SIGNAL / BECAUSE 辺）に組み立てる。
@@ -226,11 +229,30 @@ pub fn build_known_resolution_graph(
             attributes: Vec::new(),
         });
     }
-    for section_key in &kr.rationale_section_keys {
+    // 判断理由 → Rationale ノード + BECAUSE
+    if let Some(text) = &kr.rationale_text {
+        let rationale_id = harness_node_id(schema, "Rationale", &format!("{kr_id}-r"));
+        nodes.push(GraphNode {
+            id: rationale_id.clone(),
+            node_type: "Rationale".to_string(),
+            attributes: vec![
+                ("rationale_id".to_string(), format!("{kr_id}-r")),
+                ("text".to_string(), text.clone()),
+            ],
+        });
         edges.push(GraphEdge {
             from_id: kr_node_id.clone(),
-            to_id: crate::ingest::section_node_id(schema, section_key),
+            to_id: rationale_id,
             edge_type: "BECAUSE".to_string(),
+            attributes: Vec::new(),
+        });
+    }
+    // マニュアル出典 → BASED_ON → ManualSection
+    for section_key in &kr.manual_section_keys {
+        edges.push(GraphEdge {
+            from_id: kr_node_id.clone(),
+            to_id: crate::manual::schema_ids::manual_node_id(schema, "ManualSection", section_key),
+            edge_type: "BASED_ON".to_string(),
             attributes: Vec::new(),
         });
     }
@@ -615,6 +637,93 @@ mod tests {
     }
 
     #[test]
+    fn kr_graph_splits_rationale_and_manual_basis() {
+        use crate::harness::signal::Signal;
+        let new_kr = NewKnownResolution {
+            signal_set: [Signal::new("sd_not_recognized")].into_iter().collect(),
+            applicability: "全モデル".to_string(),
+            answer: "推奨は東芝製です。".to_string(),
+            origin: "escalation:esc-1".to_string(),
+            created_by: "sup-001".to_string(),
+            rationale_text: Some("メーカー動作確認リストに基づく".to_string()),
+            manual_section_keys: vec!["sec-sd-not-recognized".to_string()],
+        };
+        let build = build_known_resolution_graph("urtect", "kr-1", &new_kr);
+        // Rationale ノード + BECAUSE 辺
+        assert_eq!(
+            build
+                .nodes
+                .iter()
+                .filter(|n| n.node_type == "Rationale")
+                .count(),
+            1
+        );
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "BECAUSE")
+                .count(),
+            1
+        );
+        // BASED_ON → ManualSection 辺
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "BASED_ON")
+                .count(),
+            1
+        );
+        let based = build
+            .edges
+            .iter()
+            .find(|e| e.edge_type == "BASED_ON")
+            .unwrap();
+        assert!(based.to_id.ends_with("ManualSection:sec-sd-not-recognized"));
+        // HAS_SIGNAL は従来どおり
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "HAS_SIGNAL")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn kr_without_rationale_text_has_no_rationale_node() {
+        use crate::harness::signal::Signal;
+        let new_kr = NewKnownResolution {
+            signal_set: [Signal::new("sd_not_recognized")].into_iter().collect(),
+            applicability: "x".to_string(),
+            answer: "y".to_string(),
+            origin: "manual".to_string(),
+            created_by: "sup".to_string(),
+            rationale_text: None,
+            manual_section_keys: vec![],
+        };
+        let build = build_known_resolution_graph("urtect", "kr-2", &new_kr);
+        assert_eq!(
+            build
+                .nodes
+                .iter()
+                .filter(|n| n.node_type == "Rationale")
+                .count(),
+            0
+        );
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "BASED_ON")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn known_resolution_node_build_uses_signal_nodes_not_json_attr() {
         // I2 / アンチパターン 3: signal_set が KR ノード属性に存在しないこと
         let new_kr = NewKnownResolution {
@@ -625,7 +734,8 @@ mod tests {
             answer: "廃棄してください".to_string(),
             origin: "escalation:esc-1".to_string(),
             created_by: "sup-001".to_string(),
-            rationale_section_keys: vec!["doc-1#storage".to_string()],
+            rationale_text: Some("doc-1#storage の保管条件に基づく".to_string()),
+            manual_section_keys: vec!["doc-1#storage".to_string()],
         };
         let build = build_known_resolution_graph("sivira-cs-demo", "kr-test", &new_kr);
         let kr_node = build

@@ -205,8 +205,10 @@ pub struct AddKnownResolutionRequest {
     pub answer: String,
     /// どの escalation 起点か
     pub origin_escalation_id: Option<String>,
-    /// 根拠となる manual section（BECAUSE 辺で結線）
-    pub rationale_section_keys: Vec<String>,
+    /// 担当者の判断理由（任意）。BECAUSE → Rationale で残す
+    pub rationale_text: Option<String>,
+    /// マニュアル出典 section（BASED_ON → ManualSection で結線）
+    pub manual_section_keys: Vec<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -803,7 +805,8 @@ impl CsSupportRmcpServer {
                 .map(|id| format!("escalation:{id}"))
                 .unwrap_or_else(|| "manual".to_string()),
             created_by: ctx.actor.sub.clone(),
-            rationale_section_keys: req.rationale_section_keys.clone(),
+            rationale_text: req.rationale_text.clone(),
+            manual_section_keys: req.manual_section_keys.clone(),
         };
         let kr_id = store
             .insert_known_resolution(&ctx.schema, &new_kr)
