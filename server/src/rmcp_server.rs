@@ -8,7 +8,7 @@ use crate::{
         Harness, RequestContext,
     },
     mcp::ToolService,
-    model::{ProductCandidate, ProductView, SectionHit, SectionView},
+    model::{ProductCandidate, ProductView, SectionHit},
 };
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -52,9 +52,22 @@ pub struct ResolveProductResponse {
     pub candidates: Vec<ProductCandidate>,
 }
 
+/// manual_schema=ManualV1 の resolve_product レスポンス（ManualStore 由来の候補）。
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ResolveProductResponseManual {
+    pub candidates: Vec<crate::model::ManualProductCandidate>,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SearchManualResponse {
     pub hits: Vec<SectionHit>,
+}
+
+/// manual_schema=ManualV1 の search_manual レスポンス。ManualHit は source_url を
+/// 必ず持つ（マニュアルページの出典引用は Done 条件）。
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SearchManualResponseManual {
+    pub hits: Vec<crate::model::ManualHit>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -241,6 +254,14 @@ impl CsSupportRmcpServer {
         }
     }
 
+    /// manual_schema=ManualV1 の read tool 分岐共通ヘルパー。未設定は構成ミスとして internal_error。
+    fn manual_store(&self) -> Result<&crate::manual::retrieval::ManualStore, ErrorData> {
+        self.harness
+            .manual
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("manual store not configured", None))
+    }
+
     /// 全 tool の共通入口。認証 → scope 強制 → RequestContext（S1-1 前半）。
     fn begin(&self, extensions: &rmcp::model::Extensions) -> Result<RequestContext, ErrorData> {
         let authorization = extensions
@@ -261,23 +282,50 @@ impl CsSupportRmcpServer {
         &self,
         extensions: rmcp::model::Extensions,
         Parameters(req): Parameters<ResolveProductRequest>,
-    ) -> Result<Json<ResolveProductResponse>, ErrorData> {
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let candidates = self
-            .tools
-            .resolve_product(&ctx.schema, &req.text)
-            .await
-            .map_err(to_error)?;
-        // 誰が・いつ・どの scope で・何を検索したかを残す（spec 課題2 Harness の責務）
-        let retrieved = candidates
-            .iter()
-            .map(|c| crate::ingest::product_node_id(&ctx.schema, &c.product_key))
-            .collect();
+        let (retrieved, body) = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self.manual_store()?;
+                let candidates = store
+                    .resolve_product(&ctx.schema, &req.text)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved = candidates
+                    .iter()
+                    .map(|c| {
+                        crate::manual::schema_ids::manual_node_id(
+                            &ctx.schema,
+                            crate::manual::schema_ids::KIND_PRODUCT,
+                            &c.model,
+                        )
+                    })
+                    .collect();
+                let body = serde_json::to_value(ResolveProductResponseManual { candidates })
+                    .map_err(to_error)?;
+                (retrieved, body)
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let candidates = self
+                    .tools
+                    .resolve_product(&ctx.schema, &req.text)
+                    .await
+                    .map_err(to_error)?;
+                // 誰が・いつ・どの scope で・何を検索したかを残す（spec 課題2 Harness の責務）
+                let retrieved = candidates
+                    .iter()
+                    .map(|c| crate::ingest::product_node_id(&ctx.schema, &c.product_key))
+                    .collect();
+                let body = serde_json::to_value(ResolveProductResponse { candidates })
+                    .map_err(to_error)?;
+                (retrieved, body)
+            }
+        };
         self.harness
             .audit_with_nodes(&ctx, "read:resolve_product", None, Vec::new(), retrieved)
             .await
             .map_err(to_error)?;
-        Ok(Json(ResolveProductResponse { candidates }))
+        Ok(Json(body))
     }
 
     #[tool(
@@ -288,27 +336,59 @@ impl CsSupportRmcpServer {
         &self,
         extensions: rmcp::model::Extensions,
         Parameters(req): Parameters<SearchManualRequest>,
-    ) -> Result<Json<SearchManualResponse>, ErrorData> {
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let hits = self
-            .tools
-            .search_manual(
-                &ctx.schema,
-                &req.query_ja,
-                req.product_key.as_deref(),
-                req.top_k.unwrap_or(5),
-            )
-            .await
-            .map_err(to_error)?;
-        let retrieved = hits
-            .iter()
-            .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
-            .collect();
+        let (retrieved, body) = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self.manual_store()?;
+                let signals = self.harness.normalizer.normalize(&req.query_ja);
+                let hits = store
+                    .search(
+                        &ctx.schema,
+                        &req.query_ja,
+                        &signals,
+                        req.top_k.unwrap_or(5).max(1) as usize,
+                    )
+                    .await
+                    .map_err(to_error)?;
+                let retrieved = hits
+                    .iter()
+                    .map(|h| {
+                        crate::manual::schema_ids::manual_node_id(
+                            &ctx.schema,
+                            crate::manual::schema_ids::KIND_SECTION,
+                            &h.section_key,
+                        )
+                    })
+                    .collect();
+                let body =
+                    serde_json::to_value(SearchManualResponseManual { hits }).map_err(to_error)?;
+                (retrieved, body)
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let hits = self
+                    .tools
+                    .search_manual(
+                        &ctx.schema,
+                        &req.query_ja,
+                        req.product_key.as_deref(),
+                        req.top_k.unwrap_or(5),
+                    )
+                    .await
+                    .map_err(to_error)?;
+                let retrieved = hits
+                    .iter()
+                    .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
+                    .collect();
+                let body = serde_json::to_value(SearchManualResponse { hits }).map_err(to_error)?;
+                (retrieved, body)
+            }
+        };
         self.harness
             .audit_with_nodes(&ctx, "read:search_manual", None, Vec::new(), retrieved)
             .await
             .map_err(to_error)?;
-        Ok(Json(SearchManualResponse { hits }))
+        Ok(Json(body))
     }
 
     #[tool(
@@ -319,27 +399,45 @@ impl CsSupportRmcpServer {
         &self,
         extensions: rmcp::model::Extensions,
         Parameters(req): Parameters<GetSectionRequest>,
-    ) -> Result<Json<SectionView>, ErrorData> {
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let view = self
-            .tools
-            .get_section(&ctx.schema, &req.section_key)
-            .await
-            .map_err(to_error)?;
+        let (retrieved_id, body) = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self.manual_store()?;
+                let view = store
+                    .get_section(&ctx.schema, &req.section_key)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved_id = crate::manual::schema_ids::manual_node_id(
+                    &ctx.schema,
+                    crate::manual::schema_ids::KIND_SECTION,
+                    &req.section_key,
+                );
+                let body = serde_json::to_value(view).map_err(to_error)?;
+                (retrieved_id, body)
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let view = self
+                    .tools
+                    .get_section(&ctx.schema, &req.section_key)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved_id = crate::ingest::section_node_id(&ctx.schema, &req.section_key);
+                let body = serde_json::to_value(view).map_err(to_error)?;
+                (retrieved_id, body)
+            }
+        };
         self.harness
             .audit_with_nodes(
                 &ctx,
                 "read:get_section",
                 None,
                 Vec::new(),
-                vec![crate::ingest::section_node_id(
-                    &ctx.schema,
-                    &req.section_key,
-                )],
+                vec![retrieved_id],
             )
             .await
             .map_err(to_error)?;
-        Ok(Json(view))
+        Ok(Json(body))
     }
 
     #[tool(
