@@ -1,6 +1,7 @@
 pub mod config;
 pub mod harness;
 pub mod ingest;
+pub mod manual;
 pub mod mcp;
 pub mod model;
 pub mod project;
