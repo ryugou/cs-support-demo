@@ -54,9 +54,14 @@ async fn main() -> Result<()> {
             .projects
             .first()
             .ok_or_else(|| anyhow!("no project configured"))?;
-        let service = CsSupportRmcpServer::new(project.schema.clone(), tools, harness.clone())
-            .serve(stdio())
-            .await?;
+        let service = CsSupportRmcpServer::new(
+            project.schema.clone(),
+            tools,
+            harness.clone(),
+            project.manual_schema,
+        )
+        .serve(stdio())
+        .await?;
         service.waiting().await?;
         return Ok(());
     }
@@ -71,12 +76,14 @@ async fn main() -> Result<()> {
         let schema = project.schema.clone();
         let tools = tools.clone();
         let harness = harness.clone();
+        let manual_schema = project.manual_schema;
         let mcp = StreamableHttpService::new(
             move || {
                 Ok(CsSupportRmcpServer::new(
                     schema.clone(),
                     tools.clone(),
                     harness.clone(),
+                    manual_schema,
                 ))
             },
             Arc::new(LocalSessionManager::default()),

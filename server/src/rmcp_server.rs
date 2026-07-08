@@ -22,6 +22,7 @@ pub struct CsSupportRmcpServer {
     schema: String,
     tools: ToolService,
     harness: Arc<Harness>,
+    manual_schema: crate::config::ManualSchemaKind,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -226,11 +227,17 @@ fn operator_emit_context() -> EmitContext {
 
 #[tool_router]
 impl CsSupportRmcpServer {
-    pub fn new(schema: String, tools: ToolService, harness: Arc<Harness>) -> Self {
+    pub fn new(
+        schema: String,
+        tools: ToolService,
+        harness: Arc<Harness>,
+        manual_schema: crate::config::ManualSchemaKind,
+    ) -> Self {
         Self {
             schema,
             tools,
             harness,
+            manual_schema,
         }
     }
 
@@ -242,7 +249,7 @@ impl CsSupportRmcpServer {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
         self.harness
-            .begin(authorization.as_deref(), &self.schema)
+            .begin(authorization.as_deref(), &self.schema, self.manual_schema)
             .map_err(|err| ErrorData::invalid_request(err.to_string(), None))
     }
 

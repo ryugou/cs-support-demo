@@ -32,6 +32,11 @@ pub struct Harness {
     /// grade 更新（read-modify-write）のプロセス内直列化。単一インスタンス運用が前提。
     // TODO: bind to vegapunk atomic increment/CAS — backend 側の原子更新が使えるようになったら置き換える。
     pub grade_lock: tokio::sync::Mutex<()>,
+    /// manual_v1 スキーマ向けの manual 取得。project.manual_schema が LegacySection のみの
+    /// 構成では未使用（None でも動く）。
+    pub manual: Option<crate::manual::retrieval::ManualStore>,
+    /// 第3層エスカレーションの既定 route（config.harness.default_escalation_route）。
+    pub default_route: String,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +45,8 @@ pub struct RequestContext {
     pub scope: scope::AccessScope,
     pub schema: String,
     pub request_id: String,
+    /// project 設定から解決した manual スキーマ種別。evaluate の manual 取得経路を分岐する。
+    pub manual_schema: crate::config::ManualSchemaKind,
 }
 
 pub struct EvaluationOutcome {
@@ -54,6 +61,20 @@ pub struct EvaluationOutcome {
     pub clarification_allowed: bool,
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
+}
+
+/// manual_v1 経路（ManualHit）を LegacySection 経路と同じ `SectionHit` に薄く詰め替える。
+/// reserved フィールド body_original / original_hash は読まない（現行実装では未使用）。
+fn manual_hit_to_section_hit(hit: crate::model::ManualHit) -> SectionHit {
+    SectionHit {
+        section_key: hit.section_key,
+        title_ja: hit.title,
+        body_ja: Some(hit.body),
+        body_en: None,
+        translation_status: None,
+        breadcrumb: vec![hit.breadcrumb],
+        score: hit.score,
+    }
 }
 
 impl Harness {
@@ -99,11 +120,13 @@ impl Harness {
             worm: Arc::new(audit::WormAuditLog::open(&resolve_path(
                 &config.harness.audit_log_path,
             ))?),
-            knowledge: Some(knowledge::KnowledgeStore::new(client)),
+            knowledge: Some(knowledge::KnowledgeStore::new(client.clone())),
             thresholds: (&config.harness.thresholds).into(),
             grading: (&config.harness.grading).into(),
             queue_path: resolve_path(&config.harness.search_improvement_queue_path),
             grade_lock: tokio::sync::Mutex::new(()),
+            manual: Some(crate::manual::retrieval::ManualStore::new(client)),
+            default_route: config.harness.default_escalation_route.clone(),
         })
     }
 
@@ -340,6 +363,7 @@ impl Harness {
         &self,
         authorization: Option<&str>,
         project_schema: &str,
+        project_manual_schema: crate::config::ManualSchemaKind,
     ) -> Result<RequestContext> {
         let actor = self.authenticator.authenticate(authorization)?;
         let access = scope::resolve_scope(&actor, project_schema)?;
@@ -348,6 +372,7 @@ impl Harness {
             actor,
             scope: access,
             request_id: uuid::Uuid::new_v4().to_string(),
+            manual_schema: project_manual_schema,
         })
     }
 
@@ -375,17 +400,11 @@ impl Harness {
         // ルールの signal が語彙外だと「決してマッチしないルール」＝サイレントな
         // fail open になるため、判定前に語彙と突合して fail closed にする。
         self.validate_rule_vocabulary(&rules, &domains)?;
-        let (resolutions, hits) = tokio::try_join!(
-            knowledge.load_known_resolutions_with(&ctx.schema, &snapshot),
-            // search 側は snapshot を消費するため、共有元のここでだけ clone する
-            tools.search_manual_with_snapshot(
-                &ctx.schema,
-                question,
-                product_key,
-                5,
-                snapshot.clone()
-            ),
-        )?;
+        // manual 検索は accumulated signal 集合（会話層）を使うため、hits の取得は
+        // accumulated が確定した後ろに回す（下記 manual 取得ブロック）。
+        let resolutions = knowledge
+            .load_known_resolutions_with(&ctx.schema, &snapshot)
+            .await?;
         // [正規化] 決定論 lexicon（S1-11）。今ターン分。
         let signals = self.normalizer.normalize(question);
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
@@ -451,19 +470,71 @@ impl Harness {
                 .filter(|s| self.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
                 .count(),
         };
+        // manual 取得を manual_schema で分岐する。ManualV1 は ManualStore（signal 絞り込み(A) +
+        // body 全文(B) の max）、LegacySection は従来の tools.search_manual_with_snapshot。
+        // 判定へは共通の best_manual_score / best_manual_sections に落とし、
+        // EvaluationOutcome.hits へは SectionHit に揃えて返す（manual_hit_to_section_hit で変換）。
+        let (section_hits, retrieved_manual_ids): (Vec<SectionHit>, Vec<String>) =
+            match ctx.manual_schema {
+                crate::config::ManualSchemaKind::ManualV1 => {
+                    let store = self
+                        .manual
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("manual store not configured"))?;
+                    let hits = store.search_with_snapshot(
+                        &ctx.schema,
+                        question,
+                        &accumulated,
+                        5,
+                        &snapshot,
+                    )?;
+                    let ids = hits
+                        .iter()
+                        .map(|h| {
+                            crate::manual::schema_ids::manual_node_id(
+                                &ctx.schema,
+                                "ManualSection",
+                                &h.section_key,
+                            )
+                        })
+                        .collect();
+                    let converted = hits.into_iter().map(manual_hit_to_section_hit).collect();
+                    (converted, ids)
+                }
+                crate::config::ManualSchemaKind::LegacySection => {
+                    // search 側は snapshot を消費するため、共有元のここでだけ clone する
+                    let hits = tools
+                        .search_manual_with_snapshot(
+                            &ctx.schema,
+                            question,
+                            product_key,
+                            5,
+                            snapshot.clone(),
+                        )
+                        .await?;
+                    let ids = hits
+                        .iter()
+                        .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
+                        .collect();
+                    (hits, ids)
+                }
+            };
         // [(B) 3 層判定] 純関数。判定根拠は常に「累積 signal 集合 + known_resolution」。
-        let best = hits.first();
-        let section_keys: Vec<String> = hits.iter().map(|h| h.section_key.clone()).collect();
+        let best = section_hits.first();
+        let best_manual_score = best.map(|h| h.score);
+        let section_keys: Vec<String> =
+            section_hits.iter().map(|h| h.section_key.clone()).collect();
         let decision_result = decision::decide(&decision::DecisionInput {
             question_signals: &accumulated,
             question_raw: question,
             rules: &rules,
             domains: &domains,
             resolutions: &resolutions,
-            best_manual_score: best.map(|h| h.score),
+            best_manual_score,
             best_manual_sections: &section_keys,
             stakes_input,
             thresholds: &self.thresholds,
+            default_route: &self.default_route,
         });
         // 聞き返し可否（決定論）: 第3層グレーのみ。第1・2層は問答無用でルーティング。
         let clarification_allowed = matches!(
@@ -507,10 +578,7 @@ impl Harness {
                 layer, route_to, ..
             } => (format!("escalate:layer{layer}"), Some(route_to.clone())),
         };
-        let mut retrieved_node_ids: Vec<String> = hits
-            .iter()
-            .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
-            .collect();
+        let mut retrieved_node_ids: Vec<String> = retrieved_manual_ids;
         retrieved_node_ids.push(knowledge::harness_node_id(
             &ctx.schema,
             "support_case",
@@ -544,7 +612,7 @@ impl Harness {
             accumulated_signals: accumulated,
             case_id,
             clarification_allowed,
-            hits,
+            hits: section_hits,
             audit_event_id,
         })
     }
@@ -679,13 +747,21 @@ mod tests {
             },
             queue_path: dir.join("queue.jsonl"),
             grade_lock: tokio::sync::Mutex::new(()),
+            manual: None,
+            default_route: "triage".to_string(),
         }
     }
 
     #[test]
     fn begin_produces_request_context_with_enforced_schema() {
         let harness = harness_for_test();
-        let ctx = harness.begin(None, "sivira-cs-demo").expect("begin");
+        let ctx = harness
+            .begin(
+                None,
+                "sivira-cs-demo",
+                crate::config::ManualSchemaKind::LegacySection,
+            )
+            .expect("begin");
         assert_eq!(ctx.schema, "sivira-cs-demo");
         assert_eq!(ctx.actor.sub, "op-001");
         assert!(!ctx.request_id.is_empty());
@@ -694,6 +770,12 @@ mod tests {
     #[test]
     fn begin_rejects_out_of_scope_project() {
         let harness = harness_for_test();
-        assert!(harness.begin(None, "other-tenant").is_err());
+        assert!(harness
+            .begin(
+                None,
+                "other-tenant",
+                crate::config::ManualSchemaKind::LegacySection,
+            )
+            .is_err());
     }
 }
