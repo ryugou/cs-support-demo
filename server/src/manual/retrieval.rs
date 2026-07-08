@@ -56,8 +56,8 @@ impl ManualStore {
             .client
             .graph_snapshot(schema, SNAPSHOT_MAX_NODES)
             .await?;
-        if snap.nodes.len() >= SNAPSHOT_MAX_NODES as usize {
-            anyhow::bail!("manual snapshot reached node limit; refusing on incomplete data");
+        if snap.truncated {
+            anyhow::bail!("manual snapshot truncated at node limit; refusing on incomplete data");
         }
         Ok(snap)
     }
@@ -123,7 +123,8 @@ impl ManualStore {
         Ok(hits)
     }
 
-    /// ManualSection + 祖先(PARENT_OF)・子・BASED_ON 経由の Rationale を返す。
+    /// ManualSection + 祖先(PARENT_OF)・子を返す。
+    /// BASED_ON 経由の Rationale は未実装（KR 側で辿れるため、section 視点の逆引きは Step 1 では省略）。
     pub async fn get_section(&self, schema: &str, section_key: &str) -> Result<ManualSectionView> {
         let snap = self.snapshot(schema).await?;
         let node_id = manual_node_id(schema, "ManualSection", section_key);
