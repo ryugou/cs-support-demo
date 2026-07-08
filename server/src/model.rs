@@ -113,3 +113,29 @@ pub struct GraphEdge {
     pub edge_type: String,
     pub attributes: Vec<(String, String)>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ManualHit {
+    pub section_key: String,
+    pub title: String,
+    pub body: String,
+    pub source_url: String,
+    pub breadcrumb: String,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ManualSectionView {
+    pub section: serde_json::Value,
+    pub ancestors: Vec<serde_json::Value>,
+    pub children: Vec<serde_json::Value>,
+    pub based_on_rationale: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ManualProductCandidate {
+    pub model: String,
+    pub name: String,
+    pub score: f32,
+    pub reason: String,
+}
