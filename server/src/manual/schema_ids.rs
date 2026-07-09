@@ -40,6 +40,7 @@ pub fn with_schema_name(yaml: &str, schema: &str) -> String {
         {
             out.push_str("name: ");
             out.push_str(schema);
+            replaced = true;
         } else {
             out.push_str(line);
         }
