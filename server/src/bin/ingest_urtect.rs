@@ -288,8 +288,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let token = read_token(&args)?;
 
-    let schema_yaml = fs::read_to_string(&args.schema_file)
-        .with_context(|| format!("read schema file {}", args.schema_file.display()))?;
+    // 汎用テンプレの name をテナント schema 名に差し替える（vegapunk は name 一致を要求）。
+    let schema_yaml = cs_support_mcp::manual::schema_ids::with_schema_name(
+        &fs::read_to_string(&args.schema_file)
+            .with_context(|| format!("read schema file {}", args.schema_file.display()))?,
+        &args.schema,
+    );
     let lexicon = LexiconNormalizer::from_path(&args.lexicon_file)
         .with_context(|| format!("load signal lexicon {}", args.lexicon_file.display()))?;
     let top_url =
