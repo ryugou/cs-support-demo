@@ -21,6 +21,10 @@ pub struct VegapunkClient {
     auth_header: MetadataValue<tonic::metadata::Ascii>,
 }
 
+/// tonic 既定の受信メッセージ上限は 4MiB。マニュアル本文込みの graph snapshot は
+/// これを超えるため 64MiB に引き上げる（snapshot 自体は SNAPSHOT_MAX_NODES で別途上限）。
+const MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 impl VegapunkClient {
     pub fn connect_lazy(endpoint: &str, bearer_token: &str) -> Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())?
@@ -30,7 +34,10 @@ impl VegapunkClient {
         let auth_header = MetadataValue::try_from(format!("Bearer {bearer_token}"))
             .context("invalid bearer token metadata")?;
         Ok(Self {
-            inner: GraphRagEngineClient::new(channel),
+            // マニュアル本文込みの大きな graph snapshot が tonic 既定の 4MB decode 上限を
+            // 超える（URTECT で ~6MB）。余裕を持って上限を引き上げる。
+            inner: GraphRagEngineClient::new(channel)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             auth_header,
         })
     }
@@ -45,7 +52,10 @@ impl VegapunkClient {
         let auth_header = MetadataValue::try_from(format!("Bearer {bearer_token}"))
             .context("invalid bearer token metadata")?;
         Ok(Self {
-            inner: GraphRagEngineClient::new(channel),
+            // マニュアル本文込みの大きな graph snapshot が tonic 既定の 4MB decode 上限を
+            // 超える（URTECT で ~6MB）。余裕を持って上限を引き上げる。
+            inner: GraphRagEngineClient::new(channel)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             auth_header,
         })
     }
