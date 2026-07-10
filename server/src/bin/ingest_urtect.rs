@@ -67,14 +67,21 @@ fn extract_main_text(html: &str) -> (String, String) {
         .next()
         .unwrap_or_else(|| document.root_element());
 
-    let mut raw: String = container.text().collect::<Vec<_>>().join(" ");
-
-    // container 配下に入れ子の nav/header/footer があれば、その配下テキストを除去する。
-    let noise_selector = Selector::parse("nav, header, footer").expect("valid selector");
-    for noise in container.select(&noise_selector) {
-        let noise_text: String = noise.text().collect::<Vec<_>>().join(" ");
-        if !noise_text.trim().is_empty() {
-            raw = raw.replace(&noise_text, "");
+    // script/style/noscript/nav/header/footer 配下のテキストは本文でないため除外して収集する。
+    // `.text()` をそのまま使うと inline JS/CSS を拾い、Google Sites では本文が JS で汚染される。
+    let mut raw = String::new();
+    for node in container.descendants() {
+        let scraper::Node::Text(text) = node.value() else {
+            continue;
+        };
+        let under_noise = node.ancestors().any(|anc| {
+            matches!(anc.value(), scraper::Node::Element(el)
+                if matches!(el.name(), "script" | "style" | "noscript" | "nav" | "header" | "footer"))
+        });
+        if !under_noise {
+            let chunk: &str = text;
+            raw.push_str(chunk);
+            raw.push(' ');
         }
     }
 
@@ -514,14 +521,20 @@ mod tests {
     use super::*;
     #[test]
     fn strips_boilerplate_and_normalizes() {
-        let html = r#"<html><head><title>SDカードが認識されない</title></head>
+        let html = r#"<html><head><title>SDカードが認識されない</title>
+          <style>.x{color:red}</style></head>
           <body><nav>目次</nav><main><h1>SDカードが認識されない</h1><p>抜き差し。</p>
+          <script>var Symbol=typeof window!=="undefined";function noise(){return 42}</script>
           <footer>マニュアルの内容や画面は予告なく変更になる場合があります</footer></main></body></html>"#;
         let (title, body) = extract_main_text(html);
         assert_eq!(title, "SDカードが認識されない");
         assert!(body.contains("抜き差し"));
         assert!(!body.contains("予告なく変更"));
         assert!(!body.contains("目次"));
+        // inline JS/CSS を本文に取り込まない（Google Sites 汚染対策）
+        assert!(!body.contains("Symbol"));
+        assert!(!body.contains("noise"));
+        assert!(!body.contains("color:red"));
     }
 
     #[test]
