@@ -98,15 +98,123 @@ pub(crate) fn run_bigrams(runs: &[String]) -> Vec<String> {
     out
 }
 
-/// manual パス専用の直接性スコア（Task 11: 内容語 bigram カバレッジ）。
+/// run が正規化済みテキスト（NFKC+lowercase）にマッチするか判定する（body 限定）。
+/// - 部分文字列として直接含まれる → matched
+/// - 直接一致しないが run の bigram 数が 2 以上あり、その 50% 以上が含まれる → matched
+///   （「設定方法」のような漢字ランの過剰結合を救済する。bigrams {設定,定方,方法} のうち
+///   設定・方法 が本文にあれば 2/3 ≥ 0.5 で matched）
+/// - それ以外 → unmatched
+///
+/// 既知の限界（コードコメント）: run の bigram 断片一致は「ペリメーター」→「メーカー」のような
+/// 無関係語への誤マッチを許してしまう場合がある。business 語彙チューニング/ベクトル検索フェーズで扱う。
+fn run_matches(run: &str, text_nfkc: &str) -> bool {
+    if text_nfkc.contains(run) {
+        return true;
+    }
+    let single = [run.to_string()];
+    let bigrams = run_bigrams(&single);
+    if bigrams.len() < 2 {
+        return false;
+    }
+    let hit = bigrams
+        .iter()
+        .filter(|b| text_nfkc.contains(b.as_str()))
+        .count();
+    (hit as f32 / bigrams.len() as f32) >= 0.5
+}
+
+/// 質問の内容語ラン（重複除去済み）を返す。run が 1 つも取れない質問は None。
+fn unique_content_runs(question: &str) -> Option<Vec<String>> {
+    let runs = content_runs(question);
+    if runs.is_empty() {
+        return None;
+    }
+    let unique: Vec<String> = runs
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Some(unique)
+}
+
+/// snapshot コーパス（正規化済み ManualSection body 群）に対し、run ごとの
+/// document frequency（その run が run_matches する節数）を数える。
+/// 質問 1 回につき 1 度だけ呼ぶ想定（節ごとの再計算を避けるため）。
+pub(crate) fn run_document_frequency(corpus_bodies_nfkc: &[String], runs: &[String]) -> Vec<usize> {
+    runs.iter()
+        .map(|run| {
+            corpus_bodies_nfkc
+                .iter()
+                .filter(|body| run_matches(run, body))
+                .count()
+        })
+        .collect()
+}
+
+/// run 単位 IDF 重み付きカバレッジスコア。
+/// idf(run) = ln(1 + N / (1 + df(run)))
+/// score = Σ_{matched runs} idf(run) / Σ_{all runs} idf(run)
+fn idf_weighted_score(runs: &[String], dfs: &[usize], corpus_len: usize, body_nfkc: &str) -> f32 {
+    debug_assert_eq!(runs.len(), dfs.len());
+    let n = corpus_len as f32;
+    let mut matched_weight = 0.0_f32;
+    let mut total_weight = 0.0_f32;
+    for (run, df) in runs.iter().zip(dfs.iter()) {
+        let idf = (1.0 + n / (1.0 + *df as f32)).ln();
+        total_weight += idf;
+        if run_matches(run, body_nfkc) {
+            matched_weight += idf;
+        }
+    }
+    if total_weight <= 0.0 {
+        return 0.0;
+    }
+    matched_weight / total_weight
+}
+
+/// テスト可能に切り出した本体ロジック: 質問と節本文の集合を受け取り、各節のスコアを返す。
+/// `search_with_snapshot` はこれを ManualSection 群に対して使う（node 構造 → body 抽出は呼び出し側）。
+/// title は fast path 用に空文字を渡してよい（コーパス単位の呼び出しでは title 別枠は無い）。
+pub(crate) fn score_against_corpus(question: &str, section_bodies: &[String]) -> Vec<f32> {
+    let Some(runs) = unique_content_runs(question) else {
+        // run が 1 つも取れない質問（全ひらがな等）は legacy フォールバックを各節に適用する。
+        let query_norm = normalize_key(question);
+        return section_bodies
+            .iter()
+            .map(|b| crate::mcp::section_score(&query_norm, question, b))
+            .collect();
+    };
+    let corpus_nfkc: Vec<String> = section_bodies.iter().map(|b| nfkc_lowercase(b)).collect();
+    // DF は質問 1 回につき 1 度だけ計算する（節ごとに再計算しない）。
+    let dfs = run_document_frequency(&corpus_nfkc, &runs);
+    section_bodies
+        .iter()
+        .zip(corpus_nfkc.iter())
+        .map(|(body, body_nfkc)| {
+            // fast path: 完全部分文字列 → 1.0、正規化部分文字列 → 0.95
+            if body.contains(question) {
+                return 1.0;
+            }
+            let query_norm = normalize_key(question);
+            let body_norm = normalize_key(body);
+            if !query_norm.is_empty() && body_norm.contains(&query_norm) {
+                return 0.95;
+            }
+            idf_weighted_score(&runs, &dfs, corpus_nfkc.len(), body_nfkc)
+        })
+        .collect()
+}
+
+/// manual パス専用の直接性スコア（Task 11: 内容語 run カバレッジ、等重み）。
 /// 1. 完全部分文字列 → 1.0
 /// 2. normalize_key 正規化後の部分文字列 → 0.95
-/// 3. 質問から内容語ラン → bigram を作り、body (NFKC+lowercase, 非英数字は残す) に
-///    部分文字列として含まれる割合をスコアとする。
-/// 4. bigram が 1 つも取れない質問（全ひらがな等）は legacy の section_score にフォールバック。
+/// 3. 質問から内容語ラン（重複除去）を抽出し、run 単位で body (NFKC+lowercase, 非英数字は残す) に
+///    マッチするか判定（`run_matches`）、マッチした run の割合をスコアとする。
+///    単一節にはコーパスが無く IDF が定義できないため、ここは等重み。
+/// 4. run が 1 つも取れない質問（全ひらがな等）は legacy の section_score にフォールバック。
 ///
 /// 実装メモ（brief からの意図的な差分）: fast path (1・2) は
-/// `title + "\n" + body` を見る。しかし bigram カバレッジ (3) は body のみを見る。
+/// `title + "\n" + body` を見る。しかし run カバレッジ (3) は body のみを見る。
 /// title はしばしば症状名・見出しに過ぎず、質問の一般的な話題（例:「カメラ」）を
 /// 含むだけで具体的な回答本文が無いケースがある（実測: 浴室設置の質問に対し
 /// title「カメラの設置」が「カメラ」「設置」を含むだけで score が閾値を超えてしまう）。
@@ -126,23 +234,12 @@ pub fn manual_directness_score(question: &str, title: &str, body: &str) -> f32 {
     if !query_norm.is_empty() && text_norm.contains(&query_norm) {
         return 0.95;
     }
-    let runs = content_runs(question);
-    let bigrams = run_bigrams(&runs);
-    if bigrams.is_empty() {
+    let Some(runs) = unique_content_runs(question) else {
         return crate::mcp::section_score(&query_norm, question, &text);
-    }
-    // 重複する bigram を除去（例: 「カー」が「カード」と「メーカー」から重複して生成される場合）
-    let unique_bigrams: Vec<String> = bigrams
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    };
     let body_nfkc = nfkc_lowercase(body);
-    let hit = unique_bigrams
-        .iter()
-        .filter(|b| body_nfkc.contains(*b))
-        .count();
-    hit as f32 / unique_bigrams.len() as f32
+    let matched = runs.iter().filter(|r| run_matches(r, &body_nfkc)).count();
+    matched as f32 / runs.len() as f32
 }
 
 /// snapshot の MENTIONS_SIGNAL 辺から、質問 signal に結線された ManualSection node_id 集合を返す。
@@ -212,20 +309,41 @@ impl ManualStore {
         snapshot: &GetGraphSnapshotResponse,
     ) -> Result<Vec<ManualHit>> {
         let signal_narrowed = sections_for_signals(snapshot, signals);
-        let mut hits: Vec<ManualHit> = snapshot
+        let manual_sections: Vec<_> = snapshot
             .nodes
             .iter()
             .filter(|n| n.node_type == "ManualSection")
-            .map(|n| {
+            .collect();
+        // IDF 版 corpus スコア（run 単位マッチ + コーパス IDF 重み、body のみ対象）。
+        // DF は質問 1 回・snapshot 全体に対して 1 度だけ計算される(score_against_corpus 内部)。
+        let bodies: Vec<String> = manual_sections
+            .iter()
+            .map(|n| n.attributes.get("body").cloned().unwrap_or_default())
+            .collect();
+        let corpus_scores = score_against_corpus(question, &bodies);
+        let mut hits: Vec<ManualHit> = manual_sections
+            .into_iter()
+            .zip(corpus_scores.into_iter())
+            .map(|(n, corpus_score)| {
                 let a = n.attributes.clone();
                 let title = a.get("title").cloned().unwrap_or_default();
                 let body = a.get("body").cloned().unwrap_or_default();
-                // (B) body 全文スコア。(A) signal で絞られた候補は同じ score だがヒット保証で残す。
-                let base = score_section(question, &title, &body);
-                // signal 絞り込みに入っていれば最低 0.6 を下限にせず、base をそのまま使う（過剰応答を防ぐ）。
-                // A/B の max は「A の候補集合に入るか」で候補を残し、score は section_score を使う。
+                // title+body 対象の fast path は維持する(現行どおり): 完全部分文字列 → 1.0、
+                // 正規化部分文字列 → 0.95。それ以外は body のみに対する IDF corpus スコアを使う。
+                let text = format!("{title}\n{body}");
+                let score = if text.contains(question) {
+                    1.0
+                } else {
+                    let query_norm = normalize_key(question);
+                    let text_norm = normalize_key(&text);
+                    if !query_norm.is_empty() && text_norm.contains(&query_norm) {
+                        0.95
+                    } else {
+                        corpus_score
+                    }
+                };
+                // signal 絞り込みに入っていれば最低 0.6 を下限にせず、score をそのまま使う（過剰応答を防ぐ）。
                 let in_signal = signal_narrowed.contains(&n.node_id);
-                let score = base; // A・B とも直接性は section_score で測る（max は候補集合の和）
                 (
                     in_signal,
                     score,
@@ -394,6 +512,11 @@ mod tests {
         let body =
             "設置までのステップを説明します。壁面への取り付けは付属のブラケットを使用します。";
         let s = manual_directness_score("カメラを浴室に設置できるか", title, body);
+        // 実測 0.333 (matched=設置のみ/3 runs)。brief は等重み版で 2/3≈0.67 になり
+        // 0.6 を超えると予測し、その場合は本テストを IDF 版テストへ移行してよいと
+        // 事前承認していたが、実装・実測では run 単位マッチにより「カメラ」も
+        // unmatched (body に断片も現れない) となるため 1/3 に留まり、このテストは
+        // 等重み版のままでも通る。数値の相違を記録した上でテストは維持する。
         assert!(s < 0.6, "expected < 0.6, got {s}");
     }
 
@@ -422,6 +545,40 @@ mod tests {
         let body = "SDカードが認識されない SDカードを一度抜き差ししてください。";
         let s = manual_directness_score("SDカードを認識しません。", title, body);
         assert!(s > 0.6, "expected > 0.6, got {s}");
+    }
+
+    #[test]
+    fn idf_dilution_missing_rare_run_dominates() {
+        // 3 節の小コーパス。iphone/カメラ/設置 はありふれ、浴室 はどこにも無い。
+        let sections = vec![
+            "アプリの設定 iphoneの場合 アプリをインストールしてカメラを追加します。".to_string(),
+            "カメラの設置 壁面への設置は付属ブラケットでカメラを固定します。".to_string(),
+            "録画ルールの設定 録画ルールを設定します。".to_string(),
+        ];
+        let hits = score_against_corpus(
+            "iPhoneで使っていますが、カメラを浴室に設置できますか",
+            &sections,
+        );
+        // どの節も 0.6 未満（浴室の欠落が支配する）
+        assert!(
+            hits.iter().all(|s| *s < 0.6),
+            "expected all < 0.6, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn idf_all_runs_present_scores_high() {
+        let sections = vec![
+            "アプリの設定 iphoneの場合 アプリをインストールしてカメラを追加します。".to_string(),
+            "カメラの設置 壁面への設置は付属ブラケットでカメラを固定します。".to_string(),
+            "録画ルールの設定 録画ルールを設定します。".to_string(),
+        ];
+        let hits = score_against_corpus("カメラを壁面に設置できますか", &sections);
+        // 設置節は全 run（カメラ・壁面・設置）を含むので高スコア
+        assert!(
+            hits.iter().any(|s| *s > 0.6),
+            "expected some > 0.6, got {hits:?}"
+        );
     }
 
     #[test]
