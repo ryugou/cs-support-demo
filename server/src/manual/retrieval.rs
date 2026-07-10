@@ -7,13 +7,129 @@ use crate::vegapunk::VegapunkClient;
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
+use unicode_normalization::UnicodeNormalization;
 
 const SNAPSHOT_MAX_NODES: i32 = 5000;
 
-/// title+body への直接性（mcp::section_score と同一規則。DRY）。
+/// title+body への直接性。manual パス専用: 内容語 bigram カバレッジ（Task 11）。
+/// legacy の `crate::mcp::section_score` 本体・sivira パスはこの変更の対象外。
 pub fn score_section(question: &str, title: &str, body: &str) -> f32 {
+    manual_directness_score(question, title, body)
+}
+
+/// NFKC + lowercase のみ（非英数字を落とさない）。normalize_key と違い記号・空白を残す。
+fn nfkc_lowercase(input: &str) -> String {
+    input.nfkc().flat_map(char::to_lowercase).collect()
+}
+
+fn is_katakana(c: char) -> bool {
+    ('\u{30A0}'..='\u{30FF}').contains(&c)
+}
+
+fn is_kanji(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+}
+
+/// 質問文字を 3 クラス（ASCII 英数字 / カタカナ(ー含む) / 漢字）に分類する。
+/// 同一クラス外・ひらがな・記号・空白はラン区切り。
+fn char_class(c: char) -> Option<u8> {
+    if c.is_ascii_alphanumeric() {
+        Some(0)
+    } else if is_katakana(c) {
+        Some(1)
+    } else if is_kanji(c) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// 質問から内容語ラン（カタカナ+ / 漢字+ / ASCII 英数字+）を抽出する。
+/// ASCII ランは小文字化する。ひらがな・記号・空白はランの区切り。
+pub(crate) fn content_runs(question: &str) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    let mut current_class: Option<u8> = None;
+    for c in question.chars() {
+        match char_class(c) {
+            Some(class) if current_class == Some(class) => current.push(c),
+            Some(class) => {
+                if !current.is_empty() {
+                    runs.push(std::mem::take(&mut current));
+                }
+                current.push(c);
+                current_class = Some(class);
+            }
+            None => {
+                if !current.is_empty() {
+                    runs.push(std::mem::take(&mut current));
+                }
+                current_class = None;
+            }
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs.into_iter()
+        .map(|r| {
+            if r.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                r.to_lowercase()
+            } else {
+                r
+            }
+        })
+        .collect()
+}
+
+/// 各ラン内の文字 bigram を列挙する（ラン間をまたぐ bigram は作らない。1 文字ランは unigram）。
+pub(crate) fn run_bigrams(runs: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for run in runs {
+        let chars: Vec<char> = run.chars().collect();
+        if chars.len() <= 1 {
+            out.push(run.clone());
+        } else {
+            for w in chars.windows(2) {
+                out.push(w.iter().collect());
+            }
+        }
+    }
+    out
+}
+
+/// manual パス専用の直接性スコア（Task 11: 内容語 bigram カバレッジ）。
+/// 1. 完全部分文字列 → 1.0
+/// 2. normalize_key 正規化後の部分文字列 → 0.95
+/// 3. 質問から内容語ラン → bigram を作り、body (NFKC+lowercase, 非英数字は残す) に
+///    部分文字列として含まれる割合をスコアとする。
+/// 4. bigram が 1 つも取れない質問（全ひらがな等）は legacy の section_score にフォールバック。
+///
+/// 実装メモ（brief からの意図的な差分）: fast path (1・2) は
+/// `title + "\n" + body` を見る。しかし bigram カバレッジ (3) は body のみを見る。
+/// title はしばしば症状名・見出しに過ぎず、質問の一般的な話題（例:「カメラ」）を
+/// 含むだけで具体的な回答本文が無いケースがある（実測: 浴室設置の質問に対し
+/// title「カメラの設置」が「カメラ」「設置」を含むだけで score が閾値を超えてしまう）。
+/// これは本タスクが修正対象とする false-positive とまったく同型の欠陥のため、
+/// カバレッジ判定は「回答本文に具体的な内容語があるか」を問う body 限定とした。
+pub fn manual_directness_score(question: &str, title: &str, body: &str) -> f32 {
     let text = format!("{title}\n{body}");
-    crate::mcp::section_score(&normalize_key(question), question, &text)
+    if text.contains(question) {
+        return 1.0;
+    }
+    let query_norm = normalize_key(question);
+    let text_norm = normalize_key(&text);
+    if !query_norm.is_empty() && text_norm.contains(&query_norm) {
+        return 0.95;
+    }
+    let runs = content_runs(question);
+    let bigrams = run_bigrams(&runs);
+    if bigrams.is_empty() {
+        return crate::mcp::section_score(&query_norm, question, &text);
+    }
+    let body_nfkc = nfkc_lowercase(body);
+    let hit = bigrams.iter().filter(|b| body_nfkc.contains(*b)).count();
+    hit as f32 / bigrams.len() as f32
 }
 
 /// snapshot の MENTIONS_SIGNAL 辺から、質問 signal に結線された ManualSection node_id 集合を返す。
@@ -234,6 +350,55 @@ mod tests {
     fn score_unrelated_is_low() {
         let s = score_section("送料はいくら", "SDカードが認識されない", "抜き差し");
         assert!(s < 0.6);
+    }
+
+    #[test]
+    fn content_runs_extracts_katakana_kanji_ascii() {
+        let runs = content_runs("SDカードの推奨メーカーはどこか");
+        assert_eq!(runs, vec!["sd", "カード", "推奨", "メーカー"]);
+    }
+
+    #[test]
+    fn directness_low_when_content_words_absent() {
+        // SD カード節に「推奨」「メーカー」の記載が無い → 0.6 未満
+        let title = "SDカードが認識されない";
+        let body = "SDカードを一度抜き差ししてください。カードの向きを確認し、カチッと音がするまで挿入します。";
+        let s = manual_directness_score("SDカードの推奨メーカーはどこか", title, body);
+        assert!(s < 0.6, "expected < 0.6, got {s}");
+    }
+
+    #[test]
+    fn directness_high_when_content_words_present() {
+        let title = "録画ルール（クラウド）";
+        let body = "録画ルールの設定方法を説明します。設定画面から録画ルールを選択してください。";
+        let s = manual_directness_score("録画ルールの設定方法", title, body);
+        assert!(s > 0.6, "expected > 0.6, got {s}");
+    }
+
+    #[test]
+    fn directness_low_for_unlisted_environment() {
+        let title = "カメラの設置";
+        let body =
+            "設置までのステップを説明します。壁面への取り付けは付属のブラケットを使用します。";
+        let s = manual_directness_score("カメラを浴室に設置できるか", title, body);
+        assert!(s < 0.6, "expected < 0.6, got {s}");
+    }
+
+    #[test]
+    fn directness_exact_substring_still_one() {
+        let s = manual_directness_score(
+            "リセット穴を12秒押し続けます",
+            "工場出荷時リセット",
+            "リセット穴を12秒押し続けます。",
+        );
+        assert_eq!(s, 1.0);
+    }
+
+    #[test]
+    fn directness_falls_back_for_hiragana_only_question() {
+        // 内容ランが取れない質問はフォールバック（パニックしない・0.0..=1.0 を返す）
+        let s = manual_directness_score("これはどうすればいいの", "タイトル", "本文です。");
+        assert!((0.0..=1.0).contains(&s));
     }
 
     #[test]
