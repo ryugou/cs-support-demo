@@ -29,7 +29,7 @@ impl VegapunkClient {
     pub fn connect_lazy(endpoint: &str, bearer_token: &str) -> Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())?
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .connect_lazy();
         let auth_header = MetadataValue::try_from(format!("Bearer {bearer_token}"))
             .context("invalid bearer token metadata")?;
@@ -45,7 +45,7 @@ impl VegapunkClient {
     pub async fn connect(endpoint: &str, bearer_token: &str) -> Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())?
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .connect()
             .await
             .with_context(|| format!("connect vegapunk endpoint {endpoint}"))?;
