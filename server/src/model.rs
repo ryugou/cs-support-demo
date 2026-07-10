@@ -76,6 +76,8 @@ pub struct SectionHit {
     pub translation_status: Option<String>,
     pub breadcrumb: Vec<String>,
     pub score: f32,
+    #[serde(default)]
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -84,6 +86,8 @@ pub struct SectionView {
     pub ancestors: Vec<serde_json::Value>,
     pub children: Vec<serde_json::Value>,
     pub references: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub based_on_rationale: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]

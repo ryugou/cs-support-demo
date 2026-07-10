@@ -74,6 +74,7 @@ fn manual_hit_to_section_hit(hit: crate::model::ManualHit) -> SectionHit {
         translation_status: None,
         breadcrumb: vec![hit.breadcrumb],
         score: hit.score,
+        source_url: Some(hit.source_url),
     }
 }
 
