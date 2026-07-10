@@ -2,3 +2,4 @@
 /server/certs/*.pem
 .DS_Store
 server/data/audit/
+server/data/*/audit.jsonl
