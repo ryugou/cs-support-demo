@@ -5,7 +5,7 @@ use crate::proto::graphrag::GetGraphSnapshotResponse;
 use crate::resolve::normalize_key;
 use crate::vegapunk::VegapunkClient;
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
@@ -112,6 +112,10 @@ pub(crate) fn run_bigrams(runs: &[String]) -> Vec<String> {
 /// title「カメラの設置」が「カメラ」「設置」を含むだけで score が閾値を超えてしまう）。
 /// これは本タスクが修正対象とする false-positive とまったく同型の欠陥のため、
 /// カバレッジ判定は「回答本文に具体的な内容語があるか」を問う body 限定とした。
+///
+/// トレードオフ: 症状語がタイトルにしか無い薄い body では過小評価になり得る。
+/// ただし ingest（extract_main_text）はページ見出しを body 本文に含めて格納するため、
+/// 実データでは見出し語は body 側にも現れる。
 pub fn manual_directness_score(question: &str, title: &str, body: &str) -> f32 {
     let text = format!("{title}\n{body}");
     if text.contains(question) {
@@ -127,9 +131,18 @@ pub fn manual_directness_score(question: &str, title: &str, body: &str) -> f32 {
     if bigrams.is_empty() {
         return crate::mcp::section_score(&query_norm, question, &text);
     }
+    // 重複する bigram を除去（例: 「カー」が「カード」と「メーカー」から重複して生成される場合）
+    let unique_bigrams: Vec<String> = bigrams
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let body_nfkc = nfkc_lowercase(body);
-    let hit = bigrams.iter().filter(|b| body_nfkc.contains(*b)).count();
-    hit as f32 / bigrams.len() as f32
+    let hit = unique_bigrams
+        .iter()
+        .filter(|b| body_nfkc.contains(*b))
+        .count();
+    hit as f32 / unique_bigrams.len() as f32
 }
 
 /// snapshot の MENTIONS_SIGNAL 辺から、質問 signal に結線された ManualSection node_id 集合を返す。
@@ -399,6 +412,16 @@ mod tests {
         // 内容ランが取れない質問はフォールバック（パニックしない・0.0..=1.0 を返す）
         let s = manual_directness_score("これはどうすればいいの", "タイトル", "本文です。");
         assert!((0.0..=1.0).contains(&s));
+    }
+
+    #[test]
+    fn directness_high_for_paraphrase_when_body_contains_heading() {
+        // ingest は見出しテキストを body に含めるため、実データの body は
+        // 症状語（タイトル相当）を先頭に持つ。言い換え質問でも body 側で拾える。
+        let title = "SDカードが認識されない";
+        let body = "SDカードが認識されない SDカードを一度抜き差ししてください。";
+        let s = manual_directness_score("SDカードを認識しません。", title, body);
+        assert!(s > 0.6, "expected > 0.6, got {s}");
     }
 
     #[test]
