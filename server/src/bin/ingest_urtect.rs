@@ -371,10 +371,13 @@ async fn main() -> Result<()> {
     let nav_hierarchy_flat = enumerated_url_count > 1 && nav_entries.iter().all(|e| e.depth == 0);
 
     // 差分 ingest 用の既存 hash マップ。snapshot（完全性は上で fail closed 済み）から構築する。
+    // 同一 schema に別 document の ManualSection が同居しても誤って disappeared 判定しないよう、
+    // 今回 ingest 対象の document（DOC_KEY）に限定する。
     let existing_hash: HashMap<String, String> = existing_snapshot
         .nodes
         .iter()
         .filter(|n| n.node_type == "ManualSection")
+        .filter(|n| n.attributes.get("doc_key").map(String::as_str) == Some(DOC_KEY))
         .filter_map(|n| {
             let key = n.attributes.get("section_key")?.clone();
             let hash = n.attributes.get("content_hash")?.clone();
@@ -413,13 +416,24 @@ async fn main() -> Result<()> {
 
     // 3-4. 各 URL: fetch → extract → normalize_body → content_hash。差分があれば ingest。
     for (idx, entry) in nav_entries.iter().enumerate() {
+        let slug = section_slug(&entry.url);
         let html = match fetch(&http, &entry.url).await {
             Ok(html) => html,
             Err(err) => {
+                // 既存 section の再検証が fetch 失敗で出来ない場合は fail closed
+                // （「取得不能=変更なし」と黙って扱うと stale content/edge が残るため）。
+                // 新規 section の失敗は stale を生まないので、記録して継続する。
+                if existing_hash.contains_key(&slug) {
+                    anyhow::bail!(
+                        "fetch failed for existing section {slug} ({}): {err}; cannot verify \
+                         staleness — aborting ingest (retry, or recreate the tenant schema)",
+                        entry.url
+                    );
+                }
                 tracing::warn!(
                     url = %entry.url,
                     error = %err,
-                    "fetch failed; recording and continuing crawl"
+                    "fetch failed for new section; recording and continuing crawl"
                 );
                 fetch_failed.push(entry.url.clone());
                 continue;
@@ -429,9 +443,16 @@ async fn main() -> Result<()> {
         let (title, raw_body) = extract_main_text(&html);
         let body = normalize_body(&raw_body);
 
-        // 200 だが本文が空(ログイン/同意/エラー画面などを本文として取ってしまった可能性)は
-        // ManualSection として ingest せず、レポートに記録して次の URL に進む。
+        // 200 だが本文が空(ログイン/同意/エラー画面などを本文として取ってしまった可能性)。
+        // 既存 section なら fetch 失敗と同じく再検証不能として fail closed、新規なら記録して継続。
         if title.is_empty() && body.is_empty() {
+            if existing_hash.contains_key(&slug) {
+                anyhow::bail!(
+                    "empty title and body for existing section {slug} ({}); cannot verify \
+                     staleness — aborting ingest (retry, or recreate the tenant schema)",
+                    entry.url
+                );
+            }
             tracing::warn!(
                 url = %entry.url,
                 "empty title and body after extraction; skipping (unexpected page content?)"
@@ -439,8 +460,6 @@ async fn main() -> Result<()> {
             empty_content.push(entry.url.clone());
             continue;
         }
-
-        let slug = section_slug(&entry.url);
 
         // 親子: 現在の depth 以上を積み戻し、直近の浅い entry を親にする。
         while let Some(top) = stack.last() {
