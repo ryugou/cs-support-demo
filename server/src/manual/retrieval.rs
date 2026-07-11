@@ -100,16 +100,22 @@ pub(crate) fn run_bigrams(runs: &[String]) -> Vec<String> {
 
 /// run が正規化済みテキスト（NFKC+lowercase）にマッチするか判定する（body 限定）。
 /// - 部分文字列として直接含まれる → matched
-/// - 直接一致しないが run の bigram 数が 2 以上あり、その 50% 以上が含まれる → matched
-///   （「設定方法」のような漢字ランの過剰結合を救済する。bigrams {設定,定方,方法} のうち
+/// - 直接一致しない**漢字 run** は、bigram 数が 2 以上あり、その 50% 以上が含まれれば matched
+///   （「設定方法」のような漢字ランの過剰結合の救済。bigrams {設定,定方,方法} のうち
 ///   設定・方法 が本文にあれば 2/3 ≥ 0.5 で matched）
-/// - それ以外 → unmatched
+/// - カタカナ run / ASCII run に bigram 救済は適用しない → unmatched
+///   （「バックアップ」が ック/アッ/ップ 等の断片で誤 matched になるのを防ぐ。
+///   過剰結合は助詞省略による漢字複合語に固有で、カタカナ・英語は語自体が単位のため）
 ///
-/// 既知の限界（コードコメント）: run の bigram 断片一致は「ペリメーター」→「メーカー」のような
-/// 無関係語への誤マッチを許してしまう場合がある。business 語彙チューニング/ベクトル検索フェーズで扱う。
+/// 既知の限界（コードコメント）: 漢字 run の bigram 断片一致は無関係語への誤マッチを
+/// 許す場合がある。business 語彙チューニング/ベクトル検索フェーズで扱う。
 fn run_matches(run: &str, text_nfkc: &str) -> bool {
     if text_nfkc.contains(run) {
         return true;
+    }
+    // bigram 救済は漢字 run 限定
+    if !run.chars().all(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)) {
+        return false;
     }
     let single = [run.to_string()];
     let bigrams = run_bigrams(&single);
@@ -545,6 +551,18 @@ mod tests {
         let body = "SDカードが認識されない SDカードを一度抜き差ししてください。";
         let s = manual_directness_score("SDカードを認識しません。", title, body);
         assert!(s > 0.6, "expected > 0.6, got {s}");
+    }
+
+    #[test]
+    fn katakana_run_not_rescued_by_fragments() {
+        // 「バックアップ」は ック/アッ/ップ 等の断片が本文にあっても matched にしない
+        // （実測: NAS バックアップ質問が断片救済で 0.7 → 誤 allowed になった回帰）
+        let text = "アプリをチェックしてアップデートを実行します。クリックして設定します。";
+        assert!(!run_matches("バックアップ", text));
+        // 漢字 run の救済は維持（設定方法 → 設定+方法）
+        assert!(run_matches("設定方法", "設定を開き、方法を選択します。"));
+        // カタカナ run も完全一致なら matched
+        assert!(run_matches("バックアップ", "バックアップを作成します。"));
     }
 
     #[test]
