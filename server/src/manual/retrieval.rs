@@ -343,7 +343,9 @@ impl ManualStore {
                 let text = format!("{title}\n{body}");
                 let score =
                     substring_fast_path(question, &query_norm, &text).unwrap_or(corpus_score);
-                // signal 絞り込みに入っていれば最低 0.6 を下限にせず、score をそのまま使う（過剰応答を防ぐ）。
+                // signal 絞り込み(in_signal)は候補として残すかどうか（下の filter）にだけ効く。
+                // score には一切影響しない（floor や boost を掛けない — 過剰応答を防ぐため、
+                // 直接性は常に fast path / IDF カバレッジの実測値をそのまま使う）。
                 let in_signal = signal_narrowed.contains(&n.node_id);
                 (
                     in_signal,
