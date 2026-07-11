@@ -493,16 +493,20 @@ async fn main() -> Result<()> {
             .collect();
         // 各フィールドを区切り文字 \x1f で連結し、決定論的な複合ハッシュにする。
         // section_no は常に None（未実装）なので空文字列で固定する。
+        // 一時 String はローカルに束縛してから借用する（temporary lifetime に依存しない）。
+        let order_str = idx.to_string();
+        let models_joined = product_models.join(",");
+        let signals_joined = signal_values.join(",");
         let composite = [
             body.as_str(),                        // body（正規化済み）
             title.as_str(),                       // title
             breadcrumb.as_str(),                  // breadcrumb
             "",                                   // section_no（常に None）
-            idx.to_string().as_str(),             // order
+            order_str.as_str(),                   // order
             parent_slug.as_deref().unwrap_or(""), // parent_slug
             entry.url.as_str(),                   // source_url
-            product_models.join(",").as_str(),    // 検出済み型番（DESCRIBES 辺のもと）
-            signal_values.join(",").as_str(),     // マッチ済み signal（MENTIONS_SIGNAL 辺のもと）
+            models_joined.as_str(),               // 検出済み型番（DESCRIBES 辺のもと）
+            signals_joined.as_str(),              // マッチ済み signal（MENTIONS_SIGNAL 辺のもと）
         ]
         .join("\u{1f}");
         let hash = content_hash(&composite);

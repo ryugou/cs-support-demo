@@ -36,6 +36,13 @@ pub fn section_slug(url: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
+    // パスが空 / 非 ASCII のみで kebab 化が全て落ちた場合、"sec-" が衝突・不安定キーになる。
+    // 決定論フォールバックとして URL 全体の sha256 先頭 12 hex を使う（同一 URL → 同一 slug）。
+    if squeezed.is_empty() {
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(trimmed.as_bytes()));
+        return format!("sec-{}", &digest[..12]);
+    }
     format!("sec-{squeezed}")
 }
 
@@ -92,6 +99,19 @@ mod tests {
             section_slug("https://x/a/b/"),
             section_slug("https://x/a/b")
         );
+    }
+
+    #[test]
+    fn empty_or_non_ascii_path_gets_deterministic_hash_slug() {
+        // パスなし・非 ASCII のみのパスでも "sec-" 単独にならず、URL ごとに一意で安定
+        let a = section_slug("https://x/");
+        let b = section_slug("https://x/日本語のみ");
+        let c = section_slug("https://x/日本語のみ");
+        assert_ne!(a, "sec-");
+        assert_ne!(b, "sec-");
+        assert_ne!(a, b);
+        assert_eq!(b, c); // 決定論
+        assert!(b.starts_with("sec-"));
     }
 
     #[test]
