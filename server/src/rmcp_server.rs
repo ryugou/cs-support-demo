@@ -357,19 +357,7 @@ impl CsSupportRmcpServer {
                         )
                     })
                     .collect();
-                let hits = manual_hits
-                    .into_iter()
-                    .map(|h| SectionHit {
-                        section_key: h.section_key,
-                        title_ja: h.title,
-                        body_ja: Some(h.body),
-                        body_en: None,
-                        translation_status: None,
-                        breadcrumb: vec![h.breadcrumb],
-                        score: h.score,
-                        source_url: Some(h.source_url),
-                    })
-                    .collect();
+                let hits = manual_hits.into_iter().map(SectionHit::from).collect();
                 let body = SearchManualResponse { hits };
                 (retrieved, body)
             }

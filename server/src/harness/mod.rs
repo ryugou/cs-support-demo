@@ -63,21 +63,6 @@ pub struct EvaluationOutcome {
     pub audit_event_id: String,
 }
 
-/// manual_v1 経路（ManualHit）を LegacySection 経路と同じ `SectionHit` に薄く詰め替える。
-/// reserved フィールド body_original / original_hash は読まない（現行実装では未使用）。
-fn manual_hit_to_section_hit(hit: crate::model::ManualHit) -> SectionHit {
-    SectionHit {
-        section_key: hit.section_key,
-        title_ja: hit.title,
-        body_ja: Some(hit.body),
-        body_en: None,
-        translation_status: None,
-        breadcrumb: vec![hit.breadcrumb],
-        score: hit.score,
-        source_url: Some(hit.source_url),
-    }
-}
-
 impl Harness {
     pub fn build(
         config: &AppConfig,
@@ -474,7 +459,7 @@ impl Harness {
         // manual 取得を manual_schema で分岐する。ManualV1 は ManualStore（signal 絞り込み(A) +
         // body 全文(B) の max）、LegacySection は従来の tools.search_manual_with_snapshot。
         // 判定へは共通の best_manual_score / best_manual_sections に落とし、
-        // EvaluationOutcome.hits へは SectionHit に揃えて返す（manual_hit_to_section_hit で変換）。
+        // EvaluationOutcome.hits へは SectionHit に揃えて返す（From<ManualHit> で変換）。
         let (section_hits, retrieved_manual_ids): (Vec<SectionHit>, Vec<String>) =
             match ctx.manual_schema {
                 crate::config::ManualSchemaKind::ManualV1 => {
@@ -499,7 +484,7 @@ impl Harness {
                             )
                         })
                         .collect();
-                    let converted = hits.into_iter().map(manual_hit_to_section_hit).collect();
+                    let converted = hits.into_iter().map(SectionHit::from).collect();
                     (converted, ids)
                 }
                 crate::config::ManualSchemaKind::LegacySection => {

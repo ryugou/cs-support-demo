@@ -128,6 +128,23 @@ pub struct ManualHit {
     pub score: f32,
 }
 
+/// manual_v1 経路（ManualHit）を LegacySection 経路と同じ `SectionHit` に薄く詰め替える。
+/// reserved フィールド body_original / original_hash は読まない（現行実装では未使用）。
+impl From<ManualHit> for SectionHit {
+    fn from(hit: ManualHit) -> Self {
+        SectionHit {
+            section_key: hit.section_key,
+            title_ja: hit.title,
+            body_ja: Some(hit.body),
+            body_en: None,
+            translation_status: None,
+            breadcrumb: vec![hit.breadcrumb],
+            score: hit.score,
+            source_url: Some(hit.source_url),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ManualSectionView {
     pub section: serde_json::Value,

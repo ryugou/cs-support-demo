@@ -27,26 +27,22 @@ pub fn section_slug(url: &str) -> String {
     format!("sec-{squeezed}")
 }
 
-/// テンプレ YAML 先頭の `name:` をテナント schema 名に差し替える。
+/// テンプレ YAML のトップレベル `name` をテナント schema 名に差し替える。
 /// vegapunk は create_schema 時に YAML の name と登録名の一致を要求するため、
 /// 1 つの汎用テンプレを複数テナント（schema）に登録するにはこの差し替えが要る。
-pub fn with_schema_name(yaml: &str, schema: &str) -> String {
-    let mut out = String::with_capacity(yaml.len() + schema.len());
-    let mut replaced = false;
-    for line in yaml.lines() {
-        if !replaced
-            && line.trim_start().starts_with("name:")
-            && !line.starts_with(char::is_whitespace)
-        {
-            out.push_str("name: ");
-            out.push_str(schema);
-            replaced = true;
-        } else {
-            out.push_str(line);
-        }
-        out.push('\n');
-    }
-    out
+/// 文字列パッチでなく YAML として parse/set/serialize する（quoted 形式・flow style 等に頑健。
+/// コメントは登録用コピーからは落ちるが、リポジトリのテンプレファイル自体は変更しない）。
+pub fn with_schema_name(yaml: &str, schema: &str) -> anyhow::Result<String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| anyhow::anyhow!("parse schema template: {e}"))?;
+    let mapping = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("schema template root is not a mapping"))?;
+    mapping.insert(
+        serde_yaml::Value::String("name".to_string()),
+        serde_yaml::Value::String(schema.to_string()),
+    );
+    serde_yaml::to_string(&value).map_err(|e| anyhow::anyhow!("serialize schema template: {e}"))
 }
 
 #[cfg(test)]
@@ -62,12 +58,16 @@ mod tests {
     #[test]
     fn with_schema_name_replaces_only_top_level_name() {
         let yaml = "name: cs-support-manual\nversion: 1\nnodes:\n  Product:\n    attributes:\n      name: { type: string }\n";
-        let out = with_schema_name(yaml, "urtect");
-        assert!(out.starts_with("name: urtect\n"));
-        // ネストした `name:`（インデント付き）は変えない
-        assert!(out.contains("      name: { type: string }"));
-        // top-level name は 1 つだけ差し替わる
-        assert_eq!(out.matches("name: urtect").count(), 1);
+        let out = with_schema_name(yaml, "urtect").unwrap();
+        // 構造で検証する（再シリアライズで表記スタイルは変わりうるため）
+        let v: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(v["name"].as_str(), Some("urtect"));
+        // ネストした `name:` は変えない
+        assert_eq!(
+            v["nodes"]["Product"]["attributes"]["name"]["type"].as_str(),
+            Some("string")
+        );
+        assert_eq!(v["version"].as_i64(), Some(1));
     }
     #[test]
     fn slug_from_url_tail_is_stable_and_ascii_kebab() {

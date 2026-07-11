@@ -300,7 +300,7 @@ async fn main() -> Result<()> {
         &fs::read_to_string(&args.schema_file)
             .with_context(|| format!("read schema file {}", args.schema_file.display()))?,
         &args.schema,
-    );
+    )?;
     let lexicon = LexiconNormalizer::from_path(&args.lexicon_file)
         .with_context(|| format!("load signal lexicon {}", args.lexicon_file.display()))?;
     let top_url =

@@ -11,10 +11,17 @@ use unicode_normalization::UnicodeNormalization;
 
 const SNAPSHOT_MAX_NODES: i32 = 5000;
 
-/// title+body への直接性。manual パス専用: 内容語 bigram カバレッジ（Task 11）。
-/// legacy の `crate::mcp::section_score` 本体・sivira パスはこの変更の対象外。
-pub fn score_section(question: &str, title: &str, body: &str) -> f32 {
-    manual_directness_score(question, title, body)
+/// 完全部分文字列 → 1.0 / normalize_key 正規化後の部分文字列 → 0.95 の fast path。
+/// どちらでもなければ None（呼び出し側が run カバレッジ等で判定する）。
+/// query_norm は呼び出し側で 1 回だけ計算して渡す（節ごとに再計算しない）。
+fn substring_fast_path(question: &str, query_norm: &str, text: &str) -> Option<f32> {
+    if text.contains(question) {
+        return Some(1.0);
+    }
+    if !query_norm.is_empty() && normalize_key(text).contains(query_norm) {
+        return Some(0.95);
+    }
+    None
 }
 
 /// NFKC + lowercase のみ（非英数字を落とさない）。normalize_key と違い記号・空白を残す。
@@ -178,13 +185,23 @@ fn idf_weighted_score(runs: &[String], dfs: &[usize], corpus_len: usize, body_nf
     matched_weight / total_weight
 }
 
-/// テスト可能に切り出した本体ロジック: 質問と節本文の集合を受け取り、各節のスコアを返す。
+/// manual 直接性スコアの本体: 質問と節本文の集合を受け取り、各節のスコアを返す。
 /// `search_with_snapshot` はこれを ManualSection 群に対して使う（node 構造 → body 抽出は呼び出し側）。
-/// title は fast path 用に空文字を渡してよい（コーパス単位の呼び出しでは title 別枠は無い）。
+///
+/// 判定は body のみを見る（title を見ない）。title はしばしば症状名・見出しに過ぎず、
+/// 質問の一般的な話題（例:「カメラ」）を含むだけで具体的な回答本文が無いケースがあり、
+/// それを answerable と誤判定する false-positive の原因になるため。
+/// トレードオフ: 症状語がタイトルにしか無い薄い body では過小評価になり得るが、
+/// ingest（extract_main_text）はページ見出しを body 本文に含めて格納するため、
+/// 実データでは見出し語は body 側にも現れる。
+///
+/// スコア: fast path（完全部分文字列 1.0 / 正規化部分文字列 0.95）→
+/// run 単位 IDF 重み付きカバレッジ。run が取れない質問（全ひらがな等）は
+/// legacy の section_score にフォールバックする。
 pub(crate) fn score_against_corpus(question: &str, section_bodies: &[String]) -> Vec<f32> {
+    let query_norm = normalize_key(question);
     let Some(runs) = unique_content_runs(question) else {
         // run が 1 つも取れない質問（全ひらがな等）は legacy フォールバックを各節に適用する。
-        let query_norm = normalize_key(question);
         return section_bodies
             .iter()
             .map(|b| crate::mcp::section_score(&query_norm, question, b))
@@ -197,55 +214,10 @@ pub(crate) fn score_against_corpus(question: &str, section_bodies: &[String]) ->
         .iter()
         .zip(corpus_nfkc.iter())
         .map(|(body, body_nfkc)| {
-            // fast path: 完全部分文字列 → 1.0、正規化部分文字列 → 0.95
-            if body.contains(question) {
-                return 1.0;
-            }
-            let query_norm = normalize_key(question);
-            let body_norm = normalize_key(body);
-            if !query_norm.is_empty() && body_norm.contains(&query_norm) {
-                return 0.95;
-            }
-            idf_weighted_score(&runs, &dfs, corpus_nfkc.len(), body_nfkc)
+            substring_fast_path(question, &query_norm, body)
+                .unwrap_or_else(|| idf_weighted_score(&runs, &dfs, corpus_nfkc.len(), body_nfkc))
         })
         .collect()
-}
-
-/// manual パス専用の直接性スコア（Task 11: 内容語 run カバレッジ、等重み）。
-/// 1. 完全部分文字列 → 1.0
-/// 2. normalize_key 正規化後の部分文字列 → 0.95
-/// 3. 質問から内容語ラン（重複除去）を抽出し、run 単位で body (NFKC+lowercase, 非英数字は残す) に
-///    マッチするか判定（`run_matches`）、マッチした run の割合をスコアとする。
-///    単一節にはコーパスが無く IDF が定義できないため、ここは等重み。
-/// 4. run が 1 つも取れない質問（全ひらがな等）は legacy の section_score にフォールバック。
-///
-/// 実装メモ（brief からの意図的な差分）: fast path (1・2) は
-/// `title + "\n" + body` を見る。しかし run カバレッジ (3) は body のみを見る。
-/// title はしばしば症状名・見出しに過ぎず、質問の一般的な話題（例:「カメラ」）を
-/// 含むだけで具体的な回答本文が無いケースがある（実測: 浴室設置の質問に対し
-/// title「カメラの設置」が「カメラ」「設置」を含むだけで score が閾値を超えてしまう）。
-/// これは本タスクが修正対象とする false-positive とまったく同型の欠陥のため、
-/// カバレッジ判定は「回答本文に具体的な内容語があるか」を問う body 限定とした。
-///
-/// トレードオフ: 症状語がタイトルにしか無い薄い body では過小評価になり得る。
-/// ただし ingest（extract_main_text）はページ見出しを body 本文に含めて格納するため、
-/// 実データでは見出し語は body 側にも現れる。
-pub fn manual_directness_score(question: &str, title: &str, body: &str) -> f32 {
-    let text = format!("{title}\n{body}");
-    if text.contains(question) {
-        return 1.0;
-    }
-    let query_norm = normalize_key(question);
-    let text_norm = normalize_key(&text);
-    if !query_norm.is_empty() && text_norm.contains(&query_norm) {
-        return 0.95;
-    }
-    let Some(runs) = unique_content_runs(question) else {
-        return crate::mcp::section_score(&query_norm, question, &text);
-    };
-    let body_nfkc = nfkc_lowercase(body);
-    let matched = runs.iter().filter(|r| run_matches(r, &body_nfkc)).count();
-    matched as f32 / runs.len() as f32
 }
 
 /// snapshot の MENTIONS_SIGNAL 辺から、質問 signal に結線された ManualSection node_id 集合を返す。
@@ -327,38 +299,32 @@ impl ManualStore {
             .map(|n| n.attributes.get("body").cloned().unwrap_or_default())
             .collect();
         let corpus_scores = score_against_corpus(question, &bodies);
+        let query_norm = normalize_key(question);
+        let attr = |n: &crate::proto::graphrag::GraphNode, key: &str| -> String {
+            n.attributes.get(key).cloned().unwrap_or_default()
+        };
         let mut hits: Vec<ManualHit> = manual_sections
             .into_iter()
-            .zip(corpus_scores.into_iter())
-            .map(|(n, corpus_score)| {
-                let a = n.attributes.clone();
-                let title = a.get("title").cloned().unwrap_or_default();
-                let body = a.get("body").cloned().unwrap_or_default();
-                // title+body 対象の fast path は維持する(現行どおり): 完全部分文字列 → 1.0、
+            .zip(corpus_scores)
+            .zip(bodies)
+            .map(|((n, corpus_score), body)| {
+                let title = attr(n, "title");
+                // title 込みの fast path は維持する: 完全部分文字列 → 1.0、
                 // 正規化部分文字列 → 0.95。それ以外は body のみに対する IDF corpus スコアを使う。
                 let text = format!("{title}\n{body}");
-                let score = if text.contains(question) {
-                    1.0
-                } else {
-                    let query_norm = normalize_key(question);
-                    let text_norm = normalize_key(&text);
-                    if !query_norm.is_empty() && text_norm.contains(&query_norm) {
-                        0.95
-                    } else {
-                        corpus_score
-                    }
-                };
+                let score =
+                    substring_fast_path(question, &query_norm, &text).unwrap_or(corpus_score);
                 // signal 絞り込みに入っていれば最低 0.6 を下限にせず、score をそのまま使う（過剰応答を防ぐ）。
                 let in_signal = signal_narrowed.contains(&n.node_id);
                 (
                     in_signal,
                     score,
                     ManualHit {
-                        section_key: a.get("section_key").cloned().unwrap_or_default(),
+                        section_key: attr(n, "section_key"),
                         title,
                         body,
-                        source_url: a.get("source_url").cloned().unwrap_or_default(),
-                        breadcrumb: a.get("breadcrumb").cloned().unwrap_or_default(),
+                        source_url: attr(n, "source_url"),
+                        breadcrumb: attr(n, "breadcrumb"),
                         score,
                     },
                 )
@@ -472,20 +438,24 @@ mod tests {
     use super::*;
     use crate::harness::signal::Signal;
 
+    /// 単一節コーパスでスコアを取るテストヘルパ（production 経路と同じ score_against_corpus を使う）。
+    fn score_one(question: &str, body: &str) -> f32 {
+        score_against_corpus(question, &[body.to_string()])[0]
+    }
+
     #[test]
     fn score_exact_substring_is_one() {
-        // 質問がタイトル/本文の部分文字列 → 1.0（トラブルシュート系: タイトル=症状名）
-        let s = score_section(
+        // 質問が本文の部分文字列 → 1.0（トラブルシュート系: body 先頭に見出し=症状名）
+        let s = score_one(
             "SDカードが認識されない",
-            "SDカードが認識されない",
-            "抜き差ししてください",
+            "SDカードが認識されない 抜き差ししてください",
         );
         assert_eq!(s, 1.0);
     }
 
     #[test]
     fn score_unrelated_is_low() {
-        let s = score_section("送料はいくら", "SDカードが認識されない", "抜き差し");
+        let s = score_one("送料はいくら", "SDカードが認識されない 抜き差し");
         assert!(s < 0.6);
     }
 
@@ -498,48 +468,31 @@ mod tests {
     #[test]
     fn directness_low_when_content_words_absent() {
         // SD カード節に「推奨」「メーカー」の記載が無い → 0.6 未満
-        let title = "SDカードが認識されない";
         let body = "SDカードを一度抜き差ししてください。カードの向きを確認し、カチッと音がするまで挿入します。";
-        let s = manual_directness_score("SDカードの推奨メーカーはどこか", title, body);
+        let s = score_one("SDカードの推奨メーカーはどこか", body);
         assert!(s < 0.6, "expected < 0.6, got {s}");
     }
 
     #[test]
     fn directness_high_when_content_words_present() {
-        let title = "録画ルール（クラウド）";
         let body = "録画ルールの設定方法を説明します。設定画面から録画ルールを選択してください。";
-        let s = manual_directness_score("録画ルールの設定方法", title, body);
+        let s = score_one("録画ルールの設定方法", body);
         assert!(s > 0.6, "expected > 0.6, got {s}");
     }
 
     #[test]
     fn directness_low_for_unlisted_environment() {
-        let title = "カメラの設置";
+        // 「カメラ」「浴室」が本文に無い（設置のみ一致）→ 0.6 未満
         let body =
             "設置までのステップを説明します。壁面への取り付けは付属のブラケットを使用します。";
-        let s = manual_directness_score("カメラを浴室に設置できるか", title, body);
-        // 実測 0.333 (matched=設置のみ/3 runs)。brief は等重み版で 2/3≈0.67 になり
-        // 0.6 を超えると予測し、その場合は本テストを IDF 版テストへ移行してよいと
-        // 事前承認していたが、実装・実測では run 単位マッチにより「カメラ」も
-        // unmatched (body に断片も現れない) となるため 1/3 に留まり、このテストは
-        // 等重み版のままでも通る。数値の相違を記録した上でテストは維持する。
+        let s = score_one("カメラを浴室に設置できるか", body);
         assert!(s < 0.6, "expected < 0.6, got {s}");
-    }
-
-    #[test]
-    fn directness_exact_substring_still_one() {
-        let s = manual_directness_score(
-            "リセット穴を12秒押し続けます",
-            "工場出荷時リセット",
-            "リセット穴を12秒押し続けます。",
-        );
-        assert_eq!(s, 1.0);
     }
 
     #[test]
     fn directness_falls_back_for_hiragana_only_question() {
         // 内容ランが取れない質問はフォールバック（パニックしない・0.0..=1.0 を返す）
-        let s = manual_directness_score("これはどうすればいいの", "タイトル", "本文です。");
+        let s = score_one("これはどうすればいいの", "本文です。");
         assert!((0.0..=1.0).contains(&s));
     }
 
@@ -547,9 +500,8 @@ mod tests {
     fn directness_high_for_paraphrase_when_body_contains_heading() {
         // ingest は見出しテキストを body に含めるため、実データの body は
         // 症状語（タイトル相当）を先頭に持つ。言い換え質問でも body 側で拾える。
-        let title = "SDカードが認識されない";
         let body = "SDカードが認識されない SDカードを一度抜き差ししてください。";
-        let s = manual_directness_score("SDカードを認識しません。", title, body);
+        let s = score_one("SDカードを認識しません。", body);
         assert!(s > 0.6, "expected > 0.6, got {s}");
     }
 

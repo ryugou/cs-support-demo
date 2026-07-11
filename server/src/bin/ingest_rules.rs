@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
         &fs::read_to_string(&args.schema_file)
             .with_context(|| format!("read schema file {}", args.schema_file.display()))?,
         &args.schema,
-    );
+    )?;
     let client = VegapunkClient::connect(&args.endpoint, &token).await?;
     client
         .create_or_update_schema(&args.schema, schema_yaml)
