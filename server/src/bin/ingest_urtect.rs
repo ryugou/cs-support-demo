@@ -319,10 +319,10 @@ async fn main() -> Result<()> {
         .context("build http client")?;
 
     // 1. top ページ fetch → nav からページ一覧を列挙する。
-    // 2. 既存 ManualSection の content_hash マップ（差分 ingest 用）。
-    // 3. 既存グラフ snapshot（派生 edge の stale 検出用）。
+    // 2. 既存グラフ snapshot（差分 ingest の hash マップと派生 edge の stale 検出の両方に使う。
+    //    query_nodes は limit=1000 で取りこぼすと stale 検出が fail open になるため使わない）。
     // 互いに依存しない読み取りなので並行に発行する。
-    let (top_html, existing, existing_snapshot) = tokio::try_join!(
+    let (top_html, existing_snapshot) = tokio::try_join!(
         async {
             fetch(&http, top_url.as_str())
                 .await
@@ -330,20 +330,16 @@ async fn main() -> Result<()> {
         },
         async {
             client
-                .query_nodes(&args.schema, "ManualSection", Vec::new(), 1000)
-                .await
-                .context("query existing ManualSection")
-        },
-        async {
-            client
                 .graph_snapshot(&args.schema, 5000)
                 .await
-                .context("snapshot existing graph (stale-edge check)")
+                .context("snapshot existing graph (diff + stale-edge check)")
         },
     )?;
+    // snapshot が不完全だと差分判定・stale 検出の両方が信頼できないため fail closed。
     if existing_snapshot.truncated {
-        tracing::warn!(
-            "existing graph snapshot truncated; stale derived-edge verification is incomplete"
+        anyhow::bail!(
+            "existing graph snapshot truncated at node limit; \
+             cannot verify diff/stale-edge state — aborting ingest"
         );
     }
     // 既存の派生 edge（DESCRIBES / MENTIONS_SIGNAL）を from_id ごとに索引する。
@@ -374,24 +370,35 @@ async fn main() -> Result<()> {
     // 実質フラットになる。ページが複数あるのに全 depth 0 なら要目視確認（レポートに出す）。
     let nav_hierarchy_flat = enumerated_url_count > 1 && nav_entries.iter().all(|e| e.depth == 0);
 
-    // query_nodes の limit(1000) にちょうど達している場合、既存 ManualSection がそれ以上
-    // 存在し取りこぼしている可能性がある(この経路は total_count を返さないための代理シグナル)。
-    // レポート JSON に埋もれて見落とされないよう、ここでも警告ログを出しておく。
-    let existing_query_possibly_truncated = existing.len() >= 1000;
-    if existing_query_possibly_truncated {
-        tracing::warn!(
-            count = existing.len(),
-            "existing ManualSection query hit the 1000-row limit; diff ingest may be incomplete"
-        );
-    }
-    let existing_hash: HashMap<String, String> = existing
-        .into_iter()
+    // 差分 ingest 用の既存 hash マップ。snapshot（完全性は上で fail closed 済み）から構築する。
+    let existing_hash: HashMap<String, String> = existing_snapshot
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "ManualSection")
         .filter_map(|n| {
             let key = n.attributes.get("section_key")?.clone();
             let hash = n.attributes.get("content_hash")?.clone();
             Some((key, hash))
         })
         .collect();
+
+    // nav に現れた既存 section の追跡（fetch 失敗・空本文でも nav に居る限り slug は確定する）。
+    // crawl 後、「既存にあるが今回 nav に居ない」section は削除/非公開化とみなし fail closed する
+    // （backend に delete が無く、stale な本文と派生 edge が検索候補に残り続けるため）。
+    let seen_slugs: HashSet<String> = nav_entries.iter().map(|e| section_slug(&e.url)).collect();
+    let disappeared: Vec<&String> = existing_hash
+        .keys()
+        .filter(|k| !seen_slugs.contains(*k))
+        .collect();
+    if !disappeared.is_empty() {
+        anyhow::bail!(
+            "{} existing ManualSection(s) are no longer in the nav ({:?}); the backend exposes \
+             no delete, so their stale content/edges would keep polluting search — recreate the \
+             tenant schema and re-ingest from scratch",
+            disappeared.len(),
+            disappeared
+        );
+    }
 
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -584,7 +591,6 @@ async fn main() -> Result<()> {
             "top_url": top_url.as_str(),
             "enumerated_url_count": enumerated_url_count,
             "nav_hierarchy_flat": nav_hierarchy_flat,
-            "existing_manual_section_query_possibly_truncated": existing_query_possibly_truncated,
             "ingested_manual_sections": ingested,
             "skipped_unchanged": skipped,
             "expected_nodes": expected_nodes,
