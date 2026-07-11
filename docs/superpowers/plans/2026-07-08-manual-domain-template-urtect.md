@@ -1500,3 +1500,30 @@ CLAUDE.md コミット前チェックリスト: `simplify` → `code-review` フ
 **Type consistency:** `NewKnownResolution` は Task 5 で `rationale_text`/`manual_section_keys` に統一（Task 7 handler も同名）。`ManualSchemaKind` は Task 2 定義を Task 6/7 で参照。`ManualHit`/`ManualSectionView`/`ManualProductCandidate` は Task 4 model.rs 定義を Task 6/7 で参照。`score_section` は Task 4 で定義し `mcp::section_score`（pub(crate)）を再利用。
 
 **Placeholder scan:** 各コード step に実コードあり。fixture は完全な JSON。実機 fetch 依存（Task 9 本体・Task 10）は統合検証として明示、純関数は単体テスト化。
+
+---
+
+## 検証結果（2026-07-11 実機・vegapunk backend）
+
+Task 10 + scorer 改良（Task 11: bigram カバレッジ / Task 12: run 単位 IDF + 漢字限定 bigram 救済）後の最終結果。
+
+- ingest: 69 ページ / 252 nodes / 313 edges / fetch 失敗 0 / nav 階層検出
+- A群（回答されるべき）: **6/6 allowed**、全て score 1.0、source_url 付き
+- B群（第1・2層）: **5/5 escalate**（「警察に出したい」は語彙 gap により第3層経由 — 安全側）
+- C群（未記載）: NAS 0.27 / 他社カメラ 0.15 で escalate。「SD推奨メーカー」はマニュアル実記載
+  （製品ページ「推奨するSDカード: WD Purple」）のため allowed が正解 = §6 の未記載確認で C 群から除外
+- D群（マルチターン）: Wi-Fi→焦げ臭い で累積再判定 → 第1層 escalate
+- Done3: WORM に provenance（gov=[kr_id] / retrieved_node_ids=ManualSection）
+- Done4: 学習ループ一周（escalate → add_known_resolution → 再質問で KR 回答。
+  BASED_ON→ManualSection / BECAUSE→Rationale / HAS_SIGNAL 全て結線）
+- Done5: 「iPhoneで…浴室に設置…」→ KR blocked（leftover channel_app_ios）+ manual 0.47 < 0.6
+  → escalate reason=unknown_added_signal（包含方向のみ再利用の実証）
+- 分離マージン: answerable=1.0 vs 記載なし 0.15〜0.47（threshold 0.6）
+
+実機で発見し修正した統合バグ: schema name 差し替え / read tool の出力スキーマ panic（Json<Value> 不可）/
+gRPC 4MB decode 上限 / 30s timeout / Google Sites JS 混入 / bigram 断片の希釈・カタカナ誤救済。
+
+チューニング残（fixture 加算のみ・業務レビュー枠）: legal_privacy_question の surface_forms 追補
+（「警察に出」等）/ MENTIONS_SIGNAL ゼロの 10 節への語彙追補 / ADC-V724X の DESCRIBES 0 件 /
+lexicon 更新時は content_hash 不変のため差分 ingest では MENTIONS_SIGNAL が張り直されない
+（--force 再 ingest か hash への語彙版数混入が次フェーズ課題）/ evaluate 毎の全 snapshot 取得の最適化。
