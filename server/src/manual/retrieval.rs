@@ -272,25 +272,54 @@ impl ManualStore {
         schema: &str,
         question: &str,
         signals: &SignalSet,
+        product_key: Option<&str>,
         top_k: usize,
     ) -> Result<Vec<ManualHit>> {
         let snap = self.snapshot(schema).await?;
-        self.search_with_snapshot(schema, question, signals, top_k, &snap)
+        self.search_with_snapshot(schema, question, signals, product_key, top_k, &snap)
     }
 
+    /// `product_key` が Some のとき、候補 ManualSection は
+    /// (a) 当該 Product への DESCRIBES 辺を持つ、または (b) DESCRIBES 辺を一切持たない
+    /// （機種非依存ページはどの機種にも適用される）のいずれかに限定する。
+    /// 他機種のみを DESCRIBES する節は除外する。None のときは絞り込まない（従来通り）。
     pub fn search_with_snapshot(
         &self,
-        _schema: &str,
+        schema: &str,
         question: &str,
         signals: &SignalSet,
+        product_key: Option<&str>,
         top_k: usize,
         snapshot: &GetGraphSnapshotResponse,
     ) -> Result<Vec<ManualHit>> {
         let signal_narrowed = sections_for_signals(snapshot, signals);
+        // product_key が Some のときだけ DESCRIBES 辺を走査する（None の hot path で
+        // 無駄な snapshot.edges スキャンをしない）。除外対象は「何らかの DESCRIBES を持つが
+        // 当該 Product への DESCRIBES は持たない」節（＝他機種専用ページ）の 1 集合に畳む。
+        let excluded_by_product: Option<HashSet<String>> = product_key.map(|pk| {
+            let target = manual_node_id(schema, "Product", pk);
+            let mut describes_any: HashSet<String> = HashSet::new();
+            let mut describes_target: HashSet<String> = HashSet::new();
+            for e in snapshot.edges.iter().filter(|e| e.edge_type == "DESCRIBES") {
+                describes_any.insert(e.from_id.clone());
+                if e.to_id == target {
+                    describes_target.insert(e.from_id.clone());
+                }
+            }
+            describes_any
+                .difference(&describes_target)
+                .cloned()
+                .collect()
+        });
         let manual_sections: Vec<_> = snapshot
             .nodes
             .iter()
             .filter(|n| n.node_type == "ManualSection")
+            .filter(|n| {
+                excluded_by_product
+                    .as_ref()
+                    .is_none_or(|excluded| !excluded.contains(&n.node_id))
+            })
             .collect();
         // IDF 版 corpus スコア（run 単位マッチ + コーパス IDF 重み、body のみ対象）。
         // DF は質問 1 回・snapshot 全体に対して 1 度だけ計算される(score_against_corpus 内部)。
@@ -549,6 +578,162 @@ mod tests {
             hits.iter().any(|s| *s > 0.6),
             "expected some > 0.6, got {hits:?}"
         );
+    }
+
+    /// 実ネットワークに繋がない dummy client（connect_lazy は遅延接続で即座に返る）。
+    fn dummy_store() -> ManualStore {
+        let client = crate::vegapunk::VegapunkClient::connect_lazy("http://127.0.0.1:1", "test")
+            .expect("connect_lazy");
+        ManualStore::new(Arc::new(client))
+    }
+
+    // connect_lazy は tonic の内部リアクタが Tokio ランタイム下での呼び出しを要求するため、
+    // このテストは #[tokio::test] にする（body 自体は await しない）。
+    #[tokio::test]
+    async fn search_with_snapshot_scopes_to_product_via_describes_or_no_describes() {
+        // A: ADC-V724 を DESCRIBES / B: ADC-VC727P のみを DESCRIBES / C: DESCRIBES 辺なし（機種非依存）
+        // すべて同一本文（質問の完全部分文字列）で fast path 1.0 を取り、絞り込みだけを検証する。
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let question = "SDカードが認識されない場合の対処";
+        let section_node = |key: &str| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), key.to_string()),
+                ("title".to_string(), key.to_string()),
+                ("body".to_string(), question.to_string()),
+                ("source_url".to_string(), String::new()),
+                ("breadcrumb".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        let product_node = |key: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, "Product", key),
+                node_type: "Product".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: HashMap::new(),
+            }
+        };
+        let describes_edge = |section_key: &str, product_key: &str| -> PE {
+            PE {
+                edge_id: String::new(),
+                from_id: manual_node_id(schema, "ManualSection", section_key),
+                to_id: manual_node_id(schema, "Product", product_key),
+                edge_type: "DESCRIBES".to_string(),
+            }
+        };
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![
+                section_node("sec-a"),
+                section_node("sec-b"),
+                section_node("sec-c"),
+                product_node("ADC-V724"),
+                product_node("ADC-VC727P"),
+            ],
+            edges: vec![
+                describes_edge("sec-a", "ADC-V724"),
+                describes_edge("sec-b", "ADC-VC727P"),
+            ],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                question,
+                &SignalSet::new(),
+                Some("ADC-V724"),
+                10,
+                &snap,
+            )
+            .expect("search_with_snapshot");
+        let keys: BTreeSet<&str> = hits.iter().map(|h| h.section_key.as_str()).collect();
+        assert!(keys.contains("sec-a"), "expected sec-a in {keys:?}");
+        assert!(keys.contains("sec-c"), "expected sec-c in {keys:?}");
+        assert!(!keys.contains("sec-b"), "sec-b must be excluded: {keys:?}");
+    }
+
+    // 同じ describes-edge 構成でも product_key が None のときは絞り込まない（従来通り）ことの
+    // 非回帰テスト（codex レビュー Suggestion 対応）。
+    #[tokio::test]
+    async fn search_with_snapshot_does_not_scope_when_product_key_is_none() {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let question = "SDカードが認識されない場合の対処";
+        let section_node = |key: &str| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), key.to_string()),
+                ("title".to_string(), key.to_string()),
+                ("body".to_string(), question.to_string()),
+                ("source_url".to_string(), String::new()),
+                ("breadcrumb".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        let product_node = |key: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, "Product", key),
+                node_type: "Product".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: HashMap::new(),
+            }
+        };
+        let describes_edge = |section_key: &str, product_key: &str| -> PE {
+            PE {
+                edge_id: String::new(),
+                from_id: manual_node_id(schema, "ManualSection", section_key),
+                to_id: manual_node_id(schema, "Product", product_key),
+                edge_type: "DESCRIBES".to_string(),
+            }
+        };
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![
+                section_node("sec-a"),
+                section_node("sec-b"),
+                section_node("sec-c"),
+                product_node("ADC-V724"),
+                product_node("ADC-VC727P"),
+            ],
+            edges: vec![
+                describes_edge("sec-a", "ADC-V724"),
+                describes_edge("sec-b", "ADC-VC727P"),
+            ],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(schema, question, &SignalSet::new(), None, 10, &snap)
+            .expect("search_with_snapshot");
+        let keys: BTreeSet<&str> = hits.iter().map(|h| h.section_key.as_str()).collect();
+        assert!(keys.contains("sec-a"));
+        assert!(keys.contains("sec-b"));
+        assert!(keys.contains("sec-c"));
     }
 
     #[test]

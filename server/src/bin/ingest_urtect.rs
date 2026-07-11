@@ -408,7 +408,6 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        let hash = content_hash(&body);
         let slug = section_slug(&entry.url);
 
         // 親子: 現在の depth 以上を積み戻し、直近の浅い entry を親にする。
@@ -431,21 +430,40 @@ async fn main() -> Result<()> {
             breadcrumb: breadcrumb.clone(),
         });
 
+        // 派生属性（型番検出・signal 検出）は skip 判定より前に計算する。ハッシュに
+        // これらも含めることで、本文が変わらなくても nav 構造・lexicon・型番検出ロジックの
+        // 変更が diff-ingest の skip 判定に反映される（本文だけを見ると変更を見逃す）。
+        let product_models = detect_product_models(&body);
+        let signal_values: Vec<String> = lexicon
+            .normalize(&body)
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        // 各フィールドを区切り文字 \x1f で連結し、決定論的な複合ハッシュにする。
+        // section_no は常に None（未実装）なので空文字列で固定する。
+        let composite = [
+            body.as_str(),                        // body（正規化済み）
+            title.as_str(),                       // title
+            breadcrumb.as_str(),                  // breadcrumb
+            "",                                   // section_no（常に None）
+            idx.to_string().as_str(),             // order
+            parent_slug.as_deref().unwrap_or(""), // parent_slug
+            entry.url.as_str(),                   // source_url
+            product_models.join(",").as_str(),    // 検出済み型番（DESCRIBES 辺のもと）
+            signal_values.join(",").as_str(),     // マッチ済み signal（MENTIONS_SIGNAL 辺のもと）
+        ]
+        .join("\u{1f}");
+        let hash = content_hash(&composite);
+
         if existing_hash.get(&slug) == Some(&hash) {
             // 未変更: 子の breadcrumb/parent 継続のためスタックには積んだが、upsert はスキップする。
             skipped += 1;
             continue;
         }
 
-        let product_models = detect_product_models(&body);
         for model in &product_models {
             *describes_by_model.entry(model.clone()).or_insert(0) += 1;
         }
-        let signal_values: Vec<String> = lexicon
-            .normalize(&body)
-            .iter()
-            .map(|s| s.as_str().to_string())
-            .collect();
         if signal_values.is_empty() {
             zero_signal_sections.push(slug.clone());
         }

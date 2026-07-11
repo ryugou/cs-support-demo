@@ -343,6 +343,7 @@ impl CsSupportRmcpServer {
                         &ctx.schema,
                         &req.query_ja,
                         &signals,
+                        req.product_key.as_deref(),
                         req.top_k.unwrap_or(5).max(1) as usize,
                     )
                     .await
@@ -451,11 +452,20 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<GetProductRequest>,
     ) -> Result<Json<ProductView>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let view = self
-            .tools
-            .get_product(&ctx.schema, &req.product_key)
-            .await
-            .map_err(to_error)?;
+        let view = match ctx.manual_schema {
+            // TODO: implement ManualStore::get_product (Product + DESCRIBES sections + TOC)
+            crate::config::ManualSchemaKind::ManualV1 => {
+                return Err(ErrorData::invalid_params(
+                    "get_product is not supported for manual_v1 schemas yet; use resolve_product + search_manual",
+                    None,
+                ));
+            }
+            crate::config::ManualSchemaKind::LegacySection => self
+                .tools
+                .get_product(&ctx.schema, &req.product_key)
+                .await
+                .map_err(to_error)?,
+        };
         self.harness
             .audit_with_nodes(
                 &ctx,
@@ -898,7 +908,12 @@ impl CsSupportRmcpServer {
         // admission 判定（役割・語彙・NG 語）は Harness に一元化されている
         let signal_set = self
             .harness
-            .admit_known_resolution(&ctx, &req.signals, &req.answer)
+            .admit_known_resolution(
+                &ctx,
+                &req.signals,
+                &req.answer,
+                req.rationale_text.as_deref(),
+            )
             .map_err(|err| ErrorData::invalid_request(err.to_string(), None))?;
         let store = self.harness.store().map_err(to_error)?;
         let new_kr = NewKnownResolution {
@@ -915,7 +930,7 @@ impl CsSupportRmcpServer {
             manual_section_keys: req.manual_section_keys.clone(),
         };
         let kr_id = store
-            .insert_known_resolution(&ctx.schema, &new_kr)
+            .insert_known_resolution(&ctx.schema, &new_kr, ctx.manual_schema)
             .await
             .map_err(to_error)?;
         let audit_event_id = self

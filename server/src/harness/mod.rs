@@ -270,12 +270,20 @@ impl Harness {
         ctx: &RequestContext,
         signals: &[String],
         answer: &str,
+        rationale_text: Option<&str>,
     ) -> Result<signal::SignalSet> {
         // authoritative の担い手のみ（supervisor / admin）
         if !matches!(ctx.actor.role, authn::Role::Supervisor | authn::Role::Admin) {
             anyhow::bail!(
                 "permission_denied: add_known_resolution requires supervisor or admin role"
             );
+        }
+        // legacy schema (sivira) には Rationale ノード型が無いため、rationale_text を
+        // サイレントに落とすのではなく admission 側で拒否する（build 側は無視するだけになる）。
+        if ctx.manual_schema == crate::config::ManualSchemaKind::LegacySection
+            && rationale_text.is_some()
+        {
+            anyhow::bail!("rationale_text is not supported on legacy schemas");
         }
         // 語彙外 signal は照合不能なので拒否
         if signals.is_empty() {
@@ -471,6 +479,7 @@ impl Harness {
                         &ctx.schema,
                         question,
                         &accumulated,
+                        product_key,
                         5,
                         &snapshot,
                     )?;
@@ -644,18 +653,35 @@ impl Harness {
     }
 
     /// 訂正時の root_cause 切り分け（S1-5）: 正しい根拠がグラフ内に存在したかを再検索で判定。
+    /// manual 取得は ctx.manual_schema で分岐する（evaluate と同じ分岐方針）。
+    /// LegacySection は従来どおり tools.search_manual を使う（挙動を変えない）。
     pub async fn root_cause_probe(
         &self,
         ctx: &RequestContext,
         corrected_answer: &str,
         tools: &ToolService,
     ) -> Result<rules::RootCause> {
-        let hits = tools
-            .search_manual(&ctx.schema, corrected_answer, None, 3)
-            .await?;
-        let found = hits
-            .first()
-            .map(|h| h.score >= self.thresholds.mid)
+        let best_score: Option<f32> = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self
+                    .manual
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("manual store not configured"))?;
+                let signals = self.normalizer.normalize(corrected_answer);
+                let hits = store
+                    .search(&ctx.schema, corrected_answer, &signals, None, 3)
+                    .await?;
+                hits.first().map(|h| h.score)
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let hits = tools
+                    .search_manual(&ctx.schema, corrected_answer, None, 3)
+                    .await?;
+                hits.first().map(|h| h.score)
+            }
+        };
+        let found = best_score
+            .map(|score| score >= self.thresholds.mid)
             .unwrap_or(false);
         Ok(if found {
             rules::RootCause::RetrievalMiss
@@ -751,6 +777,37 @@ mod tests {
         assert_eq!(ctx.schema, "sivira-cs-demo");
         assert_eq!(ctx.actor.sub, "op-001");
         assert!(!ctx.request_id.is_empty());
+    }
+
+    // admission 層（Harness::admit_known_resolution）が legacy schema の rationale_text を
+    // 拒否することの直接テスト（codex レビュー Suggestion 対応）。
+    // legacy schema には Rationale ノード型が無いため、build 側で無視するのではなく
+    // ここで fail closed にする必要がある。
+    #[test]
+    fn admit_known_resolution_rejects_rationale_text_on_legacy_schema() {
+        let harness = harness_for_test();
+        let ctx = RequestContext {
+            actor: authn::Actor {
+                sub: "sup-001".to_string(),
+                role: authn::Role::Supervisor,
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+            },
+            scope: scope::AccessScope {
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+                max_sensitivity: None,
+                label_allowlist: None,
+            },
+            schema: "sivira-cs-demo".to_string(),
+            request_id: "req-test".to_string(),
+            manual_schema: crate::config::ManualSchemaKind::LegacySection,
+        };
+        let err = harness
+            .admit_known_resolution(&ctx, &["mold".to_string()], "answer", Some("because"))
+            .expect_err("legacy schema must reject rationale_text");
+        assert!(
+            err.to_string().contains("rationale_text"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

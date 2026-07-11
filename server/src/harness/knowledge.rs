@@ -173,10 +173,19 @@ pub struct NewKnownResolution {
 
 /// KR 1 件をグラフ表現（KR ノード + Signal ノード + HAS_SIGNAL / BECAUSE 辺）に組み立てる。
 /// signal_set を JSON 属性に畳まない（I2）。予約フィールドは空で持たせる（S1-3）。
+///
+/// `schema_kind` でスキーマ形状を分岐する:
+/// - `ManualV1`: Rationale ノード + BECAUSE→Rationale（rationale_text がある場合）、
+///   BASED_ON→ManualSection（manual_section_keys 分）。
+/// - `LegacySection`: Rationale ノード型もBASED_ON辺も持たないため、KR から
+///   section へ直接 BECAUSE 辺を張る（Step 1 の旧形状）。rationale_text は
+///   admission（Harness::admit_known_resolution）側で legacy を拒否済みの前提のため、
+///   ここでは無視する。
 pub fn build_known_resolution_graph(
     schema: &str,
     kr_id: &str,
     kr: &NewKnownResolution,
+    schema_kind: crate::config::ManualSchemaKind,
 ) -> GraphBuild {
     let kr_node_id = harness_node_id(schema, "KnownResolution", kr_id);
     let mut nodes = vec![GraphNode {
@@ -229,30 +238,45 @@ pub fn build_known_resolution_graph(
             attributes: Vec::new(),
         });
     }
-    // 判断理由 → Rationale ノード + BECAUSE
-    if let Some(text) = &kr.rationale_text {
-        let rationale_id = harness_node_id(schema, "Rationale", &format!("{kr_id}-r"));
-        nodes.push(GraphNode {
-            id: rationale_id.clone(),
-            node_type: "Rationale".to_string(),
-            attributes: vec![
-                ("rationale_id".to_string(), format!("{kr_id}-r")),
-                ("text".to_string(), text.clone()),
-            ],
-        });
-        edges.push(GraphEdge {
-            from_id: kr_node_id.clone(),
-            to_id: rationale_id,
-            edge_type: "BECAUSE".to_string(),
-            attributes: Vec::new(),
-        });
+    // 判断理由 → Rationale ノード + BECAUSE（ManualV1 のみ。legacy には Rationale ノード型が無い。
+    // rationale_text は admission = Harness::admit_known_resolution 側で legacy を拒否済みの
+    // 前提のため、ここでは schema_kind で見るだけで足りる）。
+    if schema_kind == crate::config::ManualSchemaKind::ManualV1 {
+        if let Some(text) = &kr.rationale_text {
+            let rationale_id = harness_node_id(schema, "Rationale", &format!("{kr_id}-r"));
+            nodes.push(GraphNode {
+                id: rationale_id.clone(),
+                node_type: "Rationale".to_string(),
+                attributes: vec![
+                    ("rationale_id".to_string(), format!("{kr_id}-r")),
+                    ("text".to_string(), text.clone()),
+                ],
+            });
+            edges.push(GraphEdge {
+                from_id: kr_node_id.clone(),
+                to_id: rationale_id,
+                edge_type: "BECAUSE".to_string(),
+                attributes: Vec::new(),
+            });
+        }
     }
-    // マニュアル出典 → BASED_ON → ManualSection
+    // マニュアル出典: ManualV1 は BASED_ON→ManualSection、legacy には ManualSection/BASED_ON が
+    // 無いため KR → section へ直接 BECAUSE 辺を張る（Step 1 の旧形状）。
     for section_key in &kr.manual_section_keys {
+        let (to_id, edge_type) = match schema_kind {
+            crate::config::ManualSchemaKind::ManualV1 => (
+                crate::manual::schema_ids::manual_node_id(schema, "ManualSection", section_key),
+                "BASED_ON",
+            ),
+            crate::config::ManualSchemaKind::LegacySection => (
+                crate::ingest::section_node_id(schema, section_key),
+                "BECAUSE",
+            ),
+        };
         edges.push(GraphEdge {
             from_id: kr_node_id.clone(),
-            to_id: crate::manual::schema_ids::manual_node_id(schema, "ManualSection", section_key),
-            edge_type: "BASED_ON".to_string(),
+            to_id,
+            edge_type: edge_type.to_string(),
             attributes: Vec::new(),
         });
     }
@@ -378,9 +402,10 @@ impl KnowledgeStore {
         &self,
         schema: &str,
         kr: &NewKnownResolution,
+        schema_kind: crate::config::ManualSchemaKind,
     ) -> Result<String> {
         let kr_id = format!("kr-{}", uuid::Uuid::new_v4());
-        let build = build_known_resolution_graph(schema, &kr_id, kr);
+        let build = build_known_resolution_graph(schema, &kr_id, kr, schema_kind);
         self.client.upsert_graph_low_level(build).await?;
         Ok(kr_id)
     }
@@ -648,7 +673,12 @@ mod tests {
             rationale_text: Some("メーカー動作確認リストに基づく".to_string()),
             manual_section_keys: vec!["sec-sd-not-recognized".to_string()],
         };
-        let build = build_known_resolution_graph("urtect", "kr-1", &new_kr);
+        let build = build_known_resolution_graph(
+            "urtect",
+            "kr-1",
+            &new_kr,
+            crate::config::ManualSchemaKind::ManualV1,
+        );
         // Rationale ノード + BECAUSE 辺
         assert_eq!(
             build
@@ -704,7 +734,12 @@ mod tests {
             rationale_text: None,
             manual_section_keys: vec![],
         };
-        let build = build_known_resolution_graph("urtect", "kr-2", &new_kr);
+        let build = build_known_resolution_graph(
+            "urtect",
+            "kr-2",
+            &new_kr,
+            crate::config::ManualSchemaKind::ManualV1,
+        );
         assert_eq!(
             build
                 .nodes
@@ -737,7 +772,12 @@ mod tests {
             rationale_text: Some("doc-1#storage の保管条件に基づく".to_string()),
             manual_section_keys: vec!["doc-1#storage".to_string()],
         };
-        let build = build_known_resolution_graph("sivira-cs-demo", "kr-test", &new_kr);
+        let build = build_known_resolution_graph(
+            "sivira-cs-demo",
+            "kr-test",
+            &new_kr,
+            crate::config::ManualSchemaKind::ManualV1,
+        );
         let kr_node = build
             .nodes
             .iter()
@@ -781,5 +821,52 @@ mod tests {
                 "missing reserved {key}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_schema_kr_graph_uses_because_edges_to_sections_no_rationale_or_based_on() {
+        // legacy (sivira) schema には Rationale ノード型も BASED_ON 辺も無い。
+        // KR → section へ直接 BECAUSE 辺を張る Step 1 の旧形状に一致すること（regression 回避）。
+        let new_kr = NewKnownResolution {
+            signal_set: [Signal::new("mold")].into_iter().collect(),
+            applicability: "全ロット".to_string(),
+            answer: "廃棄してください".to_string(),
+            origin: "escalation:esc-1".to_string(),
+            created_by: "sup-001".to_string(),
+            rationale_text: None,
+            manual_section_keys: vec!["doc-1#storage".to_string()],
+        };
+        let build = build_known_resolution_graph(
+            "sivira-cs-demo",
+            "kr-legacy",
+            &new_kr,
+            crate::config::ManualSchemaKind::LegacySection,
+        );
+        assert_eq!(
+            build
+                .nodes
+                .iter()
+                .filter(|n| n.node_type == "Rationale")
+                .count(),
+            0
+        );
+        assert_eq!(
+            build
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == "BASED_ON")
+                .count(),
+            0
+        );
+        let because_edges: Vec<_> = build
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "BECAUSE")
+            .collect();
+        assert_eq!(because_edges.len(), 1);
+        assert_eq!(
+            because_edges[0].to_id,
+            crate::ingest::section_node_id("sivira-cs-demo", "doc-1#storage")
+        );
     }
 }
