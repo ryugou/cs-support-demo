@@ -443,19 +443,20 @@ async fn main() -> Result<()> {
         let (title, raw_body) = extract_main_text(&html);
         let body = normalize_body(&raw_body);
 
-        // 200 だが本文が空(ログイン/同意/エラー画面などを本文として取ってしまった可能性)。
-        // 既存 section なら fetch 失敗と同じく再検証不能として fail closed、新規なら記録して継続。
-        if title.is_empty() && body.is_empty() {
+        // 200 だが本文が空(ログイン/同意/エラー画面や抽出失敗の可能性)。title の有無に
+        // よらず body が空なら検索対象になり得ない。既存 section なら fetch 失敗と同じく
+        // 再検証不能として fail closed、新規なら記録して継続（空 body を ingest しない）。
+        if body.is_empty() {
             if existing_hash.contains_key(&slug) {
                 anyhow::bail!(
-                    "empty title and body for existing section {slug} ({}); cannot verify \
+                    "empty body for existing section {slug} ({}); cannot verify \
                      staleness — aborting ingest (retry, or recreate the tenant schema)",
                     entry.url
                 );
             }
             tracing::warn!(
                 url = %entry.url,
-                "empty title and body after extraction; skipping (unexpected page content?)"
+                "empty body after extraction; skipping (unexpected page content?)"
             );
             empty_content.push(entry.url.clone());
             continue;
