@@ -208,7 +208,9 @@ pub struct AddKnownResolutionRequest {
     pub origin_escalation_id: Option<String>,
     /// 担当者の判断理由（任意）。BECAUSE → Rationale で残す
     pub rationale_text: Option<String>,
-    /// マニュアル出典 section（BASED_ON → ManualSection で結線）
+    /// マニュアル出典 section（manual_v1: BASED_ON → ManualSection / legacy: BECAUSE → section）。
+    /// 旧 field 名 `rationale_section_keys` は deprecated alias として受理する（後方互換）。
+    #[serde(default, alias = "rationale_section_keys")]
     pub manual_section_keys: Vec<String>,
 }
 

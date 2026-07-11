@@ -320,8 +320,9 @@ async fn main() -> Result<()> {
 
     // 1. top ページ fetch → nav からページ一覧を列挙する。
     // 2. 既存 ManualSection の content_hash マップ（差分 ingest 用）。
+    // 3. 既存グラフ snapshot（派生 edge の stale 検出用）。
     // 互いに依存しない読み取りなので並行に発行する。
-    let (top_html, existing) = tokio::try_join!(
+    let (top_html, existing, existing_snapshot) = tokio::try_join!(
         async {
             fetch(&http, top_url.as_str())
                 .await
@@ -333,7 +334,31 @@ async fn main() -> Result<()> {
                 .await
                 .context("query existing ManualSection")
         },
+        async {
+            client
+                .graph_snapshot(&args.schema, 5000)
+                .await
+                .context("snapshot existing graph (stale-edge check)")
+        },
     )?;
+    if existing_snapshot.truncated {
+        tracing::warn!(
+            "existing graph snapshot truncated; stale derived-edge verification is incomplete"
+        );
+    }
+    // 既存の派生 edge（DESCRIBES / MENTIONS_SIGNAL）を from_id ごとに索引する。
+    // backend に delete API が無いため、再 ingest で「除去が必要になる」edge 変化
+    // （旧 edge が新しい派生集合に含まれない）を検出したら fail closed にする
+    // （検索側は snapshot 上の全 DESCRIBES を信頼するため、stale edge は誤回答に直結する）。
+    let mut old_derived: HashMap<String, HashSet<String>> = HashMap::new();
+    for e in &existing_snapshot.edges {
+        if e.edge_type == "DESCRIBES" || e.edge_type == "MENTIONS_SIGNAL" {
+            old_derived
+                .entry(e.from_id.clone())
+                .or_default()
+                .insert(e.to_id.clone());
+        }
+    }
 
     // top ページは 1 度だけ parse し、タイトル抽出と nav 列挙の両方で使い回す。
     let top_document = Html::parse_document(&top_html);
@@ -459,6 +484,47 @@ async fn main() -> Result<()> {
             // 未変更: 子の breadcrumb/parent 継続のためスタックには積んだが、upsert はスキップする。
             skipped += 1;
             continue;
+        }
+
+        // 変更された既存 section について、旧 DESCRIBES / MENTIONS_SIGNAL の宛先が
+        // 新しい派生集合に全て含まれるか検証する。含まれない（= 除去が必要な）edge が
+        // あれば fail closed（upsert は追加しかできず、stale edge が検索を誤らせるため）。
+        if existing_hash.contains_key(&slug) {
+            let sec_id = cs_support_mcp::manual::schema_ids::manual_node_id(
+                &args.schema,
+                cs_support_mcp::manual::schema_ids::KIND_SECTION,
+                &slug,
+            );
+            if let Some(old_targets) = old_derived.get(&sec_id) {
+                let new_targets: HashSet<String> = product_models
+                    .iter()
+                    .map(|m| {
+                        cs_support_mcp::manual::schema_ids::manual_node_id(
+                            &args.schema,
+                            cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
+                            m,
+                        )
+                    })
+                    .chain(signal_values.iter().map(|s| {
+                        cs_support_mcp::manual::schema_ids::manual_node_id(
+                            &args.schema,
+                            "Signal",
+                            s,
+                        )
+                    }))
+                    .collect();
+                let stale: Vec<&String> = old_targets
+                    .iter()
+                    .filter(|t| !new_targets.contains(*t))
+                    .collect();
+                if !stale.is_empty() {
+                    anyhow::bail!(
+                        "section {slug} requires removing derived edges ({stale:?}) but the \
+                         backend exposes no delete; recreate the tenant schema and re-ingest \
+                         from scratch"
+                    );
+                }
+            }
         }
 
         for model in &product_models {
