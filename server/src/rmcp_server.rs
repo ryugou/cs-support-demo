@@ -328,7 +328,7 @@ impl CsSupportRmcpServer {
 
     #[tool(
         name = "search_manual",
-        description = "日本語 query_ja で日本語マニュアル本文 body_ja を検索し、breadcrumb と英語原文 fallback を返す。認証 actor の scope 内のみ検索される。"
+        description = "日本語 query_ja でマニュアル本文を検索し、breadcrumb と出典（manual_v1: source_url / legacy: 英語原文 fallback）を返す。認証 actor の scope 内のみ検索される。"
     )]
     async fn search_manual(
         &self,

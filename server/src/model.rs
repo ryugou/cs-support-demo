@@ -138,7 +138,13 @@ impl From<ManualHit> for SectionHit {
             body_ja: Some(hit.body),
             body_en: None,
             translation_status: None,
-            breadcrumb: vec![hit.breadcrumb],
+            // legacy 経路は breadcrumb を「階層セグメントごとの Vec」で返すため、
+            // ingest が " > " 連結で格納した文字列も同じ意味（1 要素 = 1 階層）に展開する。
+            breadcrumb: if hit.breadcrumb.is_empty() {
+                Vec::new()
+            } else {
+                hit.breadcrumb.split(" > ").map(str::to_string).collect()
+            },
             score: hit.score,
             source_url: Some(hit.source_url),
         }
@@ -159,4 +165,45 @@ pub struct ManualProductCandidate {
     pub name: String,
     pub score: f32,
     pub reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_hit_breadcrumb_expands_to_hierarchy_segments() {
+        let hit = ManualHit {
+            section_key: "sec-x".into(),
+            title: "SDカードが認識されない".into(),
+            body: "本文".into(),
+            source_url: "https://x/1-4/sd".into(),
+            breadcrumb: "1.4 こんなときは > SDカードが認識されない".into(),
+            score: 1.0,
+        };
+        let s: SectionHit = hit.into();
+        // legacy と同じ「1 要素 = 1 階層」の Vec に展開される
+        assert_eq!(
+            s.breadcrumb,
+            vec![
+                "1.4 こんなときは".to_string(),
+                "SDカードが認識されない".to_string()
+            ]
+        );
+        assert_eq!(s.source_url.as_deref(), Some("https://x/1-4/sd"));
+    }
+
+    #[test]
+    fn manual_hit_empty_breadcrumb_becomes_empty_vec() {
+        let hit = ManualHit {
+            section_key: "sec-x".into(),
+            title: "t".into(),
+            body: "b".into(),
+            source_url: "u".into(),
+            breadcrumb: String::new(),
+            score: 0.5,
+        };
+        let s: SectionHit = hit.into();
+        assert!(s.breadcrumb.is_empty());
+    }
 }
