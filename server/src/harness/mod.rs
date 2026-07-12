@@ -271,6 +271,7 @@ impl Harness {
         signals: &[String],
         answer: &str,
         rationale_text: Option<&str>,
+        manual_section_keys: &[String],
     ) -> Result<signal::SignalSet> {
         // authoritative の担い手のみ（supervisor / admin）
         if !matches!(ctx.actor.role, authn::Role::Supervisor | authn::Role::Admin) {
@@ -284,6 +285,15 @@ impl Harness {
             && rationale_text.is_some()
         {
             anyhow::bail!("rationale_text is not supported on legacy schemas");
+        }
+        // 監査可能性: KR は最低 1 つの根拠アンカー（BASED_ON/BECAUSE の結線元）を持つこと。
+        // manual_section_keys が空で、かつ rationale_text も無い KR は traceable evidence を
+        // 一切持たないため拒否する（legacy は rationale_text 不可なので実質 section 必須）。
+        if manual_section_keys.is_empty() && rationale_text.is_none() {
+            anyhow::bail!(
+                "known resolution requires at least one evidence anchor: \
+                 provide manual_section_keys and/or rationale_text"
+            );
         }
         // 語彙外 signal は照合不能なので拒否
         if signals.is_empty() {
@@ -802,10 +812,18 @@ mod tests {
             manual_schema: crate::config::ManualSchemaKind::LegacySection,
         };
         let err = harness
-            .admit_known_resolution(&ctx, &["mold".to_string()], "answer", Some("because"))
+            .admit_known_resolution(&ctx, &["mold".to_string()], "answer", Some("because"), &[])
             .expect_err("legacy schema must reject rationale_text");
         assert!(
             err.to_string().contains("rationale_text"),
+            "unexpected error: {err}"
+        );
+        // 根拠アンカーゼロ（section なし・rationale なし）も拒否（監査可能性）
+        let err = harness
+            .admit_known_resolution(&ctx, &["mold".to_string()], "answer", None, &[])
+            .expect_err("KR without any evidence anchor must be rejected");
+        assert!(
+            err.to_string().contains("evidence anchor"),
             "unexpected error: {err}"
         );
     }

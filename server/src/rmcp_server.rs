@@ -915,6 +915,7 @@ impl CsSupportRmcpServer {
                 &req.signals,
                 &req.answer,
                 req.rationale_text.as_deref(),
+                &req.manual_section_keys,
             )
             .map_err(|err| ErrorData::invalid_request(err.to_string(), None))?;
         let store = self.harness.store().map_err(to_error)?;
