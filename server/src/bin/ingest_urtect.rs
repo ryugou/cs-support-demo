@@ -1,5 +1,5 @@
-/// URTECT (Google Sites) manual crawler / ingest CLI. See
-/// `.superpowers/sdd/task-9-brief.md` for the task contract this file implements.
+/// URTECT (Google Sites) manual crawler / ingest CLI。設計・検証記録は
+/// `docs/superpowers/plans/2026-07-08-manual-domain-template-urtect.md` を参照。
 use anyhow::{Context, Result};
 use clap::Parser;
 use cs_support_mcp::{

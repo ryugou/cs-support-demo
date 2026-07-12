@@ -35,7 +35,12 @@ impl AppConfig {
     pub fn grpc_limits(&self) -> crate::vegapunk::GrpcLimits {
         crate::vegapunk::GrpcLimits {
             timeout_secs: self.vegapunk_timeout_secs,
-            max_decode_bytes: self.vegapunk_max_decode_mb * 1024 * 1024,
+            // 最小 1MiB にクランプ（0 は全 decode 失敗になる設定ミス）。
+            // 過大値の乗算は saturating_mul で wrap を防ぐ。
+            max_decode_bytes: self
+                .vegapunk_max_decode_mb
+                .max(1)
+                .saturating_mul(1024 * 1024),
         }
     }
 }
