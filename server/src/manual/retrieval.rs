@@ -53,7 +53,10 @@ fn char_class(c: char) -> Option<u8> {
 
 /// 質問から内容語ラン（カタカナ+ / 漢字+ / ASCII 英数字+）を抽出する。
 /// ASCII ランは小文字化する。ひらがな・記号・空白はランの区切り。
+/// 本文側（nfkc_lowercase）と揃えるため、質問もまず NFKC 正規化する
+/// （半角カタカナ ｶﾒﾗ→カメラ、全角英数 ＳＤ→SD の幅ゆれを吸収）。
 pub(crate) fn content_runs(question: &str) -> Vec<String> {
+    let question: String = question.nfkc().collect();
     let mut runs = Vec::new();
     let mut current = String::new();
     let mut current_class: Option<u8> = None;
@@ -494,6 +497,12 @@ mod tests {
     fn content_runs_extracts_katakana_kanji_ascii() {
         let runs = content_runs("SDカードの推奨メーカーはどこか");
         assert_eq!(runs, vec!["sd", "カード", "推奨", "メーカー"]);
+    }
+
+    #[test]
+    fn content_runs_normalizes_width_variants() {
+        // 半角カタカナ・全角英数でも NFKC で本文側と揃う
+        assert_eq!(content_runs("ＳＤｶｰﾄﾞの推奨"), vec!["sd", "カード", "推奨"]);
     }
 
     #[test]

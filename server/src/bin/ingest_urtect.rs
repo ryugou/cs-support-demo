@@ -346,13 +346,22 @@ async fn main() -> Result<()> {
     // backend に delete API が無いため、再 ingest で「除去が必要になる」edge 変化
     // （旧 edge が新しい派生集合に含まれない）を検出したら fail closed にする
     // （検索側は snapshot 上の全 DESCRIBES を信頼するため、stale edge は誤回答に直結する）。
+    // PARENT_OF（親→子）も同様: 親が変わった/root になった section に旧 PARENT_OF が残ると
+    // 1 section に複数 parent が付き、TOC・ancestor traversal・breadcrumb が不整合になる。
     let mut old_derived: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut old_parents: HashMap<String, HashSet<String>> = HashMap::new();
     for e in &existing_snapshot.edges {
         if e.edge_type == "DESCRIBES" || e.edge_type == "MENTIONS_SIGNAL" {
             old_derived
                 .entry(e.from_id.clone())
                 .or_default()
                 .insert(e.to_id.clone());
+        } else if e.edge_type == "PARENT_OF" {
+            // key = 子 section の node_id、value = 親 section の node_id 集合
+            old_parents
+                .entry(e.to_id.clone())
+                .or_default()
+                .insert(e.from_id.clone());
         }
     }
 
@@ -551,6 +560,28 @@ async fn main() -> Result<()> {
                 if !stale.is_empty() {
                     anyhow::bail!(
                         "section {slug} requires removing derived edges ({stale:?}) but the \
+                         backend exposes no delete; recreate the tenant schema and re-ingest \
+                         from scratch"
+                    );
+                }
+            }
+            // PARENT_OF: 旧親が新しい親（root なら「親なし」）と一致しない場合も除去が必要。
+            if let Some(old_parent_ids) = old_parents.get(&sec_id) {
+                let new_parent_id = parent_slug.as_deref().map(|p| {
+                    cs_support_mcp::manual::schema_ids::manual_node_id(
+                        &args.schema,
+                        cs_support_mcp::manual::schema_ids::KIND_SECTION,
+                        p,
+                    )
+                });
+                let stale_parents: Vec<&String> = old_parent_ids
+                    .iter()
+                    .filter(|p| Some(p.as_str()) != new_parent_id.as_deref())
+                    .collect();
+                if !stale_parents.is_empty() {
+                    anyhow::bail!(
+                        "section {slug} changed parent (old {stale_parents:?} vs new \
+                         {new_parent_id:?}) which requires removing PARENT_OF edges, but the \
                          backend exposes no delete; recreate the tenant schema and re-ingest \
                          from scratch"
                     );
