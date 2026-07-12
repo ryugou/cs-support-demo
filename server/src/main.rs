@@ -37,8 +37,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = AppConfig::load(&args.config)?;
     let bearer_token = read_bearer_token(&args)?;
-    let vegapunk = VegapunkClient::connect_lazy(&config.vegapunk_endpoint, &bearer_token)
-        .context("configure vegapunk client")?;
+    let vegapunk = VegapunkClient::connect_lazy_with_limits(
+        &config.vegapunk_endpoint,
+        &bearer_token,
+        config.grpc_limits(),
+    )
+    .context("configure vegapunk client")?;
     let tools = ToolService::new(vegapunk.clone());
     let config_dir = args
         .config

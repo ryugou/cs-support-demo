@@ -8,6 +8,12 @@ pub struct AppConfig {
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
     pub vegapunk_endpoint: String,
+    /// vegapunk gRPC の per-call timeout（秒）。大きな snapshot 読みに合わせた既定 120。
+    #[serde(default = "default_vegapunk_timeout_secs")]
+    pub vegapunk_timeout_secs: u64,
+    /// vegapunk gRPC の受信メッセージ上限（MiB）。既定 64（URTECT snapshot 実測 ~6MB）。
+    #[serde(default = "default_vegapunk_max_decode_mb")]
+    pub vegapunk_max_decode_mb: usize,
     pub projects: Vec<ProjectConfig>,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -15,6 +21,23 @@ pub struct AppConfig {
     pub actors: Vec<ActorConfig>,
     #[serde(default)]
     pub harness: HarnessConfig,
+}
+
+fn default_vegapunk_timeout_secs() -> u64 {
+    120
+}
+
+fn default_vegapunk_max_decode_mb() -> usize {
+    64
+}
+
+impl AppConfig {
+    pub fn grpc_limits(&self) -> crate::vegapunk::GrpcLimits {
+        crate::vegapunk::GrpcLimits {
+            timeout_secs: self.vegapunk_timeout_secs,
+            max_decode_bytes: self.vegapunk_max_decode_mb * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

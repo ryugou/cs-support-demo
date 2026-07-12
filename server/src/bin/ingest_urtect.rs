@@ -311,8 +311,24 @@ async fn main() -> Result<()> {
         .create_or_update_schema(&args.schema, schema_yaml)
         .await?;
 
+    // redirect は top_url と同一 scheme/host のみ追従する（nav 由来 URL が 3xx で
+    // 外部ホストへ誘導された場合の意図しない外部フェッチ/SSRF を防ぐ）。
+    let allowed_scheme = top_url.scheme().to_string();
+    let allowed_host = top_url.host_str().unwrap_or_default().to_string();
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+        let same_origin = attempt.url().scheme() == allowed_scheme
+            && attempt.url().host_str() == Some(allowed_host.as_str());
+        if !same_origin {
+            attempt.error("cross-origin redirect blocked (same-host policy)")
+        } else if attempt.previous().len() >= 5 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    });
     let http = reqwest::Client::builder()
         .user_agent("cs-support-mcp/ingest_urtect")
+        .redirect(redirect_policy)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
