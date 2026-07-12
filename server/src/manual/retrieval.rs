@@ -392,11 +392,21 @@ impl ManualStore {
         let mut ancestors = Vec::new();
         let mut cur = node_id.clone();
         for _ in 0..8 {
-            let Some(parent) = snap
+            // 親は高々 1 本のはず。複数付いている場合はデータ不整合（ingest 側で fail closed
+            // している想定が破れている）なので、非決定な traversal を返さずエラーで検出させる。
+            let parents: Vec<&crate::proto::graphrag::GraphEdge> = snap
                 .edges
                 .iter()
-                .find(|e| e.edge_type == "PARENT_OF" && e.to_id == cur)
-            else {
+                .filter(|e| e.edge_type == "PARENT_OF" && e.to_id == cur)
+                .collect();
+            if parents.len() > 1 {
+                anyhow::bail!(
+                    "section {cur} has {} PARENT_OF edges (expected at most 1); \
+                     graph is inconsistent — recreate the tenant schema and re-ingest",
+                    parents.len()
+                );
+            }
+            let Some(parent) = parents.first() else {
                 break;
             };
             if let Some(j) = node_json(&parent.from_id) {

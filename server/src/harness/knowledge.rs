@@ -772,8 +772,9 @@ mod tests {
             rationale_text: Some("doc-1#storage の保管条件に基づく".to_string()),
             manual_section_keys: vec!["doc-1#storage".to_string()],
         };
+        // ManualV1 経路のテストなので schema 名も ManualV1 テナント（urtect）に揃える
         let build = build_known_resolution_graph(
-            "sivira-cs-demo",
+            "urtect",
             "kr-test",
             &new_kr,
             crate::config::ManualSchemaKind::ManualV1,

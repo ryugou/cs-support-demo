@@ -2,6 +2,8 @@
 name = "cs-support-mcp"
 version = "0.1.0"
 edition = "2021"
+# Option::is_none_or (1.82 安定化) 等を使用。ビルド環境の下限を明示する。
+rust-version = "1.82"
 build = "build.rs"
 
 [dependencies]
