@@ -367,10 +367,15 @@ impl ManualStore {
             .filter(|(in_signal, score, _)| *in_signal || *score > 0.0)
             .map(|(_, _, h)| h)
             .collect();
+        // score 降順 + 同点は section_key 昇順の決定論 tiebreak。
+        // （sort_by 自体は stable sort だが、同点時の順序が snapshot のノード順=backend の
+        // 返却順に依存してしまう。top_k 打ち切り・best_manual_sections・WORM 記録が
+        // 実行ごとに揺れないよう、入力順に依存しない全順序で並べる。）
         hits.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.section_key.cmp(&b.section_key))
         });
         hits.truncate(top_k.max(1));
         Ok(hits)
