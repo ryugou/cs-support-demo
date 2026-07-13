@@ -32,3 +32,18 @@ Production CS MCP の 3 層判定・照合・egress は全てこの語彙の上�
 - surface_forms は `resolve::normalize_key` 正規化後の部分一致で照合される。
 - 既知の限界: 辞書外の表現は取りこぼす。第2層の raw text パターン照合と全件人承認で吸収する（S1-11）。
 - **本初版は 2026-07-03 時点のドラフト。業務担当のレビューで確定させること。**
+
+## `llm_only` / `description` フィールド（加算）
+
+`server/data/signal-lexicon.json` および `server/data/urtect/signal-lexicon.json` の各 signal エントリに、以下 2 フィールドを加算した（既存フィールドの削除・意味変更なし）。
+
+- `description`（string, optional, default 空文字）: signal の語義・限定条件を短文で記す。`LexiconNormalizer::vocabulary_for_prompt()` が `signal (class): description` の 1 行形式で全 signal を列挙する際に使う。今後の LLM 分類器がこの語彙一覧をプロンプトに埋め込み、signal 抽出の根拠として参照する。
+- `llm_only`（bool, optional, default `false`）: `true` の signal は決定論的な文字列照合（surface_forms 部分一致）の対象から除外される。`surface_forms` は空配列でよく、既存の「有効な surface form が 1 つも無い signal は拒否する」バリデーション（サイレント never-match 防止）は `llm_only = false` のエントリにのみ適用される。`llm_only = true` の signal は `class_of` / `contains_signal` / `vocabulary_for_prompt` には引き続き登録され、LLM 抽出結果としてのみ `SignalSet` に現れる。
+
+## `unclassified_risk`（catch-all, llm_only, hazard）
+
+両 lexicon に `unclassified_risk`（`class: hazard`, `llm_only: true`, `surface_forms: []`）を追加した。これは S1-1「疑わしい語は signal を立てる」の実装であり、既存のどの signal にも分類できないが安全・契約・法務・製品破損などの懸念を含みうる発話を、LLM 抽出器が「分類に迷う場合はとりあえず立てる」ための catch-all である。
+
+- 文字列照合（surface_forms 部分一致）には一切使われない。決定論 lexicon の `normalize()` からは絶対に出力されない。
+- LLM 分類器が `vocabulary_for_prompt()` の語彙一覧を見て、既存 signal に当てはまらないが hazard 相当と判断した発話に対してのみ立てる。
+- `class: hazard` のため、stakes 判定（S1-6 の mid 昇格）に効く。疑わしい発話を誤って `context` 扱いで握りつぶさないための設計。
