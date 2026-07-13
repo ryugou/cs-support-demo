@@ -265,7 +265,7 @@ impl CsSupportRmcpServer {
 
     #[tool(
         name = "resolve_product",
-        description = "商品名・型番・顧客表現から候補 product を返す。aliases テーブルは使わない。"
+        description = "商品名・型番・顧客表現から候補 product を返す。照合は正規化+部分一致(fuzzy)。reason: normalized_match | fuzzy_match。"
     )]
     async fn resolve_product(
         &self,

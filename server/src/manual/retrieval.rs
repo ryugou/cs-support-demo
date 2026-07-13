@@ -467,7 +467,7 @@ impl ManualStore {
                     reason: if score >= 1.0 {
                         "normalized_match".into()
                     } else {
-                        "semantic_nearby".into()
+                        "fuzzy_match".into()
                     },
                 })
             })
