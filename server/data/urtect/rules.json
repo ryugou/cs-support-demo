@@ -1,0 +1,14 @@
+{
+  "escalation_rules": [
+    { "rule_id": "security-incident", "condition": ["security_incident"], "owner": "security", "route": "support_desk", "binding": "mandatory" },
+    { "rule_id": "physical-damage", "condition": ["physical_damage_smell_heat"], "owner": "hardware", "route": "support_desk", "binding": "mandatory" },
+    { "rule_id": "warranty-failure", "condition": ["warranty_hardware_failure"], "owner": "hardware", "route": "support_desk", "binding": "advisory" },
+    { "rule_id": "contract-billing", "condition": ["contract_billing_question"], "owner": "contract", "route": "support_desk", "binding": "advisory" },
+    { "rule_id": "construction-risk", "condition": ["physical_construction_risk"], "owner": "installation", "route": "support_desk", "binding": "mandatory" }
+  ],
+  "prohibited_domains": [
+    { "domain_id": "legal-privacy", "domain_signals": ["legal_privacy_question"], "pattern": [], "route": "support_desk", "binding": "mandatory" },
+    { "domain_id": "security-guarantee", "domain_signals": ["security_guarantee"], "pattern": [], "route": "support_desk", "binding": "mandatory" },
+    { "domain_id": "electrical-work", "domain_signals": ["physical_construction_risk"], "pattern": ["電気工事", "高所作業"], "route": "support_desk", "binding": "mandatory" }
+  ]
+}

@@ -22,6 +22,7 @@ pub struct CsSupportRmcpServer {
     schema: String,
     tools: ToolService,
     harness: Arc<Harness>,
+    manual_schema: crate::config::ManualSchemaKind,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -205,8 +206,12 @@ pub struct AddKnownResolutionRequest {
     pub answer: String,
     /// どの escalation 起点か
     pub origin_escalation_id: Option<String>,
-    /// 根拠となる manual section（BECAUSE 辺で結線）
-    pub rationale_section_keys: Vec<String>,
+    /// 担当者の判断理由（任意）。BECAUSE → Rationale で残す
+    pub rationale_text: Option<String>,
+    /// マニュアル出典 section（manual_v1: BASED_ON → ManualSection / legacy: BECAUSE → section）。
+    /// 旧 field 名 `rationale_section_keys` は deprecated alias として受理する（後方互換）。
+    #[serde(default, alias = "rationale_section_keys")]
+    pub manual_section_keys: Vec<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -224,12 +229,26 @@ fn operator_emit_context() -> EmitContext {
 
 #[tool_router]
 impl CsSupportRmcpServer {
-    pub fn new(schema: String, tools: ToolService, harness: Arc<Harness>) -> Self {
+    pub fn new(
+        schema: String,
+        tools: ToolService,
+        harness: Arc<Harness>,
+        manual_schema: crate::config::ManualSchemaKind,
+    ) -> Self {
         Self {
             schema,
             tools,
             harness,
+            manual_schema,
         }
+    }
+
+    /// manual_schema=ManualV1 の read tool 分岐共通ヘルパー。未設定は構成ミスとして internal_error。
+    fn manual_store(&self) -> Result<&crate::manual::retrieval::ManualStore, ErrorData> {
+        self.harness
+            .manual
+            .as_ref()
+            .ok_or_else(|| ErrorData::internal_error("manual store not configured", None))
     }
 
     /// 全 tool の共通入口。認証 → scope 強制 → RequestContext（S1-1 前半）。
@@ -240,7 +259,7 @@ impl CsSupportRmcpServer {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
         self.harness
-            .begin(authorization.as_deref(), &self.schema)
+            .begin(authorization.as_deref(), &self.schema, self.manual_schema)
             .map_err(|err| ErrorData::invalid_request(err.to_string(), None))
     }
 
@@ -254,26 +273,62 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<ResolveProductRequest>,
     ) -> Result<Json<ResolveProductResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let candidates = self
-            .tools
-            .resolve_product(&ctx.schema, &req.text)
-            .await
-            .map_err(to_error)?;
-        // 誰が・いつ・どの scope で・何を検索したかを残す（spec 課題2 Harness の責務）
-        let retrieved = candidates
-            .iter()
-            .map(|c| crate::ingest::product_node_id(&ctx.schema, &c.product_key))
-            .collect();
+        let (retrieved, body) = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self.manual_store()?;
+                let manual_candidates = store
+                    .resolve_product(&ctx.schema, &req.text)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved = manual_candidates
+                    .iter()
+                    .map(|c| {
+                        crate::manual::schema_ids::manual_node_id(
+                            &ctx.schema,
+                            crate::manual::schema_ids::KIND_PRODUCT,
+                            &c.model,
+                        )
+                    })
+                    .collect();
+                let candidates = manual_candidates
+                    .into_iter()
+                    .map(|c| ProductCandidate {
+                        product_key: c.model.clone(),
+                        name_ja: c.name.clone(),
+                        name_en: c.name,
+                        model: Some(c.model),
+                        score: c.score,
+                        reason: c.reason,
+                    })
+                    .collect();
+                let body = ResolveProductResponse { candidates };
+                (retrieved, body)
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let candidates = self
+                    .tools
+                    .resolve_product(&ctx.schema, &req.text)
+                    .await
+                    .map_err(to_error)?;
+                // 誰が・いつ・どの scope で・何を検索したかを残す（spec 課題2 Harness の責務）
+                let retrieved = candidates
+                    .iter()
+                    .map(|c| crate::ingest::product_node_id(&ctx.schema, &c.product_key))
+                    .collect();
+                let body = ResolveProductResponse { candidates };
+                (retrieved, body)
+            }
+        };
         self.harness
             .audit_with_nodes(&ctx, "read:resolve_product", None, Vec::new(), retrieved)
             .await
             .map_err(to_error)?;
-        Ok(Json(ResolveProductResponse { candidates }))
+        Ok(Json(body))
     }
 
     #[tool(
         name = "search_manual",
-        description = "日本語 query_ja で日本語マニュアル本文 body_ja を検索し、breadcrumb と英語原文 fallback を返す。認証 actor の scope 内のみ検索される。"
+        description = "日本語 query_ja でマニュアル本文を検索し、breadcrumb と出典（manual_v1: source_url / legacy: 英語原文 fallback）を返す。認証 actor の scope 内のみ検索される。"
     )]
     async fn search_manual(
         &self,
@@ -281,25 +336,58 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<SearchManualRequest>,
     ) -> Result<Json<SearchManualResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let hits = self
-            .tools
-            .search_manual(
-                &ctx.schema,
-                &req.query_ja,
-                req.product_key.as_deref(),
-                req.top_k.unwrap_or(5),
-            )
-            .await
-            .map_err(to_error)?;
-        let retrieved = hits
-            .iter()
-            .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
-            .collect();
+        let (retrieved, body) = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self.manual_store()?;
+                let signals = self.harness.normalizer.normalize(&req.query_ja);
+                let manual_hits = store
+                    .search(
+                        &ctx.schema,
+                        &req.query_ja,
+                        &signals,
+                        req.product_key.as_deref(),
+                        req.top_k.unwrap_or(5).max(1) as usize,
+                    )
+                    .await
+                    .map_err(to_error)?;
+                let retrieved = manual_hits
+                    .iter()
+                    .map(|h| {
+                        crate::manual::schema_ids::manual_node_id(
+                            &ctx.schema,
+                            crate::manual::schema_ids::KIND_SECTION,
+                            &h.section_key,
+                        )
+                    })
+                    .collect();
+                let hits = manual_hits.into_iter().map(SectionHit::from).collect();
+                let body = SearchManualResponse { hits };
+                (retrieved, body)
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let hits = self
+                    .tools
+                    .search_manual(
+                        &ctx.schema,
+                        &req.query_ja,
+                        req.product_key.as_deref(),
+                        req.top_k.unwrap_or(5),
+                    )
+                    .await
+                    .map_err(to_error)?;
+                let retrieved = hits
+                    .iter()
+                    .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
+                    .collect();
+                let body = SearchManualResponse { hits };
+                (retrieved, body)
+            }
+        };
         self.harness
             .audit_with_nodes(&ctx, "read:search_manual", None, Vec::new(), retrieved)
             .await
             .map_err(to_error)?;
-        Ok(Json(SearchManualResponse { hits }))
+        Ok(Json(body))
     }
 
     #[tool(
@@ -312,25 +400,48 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<GetSectionRequest>,
     ) -> Result<Json<SectionView>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let view = self
-            .tools
-            .get_section(&ctx.schema, &req.section_key)
-            .await
-            .map_err(to_error)?;
+        let (retrieved_id, body) = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self.manual_store()?;
+                let manual_view = store
+                    .get_section(&ctx.schema, &req.section_key)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved_id = crate::manual::schema_ids::manual_node_id(
+                    &ctx.schema,
+                    crate::manual::schema_ids::KIND_SECTION,
+                    &req.section_key,
+                );
+                let body = SectionView {
+                    section: manual_view.section,
+                    ancestors: manual_view.ancestors,
+                    children: manual_view.children,
+                    references: Vec::new(),
+                    based_on_rationale: manual_view.based_on_rationale,
+                };
+                (retrieved_id, body)
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let view = self
+                    .tools
+                    .get_section(&ctx.schema, &req.section_key)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved_id = crate::ingest::section_node_id(&ctx.schema, &req.section_key);
+                (retrieved_id, view)
+            }
+        };
         self.harness
             .audit_with_nodes(
                 &ctx,
                 "read:get_section",
                 None,
                 Vec::new(),
-                vec![crate::ingest::section_node_id(
-                    &ctx.schema,
-                    &req.section_key,
-                )],
+                vec![retrieved_id],
             )
             .await
             .map_err(to_error)?;
-        Ok(Json(view))
+        Ok(Json(body))
     }
 
     #[tool(
@@ -343,11 +454,20 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<GetProductRequest>,
     ) -> Result<Json<ProductView>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let view = self
-            .tools
-            .get_product(&ctx.schema, &req.product_key)
-            .await
-            .map_err(to_error)?;
+        let view = match ctx.manual_schema {
+            // TODO: implement ManualStore::get_product (Product + DESCRIBES sections + TOC)
+            crate::config::ManualSchemaKind::ManualV1 => {
+                return Err(ErrorData::invalid_params(
+                    "get_product is not supported for manual_v1 schemas yet; use resolve_product + search_manual",
+                    None,
+                ));
+            }
+            crate::config::ManualSchemaKind::LegacySection => self
+                .tools
+                .get_product(&ctx.schema, &req.product_key)
+                .await
+                .map_err(to_error)?,
+        };
         self.harness
             .audit_with_nodes(
                 &ctx,
@@ -790,7 +910,13 @@ impl CsSupportRmcpServer {
         // admission 判定（役割・語彙・NG 語）は Harness に一元化されている
         let signal_set = self
             .harness
-            .admit_known_resolution(&ctx, &req.signals, &req.answer)
+            .admit_known_resolution(
+                &ctx,
+                &req.signals,
+                &req.answer,
+                req.rationale_text.as_deref(),
+                &req.manual_section_keys,
+            )
             .map_err(|err| ErrorData::invalid_request(err.to_string(), None))?;
         let store = self.harness.store().map_err(to_error)?;
         let new_kr = NewKnownResolution {
@@ -803,10 +929,11 @@ impl CsSupportRmcpServer {
                 .map(|id| format!("escalation:{id}"))
                 .unwrap_or_else(|| "manual".to_string()),
             created_by: ctx.actor.sub.clone(),
-            rationale_section_keys: req.rationale_section_keys.clone(),
+            rationale_text: req.rationale_text.clone(),
+            manual_section_keys: req.manual_section_keys.clone(),
         };
         let kr_id = store
-            .insert_known_resolution(&ctx.schema, &new_kr)
+            .insert_known_resolution(&ctx.schema, &new_kr, ctx.manual_schema)
             .await
             .map_err(to_error)?;
         let audit_event_id = self

@@ -145,6 +145,8 @@ pub struct DecisionInput<'a> {
     pub best_manual_sections: &'a [String],
     pub stakes_input: StakesInput,
     pub thresholds: &'a Thresholds,
+    /// config 由来の既定エスカレーション route（第3層エスカレーション先）。
+    pub default_route: &'a str,
 }
 
 /// (B) 3 層判定の decision function。LLM 非介在・同じ入力なら必ず同じ判定（純関数）。
@@ -202,7 +204,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             AnswerDecision::Escalate {
                 reason,
                 layer: 3,
-                route_to: "triage".to_string(),
+                route_to: input.default_route.to_string(),
                 disclosure_scope: DisclosureScope::ConfirmingWithTeam,
                 audit_required: true,
                 missing,
@@ -273,6 +275,7 @@ mod tests {
             best_manual_sections: sections,
             stakes_input,
             thresholds,
+            default_route: "triage",
         }
     }
 

@@ -93,6 +93,7 @@ impl ToolService {
                             .unwrap_or_default(),
                     ),
                     score,
+                    source_url: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -113,6 +114,7 @@ impl ToolService {
             ancestors: graph.ancestor_json(&node_id, 2),
             children: graph.children_json(&node_id, 2),
             references: graph.outgoing_json(&node_id, "REFERENCES"),
+            based_on_rationale: Vec::new(),
         })
     }
 

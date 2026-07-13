@@ -21,31 +21,68 @@ pub struct VegapunkClient {
     auth_header: MetadataValue<tonic::metadata::Ascii>,
 }
 
+/// gRPC channel の運用上限。マニュアル本文込みの graph snapshot が tonic 既定の
+/// 4MiB decode 上限・短い timeout を超えるため、既定を引き上げている
+/// （URTECT 実測 ~6MB / snapshot 読みで 30s 超）。環境ごとに締められるよう
+/// config（vegapunk_timeout_secs / vegapunk_max_decode_mb）から上書き可能。
+#[derive(Debug, Clone, Copy)]
+pub struct GrpcLimits {
+    pub timeout_secs: u64,
+    pub max_decode_bytes: usize,
+}
+
+impl Default for GrpcLimits {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 120,
+            max_decode_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 impl VegapunkClient {
     pub fn connect_lazy(endpoint: &str, bearer_token: &str) -> Result<Self> {
+        Self::connect_lazy_with_limits(endpoint, bearer_token, GrpcLimits::default())
+    }
+
+    pub fn connect_lazy_with_limits(
+        endpoint: &str,
+        bearer_token: &str,
+        limits: GrpcLimits,
+    ) -> Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())?
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(limits.timeout_secs))
             .connect_lazy();
         let auth_header = MetadataValue::try_from(format!("Bearer {bearer_token}"))
             .context("invalid bearer token metadata")?;
         Ok(Self {
-            inner: GraphRagEngineClient::new(channel),
+            inner: GraphRagEngineClient::new(channel)
+                .max_decoding_message_size(limits.max_decode_bytes),
             auth_header,
         })
     }
 
     pub async fn connect(endpoint: &str, bearer_token: &str) -> Result<Self> {
+        Self::connect_with_limits(endpoint, bearer_token, GrpcLimits::default()).await
+    }
+
+    pub async fn connect_with_limits(
+        endpoint: &str,
+        bearer_token: &str,
+        limits: GrpcLimits,
+    ) -> Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())?
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(limits.timeout_secs))
             .connect()
             .await
             .with_context(|| format!("connect vegapunk endpoint {endpoint}"))?;
         let auth_header = MetadataValue::try_from(format!("Bearer {bearer_token}"))
             .context("invalid bearer token metadata")?;
         Ok(Self {
-            inner: GraphRagEngineClient::new(channel),
+            inner: GraphRagEngineClient::new(channel)
+                .max_decoding_message_size(limits.max_decode_bytes),
             auth_header,
         })
     }

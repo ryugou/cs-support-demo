@@ -37,8 +37,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = AppConfig::load(&args.config)?;
     let bearer_token = read_bearer_token(&args)?;
-    let vegapunk = VegapunkClient::connect_lazy(&config.vegapunk_endpoint, &bearer_token)
-        .context("configure vegapunk client")?;
+    let vegapunk = VegapunkClient::connect_lazy_with_limits(
+        &config.vegapunk_endpoint,
+        &bearer_token,
+        config.grpc_limits(),
+    )
+    .context("configure vegapunk client")?;
     let tools = ToolService::new(vegapunk.clone());
     let config_dir = args
         .config
@@ -54,9 +58,14 @@ async fn main() -> Result<()> {
             .projects
             .first()
             .ok_or_else(|| anyhow!("no project configured"))?;
-        let service = CsSupportRmcpServer::new(project.schema.clone(), tools, harness.clone())
-            .serve(stdio())
-            .await?;
+        let service = CsSupportRmcpServer::new(
+            project.schema.clone(),
+            tools,
+            harness.clone(),
+            project.manual_schema,
+        )
+        .serve(stdio())
+        .await?;
         service.waiting().await?;
         return Ok(());
     }
@@ -71,12 +80,14 @@ async fn main() -> Result<()> {
         let schema = project.schema.clone();
         let tools = tools.clone();
         let harness = harness.clone();
+        let manual_schema = project.manual_schema;
         let mcp = StreamableHttpService::new(
             move || {
                 Ok(CsSupportRmcpServer::new(
                     schema.clone(),
                     tools.clone(),
                     harness.clone(),
+                    manual_schema,
                 ))
             },
             Arc::new(LocalSessionManager::default()),

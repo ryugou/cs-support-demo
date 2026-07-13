@@ -76,6 +76,8 @@ pub struct SectionHit {
     pub translation_status: Option<String>,
     pub breadcrumb: Vec<String>,
     pub score: f32,
+    #[serde(default)]
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -84,6 +86,8 @@ pub struct SectionView {
     pub ancestors: Vec<serde_json::Value>,
     pub children: Vec<serde_json::Value>,
     pub references: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub based_on_rationale: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -112,4 +116,94 @@ pub struct GraphEdge {
     pub to_id: String,
     pub edge_type: String,
     pub attributes: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ManualHit {
+    pub section_key: String,
+    pub title: String,
+    pub body: String,
+    pub source_url: String,
+    pub breadcrumb: String,
+    pub score: f32,
+}
+
+/// manual_v1 経路（ManualHit）を LegacySection 経路と同じ `SectionHit` に薄く詰め替える。
+/// reserved フィールド body_original / original_hash は読まない（現行実装では未使用）。
+impl From<ManualHit> for SectionHit {
+    fn from(hit: ManualHit) -> Self {
+        SectionHit {
+            section_key: hit.section_key,
+            title_ja: hit.title,
+            body_ja: Some(hit.body),
+            body_en: None,
+            translation_status: None,
+            // legacy 経路は breadcrumb を「階層セグメントごとの Vec」で返すため、
+            // ingest が " > " 連結で格納した文字列も同じ意味（1 要素 = 1 階層）に展開する。
+            breadcrumb: if hit.breadcrumb.is_empty() {
+                Vec::new()
+            } else {
+                hit.breadcrumb.split(" > ").map(str::to_string).collect()
+            },
+            score: hit.score,
+            source_url: Some(hit.source_url),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ManualSectionView {
+    pub section: serde_json::Value,
+    pub ancestors: Vec<serde_json::Value>,
+    pub children: Vec<serde_json::Value>,
+    pub based_on_rationale: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ManualProductCandidate {
+    pub model: String,
+    pub name: String,
+    pub score: f32,
+    pub reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_hit_breadcrumb_expands_to_hierarchy_segments() {
+        let hit = ManualHit {
+            section_key: "sec-x".into(),
+            title: "SDカードが認識されない".into(),
+            body: "本文".into(),
+            source_url: "https://x/1-4/sd".into(),
+            breadcrumb: "1.4 こんなときは > SDカードが認識されない".into(),
+            score: 1.0,
+        };
+        let s: SectionHit = hit.into();
+        // legacy と同じ「1 要素 = 1 階層」の Vec に展開される
+        assert_eq!(
+            s.breadcrumb,
+            vec![
+                "1.4 こんなときは".to_string(),
+                "SDカードが認識されない".to_string()
+            ]
+        );
+        assert_eq!(s.source_url.as_deref(), Some("https://x/1-4/sd"));
+    }
+
+    #[test]
+    fn manual_hit_empty_breadcrumb_becomes_empty_vec() {
+        let hit = ManualHit {
+            section_key: "sec-x".into(),
+            title: "t".into(),
+            body: "b".into(),
+            source_url: "u".into(),
+            breadcrumb: String::new(),
+            score: 0.5,
+        };
+        let s: SectionHit = hit.into();
+        assert!(s.breadcrumb.is_empty());
+    }
 }

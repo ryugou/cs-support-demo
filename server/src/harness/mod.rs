@@ -32,6 +32,11 @@ pub struct Harness {
     /// grade 更新（read-modify-write）のプロセス内直列化。単一インスタンス運用が前提。
     // TODO: bind to vegapunk atomic increment/CAS — backend 側の原子更新が使えるようになったら置き換える。
     pub grade_lock: tokio::sync::Mutex<()>,
+    /// manual_v1 スキーマ向けの manual 取得。project.manual_schema が LegacySection のみの
+    /// 構成では未使用（None でも動く）。
+    pub manual: Option<crate::manual::retrieval::ManualStore>,
+    /// 第3層エスカレーションの既定 route（config.harness.default_escalation_route）。
+    pub default_route: String,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +45,8 @@ pub struct RequestContext {
     pub scope: scope::AccessScope,
     pub schema: String,
     pub request_id: String,
+    /// project 設定から解決した manual スキーマ種別。evaluate の manual 取得経路を分岐する。
+    pub manual_schema: crate::config::ManualSchemaKind,
 }
 
 pub struct EvaluationOutcome {
@@ -99,11 +106,13 @@ impl Harness {
             worm: Arc::new(audit::WormAuditLog::open(&resolve_path(
                 &config.harness.audit_log_path,
             ))?),
-            knowledge: Some(knowledge::KnowledgeStore::new(client)),
+            knowledge: Some(knowledge::KnowledgeStore::new(client.clone())),
             thresholds: (&config.harness.thresholds).into(),
             grading: (&config.harness.grading).into(),
             queue_path: resolve_path(&config.harness.search_improvement_queue_path),
             grade_lock: tokio::sync::Mutex::new(()),
+            manual: Some(crate::manual::retrieval::ManualStore::new(client)),
+            default_route: config.harness.default_escalation_route.clone(),
         })
     }
 
@@ -261,11 +270,29 @@ impl Harness {
         ctx: &RequestContext,
         signals: &[String],
         answer: &str,
+        rationale_text: Option<&str>,
+        manual_section_keys: &[String],
     ) -> Result<signal::SignalSet> {
         // authoritative の担い手のみ（supervisor / admin）
         if !matches!(ctx.actor.role, authn::Role::Supervisor | authn::Role::Admin) {
             anyhow::bail!(
                 "permission_denied: add_known_resolution requires supervisor or admin role"
+            );
+        }
+        // legacy schema (sivira) には Rationale ノード型が無いため、rationale_text を
+        // サイレントに落とすのではなく admission 側で拒否する（build 側は無視するだけになる）。
+        if ctx.manual_schema == crate::config::ManualSchemaKind::LegacySection
+            && rationale_text.is_some()
+        {
+            anyhow::bail!("rationale_text is not supported on legacy schemas");
+        }
+        // 監査可能性: KR は最低 1 つの根拠アンカー（BASED_ON/BECAUSE の結線元）を持つこと。
+        // manual_section_keys が空で、かつ rationale_text も無い KR は traceable evidence を
+        // 一切持たないため拒否する（legacy は rationale_text 不可なので実質 section 必須）。
+        if manual_section_keys.is_empty() && rationale_text.is_none() {
+            anyhow::bail!(
+                "known resolution requires at least one evidence anchor: \
+                 provide manual_section_keys and/or rationale_text"
             );
         }
         // 語彙外 signal は照合不能なので拒否
@@ -340,6 +367,7 @@ impl Harness {
         &self,
         authorization: Option<&str>,
         project_schema: &str,
+        project_manual_schema: crate::config::ManualSchemaKind,
     ) -> Result<RequestContext> {
         let actor = self.authenticator.authenticate(authorization)?;
         let access = scope::resolve_scope(&actor, project_schema)?;
@@ -348,6 +376,7 @@ impl Harness {
             actor,
             scope: access,
             request_id: uuid::Uuid::new_v4().to_string(),
+            manual_schema: project_manual_schema,
         })
     }
 
@@ -375,17 +404,11 @@ impl Harness {
         // ルールの signal が語彙外だと「決してマッチしないルール」＝サイレントな
         // fail open になるため、判定前に語彙と突合して fail closed にする。
         self.validate_rule_vocabulary(&rules, &domains)?;
-        let (resolutions, hits) = tokio::try_join!(
-            knowledge.load_known_resolutions_with(&ctx.schema, &snapshot),
-            // search 側は snapshot を消費するため、共有元のここでだけ clone する
-            tools.search_manual_with_snapshot(
-                &ctx.schema,
-                question,
-                product_key,
-                5,
-                snapshot.clone()
-            ),
-        )?;
+        // manual 検索は accumulated signal 集合（会話層）を使うため、hits の取得は
+        // accumulated が確定した後ろに回す（下記 manual 取得ブロック）。
+        let resolutions = knowledge
+            .load_known_resolutions_with(&ctx.schema, &snapshot)
+            .await?;
         // [正規化] 決定論 lexicon（S1-11）。今ターン分。
         let signals = self.normalizer.normalize(question);
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
@@ -451,19 +474,72 @@ impl Harness {
                 .filter(|s| self.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
                 .count(),
         };
+        // manual 取得を manual_schema で分岐する。ManualV1 は ManualStore（signal 絞り込み(A) +
+        // body 全文(B) の max）、LegacySection は従来の tools.search_manual_with_snapshot。
+        // 判定へは共通の best_manual_score / best_manual_sections に落とし、
+        // EvaluationOutcome.hits へは SectionHit に揃えて返す（From<ManualHit> で変換）。
+        let (section_hits, retrieved_manual_ids): (Vec<SectionHit>, Vec<String>) =
+            match ctx.manual_schema {
+                crate::config::ManualSchemaKind::ManualV1 => {
+                    let store = self
+                        .manual
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("manual store not configured"))?;
+                    let hits = store.search_with_snapshot(
+                        &ctx.schema,
+                        question,
+                        &accumulated,
+                        product_key,
+                        5,
+                        &snapshot,
+                    )?;
+                    let ids = hits
+                        .iter()
+                        .map(|h| {
+                            crate::manual::schema_ids::manual_node_id(
+                                &ctx.schema,
+                                "ManualSection",
+                                &h.section_key,
+                            )
+                        })
+                        .collect();
+                    let converted = hits.into_iter().map(SectionHit::from).collect();
+                    (converted, ids)
+                }
+                crate::config::ManualSchemaKind::LegacySection => {
+                    // search 側は snapshot を消費するため、共有元のここでだけ clone する
+                    let hits = tools
+                        .search_manual_with_snapshot(
+                            &ctx.schema,
+                            question,
+                            product_key,
+                            5,
+                            snapshot.clone(),
+                        )
+                        .await?;
+                    let ids = hits
+                        .iter()
+                        .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
+                        .collect();
+                    (hits, ids)
+                }
+            };
         // [(B) 3 層判定] 純関数。判定根拠は常に「累積 signal 集合 + known_resolution」。
-        let best = hits.first();
-        let section_keys: Vec<String> = hits.iter().map(|h| h.section_key.clone()).collect();
+        let best = section_hits.first();
+        let best_manual_score = best.map(|h| h.score);
+        let section_keys: Vec<String> =
+            section_hits.iter().map(|h| h.section_key.clone()).collect();
         let decision_result = decision::decide(&decision::DecisionInput {
             question_signals: &accumulated,
             question_raw: question,
             rules: &rules,
             domains: &domains,
             resolutions: &resolutions,
-            best_manual_score: best.map(|h| h.score),
+            best_manual_score,
             best_manual_sections: &section_keys,
             stakes_input,
             thresholds: &self.thresholds,
+            default_route: &self.default_route,
         });
         // 聞き返し可否（決定論）: 第3層グレーのみ。第1・2層は問答無用でルーティング。
         let clarification_allowed = matches!(
@@ -507,10 +583,7 @@ impl Harness {
                 layer, route_to, ..
             } => (format!("escalate:layer{layer}"), Some(route_to.clone())),
         };
-        let mut retrieved_node_ids: Vec<String> = hits
-            .iter()
-            .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
-            .collect();
+        let mut retrieved_node_ids: Vec<String> = retrieved_manual_ids;
         retrieved_node_ids.push(knowledge::harness_node_id(
             &ctx.schema,
             "support_case",
@@ -544,7 +617,7 @@ impl Harness {
             accumulated_signals: accumulated,
             case_id,
             clarification_allowed,
-            hits,
+            hits: section_hits,
             audit_event_id,
         })
     }
@@ -590,18 +663,35 @@ impl Harness {
     }
 
     /// 訂正時の root_cause 切り分け（S1-5）: 正しい根拠がグラフ内に存在したかを再検索で判定。
+    /// manual 取得は ctx.manual_schema で分岐する（evaluate と同じ分岐方針）。
+    /// LegacySection は従来どおり tools.search_manual を使う（挙動を変えない）。
     pub async fn root_cause_probe(
         &self,
         ctx: &RequestContext,
         corrected_answer: &str,
         tools: &ToolService,
     ) -> Result<rules::RootCause> {
-        let hits = tools
-            .search_manual(&ctx.schema, corrected_answer, None, 3)
-            .await?;
-        let found = hits
-            .first()
-            .map(|h| h.score >= self.thresholds.mid)
+        let best_score: Option<f32> = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self
+                    .manual
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("manual store not configured"))?;
+                let signals = self.normalizer.normalize(corrected_answer);
+                let hits = store
+                    .search(&ctx.schema, corrected_answer, &signals, None, 3)
+                    .await?;
+                hits.first().map(|h| h.score)
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let hits = tools
+                    .search_manual(&ctx.schema, corrected_answer, None, 3)
+                    .await?;
+                hits.first().map(|h| h.score)
+            }
+        };
+        let found = best_score
+            .map(|score| score >= self.thresholds.mid)
             .unwrap_or(false);
         Ok(if found {
             rules::RootCause::RetrievalMiss
@@ -679,21 +769,74 @@ mod tests {
             },
             queue_path: dir.join("queue.jsonl"),
             grade_lock: tokio::sync::Mutex::new(()),
+            manual: None,
+            default_route: "triage".to_string(),
         }
     }
 
     #[test]
     fn begin_produces_request_context_with_enforced_schema() {
         let harness = harness_for_test();
-        let ctx = harness.begin(None, "sivira-cs-demo").expect("begin");
+        let ctx = harness
+            .begin(
+                None,
+                "sivira-cs-demo",
+                crate::config::ManualSchemaKind::LegacySection,
+            )
+            .expect("begin");
         assert_eq!(ctx.schema, "sivira-cs-demo");
         assert_eq!(ctx.actor.sub, "op-001");
         assert!(!ctx.request_id.is_empty());
     }
 
+    // admission 層（Harness::admit_known_resolution）が legacy schema の rationale_text を
+    // 拒否することの直接テスト（codex レビュー Suggestion 対応）。
+    // legacy schema には Rationale ノード型が無いため、build 側で無視するのではなく
+    // ここで fail closed にする必要がある。
+    #[test]
+    fn admit_known_resolution_rejects_rationale_text_on_legacy_schema() {
+        let harness = harness_for_test();
+        let ctx = RequestContext {
+            actor: authn::Actor {
+                sub: "sup-001".to_string(),
+                role: authn::Role::Supervisor,
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+            },
+            scope: scope::AccessScope {
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+                max_sensitivity: None,
+                label_allowlist: None,
+            },
+            schema: "sivira-cs-demo".to_string(),
+            request_id: "req-test".to_string(),
+            manual_schema: crate::config::ManualSchemaKind::LegacySection,
+        };
+        let err = harness
+            .admit_known_resolution(&ctx, &["mold".to_string()], "answer", Some("because"), &[])
+            .expect_err("legacy schema must reject rationale_text");
+        assert!(
+            err.to_string().contains("rationale_text"),
+            "unexpected error: {err}"
+        );
+        // 根拠アンカーゼロ（section なし・rationale なし）も拒否（監査可能性）
+        let err = harness
+            .admit_known_resolution(&ctx, &["mold".to_string()], "answer", None, &[])
+            .expect_err("KR without any evidence anchor must be rejected");
+        assert!(
+            err.to_string().contains("evidence anchor"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn begin_rejects_out_of_scope_project() {
         let harness = harness_for_test();
-        assert!(harness.begin(None, "other-tenant").is_err());
+        assert!(harness
+            .begin(
+                None,
+                "other-tenant",
+                crate::config::ManualSchemaKind::LegacySection,
+            )
+            .is_err());
     }
 }

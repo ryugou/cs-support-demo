@@ -64,8 +64,13 @@ async fn main() -> Result<()> {
     let token = read_token(&args)?;
 
     // 1. 加算スキーマ登録（既存 schema に node/edge type を足す）
-    let schema_yaml = fs::read_to_string(&args.schema_file)
-        .with_context(|| format!("read schema file {}", args.schema_file.display()))?;
+    // 汎用テンプレを別テナントに登録する場合に備え name をリクエスト schema 名へ揃える
+    // （同名なら no-op。vegapunk は create_schema 時に YAML name と登録名の一致を要求）。
+    let schema_yaml = cs_support_mcp::manual::schema_ids::with_schema_name(
+        &fs::read_to_string(&args.schema_file)
+            .with_context(|| format!("read schema file {}", args.schema_file.display()))?,
+        &args.schema,
+    )?;
     let client = VegapunkClient::connect(&args.endpoint, &token).await?;
     client
         .create_or_update_schema(&args.schema, schema_yaml)
