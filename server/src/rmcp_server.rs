@@ -454,19 +454,29 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<GetProductRequest>,
     ) -> Result<Json<ProductView>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let view = match ctx.manual_schema {
-            // TODO: implement ManualStore::get_product (Product + DESCRIBES sections + TOC)
+        let (retrieved_id, view) = match ctx.manual_schema {
             crate::config::ManualSchemaKind::ManualV1 => {
-                return Err(ErrorData::invalid_params(
-                    "get_product is not supported for manual_v1 schemas yet; use resolve_product + search_manual",
-                    None,
-                ));
+                let store = self.manual_store()?;
+                let view = store
+                    .get_product(&ctx.schema, &req.product_key)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved_id = crate::manual::schema_ids::manual_node_id(
+                    &ctx.schema,
+                    crate::manual::schema_ids::KIND_PRODUCT,
+                    &req.product_key,
+                );
+                (retrieved_id, view)
             }
-            crate::config::ManualSchemaKind::LegacySection => self
-                .tools
-                .get_product(&ctx.schema, &req.product_key)
-                .await
-                .map_err(to_error)?,
+            crate::config::ManualSchemaKind::LegacySection => {
+                let view = self
+                    .tools
+                    .get_product(&ctx.schema, &req.product_key)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved_id = crate::ingest::product_node_id(&ctx.schema, &req.product_key);
+                (retrieved_id, view)
+            }
         };
         self.harness
             .audit_with_nodes(
@@ -474,10 +484,7 @@ impl CsSupportRmcpServer {
                 "read:get_product",
                 None,
                 Vec::new(),
-                vec![crate::ingest::product_node_id(
-                    &ctx.schema,
-                    &req.product_key,
-                )],
+                vec![retrieved_id],
             )
             .await
             .map_err(to_error)?;

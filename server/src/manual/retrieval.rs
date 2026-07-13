@@ -1,6 +1,6 @@
 use crate::harness::signal::SignalSet;
 use crate::manual::schema_ids::manual_node_id;
-use crate::model::{ManualHit, ManualProductCandidate, ManualSectionView};
+use crate::model::{ManualHit, ManualProductCandidate, ManualSectionView, ProductView};
 use crate::proto::graphrag::GetGraphSnapshotResponse;
 use crate::resolve::normalize_key;
 use crate::vegapunk::VegapunkClient;
@@ -249,6 +249,108 @@ pub fn sections_for_signals(
         .collect()
 }
 
+/// Product + DESCRIBES 逆引きの節キー + それら節が属する ManualDocument 配下の TOC を返す純関数。
+/// manual_v1 には product -> document の直接辺が無いため、product を DESCRIBES する節の
+/// HAS_SECTION 逆引きで document を特定し、その document 配下の全節を TOC 対象にする。
+/// specs は manual_v1 では未実装のため常に空 Vec（S1-7 のスコープ外）。
+/// toc は order 属性昇順（同着は section_key 昇順）のフラットリストで、
+/// 各要素が親 section_key（PARENT_OF 逆引き）を持つ ── 階層 JSON は構築しない。
+pub fn product_view_from_snapshot(
+    _schema: &str,
+    product_key: &str,
+    snapshot: &GetGraphSnapshotResponse,
+) -> Result<ProductView> {
+    let product_node = snapshot
+        .nodes
+        .iter()
+        .find(|n| {
+            n.node_type == "Product"
+                && n.attributes.get("product_key").map(String::as_str) == Some(product_key)
+        })
+        .ok_or_else(|| anyhow!("product not found: {product_key}"))?;
+
+    let node_by_id = |id: &str| snapshot.nodes.iter().find(|n| n.node_id == id);
+
+    // DESCRIBES: ManualSection -> Product の逆引き
+    let describing_section_ids: HashSet<&str> = snapshot
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "DESCRIBES" && e.to_id == product_node.node_id)
+        .map(|e| e.from_id.as_str())
+        .collect();
+    let mut describing_section_keys: Vec<String> = describing_section_ids
+        .iter()
+        .filter_map(|id| node_by_id(id))
+        .map(|n| n.attributes.get("section_key").cloned().unwrap_or_default())
+        .collect();
+    describing_section_keys.sort();
+
+    // DESCRIBES 節が属する document（HAS_SECTION 逆引き）→ その document 配下の全節を TOC 対象にする。
+    let doc_ids: HashSet<&str> = snapshot
+        .edges
+        .iter()
+        .filter(|e| {
+            e.edge_type == "HAS_SECTION" && describing_section_ids.contains(e.to_id.as_str())
+        })
+        .map(|e| e.from_id.as_str())
+        .collect();
+    let toc_section_ids: HashSet<&str> = snapshot
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "HAS_SECTION" && doc_ids.contains(e.from_id.as_str()))
+        .map(|e| e.to_id.as_str())
+        .collect();
+    let parent_of: std::collections::HashMap<&str, &str> = snapshot
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "PARENT_OF")
+        .map(|e| (e.to_id.as_str(), e.from_id.as_str()))
+        .collect();
+
+    let mut toc: Vec<(i64, String, serde_json::Value)> = toc_section_ids
+        .iter()
+        .filter_map(|id| node_by_id(id).map(|n| (*id, n)))
+        .map(|(id, n)| {
+            let section_key = n.attributes.get("section_key").cloned().unwrap_or_default();
+            let order: i64 = n
+                .attributes
+                .get("order")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let parent_key = parent_of.get(id).and_then(|pid| node_by_id(pid)).map(|pn| {
+                pn.attributes
+                    .get("section_key")
+                    .cloned()
+                    .unwrap_or_default()
+            });
+            (
+                order,
+                section_key.clone(),
+                serde_json::json!({
+                    "section_key": section_key,
+                    "title": n.attributes.get("title").cloned().unwrap_or_default(),
+                    "order": order,
+                    "parent": parent_key,
+                }),
+            )
+        })
+        .collect();
+    toc.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let toc: Vec<serde_json::Value> = toc.into_iter().map(|(_, _, v)| v).collect();
+
+    let product = serde_json::json!({
+        "node_id": product_node.node_id,
+        "attributes": product_node.attributes,
+        "describing_section_keys": describing_section_keys,
+    });
+
+    Ok(ProductView {
+        product,
+        specs: Vec::new(),
+        toc,
+    })
+}
+
 pub struct ManualStore {
     client: Arc<VegapunkClient>,
 }
@@ -434,6 +536,12 @@ impl ManualStore {
             children,
             based_on_rationale,
         })
+    }
+
+    /// Product 概要 + DESCRIBES 節キー + document TOC を返す（S1-7）。
+    pub async fn get_product(&self, schema: &str, product_key: &str) -> Result<ProductView> {
+        let snap = self.snapshot(schema).await?;
+        product_view_from_snapshot(schema, product_key, &snap)
     }
 
     /// Product ノードを name/model/aliases の正規化一致で解決する。
@@ -760,6 +868,104 @@ mod tests {
         assert!(keys.contains("sec-a"));
         assert!(keys.contains("sec-b"));
         assert!(keys.contains("sec-c"));
+    }
+
+    #[test]
+    fn product_view_from_snapshot_returns_product_describing_sections_and_ordered_toc() {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let product_key = "SVR-HB100";
+        let product_node = PN {
+            node_id: manual_node_id(schema, "Product", product_key),
+            node_type: "Product".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [
+                ("product_key".to_string(), product_key.to_string()),
+                ("name".to_string(), "サンプル製品".to_string()),
+                ("model".to_string(), product_key.to_string()),
+                ("aliases".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let section_node = |key: &str, order: i32| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), key.to_string()),
+                ("doc_key".to_string(), "doc-1".to_string()),
+                ("title".to_string(), format!("title-{key}")),
+                ("order".to_string(), order.to_string()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        let sec_a = section_node("sec-a", 1);
+        let sec_b = section_node("sec-b", 2);
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![product_node.clone(), sec_a.clone(), sec_b.clone()],
+            edges: vec![
+                PE {
+                    edge_id: String::new(),
+                    from_id: sec_a.node_id.clone(),
+                    to_id: product_node.node_id.clone(),
+                    edge_type: "DESCRIBES".to_string(),
+                },
+                PE {
+                    edge_id: String::new(),
+                    from_id: manual_node_id(schema, "ManualDocument", "doc-1"),
+                    to_id: sec_a.node_id.clone(),
+                    edge_type: "HAS_SECTION".to_string(),
+                },
+                PE {
+                    edge_id: String::new(),
+                    from_id: manual_node_id(schema, "ManualDocument", "doc-1"),
+                    to_id: sec_b.node_id.clone(),
+                    edge_type: "HAS_SECTION".to_string(),
+                },
+                PE {
+                    edge_id: String::new(),
+                    from_id: sec_a.node_id.clone(),
+                    to_id: sec_b.node_id.clone(),
+                    edge_type: "PARENT_OF".to_string(),
+                },
+            ],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let view = product_view_from_snapshot(schema, product_key, &snap).expect("product view");
+        assert_eq!(
+            view.product["describing_section_keys"],
+            serde_json::json!(["sec-a"])
+        );
+        assert_eq!(view.specs.len(), 0);
+        assert_eq!(view.toc.len(), 2);
+        assert_eq!(view.toc[0]["section_key"], serde_json::json!("sec-a"));
+        assert_eq!(view.toc[0]["parent"], serde_json::Value::Null);
+        assert_eq!(view.toc[1]["section_key"], serde_json::json!("sec-b"));
+        assert_eq!(view.toc[1]["parent"], serde_json::json!("sec-a"));
+    }
+
+    #[test]
+    fn product_view_from_snapshot_errors_when_product_missing() {
+        use crate::proto::graphrag::GetGraphSnapshotResponse;
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![],
+            edges: vec![],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let err = product_view_from_snapshot("urtect", "NOPE", &snap).unwrap_err();
+        assert!(err.to_string().contains("product not found: NOPE"));
     }
 
     #[test]
