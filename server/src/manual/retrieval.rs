@@ -251,15 +251,27 @@ pub fn sections_for_signals(
 
 /// Product + DESCRIBES 逆引きの節キー + それら節が属する ManualDocument 配下の TOC を返す純関数。
 /// manual_v1 には product -> document の直接辺が無いため、product を DESCRIBES する節の
-/// HAS_SECTION 逆引きで document を特定し、その document 配下の全節を TOC 対象にする。
+/// HAS_SECTION 逆引きで document を特定し、その document 配下の節から product-applicable な
+/// ものだけを TOC 対象にする。product-applicable の判定基準は search_with_snapshot の
+/// スコープ絞り込みと同じ: (a) 当該 Product への DESCRIBES 辺を持つ、または
+/// (b) DESCRIBES 辺を一切持たない（機種非依存ページ）。他機種のみを DESCRIBES する節は
+/// document 配下であっても TOC から除外する（実データ: 1 document を複数 product が共有し、
+/// 各節が特定機種のみを説明する URTECT 構成での TOC 汚染を防ぐ）。
 /// specs は manual_v1 では未実装のため常に空 Vec（S1-7 のスコープ外）。
 /// toc は order 属性昇順（同着は section_key 昇順）のフラットリストで、
 /// 各要素が親 section_key（PARENT_OF 逆引き）を持つ ── 階層 JSON は構築しない。
+/// 親が TOC から除外された節（他機種専用）を指す場合でも、参照はそのまま返す（捏造・null 化しない）。
 pub fn product_view_from_snapshot(
-    _schema: &str,
     product_key: &str,
     snapshot: &GetGraphSnapshotResponse,
 ) -> Result<ProductView> {
+    // node_id → GraphNode の索引を 1 度だけ構築する（ループ内での線形スキャンを避ける）。
+    let node_index: std::collections::HashMap<&str, &crate::proto::graphrag::GraphNode> = snapshot
+        .nodes
+        .iter()
+        .map(|n| (n.node_id.as_str(), n))
+        .collect();
+
     let product_node = snapshot
         .nodes
         .iter()
@@ -269,23 +281,25 @@ pub fn product_view_from_snapshot(
         })
         .ok_or_else(|| anyhow!("product not found: {product_key}"))?;
 
-    let node_by_id = |id: &str| snapshot.nodes.iter().find(|n| n.node_id == id);
-
-    // DESCRIBES: ManualSection -> Product の逆引き
-    let describing_section_ids: HashSet<&str> = snapshot
-        .edges
-        .iter()
-        .filter(|e| e.edge_type == "DESCRIBES" && e.to_id == product_node.node_id)
-        .map(|e| e.from_id.as_str())
-        .collect();
+    // DESCRIBES: ManualSection -> Product の逆引き。
+    // describes_any: 何らかの DESCRIBES 辺を持つ節（＝機種依存ページ）全体。
+    // describing_section_ids: このうち当該 product を DESCRIBES する節。
+    let mut describes_any: HashSet<&str> = HashSet::new();
+    let mut describing_section_ids: HashSet<&str> = HashSet::new();
+    for e in snapshot.edges.iter().filter(|e| e.edge_type == "DESCRIBES") {
+        describes_any.insert(e.from_id.as_str());
+        if e.to_id == product_node.node_id {
+            describing_section_ids.insert(e.from_id.as_str());
+        }
+    }
     let mut describing_section_keys: Vec<String> = describing_section_ids
         .iter()
-        .filter_map(|id| node_by_id(id))
+        .filter_map(|id| node_index.get(id))
         .map(|n| n.attributes.get("section_key").cloned().unwrap_or_default())
         .collect();
     describing_section_keys.sort();
 
-    // DESCRIBES 節が属する document（HAS_SECTION 逆引き）→ その document 配下の全節を TOC 対象にする。
+    // DESCRIBES 節が属する document（HAS_SECTION 逆引き）→ その document 配下の全節を TOC 候補にする。
     let doc_ids: HashSet<&str> = snapshot
         .edges
         .iter()
@@ -294,11 +308,17 @@ pub fn product_view_from_snapshot(
         })
         .map(|e| e.from_id.as_str())
         .collect();
-    let toc_section_ids: HashSet<&str> = snapshot
+    let toc_candidate_ids: HashSet<&str> = snapshot
         .edges
         .iter()
         .filter(|e| e.edge_type == "HAS_SECTION" && doc_ids.contains(e.from_id.as_str()))
         .map(|e| e.to_id.as_str())
+        .collect();
+    // product-applicable のみ TOC に残す: 当該 product を DESCRIBES する、または
+    // DESCRIBES 辺を一切持たない節。他機種のみを DESCRIBES する節は除外する。
+    let toc_section_ids: HashSet<&str> = toc_candidate_ids
+        .into_iter()
+        .filter(|id| !describes_any.contains(id) || describing_section_ids.contains(id))
         .collect();
     let parent_of: std::collections::HashMap<&str, &str> = snapshot
         .edges
@@ -309,7 +329,7 @@ pub fn product_view_from_snapshot(
 
     let mut toc: Vec<(i64, String, serde_json::Value)> = toc_section_ids
         .iter()
-        .filter_map(|id| node_by_id(id).map(|n| (*id, n)))
+        .filter_map(|id| node_index.get(id).map(|n| (*id, *n)))
         .map(|(id, n)| {
             let section_key = n.attributes.get("section_key").cloned().unwrap_or_default();
             let order: i64 = n
@@ -317,12 +337,15 @@ pub fn product_view_from_snapshot(
                 .get("order")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            let parent_key = parent_of.get(id).and_then(|pid| node_by_id(pid)).map(|pn| {
-                pn.attributes
-                    .get("section_key")
-                    .cloned()
-                    .unwrap_or_default()
-            });
+            let parent_key = parent_of
+                .get(id)
+                .and_then(|pid| node_index.get(pid))
+                .map(|pn| {
+                    pn.attributes
+                        .get("section_key")
+                        .cloned()
+                        .unwrap_or_default()
+                });
             (
                 order,
                 section_key.clone(),
@@ -541,7 +564,7 @@ impl ManualStore {
     /// Product 概要 + DESCRIBES 節キー + document TOC を返す（S1-7）。
     pub async fn get_product(&self, schema: &str, product_key: &str) -> Result<ProductView> {
         let snap = self.snapshot(schema).await?;
-        product_view_from_snapshot(schema, product_key, &snap)
+        product_view_from_snapshot(product_key, &snap)
     }
 
     /// Product ノードを name/model/aliases の正規化一致で解決する。
@@ -942,7 +965,7 @@ mod tests {
             truncated: false,
             total_node_count: 0,
         };
-        let view = product_view_from_snapshot(schema, product_key, &snap).expect("product view");
+        let view = product_view_from_snapshot(product_key, &snap).expect("product view");
         assert_eq!(
             view.product["describing_section_keys"],
             serde_json::json!(["sec-a"])
@@ -956,6 +979,113 @@ mod tests {
     }
 
     #[test]
+    fn product_view_from_snapshot_excludes_sections_describing_only_other_product() {
+        // 実データ想定: 1 document を product A/B が共有し、各節が特定機種のみを説明する。
+        // s1: A のみ DESCRIBES / s2: B のみ DESCRIBES（他機種専用 → 除外）/ s3: DESCRIBES 辺なし（機種非依存 → 維持）。
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let product_a = "SVR-HB100";
+        let product_b = "SVR-HB200";
+        let product_node = |key: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, "Product", key),
+                node_type: "Product".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: [
+                    ("product_key".to_string(), key.to_string()),
+                    ("name".to_string(), format!("製品-{key}")),
+                    ("model".to_string(), key.to_string()),
+                    ("aliases".to_string(), String::new()),
+                ]
+                .into_iter()
+                .collect(),
+            }
+        };
+        let section_node = |key: &str, order: i32| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), key.to_string()),
+                ("doc_key".to_string(), "doc-1".to_string()),
+                ("title".to_string(), format!("title-{key}")),
+                ("order".to_string(), order.to_string()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        let pa = product_node(product_a);
+        let pb = product_node(product_b);
+        let s1 = section_node("s1", 1);
+        let s2 = section_node("s2", 2);
+        let s3 = section_node("s3", 3);
+        let describes_edge = |section: &PN, product: &PN| -> PE {
+            PE {
+                edge_id: String::new(),
+                from_id: section.node_id.clone(),
+                to_id: product.node_id.clone(),
+                edge_type: "DESCRIBES".to_string(),
+            }
+        };
+        let has_section_edge = |section: &PN| -> PE {
+            PE {
+                edge_id: String::new(),
+                from_id: manual_node_id(schema, "ManualDocument", "doc-1"),
+                to_id: section.node_id.clone(),
+                edge_type: "HAS_SECTION".to_string(),
+            }
+        };
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![pa.clone(), pb.clone(), s1.clone(), s2.clone(), s3.clone()],
+            edges: vec![
+                describes_edge(&s1, &pa),
+                describes_edge(&s2, &pb),
+                has_section_edge(&s1),
+                has_section_edge(&s2),
+                has_section_edge(&s3),
+                // s3 の親は s2（除外節）。除外されても親参照は捏造・null 化せずそのまま返す。
+                PE {
+                    edge_id: String::new(),
+                    from_id: s2.node_id.clone(),
+                    to_id: s3.node_id.clone(),
+                    edge_type: "PARENT_OF".to_string(),
+                },
+            ],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let view = product_view_from_snapshot(product_a, &snap).expect("product view");
+        let toc_keys: Vec<&str> = view
+            .toc
+            .iter()
+            .map(|v| v["section_key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            toc_keys,
+            vec!["s1", "s3"],
+            "s2 (describes only product B) must be excluded from A's toc: {toc_keys:?}"
+        );
+        let s3_view = view
+            .toc
+            .iter()
+            .find(|v| v["section_key"] == "s3")
+            .expect("s3 present in toc");
+        assert_eq!(
+            s3_view["parent"],
+            serde_json::json!("s2"),
+            "parent reference to an excluded section must be kept as-is, not fabricated"
+        );
+    }
+
+    #[test]
     fn product_view_from_snapshot_errors_when_product_missing() {
         use crate::proto::graphrag::GetGraphSnapshotResponse;
         let snap = GetGraphSnapshotResponse {
@@ -964,7 +1094,7 @@ mod tests {
             truncated: false,
             total_node_count: 0,
         };
-        let err = product_view_from_snapshot("urtect", "NOPE", &snap).unwrap_err();
+        let err = product_view_from_snapshot("NOPE", &snap).unwrap_err();
         assert!(err.to_string().contains("product not found: NOPE"));
     }
 
