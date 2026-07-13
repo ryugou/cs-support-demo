@@ -649,6 +649,13 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // 同一 id のノード重複を除去してから upsert する（Signal ノードは節ごとに生成されるため
+    // 共通 signal が節数ぶん重複しやすい。冪等 upsert なので正しさには影響しないが、
+    // gRPC ペイロードと ingest 時間を無駄に膨らませる）。順序は保持する。
+    let mut seen_node_ids = HashSet::new();
+    let mut nodes = nodes;
+    nodes.retain(|n| seen_node_ids.insert(n.id.clone()));
+
     let graph = GraphBuild { nodes, edges };
     let expected_nodes = graph.nodes.len();
     let expected_edges = graph.edges.len();
