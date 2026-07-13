@@ -82,6 +82,28 @@ pub struct EvaluateAnswerabilityResponse {
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
     pub request_id: String,
+    /// 参考として返す類似の過去事例（自 case は除外）。3 層判定の入力ではなく、
+    /// あくまで client 向けの参考情報（S1-1 取得段）。
+    pub related_cases: Vec<RelatedCaseJson>,
+}
+
+/// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RelatedCaseJson {
+    pub case_id: String,
+    pub question: String,
+    /// 旧行には無いことがあるため空文字を許容する。
+    pub last_decision: String,
+}
+
+impl From<crate::harness::RelatedCase> for RelatedCaseJson {
+    fn from(c: crate::harness::RelatedCase) -> Self {
+        Self {
+            case_id: c.case_id,
+            question: c.question,
+            last_decision: c.last_decision,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -529,6 +551,11 @@ impl CsSupportRmcpServer {
             hits: outcome.hits,
             audit_event_id: outcome.audit_event_id,
             request_id: ctx.request_id,
+            related_cases: outcome
+                .related_cases
+                .into_iter()
+                .map(RelatedCaseJson::from)
+                .collect(),
         }))
     }
 

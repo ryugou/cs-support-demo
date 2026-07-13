@@ -76,6 +76,48 @@ fn signal_value_index(
         .collect()
 }
 
+/// 過去事例を取得済み snapshot から検索する（追加 RPC なし。evaluate の hot path 用）。
+/// scoring は `KnowledgeStore::search_cases` と同じ `crate::mcp::section_score` を再利用する。
+/// `exclude_case_id` は現在進行中の case（呼び出し元が自身の case_id を知っている）を
+/// 除外するためのもの。S1-1 の取得段が返す参考情報であり、判定入力にはしない（呼び出し元で
+/// decide() に渡さないこと。この関数自体も decide() を一切参照しない・純関数）。
+pub fn search_cases_from_snapshot(
+    snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+    question: &str,
+    top_k: usize,
+    exclude_case_id: Option<&str>,
+) -> Vec<(PastCase, f32)> {
+    let query_norm = crate::resolve::normalize_key(question);
+    let mut hits: Vec<(PastCase, f32)> = snapshot
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == "support_case")
+        .filter_map(|n| {
+            let case_id = n.attributes.get("case_id")?.clone();
+            if exclude_case_id == Some(case_id.as_str()) {
+                return None;
+            }
+            let case = PastCase {
+                case_id,
+                question: n.attributes.get("question").cloned().unwrap_or_default(),
+                product_key: n.attributes.get("product_key").cloned().unwrap_or_default(),
+                actor: n.attributes.get("actor").cloned().unwrap_or_default(),
+                created_at: n.attributes.get("created_at").cloned().unwrap_or_default(),
+                last_decision: n
+                    .attributes
+                    .get("last_decision")
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            let score = crate::mcp::section_score(&query_norm, question, &case.question);
+            (score > 0.3).then_some((case, score))
+        })
+        .collect();
+    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(top_k.max(1));
+    hits
+}
+
 fn parse_binding(value: Option<&String>) -> Binding {
     match value.map(String::as_str) {
         Some("mandatory") => Binding::Mandatory,
@@ -155,6 +197,10 @@ pub struct PastCase {
     pub product_key: String,
     pub actor: String,
     pub created_at: String,
+    /// evaluate が最後に記録した判定（"allowed" / "escalate"）。旧行には無いことがあり、
+    /// その場合は空文字を許容する（fail closed にはしない。参考情報のため）。
+    #[serde(default)]
+    pub last_decision: String,
 }
 
 /// 担当者が追加する新ルール（add_known_resolution / correction_intake の出口）。
@@ -533,6 +579,7 @@ impl KnowledgeStore {
                     product_key: attrs.get("product_key").cloned().unwrap_or_default(),
                     actor: attrs.get("actor").cloned().unwrap_or_default(),
                     created_at: attrs.get("created_at").cloned().unwrap_or_default(),
+                    last_decision: attrs.get("last_decision").cloned().unwrap_or_default(),
                 })
             })
             .collect())
@@ -979,5 +1026,103 @@ mod tests {
             because_edges[0].to_id,
             crate::ingest::section_node_id("sivira-cs-demo", "doc-1#storage")
         );
+    }
+
+    fn support_case_node(
+        case_id: &str,
+        question: &str,
+        last_decision: &str,
+    ) -> crate::proto::graphrag::GraphNode {
+        use crate::proto::graphrag::GraphNode as ProtoNode;
+        ProtoNode {
+            node_id: format!("urtect:gen1:support_case:{case_id}"),
+            node_type: "support_case".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [
+                ("case_id".to_string(), case_id.to_string()),
+                ("question".to_string(), question.to_string()),
+                ("last_decision".to_string(), last_decision.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn search_cases_from_snapshot_excludes_current_case_orders_and_limits() {
+        use crate::proto::graphrag::GetGraphSnapshotResponse;
+        let current = support_case_node("case-current", "電源が入らない 起動しない", "escalate");
+        let strong_match = support_case_node("case-strong", "電源が入らない", "allowed");
+        let weak_match = support_case_node("case-weak", "電源 ランプ 点滅", "escalate");
+        let no_match = support_case_node("case-none", "配送先の変更方法", "allowed");
+        let snapshot = GetGraphSnapshotResponse {
+            nodes: vec![
+                current.clone(),
+                strong_match.clone(),
+                weak_match.clone(),
+                no_match.clone(),
+            ],
+            edges: vec![],
+            truncated: false,
+            total_node_count: 4,
+        };
+
+        let hits = search_cases_from_snapshot(&snapshot, "電源が入らない", 3, Some("case-current"));
+
+        // 現在の case は自己引用にならないよう除外される
+        assert!(hits.iter().all(|(c, _)| c.case_id != "case-current"));
+        // スコア降順（強い一致が先頭）
+        assert_eq!(hits.first().unwrap().0.case_id, "case-strong");
+        for pair in hits.windows(2) {
+            assert!(pair[0].1 >= pair[1].1, "hits must be sorted by score desc");
+        }
+    }
+
+    #[test]
+    fn search_cases_from_snapshot_respects_top_k() {
+        use crate::proto::graphrag::GetGraphSnapshotResponse;
+        let nodes: Vec<crate::proto::graphrag::GraphNode> = (0..5)
+            .map(|i| support_case_node(&format!("case-{i}"), "電源が入らない", "allowed"))
+            .collect();
+        let snapshot = GetGraphSnapshotResponse {
+            nodes,
+            edges: vec![],
+            truncated: false,
+            total_node_count: 5,
+        };
+
+        let hits = search_cases_from_snapshot(&snapshot, "電源が入らない", 2, None);
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn search_cases_from_snapshot_tolerates_missing_last_decision() {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphNode as ProtoNode};
+        let node = ProtoNode {
+            node_id: "urtect:gen1:support_case:case-old".to_string(),
+            node_type: "support_case".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [
+                ("case_id".to_string(), "case-old".to_string()),
+                ("question".to_string(), "電源が入らない".to_string()),
+                // last_decision は古い行に無いことがある
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let snapshot = GetGraphSnapshotResponse {
+            nodes: vec![node],
+            edges: vec![],
+            truncated: false,
+            total_node_count: 1,
+        };
+
+        let hits = search_cases_from_snapshot(&snapshot, "電源が入らない", 3, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.case_id, "case-old");
     }
 }

@@ -61,6 +61,18 @@ pub struct EvaluationOutcome {
     pub clarification_allowed: bool,
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
+    /// S1-1 取得段: 参考として返す類似の過去事例（自 case は除外）。
+    /// あくまで client 向けの参考情報であり、3 層判定（decide）の入力には使わない
+    /// （判定材料は KR/manual のみという定義を変えない）。
+    pub related_cases: Vec<RelatedCase>,
+}
+
+/// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedCase {
+    pub case_id: String,
+    pub question: String,
+    pub last_decision: String,
 }
 
 impl Harness {
@@ -605,12 +617,30 @@ impl Harness {
                 layer, route_to, ..
             } => (format!("escalate:layer{layer}"), Some(route_to.clone())),
         };
+        // [取得] S1-1: past_case も取得する（参考情報として返すのみ・decide() には渡さない）。
+        // 追加 RPC なしで、evaluate 冒頭で取得済みの snapshot を再利用する。自 case は除外する。
+        let related_cases: Vec<RelatedCase> =
+            knowledge::search_cases_from_snapshot(&snapshot, question, 3, Some(case_id.as_str()))
+                .into_iter()
+                .map(|(case, _score)| RelatedCase {
+                    case_id: case.case_id,
+                    question: case.question,
+                    last_decision: case.last_decision,
+                })
+                .collect();
         let mut retrieved_node_ids: Vec<String> = retrieved_manual_ids;
         retrieved_node_ids.push(knowledge::harness_node_id(
             &ctx.schema,
             "support_case",
             &case_id,
         ));
+        for related in &related_cases {
+            retrieved_node_ids.push(knowledge::harness_node_id(
+                &ctx.schema,
+                "support_case",
+                &related.case_id,
+            ));
+        }
         let mut governing_norm_ids = Vec::new();
         if let decision::AnswerDecision::Allowed {
             known_resolution_id: Some(kr_id),
@@ -641,6 +671,7 @@ impl Harness {
             clarification_allowed,
             hits: section_hits,
             audit_event_id,
+            related_cases,
         })
     }
 
