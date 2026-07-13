@@ -554,17 +554,39 @@ impl Harness {
         // [記録] 判定結果を case に永続化する（record_answer_attempt の lineage 検証の根拠。
         // client の自己申告でなくサーバ側の記録と突合するため）。KR 由来の回答なら
         // その kr_id もサーバ記録として残す（outcome 記録が client 申告に依存しないため）。
-        let (case_decision, case_kr_id) = match &decision_result {
-            decision::AnswerDecision::Allowed {
-                known_resolution_id,
-                ..
-            } => ("allowed", known_resolution_id.clone().unwrap_or_default()),
-            decision::AnswerDecision::Escalate { .. } => ("escalate", String::new()),
-        };
+        // last_evidence_keys / last_evidence_kind（S1-2）: record_answer_attempt が emit した
+        // 根拠を answer_evidence として書けるよう、判定が使った根拠キーをサーバ記録として残す。
+        // Allowed-manual は evidence_section_keys の結合、Allowed-KR は kr_id 単体、
+        // Escalate は空（エスカレーション済み case は emit 経路に乗らない）。
+        let (case_decision, case_kr_id, last_evidence_keys, last_evidence_kind) =
+            match &decision_result {
+                decision::AnswerDecision::Allowed {
+                    known_resolution_id,
+                    evidence_section_keys,
+                    source,
+                    ..
+                } => {
+                    let kr_id = known_resolution_id.clone().unwrap_or_default();
+                    let (keys, kind) = match source {
+                        decision::AnswerSource::KnownResolution => {
+                            (kr_id.clone(), "known_resolution")
+                        }
+                        decision::AnswerSource::Manual => {
+                            (evidence_section_keys.join(","), "manual")
+                        }
+                    };
+                    ("allowed", kr_id, keys, kind.to_string())
+                }
+                decision::AnswerDecision::Escalate { .. } => {
+                    ("escalate", String::new(), String::new(), String::new())
+                }
+            };
         case_attrs.insert("case_id".to_string(), case_id.clone());
         case_attrs.insert("last_request_id".to_string(), ctx.request_id.clone());
         case_attrs.insert("last_decision".to_string(), case_decision.to_string());
         case_attrs.insert("last_kr_id".to_string(), case_kr_id);
+        case_attrs.insert("last_evidence_keys".to_string(), last_evidence_keys);
+        case_attrs.insert("last_evidence_kind".to_string(), last_evidence_kind);
         knowledge
             .record(
                 &ctx.schema,

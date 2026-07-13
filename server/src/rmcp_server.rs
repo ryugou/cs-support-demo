@@ -691,6 +691,32 @@ impl CsSupportRmcpServer {
             )
             .await
             .map_err(to_error)?;
+        // answer_evidence（S1-2）: 判定が使った根拠キーを evaluate 側が case に記録済みのため、
+        // それを読み出して attempt に紐づく evidence として追記する。escalate 済み case は
+        // last_evidence_keys が空でここに来ないため、append_answer_evidence 側で無音スキップされる。
+        let evidence_case_attrs = store
+            .load_case(&ctx.schema, &req.case_id)
+            .await
+            .map_err(to_error)?
+            .unwrap_or_default();
+        let last_evidence_keys = evidence_case_attrs
+            .get("last_evidence_keys")
+            .cloned()
+            .unwrap_or_default();
+        let last_evidence_kind = evidence_case_attrs
+            .get("last_evidence_kind")
+            .cloned()
+            .unwrap_or_default();
+        let evidence_items: Vec<(String, String)> = last_evidence_keys
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(|key| (key.to_string(), last_evidence_kind.clone()))
+            .collect();
+        store
+            .append_answer_evidence(&ctx.schema, &attempt_id, &evidence_items)
+            .await
+            .map_err(to_error)?;
         Ok(Json(RecordAnswerAttemptResponse {
             attempt_id,
             egress: verdict,

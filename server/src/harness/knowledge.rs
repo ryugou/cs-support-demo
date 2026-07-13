@@ -283,6 +283,36 @@ pub fn build_known_resolution_graph(
     GraphBuild { nodes, edges }
 }
 
+/// answer_evidence をキー・種別ペアからグラフ表現に組み立てる（S1-2: emit した回答の証跡）。
+/// items は `(section_key, kind)` のペア。kind は `"manual"` | `"known_resolution"`。
+/// evidence_id はここで新規採番するため、呼び出す度に異なるノードが生成される（追記専用・上書きなし）。
+pub fn build_answer_evidence_graph(
+    schema: &str,
+    attempt_id: &str,
+    items: &[(&str, &str)],
+) -> GraphBuild {
+    let nodes = items
+        .iter()
+        .map(|(section_key, kind)| {
+            let evidence_id = format!("ev-{}", uuid::Uuid::new_v4());
+            GraphNode {
+                id: harness_node_id(schema, "answer_evidence", &evidence_id),
+                node_type: "answer_evidence".to_string(),
+                attributes: vec![
+                    ("evidence_id".to_string(), evidence_id),
+                    ("attempt_id".to_string(), attempt_id.to_string()),
+                    ("section_key".to_string(), section_key.to_string()),
+                    ("kind".to_string(), kind.to_string()),
+                ],
+            }
+        })
+        .collect();
+    GraphBuild {
+        nodes,
+        edges: Vec::new(),
+    }
+}
+
 /// PunkRecord（vegapunk）を材料ストアとして読み書きする層。判定は載せない（I4）。
 pub struct KnowledgeStore {
     client: Arc<VegapunkClient>,
@@ -408,6 +438,27 @@ impl KnowledgeStore {
         let build = build_known_resolution_graph(schema, &kr_id, kr, schema_kind);
         self.client.upsert_graph_low_level(build).await?;
         Ok(kr_id)
+    }
+
+    /// answer_attempt が実際に emit した根拠（manual section / known_resolution）を
+    /// answer_evidence として追記する（S1-2）。items が空なら何もしない
+    /// （escalate 済みの case は emit 経路に乗らないため呼び出し元も空で来る）。
+    pub async fn append_answer_evidence(
+        &self,
+        schema: &str,
+        attempt_id: &str,
+        items: &[(String, String)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<(&str, &str)> = items
+            .iter()
+            .map(|(section_key, kind)| (section_key.as_str(), kind.as_str()))
+            .collect();
+        let build = build_answer_evidence_graph(schema, attempt_id, &refs);
+        self.client.upsert_graph_low_level(build).await?;
+        Ok(())
     }
 
     /// support 系 record（support_case / answer_attempt など）を 1 ノードとして書く。
@@ -822,6 +873,65 @@ mod tests {
                 "missing reserved {key}"
             );
         }
+    }
+
+    #[test]
+    fn answer_evidence_nodes_built_per_key() {
+        let build = build_answer_evidence_graph(
+            "urtect",
+            "att-1",
+            &[("sec-a", "manual"), ("kr-1", "known_resolution")],
+        );
+        assert_eq!(build.nodes.len(), 2);
+        for node in &build.nodes {
+            assert_eq!(node.node_type, "answer_evidence");
+            let get = |key: &str| {
+                node.attributes
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.clone())
+            };
+            assert!(
+                get("evidence_id").filter(|v| !v.is_empty()).is_some(),
+                "evidence_id must be non-empty"
+            );
+            assert_eq!(get("attempt_id").as_deref(), Some("att-1"));
+        }
+        let pairs: Vec<(String, String)> = build
+            .nodes
+            .iter()
+            .map(|n| {
+                let get = |key: &str| {
+                    n.attributes
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.clone())
+                        .unwrap()
+                };
+                (get("section_key"), get("kind"))
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("sec-a".to_string(), "manual".to_string()),
+                ("kr-1".to_string(), "known_resolution".to_string()),
+            ]
+        );
+        // evidence_id は各ノードで異なる（衝突しない一意キー）
+        let ids: Vec<String> = build
+            .nodes
+            .iter()
+            .map(|n| {
+                n.attributes
+                    .iter()
+                    .find(|(k, _)| k == "evidence_id")
+                    .unwrap()
+                    .1
+                    .clone()
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
