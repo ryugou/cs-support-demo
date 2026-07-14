@@ -290,7 +290,7 @@ impl CsSupportRmcpServer {
 
     #[tool(
         name = "resolve_product",
-        description = "商品名・型番・顧客表現から候補 product を返す。照合は正規化+部分一致(fuzzy)。reason: normalized_match | fuzzy_match。"
+        description = "商品名・型番・顧客表現から候補 product を返す。照合は正規化+部分一致(fuzzy)。manual_v1 テナントかつ vector route 有効時は意味検索(embedding)による近傍候補も統合する。reason: normalized_match | fuzzy_match | semantic_nearby。"
     )]
     async fn resolve_product(
         &self,
@@ -302,7 +302,7 @@ impl CsSupportRmcpServer {
             crate::config::ManualSchemaKind::ManualV1 => {
                 let store = self.manual_store()?;
                 let manual_candidates = store
-                    .resolve_product(&ctx.schema, &req.text)
+                    .resolve_product(&ctx.schema, &req.text, self.harness.vector_route_enabled)
                     .await
                     .map_err(to_error)?;
                 let retrieved = manual_candidates

@@ -374,6 +374,23 @@ pub fn product_view_from_snapshot(
     })
 }
 
+/// `(node_id, score)` 群を node_id → 最大スコアの map に畳む（同一 id が複数回来た場合は
+/// max を残す）。ManualSection の vector_hits（`search_with_snapshot`）と Product の
+/// vector_hits（`merge_product_candidates`）の両方で使う共通の fold ステップ。
+fn fold_max_scores(hits: &[(String, f32)]) -> std::collections::HashMap<&str, f32> {
+    let mut map: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+    for (id, score) in hits {
+        map.entry(id.as_str())
+            .and_modify(|s| {
+                if *score > *s {
+                    *s = *score;
+                }
+            })
+            .or_insert(*score);
+    }
+    map
+}
+
 pub struct ManualStore {
     client: Arc<VegapunkClient>,
 }
@@ -418,34 +435,47 @@ impl ManualStore {
         )
     }
 
-    /// vector_route_enabled 時のみ呼ばれる意味検索経路（urtect design §2.3）。
-    /// `SearchResultItem` を ManualSection の node_id を持つものだけに絞り、(node_id, score) を返す。
-    /// backend 呼び出し失敗はテキスト検索を止めないよう warn ログ + 空 Vec にフォールバックする。
+    /// `client.search` を呼び、node_id に `marker` を含む `SearchResultItem` だけを
+    /// (node_id, score) に絞って返す共通ヘルパー。backend 呼び出し失敗は呼び出し元の
+    /// 検索経路を止めないよう warn ログ + 空 Vec にフォールバックする。
     /// 返却スコアは backend の 0-1 程度のスケールをそのまま使う（本関数ではリスケールしない。
     /// 較正は Task 11 の実測ベースで検討する）。
+    async fn search_ids_with_scores(
+        &self,
+        schema: &str,
+        text: &str,
+        top_k: usize,
+        marker: &str,
+    ) -> Vec<(String, f32)> {
+        match self.client.search(schema, text, top_k as i32).await {
+            Ok(items) => items
+                .into_iter()
+                .filter_map(|item| {
+                    let id = item.id?;
+                    id.contains(marker).then(|| (id, item.score.unwrap_or(0.0)))
+                })
+                .collect(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    marker,
+                    "vector search failed; continuing with text-only retrieval"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// vector_route_enabled 時のみ呼ばれる意味検索経路（urtect design §2.3）。
+    /// `SearchResultItem` を ManualSection の node_id を持つものだけに絞り、(node_id, score) を返す。
     pub async fn vector_hits(
         &self,
         schema: &str,
         question: &str,
         top_k: usize,
     ) -> Vec<(String, f32)> {
-        match self.client.search(schema, question, top_k as i32).await {
-            Ok(items) => items
-                .into_iter()
-                .filter_map(|item| {
-                    let id = item.id?;
-                    id.contains(":ManualSection:")
-                        .then(|| (id, item.score.unwrap_or(0.0)))
-                })
-                .collect(),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "vector search failed; continuing with text-only manual retrieval"
-                );
-                Vec::new()
-            }
-        }
+        self.search_ids_with_scores(schema, question, top_k, ":ManualSection:")
+            .await
     }
 
     /// `product_key` が Some のとき、候補 ManualSection は
@@ -512,17 +542,7 @@ impl ManualStore {
         // manual_sections（product_key フィルタ適用後の snapshot 由来の集合）に対して
         // 引くだけなので、snapshot に無い id や product_key フィルタで除外された節の
         // vector スコアは自然に無視される（別集合として union する必要がない）。
-        let mut vector_map: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-        for (id, score) in vector_hits {
-            vector_map
-                .entry(id.as_str())
-                .and_modify(|s| {
-                    if *score > *s {
-                        *s = *score;
-                    }
-                })
-                .or_insert(*score);
-        }
+        let vector_map = fold_max_scores(vector_hits);
         let mut hits: Vec<ManualHit> = manual_sections
             .into_iter()
             .zip(corpus_scores)
@@ -643,49 +663,111 @@ impl ManualStore {
     }
 
     /// Product ノードを name/model/aliases の正規化一致で解決する。
+    /// `use_semantic` が true の場合（manual_v1 かつ vector_route_enabled）、
+    /// Product ノードに対する意味検索（urtect design §2.3）の結果も統合する（A5b）。
     pub async fn resolve_product(
         &self,
         schema: &str,
         text: &str,
+        use_semantic: bool,
     ) -> Result<Vec<ManualProductCandidate>> {
-        let products = self
-            .client
-            .query_nodes(schema, "Product", Vec::new(), 1000)
-            .await
-            .context("query Product")?;
+        // query_nodes と意味検索は互いに依存しない独立した呼び出しなので、直列 await で
+        // 待ち時間を積み上げず tokio::join! で並行に投げる（use_semantic=false 時は
+        // vector_hits_fut は即座に空 Vec を返す no-op）。
+        let vector_hits_fut = async {
+            if use_semantic {
+                self.search_ids_with_scores(schema, text, 10, ":Product:")
+                    .await
+            } else {
+                Vec::new()
+            }
+        };
+        let (products, vector_hits) = tokio::join!(
+            self.client.query_nodes(schema, "Product", Vec::new(), 1000),
+            vector_hits_fut
+        );
+        let products = products.context("query Product")?;
         let q = normalize_key(text);
-        let mut cands: Vec<ManualProductCandidate> = products
+        let rows: Vec<ProductRow> = products
             .into_iter()
-            .filter_map(|p| {
+            .map(|p| {
                 let a = p.attributes;
                 let model = a.get("model").cloned().unwrap_or_default();
                 let name = a.get("name").cloned().unwrap_or_default();
                 let aliases = a.get("aliases").cloned().unwrap_or_default();
-                let score = [model.as_str(), name.as_str()]
+                let fuzzy_score = [model.as_str(), name.as_str()]
                     .into_iter()
                     .chain(aliases.split(',').map(str::trim))
                     .map(|c| crate::resolve::fuzzy_score(&q, &normalize_key(c)))
                     .fold(0.0_f32, f32::max);
-                (score > 0.1).then_some(ManualProductCandidate {
+                ProductRow {
+                    node_id: p.node_id,
                     model,
                     name,
-                    score,
-                    reason: if score >= 1.0 {
-                        "normalized_match".into()
-                    } else {
-                        "fuzzy_match".into()
-                    },
-                })
+                    fuzzy_score,
+                }
             })
             .collect();
-        cands.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        cands.truncate(5);
-        Ok(cands)
+        Ok(merge_product_candidates(rows, &vector_hits))
     }
+}
+
+/// resolve_product の候補生成に必要な Product 1 件分の行。
+/// fuzzy スコアは閾値適用前の生値を持つ（vector-only 候補判定に使うため）。
+#[derive(Debug)]
+pub(crate) struct ProductRow {
+    pub node_id: String,
+    pub model: String,
+    pub name: String,
+    pub fuzzy_score: f32,
+}
+
+/// resolve_product の意味マッチ統合（A5b）本体。全 Product 行の fuzzy スコアと
+/// vector hit (node_id, score) 群から最終候補リストを作る純関数。
+///
+/// - 各行の最終 score = max(fuzzy_score, vector_score)
+/// - score <= 0.1 の行は候補から除外する（従来の fuzzy 専用閾値を踏襲）
+/// - vector_score が fuzzy_score を上回った行（fuzzy 閾値未達の "vector-only" 候補を含む）は
+///   reason = "semantic_nearby"（ここで初めて名実一致する）
+/// - それ以外（fuzzy が同点以上で寄与）は既存の reason（normalized_match / fuzzy_match）を維持する
+/// - 決定論のため score 降順 + 同点は model 昇順の tiebreak でソートする（Task 9 の
+///   section_key tiebreak と同じ思想）
+pub(crate) fn merge_product_candidates(
+    rows: Vec<ProductRow>,
+    vector_hits: &[(String, f32)],
+) -> Vec<ManualProductCandidate> {
+    let vector_map = fold_max_scores(vector_hits);
+    let mut cands: Vec<ManualProductCandidate> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let vector_score = vector_map.get(row.node_id.as_str()).copied().unwrap_or(0.0);
+            let score = row.fuzzy_score.max(vector_score);
+            if score <= 0.1 {
+                return None;
+            }
+            let reason = if vector_score > row.fuzzy_score {
+                "semantic_nearby"
+            } else if row.fuzzy_score >= 1.0 {
+                "normalized_match"
+            } else {
+                "fuzzy_match"
+            };
+            Some(ManualProductCandidate {
+                model: row.model,
+                name: row.name,
+                score,
+                reason: reason.to_string(),
+            })
+        })
+        .collect();
+    cands.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    cands.truncate(5);
+    cands
 }
 
 #[cfg(test)]
@@ -696,6 +778,112 @@ mod tests {
     /// 単一節コーパスでスコアを取るテストヘルパ（production 経路と同じ score_against_corpus を使う）。
     fn score_one(question: &str, body: &str) -> f32 {
         score_against_corpus(question, &[body.to_string()])[0]
+    }
+
+    #[test]
+    fn fold_max_scores_keeps_the_larger_of_duplicate_ids() {
+        // 同一 node_id が複数回来た場合、低スコアが後に来ても max が採用される
+        // （順序に依存しない）ことを直接検証する（codex レビュー Suggestion 対応）。
+        let hits = vec![
+            ("p1".to_string(), 0.3_f32),
+            ("p1".to_string(), 0.9_f32),
+            ("p1".to_string(), 0.1_f32),
+        ];
+        let map = fold_max_scores(&hits);
+        assert_eq!(map.get("p1"), Some(&0.9));
+    }
+
+    fn product_row(node_id: &str, model: &str, name: &str, fuzzy_score: f32) -> ProductRow {
+        ProductRow {
+            node_id: node_id.to_string(),
+            model: model.to_string(),
+            name: name.to_string(),
+            fuzzy_score,
+        }
+    }
+
+    #[test]
+    fn merge_vector_boosts_existing_candidate_and_flips_reason() {
+        // fuzzy だけでは 0.4 (fuzzy_match) だが、vector が 0.9 で上回る → score=max=0.9、
+        // reason は "semantic_nearby" に切り替わる（vector が最終スコアの主因になったため）。
+        let rows = vec![product_row("p1", "ADC-V724", "屋外カメラ", 0.4)];
+        let vector = [("p1".to_string(), 0.9_f32)];
+        let out = merge_product_candidates(rows, &vector);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].model, "ADC-V724");
+        assert_eq!(out[0].score, 0.9);
+        assert_eq!(out[0].reason, "semantic_nearby");
+    }
+
+    #[test]
+    fn merge_vector_only_candidate_added_as_semantic_nearby() {
+        // fuzzy score が閾値(0.1)以下で本来は候補から落ちる行でも、vector hit があれば
+        // 候補に加わり、reason="semantic_nearby"。name は query_nodes 由来の行から取る。
+        let rows = vec![
+            product_row("p1", "ADC-V724", "屋外カメラ", 0.4),
+            product_row("p2", "SVR-HB100", "ホームハブ", 0.0),
+        ];
+        let vector = [("p2".to_string(), 0.55_f32)];
+        let out = merge_product_candidates(rows, &vector);
+        let p2 = out
+            .iter()
+            .find(|c| c.model == "SVR-HB100")
+            .expect("vector-only candidate must be present");
+        assert_eq!(p2.name, "ホームハブ");
+        assert_eq!(p2.score, 0.55);
+        assert_eq!(p2.reason, "semantic_nearby");
+    }
+
+    #[test]
+    fn merge_pure_fuzzy_keeps_existing_reasons_when_vector_absent_or_lower() {
+        // vector hit が無い行は従来通り。fuzzy>=1.0 は normalized_match、それ未満は fuzzy_match。
+        let rows = vec![
+            product_row("p1", "ADC-V724", "屋外カメラ", 1.0),
+            product_row("p2", "SVR-HB100", "ホームハブ", 0.4),
+        ];
+        let out = merge_product_candidates(rows, &[]);
+        let p1 = out.iter().find(|c| c.model == "ADC-V724").unwrap();
+        let p2 = out.iter().find(|c| c.model == "SVR-HB100").unwrap();
+        assert_eq!(p1.reason, "normalized_match");
+        assert_eq!(p2.reason, "fuzzy_match");
+
+        // vector が来ても fuzzy 以下なら reason は変わらない（同点は fuzzy 側を優先）。
+        let rows2 = vec![product_row("p1", "ADC-V724", "屋外カメラ", 1.0)];
+        let out2 = merge_product_candidates(rows2, &[("p1".to_string(), 1.0)]);
+        assert_eq!(out2[0].reason, "normalized_match");
+        assert_eq!(out2[0].score, 1.0);
+    }
+
+    #[test]
+    fn merge_below_threshold_and_no_vector_hit_is_excluded() {
+        let rows = vec![product_row("p1", "ADC-V724", "屋外カメラ", 0.05)];
+        let out = merge_product_candidates(rows, &[]);
+        assert!(
+            out.is_empty(),
+            "score<=0.1 with no vector hit must be excluded"
+        );
+    }
+
+    #[test]
+    fn merge_orders_by_score_desc_then_model_asc_deterministically() {
+        // 同点スコアは model 昇順で決定論的に並ぶ（実行順や snapshot 順に依存しない）。
+        let rows = vec![
+            product_row("p1", "ZZZ-100", "後半モデル", 0.5),
+            product_row("p2", "AAA-100", "前半モデル", 0.5),
+            product_row("p3", "MMM-100", "最高スコア", 0.9),
+        ];
+        let out = merge_product_candidates(rows, &[]);
+        let models: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(models, vec!["MMM-100", "AAA-100", "ZZZ-100"]);
+    }
+
+    #[test]
+    fn merge_truncates_to_five_candidates() {
+        let rows: Vec<ProductRow> = (0..8)
+            .map(|i| product_row(&format!("p{i}"), &format!("M-{i}"), "name", 0.9))
+            .collect();
+        let out = merge_product_candidates(rows, &[]);
+        assert_eq!(out.len(), 5);
     }
 
     #[test]
