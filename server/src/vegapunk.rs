@@ -53,6 +53,13 @@ impl VegapunkClient {
         let channel = Endpoint::from_shared(endpoint.to_string())?
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(limits.timeout_secs))
+            // 長寿命チャネルがアイドル後に死んだ接続を掴んだまま 120s ハングする事象への対策
+            // （実測: 新規接続の grpcurl は常に高速なのに、常駐サーバの呼び出しだけ停滞する）。
+            // h2 PING keepalive で死活を検知し、切断時は再接続させる。
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(60)))
             .connect_lazy();
         let auth_header = MetadataValue::try_from(format!("Bearer {bearer_token}"))
             .context("invalid bearer token metadata")?;
@@ -75,6 +82,13 @@ impl VegapunkClient {
         let channel = Endpoint::from_shared(endpoint.to_string())?
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(limits.timeout_secs))
+            // 長寿命チャネルがアイドル後に死んだ接続を掴んだまま 120s ハングする事象への対策
+            // （実測: 新規接続の grpcurl は常に高速なのに、常駐サーバの呼び出しだけ停滞する）。
+            // h2 PING keepalive で死活を検知し、切断時は再接続させる。
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Duration::from_secs(60)))
             .connect()
             .await
             .with_context(|| format!("connect vegapunk endpoint {endpoint}"))?;
