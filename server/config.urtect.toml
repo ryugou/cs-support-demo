@@ -41,3 +41,16 @@ promote_approvals = 3
 promote_approvers = 2
 promote_max_rejection_rate = 0.2
 demote_rejections = 2
+
+# signal 抽出エージェント（S1-11 改訂: lexicon ∪ LLM のハイブリッド）。
+# 既定は enabled = false（lexicon 単独・オフライン動作・API キー不要）。
+# 有効化する場合は enabled = true にし、API キーを env CS_SUPPORT_LLM_API_KEY
+# または api_key_file のいずれかで注入すること（config に平文キーを書かない）。
+# enabled = true で鍵を解決できない場合は起動時 fail closed で失敗する。
+# [llm]
+# enabled = true
+# model = "claude-haiku-4-5-20251001"
+# endpoint = "https://api.anthropic.com/v1/messages"
+# api_key_file = "/path/to/llm-api-key"   # または env CS_SUPPORT_LLM_API_KEY
+# timeout_secs = 20
+# max_tokens = 300

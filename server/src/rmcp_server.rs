@@ -85,6 +85,9 @@ pub struct EvaluateAnswerabilityResponse {
     /// 参考として返す類似の過去事例（自 case は除外）。3 層判定の入力ではなく、
     /// あくまで client 向けの参考情報（S1-1 取得段）。
     pub related_cases: Vec<RelatedCaseJson>,
+    /// 今ターンの signal 抽出モード（S1-11 改訂）: `lexicon_only` / `hybrid` /
+    /// `lexicon_fallback`。WORM 監査にも同値を記録している。
+    pub extraction_mode: String,
 }
 
 /// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
@@ -556,6 +559,7 @@ impl CsSupportRmcpServer {
                 .into_iter()
                 .map(RelatedCaseJson::from)
                 .collect(),
+            extraction_mode: outcome.extraction_mode.as_str().to_string(),
         }))
     }
 

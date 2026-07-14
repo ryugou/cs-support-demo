@@ -781,10 +781,13 @@ answerability_threshold(stakes) -> Threshold   # 3 段の階段関数
 
 S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を確定した。
 
-1. **normalize_to_signals の Step 1 実装は決定論 lexicon とする。**
-   - `SignalNormalizer` trait を関数境界として切り、Step 1 は同義語辞書（`server/data/signal-lexicon.json`）による表層一致の決定論実装のみを積む。単体テスト可能・API キー不要。
-   - LLM による意味的正規化は同 trait の別実装として後段で追加する。呼び出し側（パイプライン）は不変。
-   - 決定論 lexicon の既知の限界（辞書外表現の取りこぼし）は、(a) 第2層照合が signal だけでなく raw text パターンにも当たること、(b) Step 1 の利用者が担当者でありグレーは必ずエスカレーションに倒れること、の 2 点で吸収する。
+1. **normalize_to_signals は LLM 抽出（lexicon との和集合・lexicon フォールバック）を実装する（2026-07-13 改訂）。**
+   - Step 1 時点（2026-07-03）では決定論 lexicon のみを積んでいたが、本改訂で `HybridExtractor`（`server/src/harness/extraction.rs`）を実装し S1-1 本文（LLM による signal 抽出）に準拠させた。パイプライン呼び出し側（`evaluate_answerability` / `root_cause_probe`）は `AsyncSignalExtractor` trait 経由に変わったが、判定入力の形（`SignalSet`）は不変。
+   - 抽出は「lexicon.normalize()（決定論・語彙閉集合の表層一致）→ LLM が設定されていれば追加で分類を依頼 → LLM が返した signal 名を lexicon の語彙（`contains_signal`）で検証したものだけを採用 → 両者の和集合」で行う。語彙外の signal 名は破棄する（3 層判定・admission のどちらにも語彙外 signal を漏らさない）。
+   - LLM のプロンプトは語彙の閉集合分類として設計され、判断に迷う・語彙で表現できない安全/契約/法務上の懸念がある発話には catch-all `unclassified_risk`（llm_only signal。lexicon には表層一致では登録せず、語彙・分類にのみ存在）を返すよう指示する（取りこぼさない側に倒す）。
+   - LLM が未設定（`config.llm.enabled = false`）のときは lexicon 単独（`ExtractionMode::LexiconOnly`）。LLM 呼び出しが失敗した場合は lexicon 単独の結果にフォールバックする（`ExtractionMode::LexiconFallback`。判定は必ず何らかの signal 集合で走らせ、LLM 不達を理由に判定不能にはしない）。LLM 分類に成功した場合は `ExtractionMode::Hybrid`。
+   - 決定論 lexicon は安全床・オフライン動作・API キー不要の dev 経路として残す。既知の限界（辞書外表現の取りこぼし）は、(a) 第2層照合が signal だけでなく raw text パターンにも当たること、(b) LLM 抽出が語彙内の追加 signal を拾うこと、(c) Step 1 の利用者が担当者でありグレーは必ずエスカレーションに倒れること、の 3 点で吸収する。
+   - どの経路で抽出したか（`extraction_mode`: `lexicon_only` / `hybrid` / `lexicon_fallback`）は WORM 監査（`AuditDraft.extraction_mode`、加算フィールド）に記録し、`evaluate_answerability` の応答にも同値を返す（監査可能性・運用時のフォールバック頻度の可視化）。
 2. **MCP の actor 認証は JWT HS256 + config actor 表とする。**
    - `Authorization: Bearer <JWT>` を HS256 共有鍵（env / file から注入。設定ファイルに平文を置かない）で検証し、`Claims { sub, role, exp, iss }` を得る。
    - `Claims.sub` → config の actor 表（role / allowed_schemas）で AccessScope を自明写像する（サーバ導出・I1）。
