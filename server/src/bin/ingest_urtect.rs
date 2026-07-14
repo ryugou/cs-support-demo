@@ -241,6 +241,10 @@ struct Args {
         default_value = "https://sites.google.com/view/urtect-manual/top"
     )]
     top_url: String,
+    /// embed / upsert_vectors を一切呼ばずスキップする（ベクトル基盤未整備な環境向けの
+    /// 明示的な opt-out）。未指定時は embed 失敗を fail closed で扱う。
+    #[arg(long)]
+    no_vectors: bool,
 }
 
 /// token 解決: 既定は --token-file（CLAUDE.md のローカル/GCE 起動手順と同じ経路）。
@@ -438,6 +442,9 @@ async fn main() -> Result<()> {
     let mut describes_by_model: HashMap<String, usize> = HashMap::new();
     // nav 入れ子 depth に沿った祖先スタック（breadcrumb/parent_slug の組み立てに使う）。
     let mut stack: Vec<StackEntry> = Vec::new();
+    // embed 対象。今回 skip されず実際に ingest された section の (slug, body) のみを集める
+    // （body は ManualSectionInput へ move される直前に clone する）。
+    let mut section_bodies: Vec<(String, String)> = Vec::new();
 
     // 3-4. 各 URL: fetch → extract → normalize_body → content_hash。差分があれば ingest。
     for (idx, entry) in nav_entries.iter().enumerate() {
@@ -612,6 +619,7 @@ async fn main() -> Result<()> {
             zero_signal_sections.push(slug.clone());
         }
 
+        section_bodies.push((slug.clone(), body.clone()));
         let input = ManualSectionInput {
             slug,
             title,
@@ -638,15 +646,15 @@ async fn main() -> Result<()> {
         top_url.as_str(),
         &chrono::Utc::now().to_rfc3339(),
     ));
+    let mut product_inputs: Vec<ManualProductInput> = Vec::new();
     for &model in KNOWN_MODELS {
-        nodes.push(build_product_node(
-            &args.schema,
-            &ManualProductInput {
-                model: model.to_string(),
-                name: model.to_string(),
-                aliases: Vec::new(),
-            },
-        ));
+        let input = ManualProductInput {
+            model: model.to_string(),
+            name: model.to_string(),
+            aliases: Vec::new(),
+        };
+        nodes.push(build_product_node(&args.schema, &input));
+        product_inputs.push(input);
     }
 
     // 同一 id のノード重複を除去してから upsert する（Signal ノードは節ごとに生成されるため
@@ -655,6 +663,78 @@ async fn main() -> Result<()> {
     let mut seen_node_ids = HashSet::new();
     let mut nodes = nodes;
     nodes.retain(|n| seen_node_ids.insert(n.id.clone()));
+
+    // 5. embedding: 今回 ingest された section と全 product を embed し、一括 upsert する。
+    // embed は fail closed（1 件でも失敗したらベクトル無しの中途半端な状態を作らず abort）。
+    // `--no-vectors` は明示的な opt-out のみで、途中失敗の代替経路にはしない。
+    //
+    // node/edge upsert（content_hash を含む）より必ず先に実行する: ここで失敗して bail した
+    // 場合、当該 section の content_hash はまだ古い値のまま vegapunk に残るため、次回の
+    // 差分 ingest はその section を「変更あり」として再検出し、embedding も含めて再試行する。
+    // 逆順（先に node/edge を確定 → 後で embed）だと、embed/vector upsert だけが失敗しても
+    // content_hash は新しい値で確定してしまい、次回実行時に不変とみなされて section が
+    // 永久に skip され、vector が無いまま取り残される（この一巻き戻し不能ギャップを避ける）。
+    //
+    // 既知のトレードオフ（Accepted Risk。task-8-report.md 参照）: vector upsert 成功後に
+    // 続く node/edge upsert が失敗すると、新しい本文由来の vector が投入済みなのに
+    // ManualSection の body/content_hash は旧状態のまま残る一時的な不整合が起き得る
+    // （検索が新 vector 経由で旧本文の section を返す）。ただし次回再実行時は
+    // content_hash 不一致により自動的に再試行・自己修復される（＝上記の永久欠落より軽微）。
+    // proto には nodes/edges/vectors を単一 RPC でまとめる `UpsertGraph`（atomic、vector
+    // 失敗時は node/edge を best-effort rollback）が既に存在する。将来的にはそちらへ
+    // 一本化し、この一時不整合そのものを無くすことを検討する。
+    let vectors_skipped = args.no_vectors;
+    let upserted_vectors = if vectors_skipped {
+        0
+    } else {
+        let mut entries: Vec<(String, Vec<f32>, Vec<(String, String)>)> =
+            Vec::with_capacity(section_bodies.len() + product_inputs.len());
+        for (slug, body) in &section_bodies {
+            let vector = client
+                .embed(body)
+                .await
+                .with_context(|| format!("embed section {slug}"))?;
+            let id = cs_support_mcp::manual::schema_ids::manual_node_id(
+                &args.schema,
+                cs_support_mcp::manual::schema_ids::KIND_SECTION,
+                slug,
+            );
+            entries.push((
+                id,
+                vector,
+                vec![
+                    ("node_type".to_string(), "ManualSection".to_string()),
+                    ("section_key".to_string(), slug.clone()),
+                    ("doc_key".to_string(), DOC_KEY.to_string()),
+                ],
+            ));
+        }
+        for input in &product_inputs {
+            let text = format!("{} {}", input.name, input.aliases.join(" "));
+            let vector = client
+                .embed(&text)
+                .await
+                .with_context(|| format!("embed product {}", input.model))?;
+            let id = cs_support_mcp::manual::schema_ids::manual_node_id(
+                &args.schema,
+                cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
+                &input.model,
+            );
+            entries.push((
+                id,
+                vector,
+                vec![
+                    ("node_type".to_string(), "Product".to_string()),
+                    ("product_key".to_string(), input.model.clone()),
+                ],
+            ));
+        }
+        let entries_len = entries.len();
+        client
+            .upsert_vectors(entries)
+            .await
+            .with_context(|| format!("upsert vectors (entries={entries_len})"))?
+    };
 
     let graph = GraphBuild { nodes, edges };
     let expected_nodes = graph.nodes.len();
@@ -675,6 +755,8 @@ async fn main() -> Result<()> {
             "expected_edges": expected_edges,
             "upserted_nodes": upserted_nodes,
             "upserted_edges": upserted_edges,
+            "upserted_vectors": upserted_vectors,
+            "vectors_skipped": vectors_skipped,
             "describes_by_model": describes_by_model,
             "sections_with_zero_signal_matches": zero_signal_sections,
             "fetch_failed_urls": fetch_failed,

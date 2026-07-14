@@ -2,9 +2,9 @@ use crate::{
     model::{GraphBuild, GraphEdge, GraphNode},
     proto::graphrag::{
         create_schema_request, graph_rag_engine_client::GraphRagEngineClient, AttributeFilter,
-        CreateSchemaRequest, Edge, GetGraphSnapshotRequest, GetSchemaRequest, Node, NodeAttribute,
-        QueryNodesRequest, SearchRequest, UpdateSchemaRequest, UpsertEdgesRequest,
-        UpsertNodesRequest,
+        CreateSchemaRequest, Edge, EmbedRequest, GetGraphSnapshotRequest, GetSchemaRequest, Node,
+        NodeAttribute, QueryNodesRequest, SearchRequest, UpdateSchemaRequest, UpsertEdgesRequest,
+        UpsertNodesRequest, UpsertVectorsRequest, VectorEntry,
     },
 };
 use anyhow::{Context, Result};
@@ -203,6 +203,77 @@ impl VegapunkClient {
         )
         .await
         .context("upsert edges")
+    }
+
+    /// vegapunk 側の Embedding-as-a-service (`Embed` RPC) でテキストをベクトル化する。
+    /// 生成物は `upsert_vectors` の `VectorEntry.vector` にそのまま渡せる。
+    /// backend 契約違反（空 vector、`dimension` と `vector.len()` の不一致）は
+    /// 呼び出し側に不完全なベクトルを渡す前にここで弾く。
+    pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let req = EmbedRequest {
+            text: text.to_string(),
+        };
+        let resp = self
+            .call(
+                |mut client, request| async move {
+                    client.embed(request).await.map(|resp| resp.into_inner())
+                },
+                req,
+            )
+            .await
+            .context("embed")?;
+        if resp.vector.is_empty() {
+            anyhow::bail!("embed returned an empty vector (model={})", resp.model);
+        }
+        if resp.dimension <= 0 {
+            anyhow::bail!(
+                "embed returned a non-positive dimension ({}) (model={})",
+                resp.dimension,
+                resp.model
+            );
+        }
+        if resp.dimension as usize != resp.vector.len() {
+            anyhow::bail!(
+                "embed dimension mismatch: response says {} but vector has {} elements (model={})",
+                resp.dimension,
+                resp.vector.len(),
+                resp.model
+            );
+        }
+        Ok(resp.vector)
+    }
+
+    /// `(id, vector, metadata)` のタプルを `VectorEntry`（`metadata` は proto の
+    /// `map<string, string>`）へ変換して一括 upsert する。空なら RPC を発行せず 0 を返す
+    /// （`upsert_nodes` / `upsert_edges` と同じ規約）。
+    pub async fn upsert_vectors(
+        &self,
+        entries: Vec<(String, Vec<f32>, Vec<(String, String)>)>,
+    ) -> Result<i32> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let req = UpsertVectorsRequest {
+            vectors: entries
+                .into_iter()
+                .map(|(id, vector, metadata)| VectorEntry {
+                    id,
+                    vector,
+                    metadata: metadata.into_iter().collect(),
+                })
+                .collect(),
+        };
+        self.call(
+            |mut client, request| async move {
+                client
+                    .upsert_vectors(request)
+                    .await
+                    .map(|resp| resp.into_inner().upserted_count)
+            },
+            req,
+        )
+        .await
+        .context("upsert vectors")
     }
 
     pub async fn query_nodes(
