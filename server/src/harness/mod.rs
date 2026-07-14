@@ -43,6 +43,9 @@ pub struct Harness {
     pub manual: Option<crate::manual::retrieval::ManualStore>,
     /// 第3層エスカレーションの既定 route（config.harness.default_escalation_route）。
     pub default_route: String,
+    /// 意味検索（ベクトル経路）を manual retrieval に合成するか
+    /// （config.harness.vector_route_enabled、urtect design §2.3）。
+    pub vector_route_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +151,7 @@ impl Harness {
             grade_lock: tokio::sync::Mutex::new(()),
             manual: Some(crate::manual::retrieval::ManualStore::new(client)),
             default_route: config.harness.default_escalation_route.clone(),
+            vector_route_enabled: config.harness.vector_route_enabled,
         })
     }
 
@@ -557,6 +561,13 @@ impl Harness {
                         .manual
                         .as_ref()
                         .ok_or_else(|| anyhow!("manual store not configured"))?;
+                    // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
+                    // 決定論の search_with_snapshot が握る。ここでは候補材料を用意するだけ。
+                    let vector_hits: Vec<(String, f32)> = if self.vector_route_enabled {
+                        store.vector_hits(&ctx.schema, question, 5).await
+                    } else {
+                        Vec::new()
+                    };
                     let hits = store.search_with_snapshot(
                         &ctx.schema,
                         question,
@@ -564,6 +575,7 @@ impl Harness {
                         product_key,
                         5,
                         &snapshot,
+                        &vector_hits,
                     )?;
                     let ids = hits
                         .iter()
@@ -798,8 +810,10 @@ impl Harness {
                     "root_cause_probe signal extraction mode"
                 );
                 let signals = extraction_outcome.signals;
+                // root_cause_probe は訂正文の再検索であり、意味検索の合成対象は
+                // evaluate/search_manual のみ（本タスクのスコープ外・&[] で従来挙動を維持）。
                 let hits = store
-                    .search(&ctx.schema, corrected_answer, &signals, None, 3)
+                    .search(&ctx.schema, corrected_answer, &signals, None, 3, &[])
                     .await?;
                 hits.first().map(|h| h.score)
             }
@@ -893,6 +907,7 @@ mod tests {
             grade_lock: tokio::sync::Mutex::new(()),
             manual: None,
             default_route: "triage".to_string(),
+            vector_route_enabled: false,
         }
     }
 

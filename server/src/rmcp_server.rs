@@ -365,13 +365,22 @@ impl CsSupportRmcpServer {
             crate::config::ManualSchemaKind::ManualV1 => {
                 let store = self.manual_store()?;
                 let signals = self.harness.normalizer.normalize(&req.query_ja);
+                let top_k = req.top_k.unwrap_or(5).max(1) as usize;
+                // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
+                // 決定論の search が握る。ここでは候補材料を用意するだけ。
+                let vector_hits: Vec<(String, f32)> = if self.harness.vector_route_enabled {
+                    store.vector_hits(&ctx.schema, &req.query_ja, top_k).await
+                } else {
+                    Vec::new()
+                };
                 let manual_hits = store
                     .search(
                         &ctx.schema,
                         &req.query_ja,
                         &signals,
                         req.product_key.as_deref(),
-                        req.top_k.unwrap_or(5).max(1) as usize,
+                        top_k,
+                        &vector_hits,
                     )
                     .await
                     .map_err(to_error)?;

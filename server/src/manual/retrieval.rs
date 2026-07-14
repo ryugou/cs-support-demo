@@ -395,6 +395,8 @@ impl ManualStore {
     }
 
     /// signal 絞り込み(A) と body 全文(B) の max スコアで ManualSection を返す。
+    /// `vector_hits` は意味検索経路（urtect design §2.3）の (node_id, score) 群。
+    /// vector_route_enabled が false の呼び出し元は空 slice を渡す。
     pub async fn search(
         &self,
         schema: &str,
@@ -402,15 +404,60 @@ impl ManualStore {
         signals: &SignalSet,
         product_key: Option<&str>,
         top_k: usize,
+        vector_hits: &[(String, f32)],
     ) -> Result<Vec<ManualHit>> {
         let snap = self.snapshot(schema).await?;
-        self.search_with_snapshot(schema, question, signals, product_key, top_k, &snap)
+        self.search_with_snapshot(
+            schema,
+            question,
+            signals,
+            product_key,
+            top_k,
+            &snap,
+            vector_hits,
+        )
+    }
+
+    /// vector_route_enabled 時のみ呼ばれる意味検索経路（urtect design §2.3）。
+    /// `SearchResultItem` を ManualSection の node_id を持つものだけに絞り、(node_id, score) を返す。
+    /// backend 呼び出し失敗はテキスト検索を止めないよう warn ログ + 空 Vec にフォールバックする。
+    /// 返却スコアは backend の 0-1 程度のスケールをそのまま使う（本関数ではリスケールしない。
+    /// 較正は Task 11 の実測ベースで検討する）。
+    pub async fn vector_hits(
+        &self,
+        schema: &str,
+        question: &str,
+        top_k: usize,
+    ) -> Vec<(String, f32)> {
+        match self.client.search(schema, question, top_k as i32).await {
+            Ok(items) => items
+                .into_iter()
+                .filter_map(|item| {
+                    let id = item.id?;
+                    id.contains(":ManualSection:")
+                        .then(|| (id, item.score.unwrap_or(0.0)))
+                })
+                .collect(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "vector search failed; continuing with text-only manual retrieval"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// `product_key` が Some のとき、候補 ManualSection は
     /// (a) 当該 Product への DESCRIBES 辺を持つ、または (b) DESCRIBES 辺を一切持たない
     /// （機種非依存ページはどの機種にも適用される）のいずれかに限定する。
     /// 他機種のみを DESCRIBES する節は除外する。None のときは絞り込まない（従来通り）。
+    ///
+    /// `vector_hits` は意味検索経路（urtect design §2.3）の (ManualSection node_id, score) 群。
+    /// snapshot に無い node_id は無視する（実体が確認できない候補を捏造しない）。
+    /// product_key フィルタは vector 候補にも同様に適用する（テキスト候補と扱いを揃える）。
+    /// 最終スコアは `max(text_score, vector_score)`。両方が寄与した場合は "both"、
+    /// テキストのみは "text"、vector のみは "vector" を `ManualHit.score_source` に残す。
     pub fn search_with_snapshot(
         &self,
         schema: &str,
@@ -419,6 +466,7 @@ impl ManualStore {
         product_key: Option<&str>,
         top_k: usize,
         snapshot: &GetGraphSnapshotResponse,
+        vector_hits: &[(String, f32)],
     ) -> Result<Vec<ManualHit>> {
         let signal_narrowed = sections_for_signals(snapshot, signals);
         // product_key が Some のときだけ DESCRIBES 辺を走査する（None の hot path で
@@ -460,6 +508,21 @@ impl ManualStore {
         let attr = |n: &crate::proto::graphrag::GraphNode, key: &str| -> String {
             n.attributes.get(key).cloned().unwrap_or_default()
         };
+        // vector_hits を node_id → score に畳む（同一 id が複数回来た場合は max を残す）。
+        // manual_sections（product_key フィルタ適用後の snapshot 由来の集合）に対して
+        // 引くだけなので、snapshot に無い id や product_key フィルタで除外された節の
+        // vector スコアは自然に無視される（別集合として union する必要がない）。
+        let mut vector_map: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+        for (id, score) in vector_hits {
+            vector_map
+                .entry(id.as_str())
+                .and_modify(|s| {
+                    if *score > *s {
+                        *s = *score;
+                    }
+                })
+                .or_insert(*score);
+        }
         let mut hits: Vec<ManualHit> = manual_sections
             .into_iter()
             .zip(corpus_scores)
@@ -469,11 +532,22 @@ impl ManualStore {
                 // title 込みの fast path は維持する: 完全部分文字列 → 1.0、
                 // 正規化部分文字列 → 0.95。それ以外は body のみに対する IDF corpus スコアを使う。
                 let text = format!("{title}\n{body}");
-                let score =
+                let text_score =
                     substring_fast_path(question, &query_norm, &text).unwrap_or(corpus_score);
+                let vector_score = vector_map.get(n.node_id.as_str()).copied().unwrap_or(0.0);
+                // 最終スコアは max(text, vector)。backend の vector score は 0-1 程度のスケールを
+                // 前提とし、ここではリスケールしない（較正は実測ベースで Task 11 に回す）。
+                let score = text_score.max(vector_score);
+                let score_source = match (text_score > 0.0, vector_score > 0.0) {
+                    (true, true) => "both",
+                    (true, false) => "text",
+                    (false, true) => "vector",
+                    (false, false) => "text",
+                }
+                .to_string();
                 // signal 絞り込み(in_signal)は候補として残すかどうか（下の filter）にだけ効く。
                 // score には一切影響しない（floor や boost を掛けない — 過剰応答を防ぐため、
-                // 直接性は常に fast path / IDF カバレッジの実測値をそのまま使う）。
+                // 直接性は常に fast path / IDF カバレッジ / vector 類似度の実測値をそのまま使う）。
                 let in_signal = signal_narrowed.contains(&n.node_id);
                 (
                     in_signal,
@@ -485,10 +559,11 @@ impl ManualStore {
                         source_url: attr(n, "source_url"),
                         breadcrumb: attr(n, "breadcrumb"),
                         score,
+                        score_source,
                     },
                 )
             })
-            // 候補: signal 絞り込みに入る or body スコアが立つ（0 超）ものを残す
+            // 候補: signal 絞り込みに入る or (text/vector いずれかの) スコアが立つ（0 超）ものを残す
             .filter(|(in_signal, score, _)| *in_signal || *score > 0.0)
             .map(|(_, _, h)| h)
             .collect();
@@ -815,12 +890,185 @@ mod tests {
                 Some("ADC-V724"),
                 10,
                 &snap,
+                &[],
             )
             .expect("search_with_snapshot");
         let keys: BTreeSet<&str> = hits.iter().map(|h| h.section_key.as_str()).collect();
         assert!(keys.contains("sec-a"), "expected sec-a in {keys:?}");
         assert!(keys.contains("sec-c"), "expected sec-c in {keys:?}");
         assert!(!keys.contains("sec-b"), "sec-b must be excluded: {keys:?}");
+    }
+
+    /// vector_hits マージ用のテスト snapshot ビルダ。1 節の body は質問と無関係
+    /// （text score = 0）にしておき、vector_hits の寄与だけを見る。
+    fn single_section_snapshot(
+        schema: &str,
+        section_key: &str,
+        body: &str,
+        describes_product: Option<&str>,
+    ) -> GetGraphSnapshotResponse {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let attrs: HashMap<String, String> = [
+            ("section_key".to_string(), section_key.to_string()),
+            ("title".to_string(), "見出し".to_string()),
+            ("body".to_string(), body.to_string()),
+            ("source_url".to_string(), String::new()),
+            ("breadcrumb".to_string(), String::new()),
+        ]
+        .into_iter()
+        .collect();
+        let section = PN {
+            node_id: manual_node_id(schema, "ManualSection", section_key),
+            node_type: "ManualSection".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: attrs,
+        };
+        let mut nodes = vec![section.clone()];
+        let mut edges = Vec::new();
+        if let Some(pk) = describes_product {
+            nodes.push(PN {
+                node_id: manual_node_id(schema, "Product", pk),
+                node_type: "Product".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: HashMap::new(),
+            });
+            edges.push(PE {
+                edge_id: String::new(),
+                from_id: section.node_id.clone(),
+                to_id: manual_node_id(schema, "Product", pk),
+                edge_type: "DESCRIBES".to_string(),
+            });
+        }
+        GetGraphSnapshotResponse {
+            nodes,
+            edges,
+            truncated: false,
+            total_node_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_only_hit_enters_candidates_with_vector_score_source() {
+        // body は質問と無関係 → text score = 0。vector_hits にだけ載る節は
+        // score = vector score, score_source = "vector" で候補に入る。
+        let schema = "urtect";
+        let section_key = "sec-vec-only";
+        let snap = single_section_snapshot(schema, section_key, "全く関係のない本文です。", None);
+        let node_id = manual_node_id(schema, "ManualSection", section_key);
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                "SDカードが認識されない場合の対処",
+                &SignalSet::new(),
+                None,
+                10,
+                &snap,
+                &[(node_id, 0.42)],
+            )
+            .expect("search_with_snapshot");
+        let hit = hits
+            .iter()
+            .find(|h| h.section_key == section_key)
+            .expect("vector-only section must be a candidate");
+        assert_eq!(hit.score, 0.42);
+        assert_eq!(hit.score_source, "vector");
+    }
+
+    #[tokio::test]
+    async fn both_routes_merge_to_max_score_with_both_source() {
+        // body が質問の完全部分文字列 → text score = 1.0（fast path）。
+        // vector_hits には 1.0 より低いスコアを与え、max = text score = 1.0 になることを確認する。
+        // さらに別ケースで vector のほうが高いときも max がその値になることを確認する。
+        let schema = "urtect";
+        let question = "SDカードが認識されない場合の対処";
+        let section_key = "sec-both";
+        let snap = single_section_snapshot(schema, section_key, question, None);
+        let node_id = manual_node_id(schema, "ManualSection", section_key);
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                question,
+                &SignalSet::new(),
+                None,
+                10,
+                &snap,
+                &[(node_id.clone(), 0.3)],
+            )
+            .expect("search_with_snapshot");
+        let hit = hits
+            .iter()
+            .find(|h| h.section_key == section_key)
+            .expect("section must be a candidate");
+        assert_eq!(hit.score, 1.0, "max(text=1.0, vector=0.3) must be 1.0");
+        assert_eq!(hit.score_source, "both");
+    }
+
+    #[tokio::test]
+    async fn vector_id_absent_from_snapshot_is_ignored() {
+        let schema = "urtect";
+        let section_key = "sec-real";
+        let snap = single_section_snapshot(schema, section_key, "全く関係のない本文です。", None);
+        let ghost_id = manual_node_id(schema, "ManualSection", "sec-does-not-exist");
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                "SDカードが認識されない場合の対処",
+                &SignalSet::new(),
+                None,
+                10,
+                &snap,
+                &[(ghost_id, 0.9)],
+            )
+            .expect("search_with_snapshot");
+        assert!(
+            hits.iter().all(|h| h.section_key != "sec-does-not-exist"),
+            "vector hit absent from snapshot must not fabricate a candidate: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| h.section_key != section_key),
+            "sec-real has no text/signal/vector match and must not appear either: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_candidate_excluded_when_product_key_filter_excludes_it() {
+        // section は product B のみを DESCRIBES する（他機種専用）。product_key=A で絞り込むと、
+        // vector_hits に高スコアで載っていても候補から除外されなければならない。
+        let schema = "urtect";
+        let product_a = "ADC-V724";
+        let product_b = "ADC-VC727P";
+        let section_key = "sec-other-product";
+        let snap = single_section_snapshot(
+            schema,
+            section_key,
+            "全く関係のない本文です。",
+            Some(product_b),
+        );
+        let node_id = manual_node_id(schema, "ManualSection", section_key);
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                "SDカードが認識されない場合の対処",
+                &SignalSet::new(),
+                Some(product_a),
+                10,
+                &snap,
+                &[(node_id, 0.95)],
+            )
+            .expect("search_with_snapshot");
+        assert!(
+            hits.iter().all(|h| h.section_key != section_key),
+            "product filter must exclude the vector candidate too: {hits:?}"
+        );
     }
 
     // 同じ describes-edge 構成でも product_key が None のときは絞り込まない（従来通り）ことの
@@ -885,7 +1133,7 @@ mod tests {
         };
         let store = dummy_store();
         let hits = store
-            .search_with_snapshot(schema, question, &SignalSet::new(), None, 10, &snap)
+            .search_with_snapshot(schema, question, &SignalSet::new(), None, 10, &snap, &[])
             .expect("search_with_snapshot");
         let keys: BTreeSet<&str> = hits.iter().map(|h| h.section_key.as_str()).collect();
         assert!(keys.contains("sec-a"));
