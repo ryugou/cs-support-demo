@@ -1,5 +1,11 @@
 use crate::harness::signal::SignalSet;
-use crate::manual::schema_ids::manual_node_id;
+use crate::manual::schema_ids::{manual_node_id, KIND_PRODUCT, KIND_SECTION};
+
+/// node_id 内で kind を挟む marker（`{schema}:gen1:{kind}:{key}` の `:{kind}:` 部分）。
+/// Search 結果 id をノード種別で絞る際のリテラル散在を避ける。
+fn kind_marker(kind: &str) -> String {
+    format!(":{kind}:")
+}
 use crate::model::{ManualHit, ManualProductCandidate, ManualSectionView, ProductView};
 use crate::proto::graphrag::GetGraphSnapshotResponse;
 use crate::resolve::normalize_key;
@@ -466,15 +472,20 @@ impl ManualStore {
         }
     }
 
-    /// vector_route_enabled 時のみ呼ばれる意味検索経路（urtect design §2.3）。
+    /// 意味検索経路（urtect design §2.3）。`enabled=false` なら即空（no-op）。
     /// `SearchResultItem` を ManualSection の node_id を持つものだけに絞り、(node_id, score) を返す。
+    /// enabled ゲートをここに内包し、呼び出し側の if/else 重複を無くす。
     pub async fn vector_hits(
         &self,
+        enabled: bool,
         schema: &str,
         question: &str,
         top_k: usize,
     ) -> Vec<(String, f32)> {
-        self.search_ids_with_scores(schema, question, top_k, ":ManualSection:")
+        if !enabled {
+            return Vec::new();
+        }
+        self.search_ids_with_scores(schema, question, top_k, &kind_marker(KIND_SECTION))
             .await
     }
 
@@ -503,7 +514,7 @@ impl ManualStore {
         // 無駄な snapshot.edges スキャンをしない）。除外対象は「何らかの DESCRIBES を持つが
         // 当該 Product への DESCRIBES は持たない」節（＝他機種専用ページ）の 1 集合に畳む。
         let excluded_by_product: Option<HashSet<String>> = product_key.map(|pk| {
-            let target = manual_node_id(schema, "Product", pk);
+            let target = manual_node_id(schema, KIND_PRODUCT, pk);
             let mut describes_any: HashSet<String> = HashSet::new();
             let mut describes_target: HashSet<String> = HashSet::new();
             for e in snapshot.edges.iter().filter(|e| e.edge_type == "DESCRIBES") {
@@ -676,7 +687,7 @@ impl ManualStore {
         // vector_hits_fut は即座に空 Vec を返す no-op）。
         let vector_hits_fut = async {
             if use_semantic {
-                self.search_ids_with_scores(schema, text, 10, ":Product:")
+                self.search_ids_with_scores(schema, text, 10, &kind_marker(KIND_PRODUCT))
                     .await
             } else {
                 Vec::new()
@@ -1118,7 +1129,7 @@ mod tests {
         let mut edges = Vec::new();
         if let Some(pk) = describes_product {
             nodes.push(PN {
-                node_id: manual_node_id(schema, "Product", pk),
+                node_id: manual_node_id(schema, KIND_PRODUCT, pk),
                 node_type: "Product".to_string(),
                 display_text: String::new(),
                 degree: 0,
@@ -1128,7 +1139,7 @@ mod tests {
             edges.push(PE {
                 edge_id: String::new(),
                 from_id: section.node_id.clone(),
-                to_id: manual_node_id(schema, "Product", pk),
+                to_id: manual_node_id(schema, KIND_PRODUCT, pk),
                 edge_type: "DESCRIBES".to_string(),
             });
         }

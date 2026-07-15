@@ -13,7 +13,7 @@ pub fn harness_node_id(schema: &str, kind: &str, key: &str) -> String {
     format!("{}{kind}:{key}", schema_generation_prefix(schema))
 }
 
-fn csv_list(value: &str) -> Vec<String> {
+pub(crate) fn csv_list(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)

@@ -563,11 +563,9 @@ impl Harness {
                         .ok_or_else(|| anyhow!("manual store not configured"))?;
                     // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
                     // 決定論の search_with_snapshot が握る。ここでは候補材料を用意するだけ。
-                    let vector_hits: Vec<(String, f32)> = if self.vector_route_enabled {
-                        store.vector_hits(&ctx.schema, question, 5).await
-                    } else {
-                        Vec::new()
-                    };
+                    let vector_hits = store
+                        .vector_hits(self.vector_route_enabled, &ctx.schema, question, 5)
+                        .await;
                     let hits = store.search_with_snapshot(
                         &ctx.schema,
                         question,
