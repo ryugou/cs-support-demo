@@ -757,15 +757,24 @@ impl CsSupportRmcpServer {
             .get("last_evidence_kind")
             .cloned()
             .unwrap_or_default();
-        let evidence_items: Vec<(String, String)> =
-            crate::harness::knowledge::csv_list(&last_evidence_keys)
-                .into_iter()
-                .map(|key| (key, last_evidence_kind.clone()))
-                .collect();
-        store
-            .append_answer_evidence(&ctx.schema, &attempt_id, &evidence_items)
-            .await
-            .map_err(to_error)?;
+        // kind が空だと evidence lineage が曖昧になる（古い/部分移行データ対策）。
+        // keys があるのに kind が空なら append せず警告に留める（不明瞭な evidence を作らない）。
+        if !last_evidence_keys.is_empty() && last_evidence_kind.is_empty() {
+            tracing::warn!(
+                case_id = %req.case_id,
+                "case has last_evidence_keys but empty last_evidence_kind; skipping answer_evidence append"
+            );
+        } else {
+            let evidence_items: Vec<(String, String)> =
+                crate::harness::knowledge::csv_list(&last_evidence_keys)
+                    .into_iter()
+                    .map(|key| (key, last_evidence_kind.clone()))
+                    .collect();
+            store
+                .append_answer_evidence(&ctx.schema, &attempt_id, &evidence_items)
+                .await
+                .map_err(to_error)?;
+        }
         Ok(Json(RecordAnswerAttemptResponse {
             attempt_id,
             egress: verdict,
