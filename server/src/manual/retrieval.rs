@@ -485,7 +485,8 @@ impl ManualStore {
         if !enabled {
             return Vec::new();
         }
-        self.search_ids_with_scores(schema, question, top_k, &kind_marker(KIND_SECTION))
+        let marker = kind_marker(KIND_SECTION);
+        self.search_ids_with_scores(schema, question, top_k, &marker)
             .await
     }
 
@@ -685,9 +686,10 @@ impl ManualStore {
         // query_nodes と意味検索は互いに依存しない独立した呼び出しなので、直列 await で
         // 待ち時間を積み上げず tokio::join! で並行に投げる（use_semantic=false 時は
         // vector_hits_fut は即座に空 Vec を返す no-op）。
+        let product_marker = kind_marker(KIND_PRODUCT);
         let vector_hits_fut = async {
             if use_semantic {
-                self.search_ids_with_scores(schema, text, 10, &kind_marker(KIND_PRODUCT))
+                self.search_ids_with_scores(schema, text, 10, &product_marker)
                     .await
             } else {
                 Vec::new()
