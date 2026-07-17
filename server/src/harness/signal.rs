@@ -39,6 +39,13 @@ struct LexiconEntry {
     signal: String,
     class: SignalClass,
     surface_forms: Vec<String>,
+    /// LLM 抽出専用の signal。文字列照合（surface_forms）には使わず、
+    /// 分類（classes マップ）と vocabulary_for_prompt にのみ登録する。
+    #[serde(default)]
+    llm_only: bool,
+    /// LLM プロンプト向けの語義。vocabulary_for_prompt に埋め込まれる。
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,9 +59,17 @@ struct CompiledEntry {
     normalized_forms: Vec<String>,
 }
 
+/// vocabulary_for_prompt 向けに保持する語彙 1 件分（signal, class, description）。
+struct VocabularyEntry {
+    signal: String,
+    class: SignalClass,
+    description: String,
+}
+
 pub struct LexiconNormalizer {
     entries: Vec<CompiledEntry>,
     classes: std::collections::HashMap<String, SignalClass>,
+    vocabulary: Vec<VocabularyEntry>,
 }
 
 impl LexiconNormalizer {
@@ -71,9 +86,20 @@ impl LexiconNormalizer {
             .iter()
             .map(|entry| (entry.signal.clone(), entry.class))
             .collect();
+        let vocabulary = file
+            .signals
+            .iter()
+            .map(|entry| VocabularyEntry {
+                signal: entry.signal.clone(),
+                class: entry.class,
+                description: entry.description.clone(),
+            })
+            .collect();
         let entries = file
             .signals
             .into_iter()
+            // llm_only の signal は文字列照合の対象にしない（classes / vocabulary には登録済み）。
+            .filter(|entry| !entry.llm_only)
             .map(|entry| {
                 let normalized_forms: Vec<String> = entry
                     .surface_forms
@@ -95,11 +121,36 @@ impl LexiconNormalizer {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { entries, classes })
+        Ok(Self {
+            entries,
+            classes,
+            vocabulary,
+        })
     }
 
     pub fn class_of(&self, signal: &Signal) -> Option<SignalClass> {
         self.classes.get(signal.as_str()).copied()
+    }
+
+    /// signal がこの lexicon に登録されているか（llm_only も含む）。
+    pub fn contains_signal(&self, name: &str) -> bool {
+        self.classes.contains_key(name)
+    }
+
+    /// LLM 分類プロンプトに埋め込む語彙一覧。1 signal 1 行、
+    /// `signal (class): description` 形式（description は空文字の場合あり）。
+    pub fn vocabulary_for_prompt(&self) -> String {
+        self.vocabulary
+            .iter()
+            .map(|entry| {
+                let class = match entry.class {
+                    SignalClass::Hazard => "hazard",
+                    SignalClass::Context => "context",
+                };
+                format!("{} ({}): {}", entry.signal, class, entry.description)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -177,6 +228,26 @@ mod tests {
             ] }"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn llm_only_entry_allows_empty_surface_forms_and_is_not_string_matched() {
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+            { "signal": "unclassified_risk", "class": "hazard", "surface_forms": [], "llm_only": true,
+              "description": "既存のどの signal にも分類できないが、安全・契約・法務上の不安がある発話" },
+            { "signal": "mold", "class": "hazard", "surface_forms": ["カビ"] }
+        ] }"#,
+        )
+        .unwrap();
+        assert!(lex
+            .normalize("カビが生えた unclassified_risk")
+            .iter()
+            .all(|s| s.as_str() != "unclassified_risk"));
+        assert!(lex.contains_signal("unclassified_risk"));
+        assert!(lex.class_of(&Signal::new("unclassified_risk")).is_some());
+        let prompt = lex.vocabulary_for_prompt();
+        assert!(prompt.contains("unclassified_risk") && prompt.contains("分類できない"));
     }
 
     #[test]

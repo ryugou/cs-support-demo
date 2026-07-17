@@ -18,6 +18,10 @@ pub struct AuditDraft {
     pub decision: String,
     pub route: Option<String>,
     pub governing_norm_ids: Vec<String>,
+    /// signal 抽出モード（S1-11 改訂: lexicon_only / hybrid / lexicon_fallback /
+    /// not_applicable）。加算フィールド。既存ログ行にはこのキーが無いが、
+    /// `verify_chain` は行ごとに実在するキーだけを再ハッシュするため後方互換。
+    pub extraction_mode: String,
 }
 
 /// WORM に書かれる 1 行（I5: provenance キー付き構造化レコード）。
@@ -37,6 +41,8 @@ struct AuditEvent<'a> {
     governing_norm_ids: &'a [String],
     /// 将来 A / traceable_pairs へ結線するための予約（駆動は後段）。
     graph_provenance_linked: bool,
+    /// S1-11 改訂: 今ターンの signal 抽出モード（加算フィールド）。
+    extraction_mode: &'a str,
     prev_hash: &'a str,
     hash: &'a str,
 }
@@ -99,6 +105,7 @@ impl WormAuditLog {
             "route": draft.route,
             "governing_norm_ids": draft.governing_norm_ids,
             "graph_provenance_linked": false,
+            "extraction_mode": draft.extraction_mode,
         });
         let payload_text = serde_json::to_string(&payload)?;
         let mut hasher = Sha256::new();
@@ -118,6 +125,7 @@ impl WormAuditLog {
             route: draft.route.as_deref(),
             governing_norm_ids: &draft.governing_norm_ids,
             graph_provenance_linked: false,
+            extraction_mode: &draft.extraction_mode,
             prev_hash,
             hash: &hash,
         };
@@ -199,6 +207,7 @@ mod tests {
             decision: decision.to_string(),
             route: None,
             governing_norm_ids: Vec::new(),
+            extraction_mode: "not_applicable".to_string(),
         }
     }
 
@@ -230,6 +239,7 @@ mod tests {
                 "decision",
                 "governing_norm_ids",
                 "graph_provenance_linked",
+                "extraction_mode",
                 "prev_hash",
                 "hash",
             ] {

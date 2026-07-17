@@ -126,8 +126,14 @@ pub struct ManualHit {
     pub source_url: String,
     pub breadcrumb: String,
     pub score: f32,
+    /// score の由来: "text"（fast-path/IDF のみ）| "vector"（意味検索のみ）|
+    /// "both"（両方が候補に寄与、score は max）。urtect design §2.3 の監査可能性のため。
+    /// additive フィールドなので古いシリアライズ済み値には `#[serde(default)]` で対応する。
+    #[serde(default)]
+    pub score_source: String,
 }
 
+/// score_source は SectionHit に無い（legacy 経路には概念が無いため）ので変換時に捨てる。
 /// manual_v1 経路（ManualHit）を LegacySection 経路と同じ `SectionHit` に薄く詰め替える。
 /// reserved フィールド body_original / original_hash は読まない（現行実装では未使用）。
 impl From<ManualHit> for SectionHit {
@@ -180,6 +186,7 @@ mod tests {
             source_url: "https://x/1-4/sd".into(),
             breadcrumb: "1.4 こんなときは > SDカードが認識されない".into(),
             score: 1.0,
+            score_source: "text".into(),
         };
         let s: SectionHit = hit.into();
         // legacy と同じ「1 要素 = 1 階層」の Vec に展開される
@@ -202,6 +209,7 @@ mod tests {
             source_url: "u".into(),
             breadcrumb: String::new(),
             score: 0.5,
+            score_source: "text".into(),
         };
         let s: SectionHit = hit.into();
         assert!(s.breadcrumb.is_empty());

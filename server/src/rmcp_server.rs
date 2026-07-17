@@ -82,6 +82,31 @@ pub struct EvaluateAnswerabilityResponse {
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
     pub request_id: String,
+    /// 参考として返す類似の過去事例（自 case は除外）。3 層判定の入力ではなく、
+    /// あくまで client 向けの参考情報（S1-1 取得段）。
+    pub related_cases: Vec<RelatedCaseJson>,
+    /// 今ターンの signal 抽出モード（S1-11 改訂）: `lexicon_only` / `hybrid` /
+    /// `lexicon_fallback`。WORM 監査にも同値を記録している。
+    pub extraction_mode: String,
+}
+
+/// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct RelatedCaseJson {
+    pub case_id: String,
+    pub question: String,
+    /// 旧行には無いことがあるため空文字を許容する。
+    pub last_decision: String,
+}
+
+impl From<crate::harness::RelatedCase> for RelatedCaseJson {
+    fn from(c: crate::harness::RelatedCase) -> Self {
+        Self {
+            case_id: c.case_id,
+            question: c.question,
+            last_decision: c.last_decision,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -265,7 +290,7 @@ impl CsSupportRmcpServer {
 
     #[tool(
         name = "resolve_product",
-        description = "商品名・型番・顧客表現から候補 product を返す。aliases テーブルは使わない。"
+        description = "商品名・型番・顧客表現から候補 product を返す。照合は正規化+部分一致(fuzzy)。manual_v1 テナントかつ vector route 有効時は意味検索(embedding)による近傍候補も統合する。reason: normalized_match | fuzzy_match | semantic_nearby。"
     )]
     async fn resolve_product(
         &self,
@@ -277,7 +302,7 @@ impl CsSupportRmcpServer {
             crate::config::ManualSchemaKind::ManualV1 => {
                 let store = self.manual_store()?;
                 let manual_candidates = store
-                    .resolve_product(&ctx.schema, &req.text)
+                    .resolve_product(&ctx.schema, &req.text, self.harness.vector_route_enabled)
                     .await
                     .map_err(to_error)?;
                 let retrieved = manual_candidates
@@ -340,13 +365,25 @@ impl CsSupportRmcpServer {
             crate::config::ManualSchemaKind::ManualV1 => {
                 let store = self.manual_store()?;
                 let signals = self.harness.normalizer.normalize(&req.query_ja);
+                let top_k = req.top_k.unwrap_or(5).max(1) as usize;
+                // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
+                // 決定論の search が握る。ここでは候補材料を用意するだけ。
+                let vector_hits = store
+                    .vector_hits(
+                        self.harness.vector_route_enabled,
+                        &ctx.schema,
+                        &req.query_ja,
+                        top_k,
+                    )
+                    .await;
                 let manual_hits = store
                     .search(
                         &ctx.schema,
                         &req.query_ja,
                         &signals,
                         req.product_key.as_deref(),
-                        req.top_k.unwrap_or(5).max(1) as usize,
+                        top_k,
+                        &vector_hits,
                     )
                     .await
                     .map_err(to_error)?;
@@ -454,19 +491,29 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<GetProductRequest>,
     ) -> Result<Json<ProductView>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let view = match ctx.manual_schema {
-            // TODO: implement ManualStore::get_product (Product + DESCRIBES sections + TOC)
+        let (retrieved_id, view) = match ctx.manual_schema {
             crate::config::ManualSchemaKind::ManualV1 => {
-                return Err(ErrorData::invalid_params(
-                    "get_product is not supported for manual_v1 schemas yet; use resolve_product + search_manual",
-                    None,
-                ));
+                let store = self.manual_store()?;
+                let view = store
+                    .get_product(&ctx.schema, &req.product_key)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved_id = crate::manual::schema_ids::manual_node_id(
+                    &ctx.schema,
+                    crate::manual::schema_ids::KIND_PRODUCT,
+                    &req.product_key,
+                );
+                (retrieved_id, view)
             }
-            crate::config::ManualSchemaKind::LegacySection => self
-                .tools
-                .get_product(&ctx.schema, &req.product_key)
-                .await
-                .map_err(to_error)?,
+            crate::config::ManualSchemaKind::LegacySection => {
+                let view = self
+                    .tools
+                    .get_product(&ctx.schema, &req.product_key)
+                    .await
+                    .map_err(to_error)?;
+                let retrieved_id = crate::ingest::product_node_id(&ctx.schema, &req.product_key);
+                (retrieved_id, view)
+            }
         };
         self.harness
             .audit_with_nodes(
@@ -474,10 +521,7 @@ impl CsSupportRmcpServer {
                 "read:get_product",
                 None,
                 Vec::new(),
-                vec![crate::ingest::product_node_id(
-                    &ctx.schema,
-                    &req.product_key,
-                )],
+                vec![retrieved_id],
             )
             .await
             .map_err(to_error)?;
@@ -522,6 +566,12 @@ impl CsSupportRmcpServer {
             hits: outcome.hits,
             audit_event_id: outcome.audit_event_id,
             request_id: ctx.request_id,
+            related_cases: outcome
+                .related_cases
+                .into_iter()
+                .map(RelatedCaseJson::from)
+                .collect(),
+            extraction_mode: outcome.extraction_mode.as_str().to_string(),
         }))
     }
 
@@ -691,6 +741,40 @@ impl CsSupportRmcpServer {
             )
             .await
             .map_err(to_error)?;
+        // answer_evidence（S1-2）: 判定が使った根拠キーを evaluate 側が case に記録済みのため、
+        // それを読み出して attempt に紐づく evidence として追記する。escalate 済み case は
+        // last_evidence_keys が空でここに来ないため、append_answer_evidence 側で無音スキップされる。
+        let evidence_case_attrs = store
+            .load_case(&ctx.schema, &req.case_id)
+            .await
+            .map_err(to_error)?
+            .unwrap_or_default();
+        let last_evidence_keys = evidence_case_attrs
+            .get("last_evidence_keys")
+            .cloned()
+            .unwrap_or_default();
+        let last_evidence_kind = evidence_case_attrs
+            .get("last_evidence_kind")
+            .cloned()
+            .unwrap_or_default();
+        // kind が空だと evidence lineage が曖昧になる（古い/部分移行データ対策）。
+        // keys があるのに kind が空なら append せず警告に留める（不明瞭な evidence を作らない）。
+        if !last_evidence_keys.is_empty() && last_evidence_kind.is_empty() {
+            tracing::warn!(
+                case_id = %req.case_id,
+                "case has last_evidence_keys but empty last_evidence_kind; skipping answer_evidence append"
+            );
+        } else {
+            let evidence_items: Vec<(String, String)> =
+                crate::harness::knowledge::csv_list(&last_evidence_keys)
+                    .into_iter()
+                    .map(|key| (key, last_evidence_kind.clone()))
+                    .collect();
+            store
+                .append_answer_evidence(&ctx.schema, &attempt_id, &evidence_items)
+                .await
+                .map_err(to_error)?;
+        }
         Ok(Json(RecordAnswerAttemptResponse {
             attempt_id,
             egress: verdict,

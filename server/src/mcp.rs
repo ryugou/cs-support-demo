@@ -460,7 +460,7 @@ fn candidate_from_node(query: &str, node: NodeResult) -> Option<ProductCandidate
         reason: if score >= 1.0 {
             "normalized_match".to_string()
         } else {
-            "semantic_nearby".to_string()
+            "fuzzy_match".to_string()
         },
     })
 }

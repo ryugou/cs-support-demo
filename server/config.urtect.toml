@@ -28,6 +28,8 @@ search_improvement_queue_path = "data/audit/search-improvement-queue.jsonl"
 signal_lexicon_path = "data/urtect/signal-lexicon.json"
 ng_dictionary_path = "data/urtect/ng-dictionary.json"
 default_escalation_route = "support_desk"
+# 意味検索（ベクトル経路）: embeddings を ingest 済みのため有効化
+vector_route_enabled = true
 policy = "escalate_unless_answerable"
 
 [harness.thresholds]
@@ -41,3 +43,11 @@ promote_approvals = 3
 promote_approvers = 2
 promote_max_rejection_rate = 0.2
 demote_rejections = 2
+
+# signal 抽出エージェント（S1-11 改訂: lexicon ∪ LLM のハイブリッド）。
+# 既定は enabled = false（lexicon 単独・オフライン動作・API キー不要）。
+# 有効化する場合は enabled = true にし、API キーを env CS_SUPPORT_LLM_API_KEY
+# または api_key_file のいずれかで注入すること（config に平文キーを書かない）。
+# enabled = true で鍵を解決できない場合は起動時 fail closed で失敗する。
+[llm]
+enabled = true

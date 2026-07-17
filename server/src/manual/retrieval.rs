@@ -1,6 +1,12 @@
 use crate::harness::signal::SignalSet;
-use crate::manual::schema_ids::manual_node_id;
-use crate::model::{ManualHit, ManualProductCandidate, ManualSectionView};
+use crate::manual::schema_ids::{manual_node_id, KIND_PRODUCT, KIND_SECTION};
+
+/// node_id 内で kind を挟む marker（`{schema}:gen1:{kind}:{key}` の `:{kind}:` 部分）。
+/// Search 結果 id をノード種別で絞る際のリテラル散在を避ける。
+fn kind_marker(kind: &str) -> String {
+    format!(":{kind}:")
+}
+use crate::model::{ManualHit, ManualProductCandidate, ManualSectionView, ProductView};
 use crate::proto::graphrag::GetGraphSnapshotResponse;
 use crate::resolve::normalize_key;
 use crate::vegapunk::VegapunkClient;
@@ -249,6 +255,148 @@ pub fn sections_for_signals(
         .collect()
 }
 
+/// Product + DESCRIBES 逆引きの節キー + それら節が属する ManualDocument 配下の TOC を返す純関数。
+/// manual_v1 には product -> document の直接辺が無いため、product を DESCRIBES する節の
+/// HAS_SECTION 逆引きで document を特定し、その document 配下の節から product-applicable な
+/// ものだけを TOC 対象にする。product-applicable の判定基準は search_with_snapshot の
+/// スコープ絞り込みと同じ: (a) 当該 Product への DESCRIBES 辺を持つ、または
+/// (b) DESCRIBES 辺を一切持たない（機種非依存ページ）。他機種のみを DESCRIBES する節は
+/// document 配下であっても TOC から除外する（実データ: 1 document を複数 product が共有し、
+/// 各節が特定機種のみを説明する URTECT 構成での TOC 汚染を防ぐ）。
+/// specs は manual_v1 では未実装のため常に空 Vec（S1-7 のスコープ外）。
+/// toc は order 属性昇順（同着は section_key 昇順）のフラットリストで、
+/// 各要素が親 section_key（PARENT_OF 逆引き）を持つ ── 階層 JSON は構築しない。
+/// 親が TOC から除外された節（他機種専用）を指す場合でも、参照はそのまま返す（捏造・null 化しない）。
+pub fn product_view_from_snapshot(
+    product_key: &str,
+    snapshot: &GetGraphSnapshotResponse,
+) -> Result<ProductView> {
+    // node_id → GraphNode の索引を 1 度だけ構築する（ループ内での線形スキャンを避ける）。
+    let node_index: std::collections::HashMap<&str, &crate::proto::graphrag::GraphNode> = snapshot
+        .nodes
+        .iter()
+        .map(|n| (n.node_id.as_str(), n))
+        .collect();
+
+    let product_node = snapshot
+        .nodes
+        .iter()
+        .find(|n| {
+            n.node_type == "Product"
+                && n.attributes.get("product_key").map(String::as_str) == Some(product_key)
+        })
+        .ok_or_else(|| anyhow!("product not found: {product_key}"))?;
+
+    // DESCRIBES: ManualSection -> Product の逆引き。
+    // describes_any: 何らかの DESCRIBES 辺を持つ節（＝機種依存ページ）全体。
+    // describing_section_ids: このうち当該 product を DESCRIBES する節。
+    let mut describes_any: HashSet<&str> = HashSet::new();
+    let mut describing_section_ids: HashSet<&str> = HashSet::new();
+    for e in snapshot.edges.iter().filter(|e| e.edge_type == "DESCRIBES") {
+        describes_any.insert(e.from_id.as_str());
+        if e.to_id == product_node.node_id {
+            describing_section_ids.insert(e.from_id.as_str());
+        }
+    }
+    let mut describing_section_keys: Vec<String> = describing_section_ids
+        .iter()
+        .filter_map(|id| node_index.get(id))
+        .map(|n| n.attributes.get("section_key").cloned().unwrap_or_default())
+        .collect();
+    describing_section_keys.sort();
+
+    // DESCRIBES 節が属する document（HAS_SECTION 逆引き）→ その document 配下の全節を TOC 候補にする。
+    let doc_ids: HashSet<&str> = snapshot
+        .edges
+        .iter()
+        .filter(|e| {
+            e.edge_type == "HAS_SECTION" && describing_section_ids.contains(e.to_id.as_str())
+        })
+        .map(|e| e.from_id.as_str())
+        .collect();
+    let toc_candidate_ids: HashSet<&str> = snapshot
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "HAS_SECTION" && doc_ids.contains(e.from_id.as_str()))
+        .map(|e| e.to_id.as_str())
+        .collect();
+    // product-applicable のみ TOC に残す: 当該 product を DESCRIBES する、または
+    // DESCRIBES 辺を一切持たない節。他機種のみを DESCRIBES する節は除外する。
+    let toc_section_ids: HashSet<&str> = toc_candidate_ids
+        .into_iter()
+        .filter(|id| !describes_any.contains(id) || describing_section_ids.contains(id))
+        .collect();
+    let parent_of: std::collections::HashMap<&str, &str> = snapshot
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == "PARENT_OF")
+        .map(|e| (e.to_id.as_str(), e.from_id.as_str()))
+        .collect();
+
+    let mut toc: Vec<(i64, String, serde_json::Value)> = toc_section_ids
+        .iter()
+        .filter_map(|id| node_index.get(id).map(|n| (*id, *n)))
+        .map(|(id, n)| {
+            let section_key = n.attributes.get("section_key").cloned().unwrap_or_default();
+            let order: i64 = n
+                .attributes
+                .get("order")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let parent_key = parent_of
+                .get(id)
+                .and_then(|pid| node_index.get(pid))
+                .map(|pn| {
+                    pn.attributes
+                        .get("section_key")
+                        .cloned()
+                        .unwrap_or_default()
+                });
+            (
+                order,
+                section_key.clone(),
+                serde_json::json!({
+                    "section_key": section_key,
+                    "title": n.attributes.get("title").cloned().unwrap_or_default(),
+                    "order": order,
+                    "parent": parent_key,
+                }),
+            )
+        })
+        .collect();
+    toc.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let toc: Vec<serde_json::Value> = toc.into_iter().map(|(_, _, v)| v).collect();
+
+    let product = serde_json::json!({
+        "node_id": product_node.node_id,
+        "attributes": product_node.attributes,
+        "describing_section_keys": describing_section_keys,
+    });
+
+    Ok(ProductView {
+        product,
+        specs: Vec::new(),
+        toc,
+    })
+}
+
+/// `(node_id, score)` 群を node_id → 最大スコアの map に畳む（同一 id が複数回来た場合は
+/// max を残す）。ManualSection の vector_hits（`search_with_snapshot`）と Product の
+/// vector_hits（`merge_product_candidates`）の両方で使う共通の fold ステップ。
+fn fold_max_scores(hits: &[(String, f32)]) -> std::collections::HashMap<&str, f32> {
+    let mut map: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+    for (id, score) in hits {
+        map.entry(id.as_str())
+            .and_modify(|s| {
+                if *score > *s {
+                    *s = *score;
+                }
+            })
+            .or_insert(*score);
+    }
+    map
+}
+
 pub struct ManualStore {
     client: Arc<VegapunkClient>,
 }
@@ -270,6 +418,8 @@ impl ManualStore {
     }
 
     /// signal 絞り込み(A) と body 全文(B) の max スコアで ManualSection を返す。
+    /// `vector_hits` は意味検索経路（urtect design §2.3）の (node_id, score) 群。
+    /// vector_route_enabled が false の呼び出し元は空 slice を渡す。
     pub async fn search(
         &self,
         schema: &str,
@@ -277,15 +427,79 @@ impl ManualStore {
         signals: &SignalSet,
         product_key: Option<&str>,
         top_k: usize,
+        vector_hits: &[(String, f32)],
     ) -> Result<Vec<ManualHit>> {
         let snap = self.snapshot(schema).await?;
-        self.search_with_snapshot(schema, question, signals, product_key, top_k, &snap)
+        self.search_with_snapshot(
+            schema,
+            question,
+            signals,
+            product_key,
+            top_k,
+            &snap,
+            vector_hits,
+        )
+    }
+
+    /// `client.search` を呼び、node_id に `marker` を含む `SearchResultItem` だけを
+    /// (node_id, score) に絞って返す共通ヘルパー。backend 呼び出し失敗は呼び出し元の
+    /// 検索経路を止めないよう warn ログ + 空 Vec にフォールバックする。
+    /// 返却スコアは backend の 0-1 程度のスケールをそのまま使う（本関数ではリスケールしない。
+    /// 較正は Task 11 の実測ベースで検討する）。
+    async fn search_ids_with_scores(
+        &self,
+        schema: &str,
+        text: &str,
+        top_k: usize,
+        marker: &str,
+    ) -> Vec<(String, f32)> {
+        match self.client.search(schema, text, top_k as i32).await {
+            Ok(items) => items
+                .into_iter()
+                .filter_map(|item| {
+                    let id = item.id?;
+                    id.contains(marker).then(|| (id, item.score.unwrap_or(0.0)))
+                })
+                .collect(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    marker,
+                    "vector search failed; continuing with text-only retrieval"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// 意味検索経路（urtect design §2.3）。`enabled=false` なら即空（no-op）。
+    /// `SearchResultItem` を ManualSection の node_id を持つものだけに絞り、(node_id, score) を返す。
+    /// enabled ゲートをここに内包し、呼び出し側の if/else 重複を無くす。
+    pub async fn vector_hits(
+        &self,
+        enabled: bool,
+        schema: &str,
+        question: &str,
+        top_k: usize,
+    ) -> Vec<(String, f32)> {
+        if !enabled {
+            return Vec::new();
+        }
+        let marker = kind_marker(KIND_SECTION);
+        self.search_ids_with_scores(schema, question, top_k, &marker)
+            .await
     }
 
     /// `product_key` が Some のとき、候補 ManualSection は
     /// (a) 当該 Product への DESCRIBES 辺を持つ、または (b) DESCRIBES 辺を一切持たない
     /// （機種非依存ページはどの機種にも適用される）のいずれかに限定する。
     /// 他機種のみを DESCRIBES する節は除外する。None のときは絞り込まない（従来通り）。
+    ///
+    /// `vector_hits` は意味検索経路（urtect design §2.3）の (ManualSection node_id, score) 群。
+    /// snapshot に無い node_id は無視する（実体が確認できない候補を捏造しない）。
+    /// product_key フィルタは vector 候補にも同様に適用する（テキスト候補と扱いを揃える）。
+    /// 最終スコアは `max(text_score, vector_score)`。両方が寄与した場合は "both"、
+    /// テキストのみは "text"、vector のみは "vector" を `ManualHit.score_source` に残す。
     pub fn search_with_snapshot(
         &self,
         schema: &str,
@@ -294,13 +508,14 @@ impl ManualStore {
         product_key: Option<&str>,
         top_k: usize,
         snapshot: &GetGraphSnapshotResponse,
+        vector_hits: &[(String, f32)],
     ) -> Result<Vec<ManualHit>> {
         let signal_narrowed = sections_for_signals(snapshot, signals);
         // product_key が Some のときだけ DESCRIBES 辺を走査する（None の hot path で
         // 無駄な snapshot.edges スキャンをしない）。除外対象は「何らかの DESCRIBES を持つが
         // 当該 Product への DESCRIBES は持たない」節（＝他機種専用ページ）の 1 集合に畳む。
         let excluded_by_product: Option<HashSet<String>> = product_key.map(|pk| {
-            let target = manual_node_id(schema, "Product", pk);
+            let target = manual_node_id(schema, KIND_PRODUCT, pk);
             let mut describes_any: HashSet<String> = HashSet::new();
             let mut describes_target: HashSet<String> = HashSet::new();
             for e in snapshot.edges.iter().filter(|e| e.edge_type == "DESCRIBES") {
@@ -335,6 +550,11 @@ impl ManualStore {
         let attr = |n: &crate::proto::graphrag::GraphNode, key: &str| -> String {
             n.attributes.get(key).cloned().unwrap_or_default()
         };
+        // vector_hits を node_id → score に畳む（同一 id が複数回来た場合は max を残す）。
+        // manual_sections（product_key フィルタ適用後の snapshot 由来の集合）に対して
+        // 引くだけなので、snapshot に無い id や product_key フィルタで除外された節の
+        // vector スコアは自然に無視される（別集合として union する必要がない）。
+        let vector_map = fold_max_scores(vector_hits);
         let mut hits: Vec<ManualHit> = manual_sections
             .into_iter()
             .zip(corpus_scores)
@@ -344,11 +564,22 @@ impl ManualStore {
                 // title 込みの fast path は維持する: 完全部分文字列 → 1.0、
                 // 正規化部分文字列 → 0.95。それ以外は body のみに対する IDF corpus スコアを使う。
                 let text = format!("{title}\n{body}");
-                let score =
+                let text_score =
                     substring_fast_path(question, &query_norm, &text).unwrap_or(corpus_score);
+                let vector_score = vector_map.get(n.node_id.as_str()).copied().unwrap_or(0.0);
+                // 最終スコアは max(text, vector)。backend の vector score は 0-1 程度のスケールを
+                // 前提とし、ここではリスケールしない（較正は実測ベースで Task 11 に回す）。
+                let score = text_score.max(vector_score);
+                let score_source = match (text_score > 0.0, vector_score > 0.0) {
+                    (true, true) => "both",
+                    (true, false) => "text",
+                    (false, true) => "vector",
+                    (false, false) => "text",
+                }
+                .to_string();
                 // signal 絞り込み(in_signal)は候補として残すかどうか（下の filter）にだけ効く。
                 // score には一切影響しない（floor や boost を掛けない — 過剰応答を防ぐため、
-                // 直接性は常に fast path / IDF カバレッジの実測値をそのまま使う）。
+                // 直接性は常に fast path / IDF カバレッジ / vector 類似度の実測値をそのまま使う）。
                 let in_signal = signal_narrowed.contains(&n.node_id);
                 (
                     in_signal,
@@ -360,10 +591,11 @@ impl ManualStore {
                         source_url: attr(n, "source_url"),
                         breadcrumb: attr(n, "breadcrumb"),
                         score,
+                        score_source,
                     },
                 )
             })
-            // 候補: signal 絞り込みに入る or body スコアが立つ（0 超）ものを残す
+            // 候補: signal 絞り込みに入る or (text/vector いずれかの) スコアが立つ（0 超）ものを残す
             .filter(|(in_signal, score, _)| *in_signal || *score > 0.0)
             .map(|(_, _, h)| h)
             .collect();
@@ -436,50 +668,119 @@ impl ManualStore {
         })
     }
 
+    /// Product 概要 + DESCRIBES 節キー + document TOC を返す（S1-7）。
+    pub async fn get_product(&self, schema: &str, product_key: &str) -> Result<ProductView> {
+        let snap = self.snapshot(schema).await?;
+        product_view_from_snapshot(product_key, &snap)
+    }
+
     /// Product ノードを name/model/aliases の正規化一致で解決する。
+    /// `use_semantic` が true の場合（manual_v1 かつ vector_route_enabled）、
+    /// Product ノードに対する意味検索（urtect design §2.3）の結果も統合する（A5b）。
     pub async fn resolve_product(
         &self,
         schema: &str,
         text: &str,
+        use_semantic: bool,
     ) -> Result<Vec<ManualProductCandidate>> {
-        let products = self
-            .client
-            .query_nodes(schema, "Product", Vec::new(), 1000)
-            .await
-            .context("query Product")?;
+        // query_nodes と意味検索は互いに依存しない独立した呼び出しなので、直列 await で
+        // 待ち時間を積み上げず tokio::join! で並行に投げる（use_semantic=false 時は
+        // vector_hits_fut は即座に空 Vec を返す no-op）。
+        let product_marker = kind_marker(KIND_PRODUCT);
+        let vector_hits_fut = async {
+            if use_semantic {
+                self.search_ids_with_scores(schema, text, 10, &product_marker)
+                    .await
+            } else {
+                Vec::new()
+            }
+        };
+        let (products, vector_hits) = tokio::join!(
+            self.client.query_nodes(schema, "Product", Vec::new(), 1000),
+            vector_hits_fut
+        );
+        let products = products.context("query Product")?;
         let q = normalize_key(text);
-        let mut cands: Vec<ManualProductCandidate> = products
+        let rows: Vec<ProductRow> = products
             .into_iter()
-            .filter_map(|p| {
+            .map(|p| {
                 let a = p.attributes;
                 let model = a.get("model").cloned().unwrap_or_default();
                 let name = a.get("name").cloned().unwrap_or_default();
                 let aliases = a.get("aliases").cloned().unwrap_or_default();
-                let score = [model.as_str(), name.as_str()]
+                let fuzzy_score = [model.as_str(), name.as_str()]
                     .into_iter()
                     .chain(aliases.split(',').map(str::trim))
                     .map(|c| crate::resolve::fuzzy_score(&q, &normalize_key(c)))
                     .fold(0.0_f32, f32::max);
-                (score > 0.1).then_some(ManualProductCandidate {
+                ProductRow {
+                    node_id: p.node_id,
                     model,
                     name,
-                    score,
-                    reason: if score >= 1.0 {
-                        "normalized_match".into()
-                    } else {
-                        "semantic_nearby".into()
-                    },
-                })
+                    fuzzy_score,
+                }
             })
             .collect();
-        cands.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        cands.truncate(5);
-        Ok(cands)
+        Ok(merge_product_candidates(rows, &vector_hits))
     }
+}
+
+/// resolve_product の候補生成に必要な Product 1 件分の行。
+/// fuzzy スコアは閾値適用前の生値を持つ（vector-only 候補判定に使うため）。
+#[derive(Debug)]
+pub(crate) struct ProductRow {
+    pub node_id: String,
+    pub model: String,
+    pub name: String,
+    pub fuzzy_score: f32,
+}
+
+/// resolve_product の意味マッチ統合（A5b）本体。全 Product 行の fuzzy スコアと
+/// vector hit (node_id, score) 群から最終候補リストを作る純関数。
+///
+/// - 各行の最終 score = max(fuzzy_score, vector_score)
+/// - score <= 0.1 の行は候補から除外する（従来の fuzzy 専用閾値を踏襲）
+/// - vector_score が fuzzy_score を上回った行（fuzzy 閾値未達の "vector-only" 候補を含む）は
+///   reason = "semantic_nearby"（ここで初めて名実一致する）
+/// - それ以外（fuzzy が同点以上で寄与）は既存の reason（normalized_match / fuzzy_match）を維持する
+/// - 決定論のため score 降順 + 同点は model 昇順の tiebreak でソートする（Task 9 の
+///   section_key tiebreak と同じ思想）
+pub(crate) fn merge_product_candidates(
+    rows: Vec<ProductRow>,
+    vector_hits: &[(String, f32)],
+) -> Vec<ManualProductCandidate> {
+    let vector_map = fold_max_scores(vector_hits);
+    let mut cands: Vec<ManualProductCandidate> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let vector_score = vector_map.get(row.node_id.as_str()).copied().unwrap_or(0.0);
+            let score = row.fuzzy_score.max(vector_score);
+            if score <= 0.1 {
+                return None;
+            }
+            let reason = if vector_score > row.fuzzy_score {
+                "semantic_nearby"
+            } else if row.fuzzy_score >= 1.0 {
+                "normalized_match"
+            } else {
+                "fuzzy_match"
+            };
+            Some(ManualProductCandidate {
+                model: row.model,
+                name: row.name,
+                score,
+                reason: reason.to_string(),
+            })
+        })
+        .collect();
+    cands.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    cands.truncate(5);
+    cands
 }
 
 #[cfg(test)]
@@ -490,6 +791,112 @@ mod tests {
     /// 単一節コーパスでスコアを取るテストヘルパ（production 経路と同じ score_against_corpus を使う）。
     fn score_one(question: &str, body: &str) -> f32 {
         score_against_corpus(question, &[body.to_string()])[0]
+    }
+
+    #[test]
+    fn fold_max_scores_keeps_the_larger_of_duplicate_ids() {
+        // 同一 node_id が複数回来た場合、低スコアが後に来ても max が採用される
+        // （順序に依存しない）ことを直接検証する（codex レビュー Suggestion 対応）。
+        let hits = vec![
+            ("p1".to_string(), 0.3_f32),
+            ("p1".to_string(), 0.9_f32),
+            ("p1".to_string(), 0.1_f32),
+        ];
+        let map = fold_max_scores(&hits);
+        assert_eq!(map.get("p1"), Some(&0.9));
+    }
+
+    fn product_row(node_id: &str, model: &str, name: &str, fuzzy_score: f32) -> ProductRow {
+        ProductRow {
+            node_id: node_id.to_string(),
+            model: model.to_string(),
+            name: name.to_string(),
+            fuzzy_score,
+        }
+    }
+
+    #[test]
+    fn merge_vector_boosts_existing_candidate_and_flips_reason() {
+        // fuzzy だけでは 0.4 (fuzzy_match) だが、vector が 0.9 で上回る → score=max=0.9、
+        // reason は "semantic_nearby" に切り替わる（vector が最終スコアの主因になったため）。
+        let rows = vec![product_row("p1", "ADC-V724", "屋外カメラ", 0.4)];
+        let vector = [("p1".to_string(), 0.9_f32)];
+        let out = merge_product_candidates(rows, &vector);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].model, "ADC-V724");
+        assert_eq!(out[0].score, 0.9);
+        assert_eq!(out[0].reason, "semantic_nearby");
+    }
+
+    #[test]
+    fn merge_vector_only_candidate_added_as_semantic_nearby() {
+        // fuzzy score が閾値(0.1)以下で本来は候補から落ちる行でも、vector hit があれば
+        // 候補に加わり、reason="semantic_nearby"。name は query_nodes 由来の行から取る。
+        let rows = vec![
+            product_row("p1", "ADC-V724", "屋外カメラ", 0.4),
+            product_row("p2", "SVR-HB100", "ホームハブ", 0.0),
+        ];
+        let vector = [("p2".to_string(), 0.55_f32)];
+        let out = merge_product_candidates(rows, &vector);
+        let p2 = out
+            .iter()
+            .find(|c| c.model == "SVR-HB100")
+            .expect("vector-only candidate must be present");
+        assert_eq!(p2.name, "ホームハブ");
+        assert_eq!(p2.score, 0.55);
+        assert_eq!(p2.reason, "semantic_nearby");
+    }
+
+    #[test]
+    fn merge_pure_fuzzy_keeps_existing_reasons_when_vector_absent_or_lower() {
+        // vector hit が無い行は従来通り。fuzzy>=1.0 は normalized_match、それ未満は fuzzy_match。
+        let rows = vec![
+            product_row("p1", "ADC-V724", "屋外カメラ", 1.0),
+            product_row("p2", "SVR-HB100", "ホームハブ", 0.4),
+        ];
+        let out = merge_product_candidates(rows, &[]);
+        let p1 = out.iter().find(|c| c.model == "ADC-V724").unwrap();
+        let p2 = out.iter().find(|c| c.model == "SVR-HB100").unwrap();
+        assert_eq!(p1.reason, "normalized_match");
+        assert_eq!(p2.reason, "fuzzy_match");
+
+        // vector が来ても fuzzy 以下なら reason は変わらない（同点は fuzzy 側を優先）。
+        let rows2 = vec![product_row("p1", "ADC-V724", "屋外カメラ", 1.0)];
+        let out2 = merge_product_candidates(rows2, &[("p1".to_string(), 1.0)]);
+        assert_eq!(out2[0].reason, "normalized_match");
+        assert_eq!(out2[0].score, 1.0);
+    }
+
+    #[test]
+    fn merge_below_threshold_and_no_vector_hit_is_excluded() {
+        let rows = vec![product_row("p1", "ADC-V724", "屋外カメラ", 0.05)];
+        let out = merge_product_candidates(rows, &[]);
+        assert!(
+            out.is_empty(),
+            "score<=0.1 with no vector hit must be excluded"
+        );
+    }
+
+    #[test]
+    fn merge_orders_by_score_desc_then_model_asc_deterministically() {
+        // 同点スコアは model 昇順で決定論的に並ぶ（実行順や snapshot 順に依存しない）。
+        let rows = vec![
+            product_row("p1", "ZZZ-100", "後半モデル", 0.5),
+            product_row("p2", "AAA-100", "前半モデル", 0.5),
+            product_row("p3", "MMM-100", "最高スコア", 0.9),
+        ];
+        let out = merge_product_candidates(rows, &[]);
+        let models: Vec<&str> = out.iter().map(|c| c.model.as_str()).collect();
+        assert_eq!(models, vec!["MMM-100", "AAA-100", "ZZZ-100"]);
+    }
+
+    #[test]
+    fn merge_truncates_to_five_candidates() {
+        let rows: Vec<ProductRow> = (0..8)
+            .map(|i| product_row(&format!("p{i}"), &format!("M-{i}"), "name", 0.9))
+            .collect();
+        let out = merge_product_candidates(rows, &[]);
+        assert_eq!(out.len(), 5);
     }
 
     #[test]
@@ -684,12 +1091,185 @@ mod tests {
                 Some("ADC-V724"),
                 10,
                 &snap,
+                &[],
             )
             .expect("search_with_snapshot");
         let keys: BTreeSet<&str> = hits.iter().map(|h| h.section_key.as_str()).collect();
         assert!(keys.contains("sec-a"), "expected sec-a in {keys:?}");
         assert!(keys.contains("sec-c"), "expected sec-c in {keys:?}");
         assert!(!keys.contains("sec-b"), "sec-b must be excluded: {keys:?}");
+    }
+
+    /// vector_hits マージ用のテスト snapshot ビルダ。1 節の body は質問と無関係
+    /// （text score = 0）にしておき、vector_hits の寄与だけを見る。
+    fn single_section_snapshot(
+        schema: &str,
+        section_key: &str,
+        body: &str,
+        describes_product: Option<&str>,
+    ) -> GetGraphSnapshotResponse {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let attrs: HashMap<String, String> = [
+            ("section_key".to_string(), section_key.to_string()),
+            ("title".to_string(), "見出し".to_string()),
+            ("body".to_string(), body.to_string()),
+            ("source_url".to_string(), String::new()),
+            ("breadcrumb".to_string(), String::new()),
+        ]
+        .into_iter()
+        .collect();
+        let section = PN {
+            node_id: manual_node_id(schema, "ManualSection", section_key),
+            node_type: "ManualSection".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: attrs,
+        };
+        let mut nodes = vec![section.clone()];
+        let mut edges = Vec::new();
+        if let Some(pk) = describes_product {
+            nodes.push(PN {
+                node_id: manual_node_id(schema, KIND_PRODUCT, pk),
+                node_type: "Product".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: HashMap::new(),
+            });
+            edges.push(PE {
+                edge_id: String::new(),
+                from_id: section.node_id.clone(),
+                to_id: manual_node_id(schema, KIND_PRODUCT, pk),
+                edge_type: "DESCRIBES".to_string(),
+            });
+        }
+        GetGraphSnapshotResponse {
+            nodes,
+            edges,
+            truncated: false,
+            total_node_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_only_hit_enters_candidates_with_vector_score_source() {
+        // body は質問と無関係 → text score = 0。vector_hits にだけ載る節は
+        // score = vector score, score_source = "vector" で候補に入る。
+        let schema = "urtect";
+        let section_key = "sec-vec-only";
+        let snap = single_section_snapshot(schema, section_key, "全く関係のない本文です。", None);
+        let node_id = manual_node_id(schema, "ManualSection", section_key);
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                "SDカードが認識されない場合の対処",
+                &SignalSet::new(),
+                None,
+                10,
+                &snap,
+                &[(node_id, 0.42)],
+            )
+            .expect("search_with_snapshot");
+        let hit = hits
+            .iter()
+            .find(|h| h.section_key == section_key)
+            .expect("vector-only section must be a candidate");
+        assert_eq!(hit.score, 0.42);
+        assert_eq!(hit.score_source, "vector");
+    }
+
+    #[tokio::test]
+    async fn both_routes_merge_to_max_score_with_both_source() {
+        // body が質問の完全部分文字列 → text score = 1.0（fast path）。
+        // vector_hits には 1.0 より低いスコアを与え、max = text score = 1.0 になることを確認する。
+        // さらに別ケースで vector のほうが高いときも max がその値になることを確認する。
+        let schema = "urtect";
+        let question = "SDカードが認識されない場合の対処";
+        let section_key = "sec-both";
+        let snap = single_section_snapshot(schema, section_key, question, None);
+        let node_id = manual_node_id(schema, "ManualSection", section_key);
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                question,
+                &SignalSet::new(),
+                None,
+                10,
+                &snap,
+                &[(node_id.clone(), 0.3)],
+            )
+            .expect("search_with_snapshot");
+        let hit = hits
+            .iter()
+            .find(|h| h.section_key == section_key)
+            .expect("section must be a candidate");
+        assert_eq!(hit.score, 1.0, "max(text=1.0, vector=0.3) must be 1.0");
+        assert_eq!(hit.score_source, "both");
+    }
+
+    #[tokio::test]
+    async fn vector_id_absent_from_snapshot_is_ignored() {
+        let schema = "urtect";
+        let section_key = "sec-real";
+        let snap = single_section_snapshot(schema, section_key, "全く関係のない本文です。", None);
+        let ghost_id = manual_node_id(schema, "ManualSection", "sec-does-not-exist");
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                "SDカードが認識されない場合の対処",
+                &SignalSet::new(),
+                None,
+                10,
+                &snap,
+                &[(ghost_id, 0.9)],
+            )
+            .expect("search_with_snapshot");
+        assert!(
+            hits.iter().all(|h| h.section_key != "sec-does-not-exist"),
+            "vector hit absent from snapshot must not fabricate a candidate: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| h.section_key != section_key),
+            "sec-real has no text/signal/vector match and must not appear either: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_candidate_excluded_when_product_key_filter_excludes_it() {
+        // section は product B のみを DESCRIBES する（他機種専用）。product_key=A で絞り込むと、
+        // vector_hits に高スコアで載っていても候補から除外されなければならない。
+        let schema = "urtect";
+        let product_a = "ADC-V724";
+        let product_b = "ADC-VC727P";
+        let section_key = "sec-other-product";
+        let snap = single_section_snapshot(
+            schema,
+            section_key,
+            "全く関係のない本文です。",
+            Some(product_b),
+        );
+        let node_id = manual_node_id(schema, "ManualSection", section_key);
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                "SDカードが認識されない場合の対処",
+                &SignalSet::new(),
+                Some(product_a),
+                10,
+                &snap,
+                &[(node_id, 0.95)],
+            )
+            .expect("search_with_snapshot");
+        assert!(
+            hits.iter().all(|h| h.section_key != section_key),
+            "product filter must exclude the vector candidate too: {hits:?}"
+        );
     }
 
     // 同じ describes-edge 構成でも product_key が None のときは絞り込まない（従来通り）ことの
@@ -754,12 +1334,217 @@ mod tests {
         };
         let store = dummy_store();
         let hits = store
-            .search_with_snapshot(schema, question, &SignalSet::new(), None, 10, &snap)
+            .search_with_snapshot(schema, question, &SignalSet::new(), None, 10, &snap, &[])
             .expect("search_with_snapshot");
         let keys: BTreeSet<&str> = hits.iter().map(|h| h.section_key.as_str()).collect();
         assert!(keys.contains("sec-a"));
         assert!(keys.contains("sec-b"));
         assert!(keys.contains("sec-c"));
+    }
+
+    #[test]
+    fn product_view_from_snapshot_returns_product_describing_sections_and_ordered_toc() {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let product_key = "SVR-HB100";
+        let product_node = PN {
+            node_id: manual_node_id(schema, "Product", product_key),
+            node_type: "Product".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [
+                ("product_key".to_string(), product_key.to_string()),
+                ("name".to_string(), "サンプル製品".to_string()),
+                ("model".to_string(), product_key.to_string()),
+                ("aliases".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let section_node = |key: &str, order: i32| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), key.to_string()),
+                ("doc_key".to_string(), "doc-1".to_string()),
+                ("title".to_string(), format!("title-{key}")),
+                ("order".to_string(), order.to_string()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        let sec_a = section_node("sec-a", 1);
+        let sec_b = section_node("sec-b", 2);
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![product_node.clone(), sec_a.clone(), sec_b.clone()],
+            edges: vec![
+                PE {
+                    edge_id: String::new(),
+                    from_id: sec_a.node_id.clone(),
+                    to_id: product_node.node_id.clone(),
+                    edge_type: "DESCRIBES".to_string(),
+                },
+                PE {
+                    edge_id: String::new(),
+                    from_id: manual_node_id(schema, "ManualDocument", "doc-1"),
+                    to_id: sec_a.node_id.clone(),
+                    edge_type: "HAS_SECTION".to_string(),
+                },
+                PE {
+                    edge_id: String::new(),
+                    from_id: manual_node_id(schema, "ManualDocument", "doc-1"),
+                    to_id: sec_b.node_id.clone(),
+                    edge_type: "HAS_SECTION".to_string(),
+                },
+                PE {
+                    edge_id: String::new(),
+                    from_id: sec_a.node_id.clone(),
+                    to_id: sec_b.node_id.clone(),
+                    edge_type: "PARENT_OF".to_string(),
+                },
+            ],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let view = product_view_from_snapshot(product_key, &snap).expect("product view");
+        assert_eq!(
+            view.product["describing_section_keys"],
+            serde_json::json!(["sec-a"])
+        );
+        assert_eq!(view.specs.len(), 0);
+        assert_eq!(view.toc.len(), 2);
+        assert_eq!(view.toc[0]["section_key"], serde_json::json!("sec-a"));
+        assert_eq!(view.toc[0]["parent"], serde_json::Value::Null);
+        assert_eq!(view.toc[1]["section_key"], serde_json::json!("sec-b"));
+        assert_eq!(view.toc[1]["parent"], serde_json::json!("sec-a"));
+    }
+
+    #[test]
+    fn product_view_from_snapshot_excludes_sections_describing_only_other_product() {
+        // 実データ想定: 1 document を product A/B が共有し、各節が特定機種のみを説明する。
+        // s1: A のみ DESCRIBES / s2: B のみ DESCRIBES（他機種専用 → 除外）/ s3: DESCRIBES 辺なし（機種非依存 → 維持）。
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let product_a = "SVR-HB100";
+        let product_b = "SVR-HB200";
+        let product_node = |key: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, "Product", key),
+                node_type: "Product".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: [
+                    ("product_key".to_string(), key.to_string()),
+                    ("name".to_string(), format!("製品-{key}")),
+                    ("model".to_string(), key.to_string()),
+                    ("aliases".to_string(), String::new()),
+                ]
+                .into_iter()
+                .collect(),
+            }
+        };
+        let section_node = |key: &str, order: i32| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), key.to_string()),
+                ("doc_key".to_string(), "doc-1".to_string()),
+                ("title".to_string(), format!("title-{key}")),
+                ("order".to_string(), order.to_string()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        let pa = product_node(product_a);
+        let pb = product_node(product_b);
+        let s1 = section_node("s1", 1);
+        let s2 = section_node("s2", 2);
+        let s3 = section_node("s3", 3);
+        let describes_edge = |section: &PN, product: &PN| -> PE {
+            PE {
+                edge_id: String::new(),
+                from_id: section.node_id.clone(),
+                to_id: product.node_id.clone(),
+                edge_type: "DESCRIBES".to_string(),
+            }
+        };
+        let has_section_edge = |section: &PN| -> PE {
+            PE {
+                edge_id: String::new(),
+                from_id: manual_node_id(schema, "ManualDocument", "doc-1"),
+                to_id: section.node_id.clone(),
+                edge_type: "HAS_SECTION".to_string(),
+            }
+        };
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![pa.clone(), pb.clone(), s1.clone(), s2.clone(), s3.clone()],
+            edges: vec![
+                describes_edge(&s1, &pa),
+                describes_edge(&s2, &pb),
+                has_section_edge(&s1),
+                has_section_edge(&s2),
+                has_section_edge(&s3),
+                // s3 の親は s2（除外節）。除外されても親参照は捏造・null 化せずそのまま返す。
+                PE {
+                    edge_id: String::new(),
+                    from_id: s2.node_id.clone(),
+                    to_id: s3.node_id.clone(),
+                    edge_type: "PARENT_OF".to_string(),
+                },
+            ],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let view = product_view_from_snapshot(product_a, &snap).expect("product view");
+        let toc_keys: Vec<&str> = view
+            .toc
+            .iter()
+            .map(|v| v["section_key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            toc_keys,
+            vec!["s1", "s3"],
+            "s2 (describes only product B) must be excluded from A's toc: {toc_keys:?}"
+        );
+        let s3_view = view
+            .toc
+            .iter()
+            .find(|v| v["section_key"] == "s3")
+            .expect("s3 present in toc");
+        assert_eq!(
+            s3_view["parent"],
+            serde_json::json!("s2"),
+            "parent reference to an excluded section must be kept as-is, not fabricated"
+        );
+    }
+
+    #[test]
+    fn product_view_from_snapshot_errors_when_product_missing() {
+        use crate::proto::graphrag::GetGraphSnapshotResponse;
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![],
+            edges: vec![],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let err = product_view_from_snapshot("NOPE", &snap).unwrap_err();
+        assert!(err.to_string().contains("product not found: NOPE"));
     }
 
     #[test]

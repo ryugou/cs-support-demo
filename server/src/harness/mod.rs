@@ -3,6 +3,7 @@ pub mod authn;
 pub mod correction;
 pub mod decision;
 pub mod egress;
+pub mod extraction;
 pub mod grading;
 pub mod knowledge;
 pub mod rules;
@@ -21,8 +22,13 @@ use std::sync::Arc;
 /// tool handler はここを経由し、判定ロジックを直書きしない（S1-0 三原則 1）。
 pub struct Harness {
     pub authenticator: authn::Authenticator,
+    /// admission 検証（admit_known_resolution / validate_rule_vocabulary）専用の
+    /// 決定論 lexicon 直参照。signal 抽出そのものは `extractor` を使う（S1-11 改訂）。
     pub normalizer: Arc<dyn signal::SignalNormalizer>,
     pub lexicon: Arc<signal::LexiconNormalizer>,
+    /// signal 抽出の入口（lexicon ∪ LLM のハイブリッド、LLM 不達時は lexicon フォールバック）。
+    /// `evaluate` / `root_cause_probe` はここ経由で signal を得る（S1-11 改訂）。
+    pub extractor: Arc<dyn extraction::AsyncSignalExtractor>,
     pub ng: egress::NgDictionary,
     pub worm: Arc<audit::WormAuditLog>,
     pub knowledge: Option<knowledge::KnowledgeStore>,
@@ -37,6 +43,9 @@ pub struct Harness {
     pub manual: Option<crate::manual::retrieval::ManualStore>,
     /// 第3層エスカレーションの既定 route（config.harness.default_escalation_route）。
     pub default_route: String,
+    /// 意味検索（ベクトル経路）を manual retrieval に合成するか
+    /// （config.harness.vector_route_enabled、urtect design §2.3）。
+    pub vector_route_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +70,20 @@ pub struct EvaluationOutcome {
     pub clarification_allowed: bool,
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
+    /// S1-1 取得段: 参考として返す類似の過去事例（自 case は除外）。
+    /// あくまで client 向けの参考情報であり、3 層判定（decide）の入力には使わない
+    /// （判定材料は KR/manual のみという定義を変えない）。
+    pub related_cases: Vec<RelatedCase>,
+    /// 今ターンの signal 抽出がどの経路を通ったか（S1-11 改訂・WORM 監査にも記録済み）。
+    pub extraction_mode: extraction::ExtractionMode,
+}
+
+/// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedCase {
+    pub case_id: String,
+    pub question: String,
+    pub last_decision: String,
 }
 
 impl Harness {
@@ -93,6 +116,20 @@ impl Harness {
         let lexicon = Arc::new(signal::LexiconNormalizer::from_path(&resolve_path(
             &config.harness.signal_lexicon_path,
         ))?);
+        // LLM signal 抽出（S1-11 改訂）。`enabled = true` かつ鍵が解決できない場合は
+        // `from_config` が Err を返し、ここで起動が fail closed する。
+        let anthropic_client = crate::llm::AnthropicClient::from_config(&config.llm)
+            .context("configure llm signal extraction client")?;
+        let llm_classifier: Option<Arc<dyn extraction::ClassifyLlm>> =
+            anthropic_client.map(|client| {
+                Arc::new(extraction::AnthropicSignalClassifier::new(
+                    client,
+                    lexicon.vocabulary_for_prompt(),
+                )) as Arc<dyn extraction::ClassifyLlm>
+            });
+        let extractor: Arc<dyn extraction::AsyncSignalExtractor> = Arc::new(
+            extraction::HybridExtractor::new(lexicon.clone(), llm_classifier),
+        );
         Ok(Self {
             authenticator: authn::Authenticator::new(
                 secret,
@@ -102,6 +139,7 @@ impl Harness {
             .with_issuer(config.auth.jwt_issuer.clone()),
             normalizer: lexicon.clone(),
             lexicon,
+            extractor,
             ng: egress::NgDictionary::from_path(&resolve_path(&config.harness.ng_dictionary_path))?,
             worm: Arc::new(audit::WormAuditLog::open(&resolve_path(
                 &config.harness.audit_log_path,
@@ -113,6 +151,7 @@ impl Harness {
             grade_lock: tokio::sync::Mutex::new(()),
             manual: Some(crate::manual::retrieval::ManualStore::new(client)),
             default_route: config.harness.default_escalation_route.clone(),
+            vector_route_enabled: config.harness.vector_route_enabled,
         })
     }
 
@@ -139,6 +178,12 @@ impl Harness {
             .await
     }
 
+    /// signal 抽出を伴わない tool（read 系・記録系）の WORM `extraction_mode` に
+    /// 記録する値。単一の定義箇所にすることで、フォワード先の
+    /// `audit_with_nodes_and_extraction_mode` 呼び出しと将来のログ読み手（grep 等）が
+    /// 同じリテラルを参照できるようにする。
+    const AUDIT_EXTRACTION_MODE_NOT_APPLICABLE: &'static str = "not_applicable";
+
     /// WORM の同期ファイル書き込み（hash chain のため直列）は spawn_blocking で
     /// async ワーカーから隔離する（tool handler をブロックしない）。
     pub async fn audit_with_nodes(
@@ -149,6 +194,31 @@ impl Harness {
         governing_norm_ids: Vec<String>,
         retrieved_node_ids: Vec<String>,
     ) -> Result<String> {
+        // signal 抽出を伴わない tool（read 系・記録系）は "not_applicable" を記録する。
+        // 抽出を伴う経路（evaluate / root_cause_probe）は
+        // `audit_with_nodes_and_extraction_mode` を使う。
+        self.audit_with_nodes_and_extraction_mode(
+            ctx,
+            decision,
+            route,
+            governing_norm_ids,
+            retrieved_node_ids,
+            Self::AUDIT_EXTRACTION_MODE_NOT_APPLICABLE,
+        )
+        .await
+    }
+
+    /// `audit_with_nodes` に signal 抽出モードを additive に記録するバリアント
+    /// （S1-11 改訂: extraction_mode を WORM 監査に残す）。
+    pub async fn audit_with_nodes_and_extraction_mode(
+        &self,
+        ctx: &RequestContext,
+        decision: impl Into<String>,
+        route: Option<String>,
+        governing_norm_ids: Vec<String>,
+        retrieved_node_ids: Vec<String>,
+        extraction_mode: impl Into<String>,
+    ) -> Result<String> {
         let draft = audit::AuditDraft {
             request_id: ctx.request_id.clone(),
             schema: ctx.schema.clone(),
@@ -158,6 +228,7 @@ impl Harness {
             decision: decision.into(),
             route,
             governing_norm_ids,
+            extraction_mode: extraction_mode.into(),
         };
         let worm = self.worm.clone();
         tokio::task::spawn_blocking(move || worm.append(draft))
@@ -406,11 +477,16 @@ impl Harness {
         self.validate_rule_vocabulary(&rules, &domains)?;
         // manual 検索は accumulated signal 集合（会話層）を使うため、hits の取得は
         // accumulated が確定した後ろに回す（下記 manual 取得ブロック）。
-        let resolutions = knowledge
-            .load_known_resolutions_with(&ctx.schema, &snapshot)
-            .await?;
-        // [正規化] 決定論 lexicon（S1-11）。今ターン分。
-        let signals = self.normalizer.normalize(question);
+        // [正規化] lexicon ∪ LLM のハイブリッド抽出（S1-11 改訂）。今ターン分。
+        // KR 読み込み（gRPC）と signal 抽出（LLM 有効時は HTTP 往復を伴う）は互いに
+        // 依存しないため並列発行し、LLM 往復レイテンシを KR 読み込みの裏に隠す。
+        let (resolutions, extraction_outcome) = tokio::join!(
+            knowledge.load_known_resolutions_with(&ctx.schema, &snapshot),
+            self.extractor.extract(question),
+        );
+        let resolutions = resolutions?;
+        let signals = extraction_outcome.signals;
+        let extraction_mode = extraction_outcome.mode;
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
         // 既存 case_id は存在を検証する（未知の id への orphan edge 追加を防ぐ）。
         // case の全属性を手元に保持し、後段の判定記録は read-merge-write で全属性を再送する
@@ -485,6 +561,11 @@ impl Harness {
                         .manual
                         .as_ref()
                         .ok_or_else(|| anyhow!("manual store not configured"))?;
+                    // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
+                    // 決定論の search_with_snapshot が握る。ここでは候補材料を用意するだけ。
+                    let vector_hits = store
+                        .vector_hits(self.vector_route_enabled, &ctx.schema, question, 5)
+                        .await;
                     let hits = store.search_with_snapshot(
                         &ctx.schema,
                         question,
@@ -492,6 +573,7 @@ impl Harness {
                         product_key,
                         5,
                         &snapshot,
+                        &vector_hits,
                     )?;
                     let ids = hits
                         .iter()
@@ -554,17 +636,39 @@ impl Harness {
         // [記録] 判定結果を case に永続化する（record_answer_attempt の lineage 検証の根拠。
         // client の自己申告でなくサーバ側の記録と突合するため）。KR 由来の回答なら
         // その kr_id もサーバ記録として残す（outcome 記録が client 申告に依存しないため）。
-        let (case_decision, case_kr_id) = match &decision_result {
-            decision::AnswerDecision::Allowed {
-                known_resolution_id,
-                ..
-            } => ("allowed", known_resolution_id.clone().unwrap_or_default()),
-            decision::AnswerDecision::Escalate { .. } => ("escalate", String::new()),
-        };
+        // last_evidence_keys / last_evidence_kind（S1-2）: record_answer_attempt が emit した
+        // 根拠を answer_evidence として書けるよう、判定が使った根拠キーをサーバ記録として残す。
+        // Allowed-manual は evidence_section_keys の結合、Allowed-KR は kr_id 単体、
+        // Escalate は空（エスカレーション済み case は emit 経路に乗らない）。
+        let (case_decision, case_kr_id, last_evidence_keys, last_evidence_kind) =
+            match &decision_result {
+                decision::AnswerDecision::Allowed {
+                    known_resolution_id,
+                    evidence_section_keys,
+                    source,
+                    ..
+                } => {
+                    let kr_id = known_resolution_id.clone().unwrap_or_default();
+                    let (keys, kind) = match source {
+                        decision::AnswerSource::KnownResolution => {
+                            (kr_id.clone(), "known_resolution")
+                        }
+                        decision::AnswerSource::Manual => {
+                            (evidence_section_keys.join(","), "manual")
+                        }
+                    };
+                    ("allowed", kr_id, keys, kind.to_string())
+                }
+                decision::AnswerDecision::Escalate { .. } => {
+                    ("escalate", String::new(), String::new(), String::new())
+                }
+            };
         case_attrs.insert("case_id".to_string(), case_id.clone());
         case_attrs.insert("last_request_id".to_string(), ctx.request_id.clone());
         case_attrs.insert("last_decision".to_string(), case_decision.to_string());
         case_attrs.insert("last_kr_id".to_string(), case_kr_id);
+        case_attrs.insert("last_evidence_keys".to_string(), last_evidence_keys);
+        case_attrs.insert("last_evidence_kind".to_string(), last_evidence_kind);
         knowledge
             .record(
                 &ctx.schema,
@@ -583,12 +687,30 @@ impl Harness {
                 layer, route_to, ..
             } => (format!("escalate:layer{layer}"), Some(route_to.clone())),
         };
+        // [取得] S1-1: past_case も取得する（参考情報として返すのみ・decide() には渡さない）。
+        // 追加 RPC なしで、evaluate 冒頭で取得済みの snapshot を再利用する。自 case は除外する。
+        let related_cases: Vec<RelatedCase> =
+            knowledge::search_cases_from_snapshot(&snapshot, question, 3, Some(case_id.as_str()))
+                .into_iter()
+                .map(|(case, _score)| RelatedCase {
+                    case_id: case.case_id,
+                    question: case.question,
+                    last_decision: case.last_decision,
+                })
+                .collect();
         let mut retrieved_node_ids: Vec<String> = retrieved_manual_ids;
         retrieved_node_ids.push(knowledge::harness_node_id(
             &ctx.schema,
             "support_case",
             &case_id,
         ));
+        for related in &related_cases {
+            retrieved_node_ids.push(knowledge::harness_node_id(
+                &ctx.schema,
+                "support_case",
+                &related.case_id,
+            ));
+        }
         let mut governing_norm_ids = Vec::new();
         if let decision::AnswerDecision::Allowed {
             known_resolution_id: Some(kr_id),
@@ -603,12 +725,13 @@ impl Harness {
             governing_norm_ids.push(kr_id.clone());
         }
         let audit_event_id = self
-            .audit_with_nodes(
+            .audit_with_nodes_and_extraction_mode(
                 ctx,
                 decision_label,
                 route,
                 governing_norm_ids,
                 retrieved_node_ids,
+                extraction_mode.as_str(),
             )
             .await?;
         Ok(EvaluationOutcome {
@@ -619,6 +742,8 @@ impl Harness {
             clarification_allowed,
             hits: section_hits,
             audit_event_id,
+            related_cases,
+            extraction_mode,
         })
     }
 
@@ -677,9 +802,16 @@ impl Harness {
                     .manual
                     .as_ref()
                     .ok_or_else(|| anyhow!("manual store not configured"))?;
-                let signals = self.normalizer.normalize(corrected_answer);
+                let extraction_outcome = self.extractor.extract(corrected_answer).await;
+                tracing::debug!(
+                    mode = extraction_outcome.mode.as_str(),
+                    "root_cause_probe signal extraction mode"
+                );
+                let signals = extraction_outcome.signals;
+                // root_cause_probe は訂正文の再検索であり、意味検索の合成対象は
+                // evaluate/search_manual のみ（本タスクのスコープ外・&[] で従来挙動を維持）。
                 let hits = store
-                    .search(&ctx.schema, corrected_answer, &signals, None, 3)
+                    .search(&ctx.schema, corrected_answer, &signals, None, 3, &[])
                     .await?;
                 hits.first().map(|h| h.score)
             }
@@ -738,6 +870,8 @@ mod tests {
 
     fn harness_for_test() -> Harness {
         let dir = std::env::temp_dir().join(format!("harness-test-{}", uuid::Uuid::new_v4()));
+        // build() と同じく単一の lexicon を normalizer / lexicon / extractor で共有する。
+        let lexicon = Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap());
         Harness {
             authenticator: authn::Authenticator::new(
                 None,
@@ -748,10 +882,10 @@ mod tests {
                 }],
                 Some("op-001".to_string()),
             ),
-            normalizer: Arc::new(
-                signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap(),
-            ),
-            lexicon: Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap()),
+            normalizer: lexicon.clone(),
+            // LLM 未設定（enabled = false 相当）→ lexicon 単独の extractor。
+            extractor: Arc::new(extraction::HybridExtractor::new(lexicon.clone(), None)),
+            lexicon,
             ng: egress::NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#)
                 .unwrap(),
             worm: Arc::new(audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap()),
@@ -771,6 +905,7 @@ mod tests {
             grade_lock: tokio::sync::Mutex::new(()),
             manual: None,
             default_route: "triage".to_string(),
+            vector_route_enabled: false,
         }
     }
 

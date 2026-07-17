@@ -3,3 +3,6 @@
 .DS_Store
 server/data/audit/
 server/data/*/audit.jsonl
+.env
+*.env
+!.env.example

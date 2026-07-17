@@ -21,6 +21,36 @@ pub struct AppConfig {
     pub actors: Vec<ActorConfig>,
     #[serde(default)]
     pub harness: HarnessConfig,
+    /// signal 抽出エージェント（LLM コンポーネント）の設定。既定は無効（lexicon 単独）。
+    #[serde(default)]
+    pub llm: LlmConfig,
+}
+
+/// Anthropic Messages API による signal 抽出エージェントの設定。
+/// API キーは env `CS_SUPPORT_LLM_API_KEY` または `api_key_file` から注入する
+/// （config への平文記載は禁止）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LlmConfig {
+    pub enabled: bool,
+    pub model: String,
+    pub endpoint: String,
+    pub api_key_file: Option<String>,
+    pub timeout_secs: u64,
+    pub max_tokens: u32,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: "claude-haiku-4-5-20251001".to_string(),
+            endpoint: "https://api.anthropic.com/v1/messages".to_string(),
+            api_key_file: None,
+            timeout_secs: 20,
+            max_tokens: 300,
+        }
+    }
 }
 
 fn default_vegapunk_timeout_secs() -> u64 {
@@ -121,6 +151,10 @@ pub struct HarnessConfig {
     pub grading: GradingConfig,
     #[serde(default = "default_escalation_route")]
     pub default_escalation_route: String,
+    /// 意味検索（ベクトル経路）を manual retrieval に合成するか。
+    /// embeddings を ingest 済みのテナントでのみ有効化する（urtect design §2.3）。
+    #[serde(default)]
+    pub vector_route_enabled: bool,
 }
 
 fn default_audit_log_path() -> String {
@@ -153,6 +187,7 @@ impl Default for HarnessConfig {
             thresholds: ThresholdsConfig::default(),
             grading: GradingConfig::default(),
             default_escalation_route: default_escalation_route(),
+            vector_route_enabled: false,
         }
     }
 }
@@ -195,6 +230,41 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_config_defaults_disabled() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.llm.enabled);
+        assert_eq!(cfg.llm.model, "claude-haiku-4-5-20251001");
+        assert!(!cfg.harness.vector_route_enabled);
+    }
+
+    #[test]
+    fn llm_config_parses_section() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+[llm]
+enabled = true
+api_key_file = "/tmp/key"
+[harness]
+vector_route_enabled = true
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.llm.enabled);
+        assert_eq!(cfg.llm.api_key_file.as_deref(), Some("/tmp/key"));
+        assert!(cfg.harness.vector_route_enabled);
+    }
 
     #[test]
     fn project_defaults_to_legacy_section() {
