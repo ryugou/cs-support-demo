@@ -69,18 +69,18 @@ pub trait ClassifyLlm: Send + Sync {
 }
 
 /// `AnthropicClient` を `ClassifyLlm` として使うためのアダプタ。
-/// vocabulary_prompt は signal 語彙から 1 度だけ組み立て、以後の呼び出しで使い回す
-/// （毎ターン lexicon から再構築しない）。
+/// system prompt（injection 対策文言 + signal 語彙）は構築時に 1 度だけ組み立て、
+/// 以後の呼び出しで使い回す（毎ターン `build_system_prompt` を再実行しない）。
 pub struct AnthropicSignalClassifier {
     client: AnthropicClient,
-    vocabulary_prompt: String,
+    system_prompt: String,
 }
 
 impl AnthropicSignalClassifier {
     pub fn new(client: AnthropicClient, vocabulary_prompt: String) -> Self {
         Self {
             client,
-            vocabulary_prompt,
+            system_prompt: crate::llm::build_system_prompt(&vocabulary_prompt),
         }
     }
 }
@@ -89,7 +89,7 @@ impl AnthropicSignalClassifier {
 impl ClassifyLlm for AnthropicSignalClassifier {
     async fn classify(&self, question: &str) -> anyhow::Result<Vec<String>> {
         self.client
-            .classify_signals(question, &self.vocabulary_prompt)
+            .classify_signals(question, &self.system_prompt)
             .await
     }
 }
@@ -247,6 +247,17 @@ mod tests {
         assert_eq!(
             audit_extraction_mode(Some(ExtractionMode::Hybrid)),
             ExtractionMode::Hybrid.as_str()
+        );
+    }
+
+    #[test]
+    fn audit_extraction_mode_some_hybrid_is_literal_hybrid_string() {
+        // 上のテストは右辺に as_str() を使っており準トートロジー（実装と期待値が同じ関数を
+        // 経由するため、as_str() の中身が変わっても検知できない）。WORM に書かれる実際の
+        // 文字列値をリテラルで固定し、意図せぬ変更（serialize 結果の破壊的変更）を検知する。
+        assert_eq!(
+            audit_extraction_mode(Some(ExtractionMode::Hybrid)),
+            "hybrid"
         );
     }
 }

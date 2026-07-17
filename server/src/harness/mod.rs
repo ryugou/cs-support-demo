@@ -18,6 +18,10 @@ use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// evaluate 経路の manual 検索 top_k（vector_hits / search_with_snapshot の両方で使う）。
+/// tool handler 側の `unwrap_or(5)`（リクエストの既定値）とは別物で、対象外。
+const EVALUATE_TOP_K: usize = 5;
+
 /// AuthN → (A) scope → 取得 → 正規化 → 会話層 → (B) 3 層判定 → 記録 を束ねる本体。
 /// tool handler はここを経由し、判定ロジックを直書きしない（S1-0 三原則 1）。
 pub struct Harness {
@@ -102,14 +106,12 @@ impl Harness {
         };
         let secret = match &config.auth.jwt_secret_file {
             Some(path) => {
-                let raw = std::fs::read_to_string(resolve_path(path))
-                    .with_context(|| format!("read jwt secret file {path}"))?;
-                let trimmed = raw.trim();
-                // 空鍵は実質的な認証無効化になるため、設定ミスとして起動失敗（fail closed）
-                if trimmed.is_empty() {
-                    return Err(anyhow!("jwt secret file {path} is empty"));
-                }
-                Some(trimmed.as_bytes().to_vec())
+                // 空鍵は実質的な認証無効化になるため、設定ミスとして起動失敗（fail closed）。
+                // 読み込み・trim・空拒否は config::read_secret_file に共通化済み
+                // （llm.rs::resolve_api_key と同じ fail-closed 方針）。
+                let secret =
+                    crate::config::read_secret_file("jwt secret file", &resolve_path(path))?;
+                Some(secret.into_bytes())
             }
             None => None,
         };
@@ -542,14 +544,19 @@ impl Harness {
                     // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
                     // 決定論の search_with_snapshot が握る。ここでは候補材料を用意するだけ。
                     let vector_hits = store
-                        .vector_hits(self.vector_route_enabled, &ctx.schema, question, 5)
+                        .vector_hits(
+                            self.vector_route_enabled,
+                            &ctx.schema,
+                            question,
+                            EVALUATE_TOP_K,
+                        )
                         .await;
                     let hits = store.search_with_snapshot(
                         &ctx.schema,
                         question,
                         &accumulated,
                         product_key,
-                        5,
+                        EVALUATE_TOP_K,
                         &snapshot,
                         &vector_hits,
                     )?;

@@ -1,6 +1,25 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::{env, fs, path::Path};
+
+/// secret ファイルを読み、trim して返す共通ヘルパー。空（trim 後）は拒否する
+/// （設定ミスによる実質的な認証無効化・鍵未設定を防ぐ fail closed）。
+///
+/// `label` は呼び出し元がエラーメッセージに残したい用途名（例: `"jwt secret file"` /
+/// `"llm api_key_file"`）。呼び出し側で後から `.with_context()` を重ねる形にすると、
+/// anyhow の `Display`（`to_string()`）は最も外側のフレームしか見せないため、内側の
+/// "is empty" 等の詳細が呼び出し元から見えなくなる（`{:?}` の chain 表示でしか追えなくなる）。
+/// 呼び出し元テストは `err.to_string()` で "is empty" 等の文言を直接 assert しているため、
+/// ここで label を埋め込んで従来メッセージと同一のフラットな 1 メッセージを生成する。
+pub(crate) fn read_secret_file(label: &str, path: &Path) -> Result<String> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read {label} {}", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{label} {} is empty", path.display());
+    }
+    Ok(trimmed.to_string())
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -230,6 +249,53 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用の一時ディレクトリ（テストごとに衝突しないよう uuid でユニーク化する）。
+    fn temp_dir() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("cs-support-config-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn read_secret_file_trims_and_returns_content() {
+        let dir = temp_dir();
+        let path = dir.join("secret.txt");
+        std::fs::write(&path, "  s3cr3t\n").expect("write secret file");
+        let got = read_secret_file("test secret", &path).expect("non-empty file must read ok");
+        assert_eq!(got, "s3cr3t");
+    }
+
+    #[test]
+    fn read_secret_file_rejects_blank_content() {
+        let dir = temp_dir();
+        let path = dir.join("blank.txt");
+        std::fs::write(&path, "   \n\t \n").expect("write blank secret file");
+        let err = read_secret_file("test secret", &path)
+            .expect_err("whitespace-only content must be rejected as empty");
+        assert!(
+            err.to_string().contains("is empty"),
+            "error must say the secret is empty, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_secret_file_reports_label_and_path_on_missing_file() {
+        let dir = temp_dir();
+        let path = dir.join("does-not-exist.txt");
+        let err = read_secret_file("test secret", &path)
+            .expect_err("missing file must be a read error, not silently Ok");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("test secret"),
+            "error must identify which secret failed to read, got: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must include the file path for operator diagnosis, got: {msg}"
+        );
+    }
 
     #[test]
     fn llm_config_defaults_disabled() {
