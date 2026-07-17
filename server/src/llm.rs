@@ -104,14 +104,20 @@ impl AnthropicClient {
             .context("call anthropic messages api")?;
 
         let status = response.status();
+        // provider の request-id はサポート問い合わせ用の非機密な相関子。エラーには
+        // レスポンス本文を載せず（ログ経由の情報漏洩を避ける）、status と request-id のみ残す。
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
         let text = response
             .text()
             .await
             .context("read anthropic messages api response body")?;
         if !status.is_success() {
-            // 鍵はヘッダにのみ載せておりここでは扱わないため、body snippet を含めてもキーは漏れない。
-            let snippet: String = text.chars().take(500).collect();
-            bail!("anthropic messages api returned {status}: {snippet}");
+            bail!("anthropic messages api returned {status} (request-id: {request_id})");
         }
 
         let parsed: MessagesResponse =
@@ -189,8 +195,10 @@ struct SignalResponse {
 /// 応答が JSON として解釈できない、または `signals` フィールドが無い場合は `Err`。
 pub fn parse_signal_response(text: &str) -> Result<Vec<String>> {
     let cleaned = strip_markdown_fence(text);
+    // エラー文脈にモデル出力そのものを載せない（ログ経由の漏洩を避ける）。
+    // 長さのみ残し、詳細は underlying な serde_json エラーに委ねる。
     let parsed: SignalResponse = serde_json::from_str(cleaned)
-        .with_context(|| format!("parse signal response json: {cleaned}"))?;
+        .with_context(|| format!("parse signal response json (len={} chars)", cleaned.len()))?;
     Ok(parsed.signals)
 }
 
