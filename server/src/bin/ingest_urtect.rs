@@ -27,6 +27,10 @@ use url::Url;
 /// （Task 3 サンプルテストと同じ規約 "doc-manual"）。
 const DOC_KEY: &str = "doc-manual";
 
+/// embed 呼び出しの同時実行数上限。vegapunk backend への負荷配慮のため固定値とする
+/// （ingest 規模は ~数十〜百件程度で、動的なチューニングが要る負荷特性ではない）。
+const EMBED_CONCURRENCY: usize = 4;
+
 /// 本文中に出現しうる既知型番。"ADC-V724" は "ADC-V724X" の前方一致になるため、
 /// detect_product_models 側で英数字境界を見て誤爆(V724X ページを V724 とも誤判定)を防ぐ。
 ///
@@ -689,11 +693,20 @@ async fn main() -> Result<()> {
     } else {
         let mut entries: Vec<(String, Vec<f32>, Vec<(String, String)>)> =
             Vec::with_capacity(section_bodies.len() + product_inputs.len());
-        for (slug, body) in &section_bodies {
-            let vector = client
-                .embed(body)
-                .await
-                .with_context(|| format!("embed section {slug}"))?;
+
+        // section_bodies はここ以降使わないため move で消費する（body は section 本文の
+        // 全文で ingest 中最大級の String。clone を避ける）。slug は zip 用に残す。
+        let mut section_slugs: Vec<String> = Vec::with_capacity(section_bodies.len());
+        let section_items: Vec<(String, String)> = section_bodies
+            .into_iter()
+            .map(|(slug, body)| {
+                let label = format!("section {slug}");
+                section_slugs.push(slug);
+                (label, body)
+            })
+            .collect();
+        let section_vectors = embed_all(&client, section_items, EMBED_CONCURRENCY).await?;
+        for (slug, vector) in section_slugs.iter().zip(section_vectors) {
             let id = cs_support_mcp::manual::schema_ids::manual_node_id(
                 &args.schema,
                 cs_support_mcp::manual::schema_ids::KIND_SECTION,
@@ -709,12 +722,16 @@ async fn main() -> Result<()> {
                 ],
             ));
         }
-        for input in &product_inputs {
-            let text = format!("{} {}", input.name, input.aliases.join(" "));
-            let vector = client
-                .embed(&text)
-                .await
-                .with_context(|| format!("embed product {}", input.model))?;
+
+        let product_items: Vec<(String, String)> = product_inputs
+            .iter()
+            .map(|input| {
+                let text = format!("{} {}", input.name, input.aliases.join(" "));
+                (format!("product {}", input.model), text)
+            })
+            .collect();
+        let product_vectors = embed_all(&client, product_items, EMBED_CONCURRENCY).await?;
+        for (input, vector) in product_inputs.iter().zip(product_vectors) {
             let id = cs_support_mcp::manual::schema_ids::manual_node_id(
                 &args.schema,
                 cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
@@ -764,6 +781,70 @@ async fn main() -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+/// `items`（`(label, text)`）を最大 `concurrency` 件まで同時実行で embed する。
+///
+/// - 全タスクを先に spawn するが、各タスクは Semaphore permit を取ってから embed RPC を
+///   発行するため、実行中の RPC は常に最大 `concurrency` 件に制限される。
+/// - fail-closed: 1 件でも失敗したら失敗 label を context に含めて即座に bail する。
+///   early return による `JoinSet` の drop が未完了タスクを abort するため、部分的な
+///   ベクトル状態を後続処理に渡さない（呼び出し側は成功時の `Vec` を丸ごと使うか、
+///   エラーで ingest 全体を abort するかの二択になる）。
+/// - 返り値は `items` と同じ順序を保つ（呼び出し側が id/attrs を zip で組み立てられるように）。
+///   completion 順は不定なので、`idx` 付きで結果を集めてから index 順に並べ直す。
+async fn embed_all(
+    client: &VegapunkClient,
+    items: Vec<(String, String)>,
+    concurrency: usize,
+) -> Result<Vec<Vec<f32>>> {
+    // concurrency = 0 は permit が永久に取れず全タスクがハングする（プログラミングエラー）。
+    // 静かなデッドロックより即時失敗を選ぶ。
+    anyhow::ensure!(concurrency > 0, "embed_all: concurrency must be > 0");
+    let total = items.len();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut set: tokio::task::JoinSet<(usize, String, Result<Vec<f32>>)> =
+        tokio::task::JoinSet::new();
+    // JoinError（タスク panic / cancel）経路でも失敗 label を報告できるように、
+    // task id -> label を控えておく（成功/embed エラー経路は tuple の label を使う）。
+    let mut labels_by_task: HashMap<tokio::task::Id, String> = HashMap::with_capacity(total);
+
+    for (idx, (label, text)) in items.into_iter().enumerate() {
+        let client = client.clone();
+        let semaphore = semaphore.clone();
+        let label_for_join_error = label.clone();
+        let handle = set.spawn(async move {
+            // owned permit: 同時実行数を concurrency 件に絞る。Semaphore を close() する
+            // 経路が無いため acquire_owned が Err になることは実運用上ないが、パニックせず
+            // 呼び出し元まで context 付きでエラーを伝搬させる（観測性優先、unwrap しない）。
+            let result = match semaphore.acquire_owned().await {
+                Ok(_permit) => client.embed(&text).await,
+                Err(err) => Err(anyhow::anyhow!("embed concurrency semaphore closed: {err}")),
+            };
+            (idx, label, result)
+        });
+        labels_by_task.insert(handle.id(), label_for_join_error);
+    }
+
+    let mut results: Vec<(usize, Vec<f32>)> = Vec::with_capacity(total);
+    while let Some(joined) = set.join_next().await {
+        // JoinError（タスク panic / cancel）自体も fail-closed の対象。
+        let (idx, label, result) = joined.map_err(|err| {
+            let label = labels_by_task
+                .get(&err.id())
+                .map(String::as_str)
+                .unwrap_or("<unknown item>");
+            anyhow::anyhow!(err)
+                .context(format!("embed task for {label} panicked or was cancelled"))
+        })?;
+        let vector = result.with_context(|| format!("embed {label}"))?;
+        results.push((idx, vector));
+    }
+
+    // 全 join が成功した場合のみここへ到達する（= results は必ず total 件）。
+    // idx は enumerate 由来で一意なので、sort 後は入力順と一致する。
+    results.sort_by_key(|(idx, _)| *idx);
+    Ok(results.into_iter().map(|(_, vector)| vector).collect())
 }
 
 #[cfg(test)]
