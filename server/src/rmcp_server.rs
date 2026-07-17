@@ -345,7 +345,14 @@ impl CsSupportRmcpServer {
             }
         };
         self.harness
-            .audit_with_nodes(&ctx, "read:resolve_product", None, Vec::new(), retrieved)
+            .audit_with_nodes(
+                &ctx,
+                "read:resolve_product",
+                None,
+                Vec::new(),
+                retrieved,
+                None,
+            )
             .await
             .map_err(to_error)?;
         Ok(Json(body))
@@ -361,10 +368,12 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<SearchManualRequest>,
     ) -> Result<Json<SearchManualResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        let (retrieved, body) = match ctx.manual_schema {
+        let (retrieved, body, extraction_mode) = match ctx.manual_schema {
             crate::config::ManualSchemaKind::ManualV1 => {
                 let store = self.manual_store()?;
-                let signals = self.harness.normalizer.normalize(&req.query_ja);
+                // evaluate と同じ抽出口を使う（lexicon 単独直呼びをやめ、LLM ハイブリッド
+                // 抽出とプレビューの signal 集合を一致させる。S1-11 followup）。
+                let extraction = self.harness.extractor.extract(&req.query_ja).await;
                 let top_k = req.top_k.unwrap_or(5).max(1) as usize;
                 // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
                 // 決定論の search が握る。ここでは候補材料を用意するだけ。
@@ -380,7 +389,7 @@ impl CsSupportRmcpServer {
                     .search(
                         &ctx.schema,
                         &req.query_ja,
-                        &signals,
+                        &extraction.signals,
                         req.product_key.as_deref(),
                         top_k,
                         &vector_hits,
@@ -399,9 +408,10 @@ impl CsSupportRmcpServer {
                     .collect();
                 let hits = manual_hits.into_iter().map(SectionHit::from).collect();
                 let body = SearchManualResponse { hits };
-                (retrieved, body)
+                (retrieved, body, Some(extraction.mode))
             }
             crate::config::ManualSchemaKind::LegacySection => {
+                // legacy 経路は signal 抽出を使わない（従来挙動を変えない）。
                 let hits = self
                     .tools
                     .search_manual(
@@ -417,11 +427,18 @@ impl CsSupportRmcpServer {
                     .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
                     .collect();
                 let body = SearchManualResponse { hits };
-                (retrieved, body)
+                (retrieved, body, None)
             }
         };
         self.harness
-            .audit_with_nodes(&ctx, "read:search_manual", None, Vec::new(), retrieved)
+            .audit_with_nodes(
+                &ctx,
+                "read:search_manual",
+                None,
+                Vec::new(),
+                retrieved,
+                extraction_mode,
+            )
             .await
             .map_err(to_error)?;
         Ok(Json(body))
@@ -475,6 +492,7 @@ impl CsSupportRmcpServer {
                 None,
                 Vec::new(),
                 vec![retrieved_id],
+                None,
             )
             .await
             .map_err(to_error)?;
@@ -522,6 +540,7 @@ impl CsSupportRmcpServer {
                 None,
                 Vec::new(),
                 vec![retrieved_id],
+                None,
             )
             .await
             .map_err(to_error)?;
@@ -586,7 +605,10 @@ impl CsSupportRmcpServer {
     ) -> Result<Json<SearchKnownResolutionsResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
         let store = self.harness.store().map_err(to_error)?;
-        let question_signals = self.harness.normalizer.normalize(&req.question);
+        // evaluate と同じ抽出口を使う（lexicon 単独直呼びをやめ、evaluate で適用される
+        // KR がこのプレビューでは当たらない不整合を解消する。S1-11 followup）。
+        let extraction = self.harness.extractor.extract(&req.question).await;
+        let question_signals = extraction.signals;
         let resolutions = store
             .load_known_resolutions(&ctx.schema)
             .await
@@ -629,6 +651,7 @@ impl CsSupportRmcpServer {
                 None,
                 Vec::new(),
                 retrieved,
+                Some(extraction.mode),
             )
             .await
             .map_err(to_error)?;
@@ -676,7 +699,14 @@ impl CsSupportRmcpServer {
             })
             .collect();
         self.harness
-            .audit_with_nodes(&ctx, "read:search_past_cases", None, Vec::new(), retrieved)
+            .audit_with_nodes(
+                &ctx,
+                "read:search_past_cases",
+                None,
+                Vec::new(),
+                retrieved,
+                None,
+            )
             .await
             .map_err(to_error)?;
         Ok(Json(SearchPastCasesResponse { cases }))

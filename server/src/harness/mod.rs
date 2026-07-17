@@ -174,18 +174,20 @@ impl Harness {
         route: Option<String>,
         governing_norm_ids: Vec<String>,
     ) -> Result<String> {
-        self.audit_with_nodes(ctx, decision, route, governing_norm_ids, Vec::new())
+        self.audit_with_nodes(ctx, decision, route, governing_norm_ids, Vec::new(), None)
             .await
     }
 
-    /// signal 抽出を伴わない tool（read 系・記録系）の WORM `extraction_mode` に
-    /// 記録する値。単一の定義箇所にすることで、フォワード先の
-    /// `audit_with_nodes_and_extraction_mode` 呼び出しと将来のログ読み手（grep 等）が
-    /// 同じリテラルを参照できるようにする。
-    const AUDIT_EXTRACTION_MODE_NOT_APPLICABLE: &'static str = "not_applicable";
-
+    /// 監査イベントの入口（retrieved_node_ids・extraction_mode を additive に受け取る版）。
     /// WORM の同期ファイル書き込み（hash chain のため直列）は spawn_blocking で
     /// async ワーカーから隔離する（tool handler をブロックしない）。
+    ///
+    /// `extraction_mode`: 今ターンの signal 抽出がどの経路を通ったか。抽出を行わない
+    /// tool（resolve_product / get_section / get_product / search_past_cases /
+    /// legacy search_manual 等）は `None` を渡す（WORM には `"not_applicable"` と記録
+    /// される、`extraction::audit_extraction_mode` 参照）。抽出を伴う経路（evaluate、
+    /// signal 抽出統一後の search_manual / search_known_resolutions）は `Some(mode)`
+    /// を渡す。
     pub async fn audit_with_nodes(
         &self,
         ctx: &RequestContext,
@@ -193,31 +195,7 @@ impl Harness {
         route: Option<String>,
         governing_norm_ids: Vec<String>,
         retrieved_node_ids: Vec<String>,
-    ) -> Result<String> {
-        // signal 抽出を伴わない tool（read 系・記録系）は "not_applicable" を記録する。
-        // 抽出を伴う経路（evaluate / root_cause_probe）は
-        // `audit_with_nodes_and_extraction_mode` を使う。
-        self.audit_with_nodes_and_extraction_mode(
-            ctx,
-            decision,
-            route,
-            governing_norm_ids,
-            retrieved_node_ids,
-            Self::AUDIT_EXTRACTION_MODE_NOT_APPLICABLE,
-        )
-        .await
-    }
-
-    /// `audit_with_nodes` に signal 抽出モードを additive に記録するバリアント
-    /// （S1-11 改訂: extraction_mode を WORM 監査に残す）。
-    pub async fn audit_with_nodes_and_extraction_mode(
-        &self,
-        ctx: &RequestContext,
-        decision: impl Into<String>,
-        route: Option<String>,
-        governing_norm_ids: Vec<String>,
-        retrieved_node_ids: Vec<String>,
-        extraction_mode: impl Into<String>,
+        extraction_mode: Option<extraction::ExtractionMode>,
     ) -> Result<String> {
         let draft = audit::AuditDraft {
             request_id: ctx.request_id.clone(),
@@ -228,7 +206,7 @@ impl Harness {
             decision: decision.into(),
             route,
             governing_norm_ids,
-            extraction_mode: extraction_mode.into(),
+            extraction_mode: extraction::audit_extraction_mode(extraction_mode),
         };
         let worm = self.worm.clone();
         tokio::task::spawn_blocking(move || worm.append(draft))
@@ -725,13 +703,13 @@ impl Harness {
             governing_norm_ids.push(kr_id.clone());
         }
         let audit_event_id = self
-            .audit_with_nodes_and_extraction_mode(
+            .audit_with_nodes(
                 ctx,
                 decision_label,
                 route,
                 governing_norm_ids,
                 retrieved_node_ids,
-                extraction_mode.as_str(),
+                Some(extraction_mode),
             )
             .await?;
         Ok(EvaluationOutcome {
