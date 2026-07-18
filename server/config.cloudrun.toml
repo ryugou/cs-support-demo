@@ -1,0 +1,64 @@
+# Cloud Run 本番構成。
+# bind_addr / vegapunk_endpoint / auth.jwt_secret_file は BIND_ADDR / VEGAPUNK_ENDPOINT /
+# CS_SUPPORT_JWT_SECRET_FILE の env で上書きされる（server/src/config.rs::AppConfig::load）。
+# ここに書く値は env 未設定時のフォールバックであり、Cloud Run では常に env を注入する運用とする。
+bind_addr = "0.0.0.0:8080"
+# VPC peering 越しの punkrecord-egghead 実 IP。Cloud Run では env VEGAPUNK_ENDPOINT で上書きする。
+vegapunk_endpoint = "http://10.10.0.2:6840"
+
+[[projects]]
+project_id = "sivira-cs-demo"
+schema = "sivira-cs-demo"
+
+[[projects]]
+project_id = "urtect"
+schema = "urtect"
+manual_schema = "manual_v1"
+
+[auth]
+# Cloud Run では JWT 必須: CS_SUPPORT_JWT_SECRET_FILE を Secret Manager injection（ファイルマウント）で渡す。
+# default_actor は置かない（dev フォールバック禁止。JWT 未設定時は認証エラーで fail closed）。
+
+[[actors]]
+sub = "op-001"
+role = "operator"
+allowed_schemas = ["sivira-cs-demo", "urtect"]
+
+[[actors]]
+sub = "sup-001"
+role = "supervisor"
+allowed_schemas = ["sivira-cs-demo", "urtect"]
+
+# harness は AppConfig 全体で 1 系統（project ごとには分かれない）。
+# audit_log_path / search_improvement_queue_path は GCS ボリュームマウント先の絶対パスにする
+# （resolve_path は絶対パスをそのまま使う。config_dir 基準の相対解決をしない）。
+# lexicon / ng は urtect 用（イメージ内 data/urtect/... 、WORKDIR /app/server からの相対）を使う。
+# sivira-cs-demo はレガシー据え置きのため urtect 語彙下でも動作に支障はない
+# （signal 抽出は urtect 側の運用強化が目的で、sivira 側は従来どおり lexicon_fallback で動く）。
+[harness]
+audit_log_path = "/data/audit/audit.jsonl"
+search_improvement_queue_path = "/data/audit/search-improvement-queue.jsonl"
+signal_lexicon_path = "data/urtect/signal-lexicon.json"
+ng_dictionary_path = "data/urtect/ng-dictionary.json"
+policy = "escalate_unless_answerable"
+default_escalation_route = "support_desk"
+# 意味検索（ベクトル経路）: urtect は embeddings ingest 済みのため有効化
+vector_route_enabled = true
+
+[harness.thresholds]
+low = 0.6
+mid = 0.8
+high = 0.95
+
+# S1-11 追記 4 の仮置き値。業務確認で確定させる
+[harness.grading]
+promote_approvals = 3
+promote_approvers = 2
+promote_max_rejection_rate = 0.2
+demote_rejections = 2
+
+# signal 抽出エージェント（S1-11 改訂: lexicon ∪ LLM のハイブリッド）。
+# API キーは env CS_SUPPORT_LLM_API_KEY（Secret Manager injection）から注入する。
+# enabled = true で鍵を解決できない場合は起動時 fail closed で失敗する。
+[llm]
+enabled = true

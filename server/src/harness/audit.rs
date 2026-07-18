@@ -133,6 +133,16 @@ impl WormAuditLog {
         writeln!(file, "{line}")
             .with_context(|| format!("append audit log {}", self.path.display()))?;
         file.flush().context("flush audit log")?;
+        // Cloud Run では /data を GCS FUSE (gcsfuse) でマウントする運用を想定する。
+        // gcsfuse は close/fsync のタイミングで GCS へのアップロードを確定させるため、
+        // flush だけではプロセス kill・インスタンス強制終了時にイベントが GCS 側に
+        // 届いている保証がない。1 イベントごとに sync_all（fsync 相当）してから
+        // event_id を返すことで、「append が成功した」= 「耐久化された」を一致させる
+        // （I5: WORM の provenance はイベント単位で耐久していなければ監査の意味がない）。
+        // 失敗を握りつぶすと「監査ログに残ったはず」という誤った前提で運用してしまうため、
+        // ここも他の I/O と同様に Err を呼び出し元へ伝播する（fail closed）。
+        file.sync_all()
+            .with_context(|| format!("fsync audit log {}", self.path.display()))?;
         *prev_hash = hash;
         Ok(event_id)
     }
