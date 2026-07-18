@@ -1,0 +1,197 @@
+name: Deploy Cloud Run
+
+# main マージで build → push → deploy を常時実行し、server/data/** or schema/** の変更が
+# あった場合のみ ingest-rules Job を自動実行する。手動実行（workflow_dispatch）は
+# 既存イメージに対して recrawl（ingest-urtect: マニュアル再クロール）または
+# rules（ingest-rules: 業務データ再投入）のいずれかを起動するだけで、再デプロイはしない
+# （docs/superpowers/plans/2026-07-18-gcp-cloudrun-deploy.md Task 2）。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "手動実行する Job（recrawl=ingest_urtect 再クロール / rules=ingest_rules 業務データ再投入）"
+        required: true
+        type: choice
+        options:
+          - recrawl
+          - rules
+
+# 同時に複数回デプロイ・Job 実行が走ると Cloud Run 側の状態が競合するため、
+# push / workflow_dispatch を問わず直列化する。実行中のデプロイを取り消すと
+# 中途半端なリビジョンが残りかねないため cancel-in-progress は false にする。
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Workload Identity Federation（キーレス認証）に必須。
+  id-token: write
+
+env:
+  # NOTE: すべて GitHub Actions variables（vars.*）として Task 3 のプロビジョニング後に
+  # gh CLI で設定する。secret ではなく values の追跡のため vars を使う。
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  RUN_REGION: ${{ vars.RUN_REGION }}
+  GAR_IMAGE: ${{ vars.GAR_IMAGE }}
+
+jobs:
+  build-deploy:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image_tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6 # SHA ピン推奨（reviewer 判断待ち）
+
+      # Rust の release ビルドを Docker 内で行うため、runner 側の未使用プリインストール
+      # SDK を先に落として /var/lib/docker 用のディスク枠を確保する。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Resolve image tag
+        id: image
+        run: echo "tag=${{ env.GAR_IMAGE }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Artifact Registry host
+        id: ar
+        # GAR_IMAGE はフルイメージパス（例: asia-northeast1-docker.pkg.dev/PROJECT/cs-support/cs-support-mcp）。
+        # login 先レジストリのホスト名だけを取り出す（RUN_REGION から再構成すると
+        # リージョン名とホスト名の綴りがずれた場合に気づけないため、GAR_IMAGE 由来に統一する）。
+        run: echo "host=$(echo '${{ env.GAR_IMAGE }}' | cut -d/ -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (WIF)
+        id: auth
+        uses: google-github-actions/auth@v3 # SHA ピン推奨（reviewer 判断待ち）
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          # docker login 用に access token も出力させる（ADC ファイルは併せて作成される）。
+          token_format: access_token
+
+      - uses: google-github-actions/setup-gcloud@v2 # SHA ピン推奨（reviewer 判断待ち）
+
+      - name: Configure Docker auth to Artifact Registry
+        uses: docker/login-action@v4 # SHA ピン推奨（reviewer 判断待ち）
+        with:
+          registry: ${{ steps.ar.outputs.host }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - uses: docker/setup-buildx-action@v4 # SHA ピン推奨（reviewer 判断待ち）
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7 # SHA ピン推奨（reviewer 判断待ち）
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image.outputs.tag }}
+            ${{ env.GAR_IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy Cloud Run service
+        # サービス定義（VPC / secrets / メモリ等）は Task 3 の gcloud run deploy 初回作成で
+        # 固定済みのため、CI からは --image のみ更新する（デプロイフラグで定義を上書きしない）。
+        run: |
+          gcloud run deploy cs-support-mcp \
+            --project "${{ env.GCP_PROJECT_ID }}" \
+            --region "${{ env.RUN_REGION }}" \
+            --image "${{ steps.image.outputs.tag }}"
+
+      - name: Update ingest-rules job image
+        run: |
+          gcloud run jobs update ingest-rules \
+            --project "${{ env.GCP_PROJECT_ID }}" \
+            --region "${{ env.RUN_REGION }}" \
+            --image "${{ steps.image.outputs.tag }}"
+
+      - name: Update ingest-urtect job image
+        run: |
+          gcloud run jobs update ingest-urtect \
+            --project "${{ env.GCP_PROJECT_ID }}" \
+            --region "${{ env.RUN_REGION }}" \
+            --image "${{ steps.image.outputs.tag }}"
+
+  auto-ingest:
+    needs: build-deploy
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6 # SHA ピン推奨（reviewer 判断待ち）
+        with:
+          # dorny/paths-filter が push の 1 つ前のコミットと比較できるよう履歴を残す
+          # （shallow clone だと merge コミットの前が無く差分検知に失敗し得る）。
+          fetch-depth: 0
+
+      - name: Detect business-data changes
+        id: filter
+        uses: dorny/paths-filter@v4 # SHA ピン推奨（reviewer 判断待ち）
+        with:
+          filters: |
+            rules:
+              - 'server/data/**'
+              - 'schema/**'
+
+      - name: Authenticate to Google Cloud (WIF)
+        if: steps.filter.outputs.rules == 'true'
+        uses: google-github-actions/auth@v3 # SHA ピン推奨（reviewer 判断待ち）
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - name: Setup gcloud
+        if: steps.filter.outputs.rules == 'true'
+        uses: google-github-actions/setup-gcloud@v2 # SHA ピン推奨（reviewer 判断待ち）
+
+      - name: Execute ingest-rules job
+        if: steps.filter.outputs.rules == 'true'
+        run: |
+          gcloud run jobs execute ingest-rules \
+            --project "${{ env.GCP_PROJECT_ID }}" \
+            --region "${{ env.RUN_REGION }}" \
+            --wait
+
+  manual-ingest:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v3 # SHA ピン推奨（reviewer 判断待ち）
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2 # SHA ピン推奨（reviewer 判断待ち）
+
+      - name: Execute selected ingest job
+        # 既存デプロイ済みイメージに対する手動実行のみ。再ビルド・再デプロイはしない
+        # （このジョブは build-deploy に依存しない独立ジョブ）。
+        run: |
+          case "${{ inputs.job }}" in
+            recrawl)
+              gcloud run jobs execute ingest-urtect \
+                --project "${{ env.GCP_PROJECT_ID }}" \
+                --region "${{ env.RUN_REGION }}" \
+                --wait
+              ;;
+            rules)
+              gcloud run jobs execute ingest-rules \
+                --project "${{ env.GCP_PROJECT_ID }}" \
+                --region "${{ env.RUN_REGION }}" \
+                --wait
+              ;;
+            *)
+              echo "unknown job input: ${{ inputs.job }}" >&2
+              exit 1
+              ;;
+          esac
