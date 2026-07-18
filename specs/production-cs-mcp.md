@@ -819,6 +819,14 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
   - ロードマップ遵守事項: マルチターン累積再判定（変色→+カビで unknown_added_signal 自動エスカレーション）、grade 昇格（resolved×3・承認者 2 名→auto_answer_audited）・降格（wrong_answer×2→demoted）、GMR 進化（例外ルール「変色+カビ→廃棄」追加で具体ルール優先）
 - 残: signal 語彙 / NG 辞書 / grading しきい値の業務レビューによる確定。UpsertNodes は read-merge-write 済みで merge/置換いずれのセマンティクスでも整合。
 
+### ベクトル経路（意味検索）の解決と実測（2026-07-18）
+
+- **A6 ブロッカー解消**: 「UpsertVectors が成功応答を返すのに Search/GetVectors から不可視」の原因は vegapunk 側の未文書化契約 — `VectorEntry.metadata` は固定列マッピングで、認識キーは `node_id` / `text` / `source_type` / `timestamp_ms` の 4 つのみ。**schema スコープは `node_id` 列への `starts_with("{schema}:gen{N}:")` で効くため `metadata.node_id`（= `id` と同一値）が必須**。ingest 側を契約準拠に修正（`vector_entry` ヘルパで `id == metadata.node_id` を構造強制）。
+- 受け入れ実測（urtect 再構築後）: `GetVectors({schema:"urtect"})` に 72 vectors（ManualSection 69 + Product 3）が node_id 付きで列挙 / `Search(mode:"local")` が投入 ManualSection id を score 付きで返却。merge 等の後処理は不要（local は即時。global/コミュニティ系のみ merge 待ち）。
+- 実機挙動: 意味的言い換え「カメラの映像がぼやけて鮮明ではない」→ allowed 0.75（top=画質の設定。LLM 抽出 + 検索の意味経路が語彙重なりゼロの言い換えを回答に導く）。C 群（NAS/他社カメラ/浴室）は escalate 維持。
+- **キャリブレーション留意（要監視）**: backend の vector score はスケール圧縮が強い（完全一致クエリでも ~0.65、無関連でも ~0.53-0.55）。`max(text, vector)` 合成により C 群スコアが 0.53-0.55 まで上昇し、しきい値 0.6 とのマージンが薄い。現状は vector 単独で判定を覆せない安全な構成だが、コーパス拡大・backend モデル変更時は C 群相当の質問で再測定すること。必要になった場合の対策は vector score への上限係数（config 化）を予定。
+- ingest 全体 63 秒（69 ページ crawl + 並行 embed 同時 4 + upsert 込み。並行化の実測確認済み）。
+
 ### 本番運用時の課題（デモでは保留）
 
 - **JWT 認証の本番化（B6）**: デモ運用ではローカルは `[auth] default_actor` フォールバック、GCE も同様に緩めてよい。本番では `CS_SUPPORT_JWT_SECRET_FILE` を既存 stack の Secret Manager injection で渡し、`config.gce.toml` から `default_actor` を外して JWT 必須にする。actor 表（sub → role / allowed_schemas）の払い出し・失効運用も本番で確定する。
