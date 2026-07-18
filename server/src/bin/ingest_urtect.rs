@@ -157,6 +157,23 @@ fn vector_metadata(
     ]
 }
 
+/// vector entry 1 件 `(id, vector, metadata)` を組み立てる。
+///
+/// entry の `id`（graph node_id）と `metadata` 内の `node_id` は同一文字列でなければ
+/// ならない契約（`vector_metadata` のコメント参照）。呼び出し側が `id` を 2 回書いて
+/// 別値が入り込む余地をなくすため、ここで `id` を 1 回だけ受け取り内部で
+/// `vector_metadata(&id, ...)` に渡してから entry を返す。
+fn vector_entry(
+    id: String,
+    vector: Vec<f32>,
+    text: &str,
+    source_type: &str,
+    timestamp_ms: &str,
+) -> (String, Vec<f32>, Vec<(String, String)>) {
+    let metadata = vector_metadata(&id, text, source_type, timestamp_ms);
+    (id, vector, metadata)
+}
+
 /// nav リンク 1 件（同一ホスト・manual 配下のみ列挙。列挙順を保つ Vec）。
 struct NavEntry {
     url: String,
@@ -754,43 +771,51 @@ async fn main() -> Result<()> {
             );
             // metadata は固定列マッピングで認識キーは node_id/text/source_type/timestamp_ms
             // のみ（2026-07-18 backend 契約）。旧キー node_type/section_key/doc_key は
-            // backend に保存されない dead weight だったため削除した。
-            let metadata = vector_metadata(
-                &id,
+            // backend に保存されない dead weight だったため削除した。id と
+            // metadata.node_id の一致は vector_entry ヘルパが構造的に保証する。
+            entries.push(vector_entry(
+                id,
+                vector,
                 text,
                 cs_support_mcp::manual::schema_ids::KIND_SECTION,
                 &ingest_timestamp_ms,
-            );
-            entries.push((id, vector, metadata));
+            ));
         }
 
+        // text は embed 入力と metadata の両方で同じ値を使う契約（vector metadata の `text` は
+        // 埋め込み元テキストそのもの）。sections と同様、1 回だけ計算して両者に渡し、
+        // 片側だけ組み立て式を変更して契約が乖離する余地を無くす。
+        let mut product_texts: Vec<String> = Vec::with_capacity(product_inputs.len());
         let product_items: Vec<(String, String)> = product_inputs
             .iter()
             .map(|input| {
                 let text = format!("{} {}", input.name, input.aliases.join(" "));
+                product_texts.push(text.clone());
                 (format!("product {}", input.model), text)
             })
             .collect();
         let product_vectors = embed_all(&client, product_items, EMBED_CONCURRENCY).await?;
-        for (input, vector) in product_inputs.iter().zip(product_vectors) {
+        for ((input, text), vector) in product_inputs
+            .iter()
+            .zip(product_texts.iter())
+            .zip(product_vectors)
+        {
             let id = cs_support_mcp::manual::schema_ids::manual_node_id(
                 &args.schema,
                 cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
                 &input.model,
             );
-            // embed_all に渡した text と同じ組み立て式を使う（vector metadata の `text` は
-            // 埋め込み元テキストそのものという契約のため）。
-            let text = format!("{} {}", input.name, input.aliases.join(" "));
             // metadata は固定列マッピングで認識キーは node_id/text/source_type/timestamp_ms
             // のみ（2026-07-18 backend 契約）。旧キー node_type/product_key は backend に
-            // 保存されない dead weight だったため削除した。
-            let metadata = vector_metadata(
-                &id,
-                &text,
+            // 保存されない dead weight だったため削除した。id と metadata.node_id の一致は
+            // vector_entry ヘルパが構造的に保証する。
+            entries.push(vector_entry(
+                id,
+                vector,
+                text,
                 cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
                 &ingest_timestamp_ms,
-            );
-            entries.push((id, vector, metadata));
+            ));
         }
         let entries_len = entries.len();
         client
@@ -953,10 +978,47 @@ mod tests {
         // backend は固定列マッピングで、認識キー以外は保存されない。旧キー
         // (node_type/section_key/doc_key) を混ぜても無視されるだけの dead weight になるため、
         // 4 キーちょうどであることをテストで固定する。
-        let metadata = vector_metadata("id", "text", "ManualSection", "1737200000000");
+        // 値も key/value を取り違えていないことを見るため、4 引数それぞれ異なるリテラルにする。
+        let metadata = vector_metadata(
+            "urtect:gen1:ManualSection:sec-1",
+            "抜き差ししてください",
+            "ManualSection",
+            "1737200000000",
+        );
         let mut keys: Vec<&str> = metadata.iter().map(|(k, _)| k.as_str()).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["node_id", "source_type", "text", "timestamp_ms"]);
+
+        let get = |key: &str| {
+            metadata
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        // text は embed 元テキストそのもの、source_type は呼び出し側が渡した kind 文字列と
+        // 一致する契約。キー名だけでなく値も引数と食い違っていないことを固定する。
+        assert_eq!(get("text"), Some("抜き差ししてください"));
+        assert_eq!(get("source_type"), Some("ManualSection"));
+    }
+
+    #[test]
+    fn vector_entry_id_matches_metadata_node_id() {
+        // entry の id と metadata.node_id が別値になる余地をコンパイル構造で消すための
+        // ヘルパ。返る (id, _, metadata) の id と metadata 内 node_id が同一値であることを固定する。
+        let (id, vector, metadata) = vector_entry(
+            "urtect:gen1:ManualSection:sec-1".to_string(),
+            vec![0.1, 0.2],
+            "本文",
+            "ManualSection",
+            "1737200000000",
+        );
+        let node_id = metadata
+            .iter()
+            .find(|(k, _)| k == "node_id")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(id, "urtect:gen1:ManualSection:sec-1");
+        assert_eq!(node_id, Some(id.as_str()));
+        assert_eq!(vector, vec![0.1, 0.2]);
     }
 
     #[test]
