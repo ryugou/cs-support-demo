@@ -255,6 +255,26 @@ pub fn sections_for_signals(
         .collect()
 }
 
+/// DESCRIBES 辺（ManualSection -> Product）を `product_node_id` に対して 2 集合に分割する。
+/// 戻り値: `(any, target)`。`any` は何らかの DESCRIBES 辺を持つ節全体（＝機種依存ページ）、
+/// `target` はそのうち `product_node_id` を DESCRIBES する節。
+/// `product_view_from_snapshot` と `search_with_snapshot` の product スコープ絞り込みで
+/// 同じ集合計算を共有する（挙動は変えない。重複していた走査を 1 箇所に畳むだけ）。
+fn describes_sets<'a>(
+    edges: &'a [crate::proto::graphrag::GraphEdge],
+    product_node_id: &str,
+) -> (HashSet<&'a str>, HashSet<&'a str>) {
+    let mut any: HashSet<&str> = HashSet::new();
+    let mut target: HashSet<&str> = HashSet::new();
+    for e in edges.iter().filter(|e| e.edge_type == "DESCRIBES") {
+        any.insert(e.from_id.as_str());
+        if e.to_id == product_node_id {
+            target.insert(e.from_id.as_str());
+        }
+    }
+    (any, target)
+}
+
 /// Product + DESCRIBES 逆引きの節キー + それら節が属する ManualDocument 配下の TOC を返す純関数。
 /// manual_v1 には product -> document の直接辺が無いため、product を DESCRIBES する節の
 /// HAS_SECTION 逆引きで document を特定し、その document 配下の節から product-applicable な
@@ -290,14 +310,8 @@ pub fn product_view_from_snapshot(
     // DESCRIBES: ManualSection -> Product の逆引き。
     // describes_any: 何らかの DESCRIBES 辺を持つ節（＝機種依存ページ）全体。
     // describing_section_ids: このうち当該 product を DESCRIBES する節。
-    let mut describes_any: HashSet<&str> = HashSet::new();
-    let mut describing_section_ids: HashSet<&str> = HashSet::new();
-    for e in snapshot.edges.iter().filter(|e| e.edge_type == "DESCRIBES") {
-        describes_any.insert(e.from_id.as_str());
-        if e.to_id == product_node.node_id {
-            describing_section_ids.insert(e.from_id.as_str());
-        }
-    }
+    let (describes_any, describing_section_ids) =
+        describes_sets(&snapshot.edges, &product_node.node_id);
     let mut describing_section_keys: Vec<String> = describing_section_ids
         .iter()
         .filter_map(|id| node_index.get(id))
@@ -499,7 +513,9 @@ impl ManualStore {
     /// snapshot に無い node_id は無視する（実体が確認できない候補を捏造しない）。
     /// product_key フィルタは vector 候補にも同様に適用する（テキスト候補と扱いを揃える）。
     /// 最終スコアは `max(text_score, vector_score)`。両方が寄与した場合は "both"、
-    /// テキストのみは "text"、vector のみは "vector" を `ManualHit.score_source` に残す。
+    /// テキストのみは "text"、vector のみは "vector"、どちらも 0 で signal 絞り込みだけで
+    /// 候補に残った場合は "signal" を `ManualHit.score_source` に残す（テキスト一致した
+    /// かのような偽りの "text" にしない）。
     pub fn search_with_snapshot(
         &self,
         schema: &str,
@@ -516,17 +532,10 @@ impl ManualStore {
         // 当該 Product への DESCRIBES は持たない」節（＝他機種専用ページ）の 1 集合に畳む。
         let excluded_by_product: Option<HashSet<String>> = product_key.map(|pk| {
             let target = manual_node_id(schema, KIND_PRODUCT, pk);
-            let mut describes_any: HashSet<String> = HashSet::new();
-            let mut describes_target: HashSet<String> = HashSet::new();
-            for e in snapshot.edges.iter().filter(|e| e.edge_type == "DESCRIBES") {
-                describes_any.insert(e.from_id.clone());
-                if e.to_id == target {
-                    describes_target.insert(e.from_id.clone());
-                }
-            }
+            let (describes_any, describes_target) = describes_sets(&snapshot.edges, &target);
             describes_any
                 .difference(&describes_target)
-                .cloned()
+                .map(|s| s.to_string())
                 .collect()
         });
         let manual_sections: Vec<_> = snapshot
@@ -570,11 +579,14 @@ impl ManualStore {
                 // 最終スコアは max(text, vector)。backend の vector score は 0-1 程度のスケールを
                 // 前提とし、ここではリスケールしない（較正は実測ベースで Task 11 に回す）。
                 let score = text_score.max(vector_score);
+                // (false, false) は signal 絞り込み（in_signal、下の filter で判定）だけで
+                // 候補に残ったケース。テキスト一致は無いので "text" ではなく "signal" と正直に
+                // ラベル付けする。
                 let score_source = match (text_score > 0.0, vector_score > 0.0) {
                     (true, true) => "both",
                     (true, false) => "text",
                     (false, true) => "vector",
-                    (false, false) => "text",
+                    (false, false) => "signal",
                 }
                 .to_string();
                 // signal 絞り込み(in_signal)は候補として残すかどうか（下の filter）にだけ効く。
@@ -1209,6 +1221,75 @@ mod tests {
             .expect("section must be a candidate");
         assert_eq!(hit.score, 1.0, "max(text=1.0, vector=0.3) must be 1.0");
         assert_eq!(hit.score_source, "both");
+    }
+
+    #[tokio::test]
+    async fn signal_only_hit_has_signal_score_source() {
+        // body は質問と無関係（text score = 0）、vector_hits も渡さない（vector score = 0）。
+        // signal 絞り込み（MENTIONS_SIGNAL）だけで候補に残った節の score_source は、
+        // テキスト一致したかのような偽りの "text" ではなく "signal" であるべき
+        // （signal 絞り込みのみで候補に残った節の正直なラベル）。
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        let schema = "urtect";
+        let section_key = "sec-signal-only";
+        let node_id = manual_node_id(schema, "ManualSection", section_key);
+        let signal_node_id = "urtect:gen1:Signal:sd_not_recognized".to_string();
+        let section = PN {
+            node_id: node_id.clone(),
+            node_type: "ManualSection".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [
+                ("section_key".to_string(), section_key.to_string()),
+                ("title".to_string(), "見出し".to_string()),
+                ("body".to_string(), "全く関係のない本文です。".to_string()),
+                ("source_url".to_string(), String::new()),
+                ("breadcrumb".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let signal_node = PN {
+            node_id: signal_node_id.clone(),
+            node_type: "Signal".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [("value".to_string(), "sd_not_recognized".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![section, signal_node],
+            edges: vec![PE {
+                edge_id: String::new(),
+                from_id: node_id,
+                to_id: signal_node_id,
+                edge_type: "MENTIONS_SIGNAL".to_string(),
+            }],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let signals: SignalSet = [Signal::new("sd_not_recognized")].into_iter().collect();
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(
+                schema,
+                "SDカードが認識されない場合の対処",
+                &signals,
+                None,
+                10,
+                &snap,
+                &[],
+            )
+            .expect("search_with_snapshot");
+        let hit = hits
+            .iter()
+            .find(|h| h.section_key == section_key)
+            .expect("signal-narrowed section with no text/vector match must still be a candidate");
+        assert_eq!(hit.score, 0.0);
+        assert_eq!(hit.score_source, "signal");
     }
 
     #[tokio::test]

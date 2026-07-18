@@ -32,6 +32,21 @@ impl ExtractionMode {
     }
 }
 
+/// `Option<ExtractionMode>` を WORM 監査の `extraction_mode` 文字列に変換する
+/// （S1-11 followup: audit_with_nodes の型を Option<ExtractionMode> に統一した際の
+/// 単一の変換窓口）。
+///
+/// 抽出を行わない tool（resolve_product / get_section / get_product /
+/// search_past_cases / legacy search_manual 等）は `None` を渡し `"not_applicable"` に
+/// なる。抽出を伴う経路（evaluate、および読み取り系の signal 抽出統一後の
+/// search_manual / search_known_resolutions）は `Some` を渡し、
+/// `ExtractionMode::as_str()` の既存値をそのまま使う（WORM の serialize 結果は
+/// 不変のまま）。
+pub fn audit_extraction_mode(mode: Option<ExtractionMode>) -> String {
+    mode.map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "not_applicable".to_string())
+}
+
 /// 抽出結果（signal 集合 + どの経路で得られたか）。
 #[derive(Debug, Clone)]
 pub struct ExtractionResult {
@@ -54,18 +69,18 @@ pub trait ClassifyLlm: Send + Sync {
 }
 
 /// `AnthropicClient` を `ClassifyLlm` として使うためのアダプタ。
-/// vocabulary_prompt は signal 語彙から 1 度だけ組み立て、以後の呼び出しで使い回す
-/// （毎ターン lexicon から再構築しない）。
+/// system prompt（injection 対策文言 + signal 語彙）は構築時に 1 度だけ組み立て、
+/// 以後の呼び出しで使い回す（毎ターン `build_system_prompt` を再実行しない）。
 pub struct AnthropicSignalClassifier {
     client: AnthropicClient,
-    vocabulary_prompt: String,
+    system_prompt: String,
 }
 
 impl AnthropicSignalClassifier {
     pub fn new(client: AnthropicClient, vocabulary_prompt: String) -> Self {
         Self {
             client,
-            vocabulary_prompt,
+            system_prompt: crate::llm::build_system_prompt(&vocabulary_prompt),
         }
     }
 }
@@ -74,7 +89,7 @@ impl AnthropicSignalClassifier {
 impl ClassifyLlm for AnthropicSignalClassifier {
     async fn classify(&self, question: &str) -> anyhow::Result<Vec<String>> {
         self.client
-            .classify_signals(question, &self.vocabulary_prompt)
+            .classify_signals(question, &self.system_prompt)
             .await
     }
 }
@@ -217,5 +232,32 @@ mod tests {
         let r = ex.extract("カビが生えた").await;
         assert!(r.signals.iter().any(|s| s.as_str() == "mold"));
         assert!(matches!(r.mode, ExtractionMode::LexiconOnly));
+    }
+
+    #[test]
+    fn audit_extraction_mode_none_is_not_applicable() {
+        // 抽出を行わない tool（read 系）は WORM に "not_applicable" を記録する。
+        assert_eq!(audit_extraction_mode(None), "not_applicable");
+    }
+
+    #[test]
+    fn audit_extraction_mode_some_uses_as_str() {
+        // 抽出を伴う経路（evaluate 等）は ExtractionMode::as_str() の既存値をそのまま使う
+        // （WORM の serialize 結果は変えない）。
+        assert_eq!(
+            audit_extraction_mode(Some(ExtractionMode::Hybrid)),
+            ExtractionMode::Hybrid.as_str()
+        );
+    }
+
+    #[test]
+    fn audit_extraction_mode_some_hybrid_is_literal_hybrid_string() {
+        // 上のテストは右辺に as_str() を使っており準トートロジー（実装と期待値が同じ関数を
+        // 経由するため、as_str() の中身が変わっても検知できない）。WORM に書かれる実際の
+        // 文字列値をリテラルで固定し、意図せぬ変更（serialize 結果の破壊的変更）を検知する。
+        assert_eq!(
+            audit_extraction_mode(Some(ExtractionMode::Hybrid)),
+            "hybrid"
+        );
     }
 }
