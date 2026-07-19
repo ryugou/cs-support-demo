@@ -38,6 +38,11 @@ uuid = { version = "1", features = ["v4"] }
 [build-dependencies]
 tonic-build = "0.12"
 
+[dev-dependencies]
+# health_router のルーティングを HTTP レベルで検証するための `oneshot`。
+# axum 0.8 は tower 0.5 系の Service を使うため合わせる。
+tower = { version = "0.5", features = ["util"] }
+
 [[bin]]
 name = "cs-support-mcp"
 path = "src/main.rs"

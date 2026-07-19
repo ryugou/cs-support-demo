@@ -1,5 +1,6 @@
 pub mod config;
 pub mod harness;
+pub mod health;
 pub mod ingest;
 pub mod llm;
 pub mod manual;

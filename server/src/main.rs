@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use axum::{routing::get, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use cs_support_mcp::{
@@ -72,9 +71,10 @@ async fn main() -> Result<()> {
 
     let bind_addr: SocketAddr = config.bind_addr.parse()?;
 
-    let mut app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .layer(TraceLayer::new_for_http());
+    // health ルートは /healthz と /livez を張る。`*.run.app` エッジは /healthz を
+    // 予約横取りするため、Cloud Run 上での到達可能なヘルスパスは /livez を使う
+    // （詳細は cs_support_mcp::health を参照）。
+    let mut app = cs_support_mcp::health::health_router().layer(TraceLayer::new_for_http());
 
     for project in config.projects.iter() {
         let schema = project.schema.clone();
