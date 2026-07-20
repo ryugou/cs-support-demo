@@ -74,7 +74,24 @@ async fn main() -> Result<()> {
     // health ルートは /healthz と /livez を張る。`*.run.app` エッジは /healthz を
     // 予約横取りするため、Cloud Run 上での到達可能なヘルスパスは /livez を使う
     // （詳細は cs_support_mcp::health を参照）。
-    let mut app = cs_support_mcp::health::health_router().layer(TraceLayer::new_for_http());
+    //
+    // OAuth 保護リソースメタデータ（RFC 9728）はここで無認証公開する。
+    // `CS_SUPPORT_PUBLIC_DOMAIN` 未設定時は空文字のまま `resource` が
+    // `https://` のみになり不正な URL を返すが、これは Task 3/5 で認証を有効化する際に
+    // 必須 env として検証されるべき設定不足であり、ここでは fail-closed にしない
+    // （メタデータ endpoint 自体は未認証で公開する仕様のため、起動を止める理由がない）。
+    let public_host = env::var("CS_SUPPORT_PUBLIC_DOMAIN").unwrap_or_default();
+    let project_ids: Vec<String> = config
+        .projects
+        .iter()
+        .map(|p| p.project_id.clone())
+        .collect();
+    let mut app = cs_support_mcp::health::health_router()
+        .merge(cs_support_mcp::oauth::metadata::metadata_router(
+            public_host,
+            project_ids,
+        ))
+        .layer(TraceLayer::new_for_http());
 
     for project in config.projects.iter() {
         let schema = project.schema.clone();

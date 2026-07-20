@@ -6,6 +6,7 @@ pub mod llm;
 pub mod manual;
 pub mod mcp;
 pub mod model;
+pub mod oauth;
 pub mod project;
 pub mod proto;
 pub mod resolve;
