@@ -29,6 +29,15 @@ email = "ryugo@sivira.co"
 role = "supervisor"
 allowed_schemas = ["sivira-cs-demo", "urtect"]
 
+# 暫定運用: config ベースのホワイトリスト([[actors]])を DB ベースに作り直すまでの
+# 当面の暫定開放。[[actors]] に未登録の email も operator として受理する（fail-open）。
+# [[actors]] 一致は常に優先されるため、上記登録済み email の権限には影響しない。
+# DB ベースのホワイトリスト導入時は、このセクションを削除すれば fail-closed（未登録 email 拒否）
+# に戻る。
+[default_actor]
+role = "operator"
+allowed_schemas = ["sivira-cs-demo", "urtect"]
+
 # harness は AppConfig 全体で 1 系統（project ごとには分かれない）。
 # audit_log_path / search_improvement_queue_path は GCS ボリュームマウント先の絶対パスにする
 # （resolve_path は絶対パスをそのまま使う。config_dir 基準の相対解決をしない）。

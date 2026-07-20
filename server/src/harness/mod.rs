@@ -122,7 +122,7 @@ impl Harness {
             extraction::HybridExtractor::new(lexicon.clone(), llm_classifier),
         );
         Ok(Self {
-            authenticator: authn::Authenticator::new(&config.actors),
+            authenticator: authn::Authenticator::new(&config.actors, config.default_actor.clone()),
             normalizer: lexicon.clone(),
             lexicon,
             extractor,
@@ -843,12 +843,15 @@ mod tests {
         // build() と同じく単一の lexicon を normalizer / lexicon / extractor で共有する。
         let lexicon = Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap());
         Harness {
-            authenticator: authn::Authenticator::new(&[ActorConfig {
-                sub: "op-001".to_string(),
-                email: "op@sivira.co".to_string(),
-                role: "operator".to_string(),
-                allowed_schemas: vec!["sivira-cs-demo".to_string()],
-            }]),
+            authenticator: authn::Authenticator::new(
+                &[ActorConfig {
+                    sub: "op-001".to_string(),
+                    email: "op@sivira.co".to_string(),
+                    role: "operator".to_string(),
+                    allowed_schemas: vec!["sivira-cs-demo".to_string()],
+                }],
+                None,
+            ),
             normalizer: lexicon.clone(),
             // LLM 未設定（enabled = false 相当）→ lexicon 単独の extractor。
             extractor: Arc::new(extraction::HybridExtractor::new(lexicon.clone(), None)),
