@@ -88,10 +88,21 @@ async fn main() -> Result<()> {
         .collect();
     let mut app = cs_support_mcp::health::health_router()
         .merge(cs_support_mcp::oauth::metadata::metadata_router(
-            public_host,
+            public_host.clone(),
             project_ids,
         ))
         .layer(TraceLayer::new_for_http());
+
+    // `/{project_id}/mcp` は Google OAuth ミドルウェアで包む（RFC 9728 の 401 発見トリガを
+    // 成立させるため）。verifier は project 間で共有できる（Google 検証は project 非依存）ので
+    // 1 個作って Arc で配る。client_id 未設定は「MCP が丸ごと無認証で公開される」という
+    // 重大な設定不備になるため、起動時に fail-closed で落とす。
+    let google_client_id = env::var("CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID").context(
+        "CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID is required for OAuth (Google tokeninfo aud check)",
+    )?;
+    let verifier = Arc::new(cs_support_mcp::oauth::verifier::GoogleTokenVerifier::new(
+        google_client_id,
+    ));
 
     for project in config.projects.iter() {
         let schema = project.schema.clone();
@@ -110,8 +121,22 @@ async fn main() -> Result<()> {
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts()),
         );
+        let auth_state = cs_support_mcp::oauth::middleware::AuthState {
+            verifier: verifier.clone(),
+            resource_metadata_url: format!(
+                "https://{public_host}/.well-known/oauth-protected-resource/{}/mcp",
+                project.project_id
+            ),
+        };
+        let guarded =
+            axum::Router::new()
+                .fallback_service(mcp)
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state,
+                    cs_support_mcp::oauth::middleware::require_google_auth,
+                ));
         let path = format!("/{}/mcp", project.project_id);
-        app = app.nest_service(&path, mcp);
+        app = app.nest_service(&path, guarded);
     }
 
     if let (Some(cert), Some(key)) = (&config.tls_cert_path, &config.tls_key_path) {

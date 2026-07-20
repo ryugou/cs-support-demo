@@ -1,4 +1,5 @@
 pub mod metadata;
+pub mod middleware;
 pub mod verifier;
 
 /// 認証ミドルウェアが request extensions に注入する、検証済み Google email。
