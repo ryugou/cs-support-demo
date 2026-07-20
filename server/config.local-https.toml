@@ -7,17 +7,10 @@ vegapunk_endpoint = "http://vegapunk.local:6840"
 project_id = "sivira-cs-demo"
 schema = "sivira-cs-demo"
 
-[[actors]]
-sub = "op-001"
-email = "op@sivira.co"
-role = "operator"
-allowed_schemas = ["sivira-cs-demo"]
-
-[[actors]]
-sub = "sup-001"
-email = "ryugo@sivira.co"
-role = "supervisor"
-allowed_schemas = ["sivira-cs-demo"]
+# email ホワイトリスト（[[actors]]）は廃止した。アクセス制御は将来 DB ベースで
+# 実装する方針であり、config と DB の二重の正本を避けるため、当面は
+# ホワイトリストなしで運用する（検証済み Google email はすべて受け入れる。
+# 詳細は server/src/harness/authn.rs の Authenticator doc comment を参照）。
 
 [harness]
 audit_log_path = "data/audit/audit.jsonl"

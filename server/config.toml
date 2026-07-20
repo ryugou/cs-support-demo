@@ -5,18 +5,6 @@ vegapunk_endpoint = "http://127.0.0.1:16840"
 project_id = "sivira-cs-demo"
 schema = "sivira-cs-demo"
 
-[[actors]]
-sub = "op-001"
-email = "op@sivira.co"
-role = "operator"
-allowed_schemas = ["sivira-cs-demo"]
-
-[[actors]]
-sub = "sup-001"
-email = "ryugo@sivira.co"
-role = "supervisor"
-allowed_schemas = ["sivira-cs-demo"]
-
 [harness]
 audit_log_path = "data/audit/audit.jsonl"
 search_improvement_queue_path = "data/audit/search-improvement-queue.jsonl"

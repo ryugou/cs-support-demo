@@ -122,7 +122,9 @@ impl Harness {
             extraction::HybridExtractor::new(lexicon.clone(), llm_classifier),
         );
         Ok(Self {
-            authenticator: authn::Authenticator::new(&config.actors),
+            authenticator: authn::Authenticator::new(
+                config.projects.iter().map(|p| p.schema.clone()).collect(),
+            ),
             normalizer: lexicon.clone(),
             lexicon,
             extractor,
@@ -836,19 +838,15 @@ impl Harness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ActorConfig;
 
     fn harness_for_test() -> Harness {
         let dir = std::env::temp_dir().join(format!("harness-test-{}", uuid::Uuid::new_v4()));
         // build() と同じく単一の lexicon を normalizer / lexicon / extractor で共有する。
         let lexicon = Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap());
         Harness {
-            authenticator: authn::Authenticator::new(&[ActorConfig {
-                sub: "op-001".to_string(),
-                email: "op@sivira.co".to_string(),
-                role: "operator".to_string(),
-                allowed_schemas: vec!["sivira-cs-demo".to_string()],
-            }]),
+            // config actor ホワイトリスト廃止（authn.rs 参照）に伴い、Authenticator は
+            // project schema 一覧のみを受け取る。email 突合はしない。
+            authenticator: authn::Authenticator::new(vec!["sivira-cs-demo".to_string()]),
             normalizer: lexicon.clone(),
             // LLM 未設定（enabled = false 相当）→ lexicon 単独の extractor。
             extractor: Arc::new(extraction::HybridExtractor::new(lexicon.clone(), None)),
@@ -887,7 +885,8 @@ mod tests {
             )
             .expect("begin");
         assert_eq!(ctx.schema, "sivira-cs-demo");
-        assert_eq!(ctx.actor.sub, "op-001");
+        // ホワイトリスト廃止に伴い sub は "google:{email}" 導出になる（authn.rs 参照）。
+        assert_eq!(ctx.actor.sub, "google:op@sivira.co");
         assert!(!ctx.request_id.is_empty());
     }
 

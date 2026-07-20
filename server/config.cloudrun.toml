@@ -1,8 +1,11 @@
 # Cloud Run 本番構成。
 # bind_addr / vegapunk_endpoint は BIND_ADDR / VEGAPUNK_ENDPOINT の env で上書きされる
 # （server/src/config.rs::AppConfig::load）。認証は Google OAuth 一本（静的 JWT は撤去済み）。
-# aud 照合は env CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID。actor 表（email ホワイトリスト）は
-# 以下 [[actors]] が正本で、env 上書きはしない。
+# aud 照合は env CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID。
+# email ホワイトリスト（[[actors]]）は廃止した。アクセス制御は将来 DB ベースで実装する
+# 方針であり、config と DB の二重の正本を避けるため、当面はホワイトリストなしで運用する
+# （検証済み Google email はすべて supervisor role で受け入れる。詳細は
+# server/src/harness/authn.rs の Authenticator doc comment を参照）。
 # ここに書く値は env 未設定時のフォールバックであり、Cloud Run では常に env を注入する運用とする。
 bind_addr = "0.0.0.0:8080"
 # VPC peering 越しの punkrecord-egghead 実 IP。Cloud Run では env VEGAPUNK_ENDPOINT で上書きする。
@@ -16,18 +19,6 @@ schema = "sivira-cs-demo"
 project_id = "urtect"
 schema = "urtect"
 manual_schema = "manual_v1"
-
-[[actors]]
-sub = "op-001"
-email = "op@sivira.co"
-role = "operator"
-allowed_schemas = ["sivira-cs-demo", "urtect"]
-
-[[actors]]
-sub = "sup-001"
-email = "ryugo@sivira.co"
-role = "supervisor"
-allowed_schemas = ["sivira-cs-demo", "urtect"]
 
 # harness は AppConfig 全体で 1 系統（project ごとには分かれない）。
 # audit_log_path / search_improvement_queue_path は GCS ボリュームマウント先の絶対パスにする

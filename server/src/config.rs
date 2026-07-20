@@ -35,8 +35,6 @@ pub struct AppConfig {
     pub vegapunk_max_decode_mb: usize,
     pub projects: Vec<ProjectConfig>,
     #[serde(default)]
-    pub actors: Vec<ActorConfig>,
-    #[serde(default)]
     pub harness: HarnessConfig,
     /// signal 抽出エージェント（LLM コンポーネント）の設定。既定は無効（lexicon 単独）。
     #[serde(default)]
@@ -90,15 +88,6 @@ impl AppConfig {
                 .saturating_mul(1024 * 1024),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ActorConfig {
-    pub sub: String,
-    /// Google OAuth で検証済みの email（照合キー・必須）。認可の正本はこの表（ホワイトリスト）。
-    pub email: String,
-    pub role: String,
-    pub allowed_schemas: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

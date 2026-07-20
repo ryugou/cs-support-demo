@@ -8,17 +8,10 @@ project_id = "urtect"
 schema = "urtect"
 manual_schema = "manual_v1"
 
-[[actors]]
-sub = "op-001"
-email = "op@sivira.co"
-role = "operator"
-allowed_schemas = ["urtect"]
-
-[[actors]]
-sub = "sup-001"
-email = "ryugo@sivira.co"
-role = "supervisor"
-allowed_schemas = ["urtect"]
+# email ホワイトリスト（[[actors]]）は廃止した。アクセス制御は将来 DB ベースで
+# 実装する方針であり、config と DB の二重の正本を避けるため、当面は
+# ホワイトリストなしで運用する（検証済み Google email はすべて受け入れる。
+# 詳細は server/src/harness/authn.rs の Authenticator doc comment を参照）。
 
 [harness]
 audit_log_path = "data/urtect/audit.jsonl"
