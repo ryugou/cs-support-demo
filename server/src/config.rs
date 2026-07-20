@@ -36,10 +36,6 @@ pub struct AppConfig {
     pub projects: Vec<ProjectConfig>,
     #[serde(default)]
     pub actors: Vec<ActorConfig>,
-    /// 未登録 email を fail-open で受理する暫定フォールバック（明示設定時のみ有効）。
-    /// DB ベースのホワイトリスト導入までの運用判断。`None`（未指定）なら従来どおり fail-closed。
-    #[serde(default)]
-    pub default_actor: Option<DefaultActorConfig>,
     #[serde(default)]
     pub harness: HarnessConfig,
     /// signal 抽出エージェント（LLM コンポーネント）の設定。既定は無効（lexicon 単独）。
@@ -101,14 +97,6 @@ pub struct ActorConfig {
     pub sub: String,
     /// Google OAuth で検証済みの email（照合キー・必須）。認可の正本はこの表（ホワイトリスト）。
     pub email: String,
-    pub role: String,
-    pub allowed_schemas: Vec<String>,
-}
-
-/// `[[actors]]` に未登録の email に、明示設定時のみ付与するフォールバック actor 属性。
-/// `sub` は持たない（`google:{email}` として呼び出し側で導出するため）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DefaultActorConfig {
     pub role: String,
     pub allowed_schemas: Vec<String>,
 }
