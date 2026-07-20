@@ -8,17 +8,15 @@ project_id = "urtect"
 schema = "urtect"
 manual_schema = "manual_v1"
 
-[auth]
-# jwt_secret_file = "/path/to/jwt-secret"   # env CS_SUPPORT_JWT_SECRET_FILE で上書き
-default_actor = "sup-001"                    # dev 専用フォールバック（JWT 未設定時のみ）
-
 [[actors]]
 sub = "op-001"
+email = "op@sivira.co"
 role = "operator"
 allowed_schemas = ["urtect"]
 
 [[actors]]
 sub = "sup-001"
+email = "ryugo@sivira.co"
 role = "supervisor"
 allowed_schemas = ["urtect"]
 
