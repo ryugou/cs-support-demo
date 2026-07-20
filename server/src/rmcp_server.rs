@@ -277,14 +277,18 @@ impl CsSupportRmcpServer {
     }
 
     /// 全 tool の共通入口。認証 → scope 強制 → RequestContext（S1-1 前半）。
+    /// email は axum の Google OAuth ミドルウェア（`oauth::middleware::require_google_auth`）が
+    /// 検証済みで `http::request::Parts` の extensions に注入している（`oauth::VerifiedEmail`）。
+    /// ここに値が無いのはミドルウェアの配線漏れ・構成ミスであり、fail closed で拒否する。
     fn begin(&self, extensions: &rmcp::model::Extensions) -> Result<RequestContext, ErrorData> {
-        let authorization = extensions
+        let email = extensions
             .get::<http::request::Parts>()
-            .and_then(|parts| parts.headers.get(http::header::AUTHORIZATION))
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+            .and_then(|parts| parts.extensions.get::<crate::oauth::VerifiedEmail>())
+            .map(|v| v.0.clone());
+        let email =
+            email.ok_or_else(|| ErrorData::invalid_request("unauthenticated".to_string(), None))?;
         self.harness
-            .begin(authorization.as_deref(), &self.schema, self.manual_schema)
+            .begin(&email, &self.schema, self.manual_schema)
             .map_err(|err| ErrorData::invalid_request(err.to_string(), None))
     }
 

@@ -35,8 +35,6 @@ pub struct AppConfig {
     pub vegapunk_max_decode_mb: usize,
     pub projects: Vec<ProjectConfig>,
     #[serde(default)]
-    pub auth: AuthConfig,
-    #[serde(default)]
     pub actors: Vec<ActorConfig>,
     #[serde(default)]
     pub harness: HarnessConfig,
@@ -94,19 +92,11 @@ impl AppConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct AuthConfig {
-    /// HS256 共有鍵ファイルパス。env CS_SUPPORT_JWT_SECRET_FILE で上書き可。
-    pub jwt_secret_file: Option<String>,
-    /// 設定時は JWT の iss をこの値と照合する（未設定時は存在のみ要求）。
-    pub jwt_issuer: Option<String>,
-    /// JWT 未設定時の dev 専用フォールバック actor（sub）。
-    pub default_actor: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActorConfig {
     pub sub: String,
+    /// Google OAuth で検証済みの email（照合キー・必須）。認可の正本はこの表（ホワイトリスト）。
+    pub email: String,
     pub role: String,
     pub allowed_schemas: Vec<String>,
 }
@@ -238,9 +228,6 @@ impl AppConfig {
         }
         if let Ok(endpoint) = env::var("VEGAPUNK_ENDPOINT") {
             config.vegapunk_endpoint = endpoint;
-        }
-        if let Ok(path) = env::var("CS_SUPPORT_JWT_SECRET_FILE") {
-            config.auth.jwt_secret_file = Some(path);
         }
         Ok(config)
     }

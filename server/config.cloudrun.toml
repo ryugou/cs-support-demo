@@ -1,6 +1,8 @@
 # Cloud Run 本番構成。
-# bind_addr / vegapunk_endpoint / auth.jwt_secret_file は BIND_ADDR / VEGAPUNK_ENDPOINT /
-# CS_SUPPORT_JWT_SECRET_FILE の env で上書きされる（server/src/config.rs::AppConfig::load）。
+# bind_addr / vegapunk_endpoint は BIND_ADDR / VEGAPUNK_ENDPOINT の env で上書きされる
+# （server/src/config.rs::AppConfig::load）。認証は Google OAuth 一本（静的 JWT は撤去済み）。
+# aud 照合は env CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID。actor 表（email ホワイトリスト）は
+# 以下 [[actors]] が正本で、env 上書きはしない。
 # ここに書く値は env 未設定時のフォールバックであり、Cloud Run では常に env を注入する運用とする。
 bind_addr = "0.0.0.0:8080"
 # VPC peering 越しの punkrecord-egghead 実 IP。Cloud Run では env VEGAPUNK_ENDPOINT で上書きする。
@@ -15,17 +17,15 @@ project_id = "urtect"
 schema = "urtect"
 manual_schema = "manual_v1"
 
-[auth]
-# Cloud Run では JWT 必須: CS_SUPPORT_JWT_SECRET_FILE を Secret Manager injection（ファイルマウント）で渡す。
-# default_actor は置かない（dev フォールバック禁止。JWT 未設定時は認証エラーで fail closed）。
-
 [[actors]]
 sub = "op-001"
+email = "op@sivira.co"
 role = "operator"
 allowed_schemas = ["sivira-cs-demo", "urtect"]
 
 [[actors]]
 sub = "sup-001"
+email = "ryugo@sivira.co"
 role = "supervisor"
 allowed_schemas = ["sivira-cs-demo", "urtect"]
 

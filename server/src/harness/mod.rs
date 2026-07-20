@@ -104,17 +104,6 @@ impl Harness {
                 config_dir.join(path)
             }
         };
-        let secret = match &config.auth.jwt_secret_file {
-            Some(path) => {
-                // 空鍵は実質的な認証無効化になるため、設定ミスとして起動失敗（fail closed）。
-                // 読み込み・trim・空拒否は config::read_secret_file に共通化済み
-                // （llm.rs::resolve_api_key と同じ fail-closed 方針）。
-                let secret =
-                    crate::config::read_secret_file("jwt secret file", &resolve_path(path))?;
-                Some(secret.into_bytes())
-            }
-            None => None,
-        };
         let lexicon = Arc::new(signal::LexiconNormalizer::from_path(&resolve_path(
             &config.harness.signal_lexicon_path,
         ))?);
@@ -133,12 +122,7 @@ impl Harness {
             extraction::HybridExtractor::new(lexicon.clone(), llm_classifier),
         );
         Ok(Self {
-            authenticator: authn::Authenticator::new(
-                secret,
-                &config.actors,
-                config.auth.default_actor.clone(),
-            )
-            .with_issuer(config.auth.jwt_issuer.clone()),
+            authenticator: authn::Authenticator::new(&config.actors),
             normalizer: lexicon.clone(),
             lexicon,
             extractor,
@@ -414,13 +398,14 @@ impl Harness {
     }
 
     /// S1-1 パイプライン前半: [認証] → [(A) 権限]。全 tool がここを通る。
+    /// `email` は Google OAuth ミドルウェアが検証済みの Google email（`oauth::VerifiedEmail`）。
     pub fn begin(
         &self,
-        authorization: Option<&str>,
+        email: &str,
         project_schema: &str,
         project_manual_schema: crate::config::ManualSchemaKind,
     ) -> Result<RequestContext> {
-        let actor = self.authenticator.authenticate(authorization)?;
+        let actor = self.authenticator.lookup_by_email(email)?;
         let access = scope::resolve_scope(&actor, project_schema)?;
         Ok(RequestContext {
             schema: access.enforced_schema().to_string(),
@@ -858,15 +843,12 @@ mod tests {
         // build() と同じく単一の lexicon を normalizer / lexicon / extractor で共有する。
         let lexicon = Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap());
         Harness {
-            authenticator: authn::Authenticator::new(
-                None,
-                &[ActorConfig {
-                    sub: "op-001".to_string(),
-                    role: "operator".to_string(),
-                    allowed_schemas: vec!["sivira-cs-demo".to_string()],
-                }],
-                Some("op-001".to_string()),
-            ),
+            authenticator: authn::Authenticator::new(&[ActorConfig {
+                sub: "op-001".to_string(),
+                email: "op@sivira.co".to_string(),
+                role: "operator".to_string(),
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+            }]),
             normalizer: lexicon.clone(),
             // LLM 未設定（enabled = false 相当）→ lexicon 単独の extractor。
             extractor: Arc::new(extraction::HybridExtractor::new(lexicon.clone(), None)),
@@ -899,7 +881,7 @@ mod tests {
         let harness = harness_for_test();
         let ctx = harness
             .begin(
-                None,
+                "op@sivira.co",
                 "sivira-cs-demo",
                 crate::config::ManualSchemaKind::LegacySection,
             )
@@ -953,7 +935,7 @@ mod tests {
         let harness = harness_for_test();
         assert!(harness
             .begin(
-                None,
+                "op@sivira.co",
                 "other-tenant",
                 crate::config::ManualSchemaKind::LegacySection,
             )
