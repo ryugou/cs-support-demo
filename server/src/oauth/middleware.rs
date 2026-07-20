@@ -41,11 +41,18 @@ pub async fn require_google_auth(
         .map(str::to_string);
 
     let token = match bearer {
-        Some(t) => t,
         None => {
             tracing::info!(reason = "missing_bearer", "auth rejected");
             return unauthorized(&state.resource_metadata_url);
         }
+        // `Bearer ` の後ろが空文字（ヘッダはあるがトークンが空）。ここで弾かないと
+        // 空トークンのまま Google tokeninfo に問い合わせてしまう（無駄なリクエスト、かつ
+        // 呼び出しごとに区別できないログになる）。missing_bearer とは reason を分けて残す。
+        Some(t) if t.is_empty() => {
+            tracing::info!(reason = "empty_bearer", "auth rejected");
+            return unauthorized(&state.resource_metadata_url);
+        }
+        Some(t) => t,
     };
 
     match state.verifier.verify(&token).await {
@@ -136,5 +143,23 @@ mod tests {
             .unwrap();
         assert!(wa.contains("resource_metadata="));
         assert!(wa.contains("/.well-known/oauth-protected-resource/urtect/mcp"));
+    }
+
+    /// `Bearer ` の後ろが空文字のケース。実 Google エンドポイントに到達できない
+    /// テスト環境でも、このケースは verifier を呼ばず即 401 になることを保証する
+    /// （呼んでしまうと到達不能で 503 になり得るため、このテストが両者を区別する）。
+    #[tokio::test]
+    async fn empty_bearer_yields_401_without_calling_verifier() {
+        let res = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/urtect/mcp")
+                    .header(header::AUTHORIZATION, "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

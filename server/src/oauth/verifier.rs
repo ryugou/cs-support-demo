@@ -5,8 +5,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const TOKENINFO_URL: &str = "https://oauth2.googleapis.com/tokeninfo";
-/// 検証済み email のキャッシュ上限。Google tokeninfo への RTT を抑えるための短時間キャッシュであり、
-/// 失効直後のトークンでも最大この秒数だけ古い判定が使われ得る（許容トレードオフ。トークン単位）。
+/// 検証済み email のキャッシュエントリに許す TTL 上限。Google tokeninfo への RTT を抑えるための
+/// 短時間キャッシュであり、実トークンの `expires_in` がこれより長くても、失効直後の判定が
+/// 古くなり過ぎないようここで頭打ちにする（許容トレードオフ。トークン単位）。
 const MAX_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Google tokeninfo のレスポンス（フィールドは Google 仕様通りすべて文字列で返る）。
@@ -16,6 +17,20 @@ pub(crate) struct TokenInfo {
     pub azp: Option<String>,
     pub email: Option<String>,
     pub email_verified: Option<String>,
+    /// トークンの残り有効秒数（Google 仕様通り文字列）。無い/パース不可な応答もあり得るため、
+    /// キャッシュ TTL 計算では欠落時と同様に扱う（`cache_ttl` 参照）。
+    pub expires_in: Option<String>,
+}
+
+/// キャッシュ TTL を決める純粋関数（ネットワーク非依存・単体テスト対象）。
+/// 実トークンの残り秒数 `expires_in` と `MAX_CACHE_TTL` の小さい方を採用する。
+/// `expires_in` が無い、または数値としてパースできない場合は `MAX_CACHE_TTL` を使う
+/// （tokeninfo の応答形式ゆれで TTL 計算だけが失敗しても、検証結果は活かして無期限延命はしない側に倒す）。
+pub(crate) fn cache_ttl(expires_in: Option<&str>) -> Duration {
+    match expires_in.and_then(|s| s.parse::<u64>().ok()) {
+        Some(secs) => Duration::from_secs(secs).min(MAX_CACHE_TTL),
+        None => MAX_CACHE_TTL,
+    }
 }
 
 /// tokeninfo 応答から検証済み email を導く純粋関数（ネットワーク非依存・単体テスト対象）。
@@ -91,8 +106,9 @@ impl GoogleTokenVerifier {
             .map_err(|e| AuthError::Unreachable(format!("tokeninfo body read failed: {e}")))?;
         let info: TokenInfo = serde_json::from_str(&text)
             .map_err(|e| AuthError::Unreachable(format!("tokeninfo parse failed: {e}")))?;
+        let ttl = cache_ttl(info.expires_in.as_deref());
         let email = decide(&info, &self.client_id)?;
-        self.store(bearer_token, &email);
+        self.store(bearer_token, &email, ttl);
         Ok(email)
     }
 
@@ -105,12 +121,14 @@ impl GoogleTokenVerifier {
             .map(|(email, _)| email.clone())
     }
 
-    fn store(&self, token: &str, email: &str) {
+    fn store(&self, token: &str, email: &str, ttl: Duration) {
         let mut cache = self.cache.lock().unwrap();
-        cache.insert(
-            token.to_string(),
-            (email.to_string(), Instant::now() + MAX_CACHE_TTL),
-        );
+        // insert 前に期限切れエントリを purge する。TTL は実トークンの exp 由来（`cache_ttl`）
+        // なので、これで「有効なトークン数」に比例した大きさに有界化される
+        // （TTL 無視の固定 300 秒だと、失効済みトークンのエントリが最大 300 秒分溜まり続けていた）。
+        let now = Instant::now();
+        cache.retain(|_, (_, exp)| *exp > now);
+        cache.insert(token.to_string(), (email.to_string(), now + ttl));
     }
 }
 
@@ -124,6 +142,7 @@ mod tests {
             azp: None,
             email: email.map(ToString::to_string),
             email_verified: Some(verified.to_string()),
+            expires_in: None,
         }
     }
 
@@ -164,5 +183,25 @@ mod tests {
         let mut i = info("aud-other", "true", Some("a@sivira.co"));
         i.azp = Some("client-123".to_string());
         assert_eq!(decide(&i, "client-123").unwrap(), "a@sivira.co");
+    }
+
+    #[test]
+    fn cache_ttl_uses_expires_in_when_shorter_than_cap() {
+        assert_eq!(cache_ttl(Some("120")), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn cache_ttl_caps_expires_in_at_max_cache_ttl() {
+        assert_eq!(cache_ttl(Some("9999")), MAX_CACHE_TTL);
+    }
+
+    #[test]
+    fn cache_ttl_defaults_to_max_cache_ttl_when_missing() {
+        assert_eq!(cache_ttl(None), MAX_CACHE_TTL);
+    }
+
+    #[test]
+    fn cache_ttl_defaults_to_max_cache_ttl_when_unparseable() {
+        assert_eq!(cache_ttl(Some("not-a-number")), MAX_CACHE_TTL);
     }
 }

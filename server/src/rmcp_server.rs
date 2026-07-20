@@ -285,11 +285,23 @@ impl CsSupportRmcpServer {
             .get::<http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<crate::oauth::VerifiedEmail>())
             .map(|v| v.0.clone());
-        let email =
-            email.ok_or_else(|| ErrorData::invalid_request("unauthenticated".to_string(), None))?;
+        let email = email.ok_or_else(|| {
+            tracing::warn!(reason = "missing_verified_email", "auth rejected at begin");
+            ErrorData::invalid_request("unauthenticated".to_string(), None)
+        })?;
         self.harness
             .begin(&email, &self.schema, self.manual_schema)
-            .map_err(|err| ErrorData::invalid_request(err.to_string(), None))
+            .map_err(|err| {
+                // allowlist 外 / scope 外の拒否は無音にしない。email は actor 識別に必要な
+                // 監査情報でありログ可（token 本体ではない）。token は絶対にログしない。
+                tracing::warn!(
+                    reason = "unregistered_or_unscoped",
+                    email = %email,
+                    error = %err,
+                    "authorization denied"
+                );
+                ErrorData::invalid_request(err.to_string(), None)
+            })
     }
 
     #[tool(

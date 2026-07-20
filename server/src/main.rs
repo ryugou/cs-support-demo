@@ -76,11 +76,16 @@ async fn main() -> Result<()> {
     // （詳細は cs_support_mcp::health を参照）。
     //
     // OAuth 保護リソースメタデータ（RFC 9728）はここで無認証公開する。
-    // `CS_SUPPORT_PUBLIC_DOMAIN` 未設定時は空文字のまま `resource` が
-    // `https://` のみになり不正な URL を返すが、これは Task 3/5 で認証を有効化する際に
-    // 必須 env として検証されるべき設定不足であり、ここでは fail-closed にしない
-    // （メタデータ endpoint 自体は未認証で公開する仕様のため、起動を止める理由がない）。
-    let public_host = env::var("CS_SUPPORT_PUBLIC_DOMAIN").unwrap_or_default();
+    // ただし `public_host` 自体は必須 env とし、未設定/空文字なら起動を止める
+    // （fail-closed）。ここが空のまま起動を許すと、metadata の `resource` が
+    // `https://` のみの不正 URL になり、かつ下の `AuthState.resource_metadata_url` も
+    // 同じく壊れた URL になって Claude 側の OAuth 発見フローがサイレントに破綻する
+    // （401 は返るが WWW-Authenticate が指す先が無意味になる）。client_id と同様、
+    // 設定不備は起動失敗として運用者に即座に知らせる。
+    let public_host = env::var("CS_SUPPORT_PUBLIC_DOMAIN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context("CS_SUPPORT_PUBLIC_DOMAIN is required for OAuth resource metadata")?;
     let project_ids: Vec<String> = config
         .projects
         .iter()
