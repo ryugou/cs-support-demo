@@ -98,10 +98,13 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Deploy Cloud Run service
-        # サービス定義（VPC / secrets / メモリ等）は Task 3 の gcloud run deploy 初回作成で
-        # 固定済みのため、CI からは --image のみ更新する（デプロイフラグで定義を上書きしない）。
+        # サービス定義（VPC / secrets / メモリ等）は Task 3 の初回作成で固定済みのため、
+        # CI からは image のみ更新する。`gcloud run deploy` は未指定フラグに CLI 既定値を
+        # 適用しうる（既定値は gcloud のバージョンで変わる）ため、image 以外に触れない
+        # `gcloud run services update` を使う。ここを `deploy` に戻すと、CLI 更新のたびに
+        # サービス定義が静かに書き換わる経路が復活する。
         run: |
-          gcloud run deploy cs-support-mcp \
+          gcloud run services update cs-support-mcp \
             --project "${{ env.GCP_PROJECT_ID }}" \
             --region "${{ env.RUN_REGION }}" \
             --image "${{ steps.image.outputs.tag }}"
@@ -121,6 +124,16 @@ jobs:
             --image "${{ steps.image.outputs.tag }}"
 
   auto-ingest:
+    # 既知の制約: この job は build-deploy（service デプロイ）の "後" に走る。
+    # schema/** に属性を加算した変更では、新コードが本番へ出てからスキーマ登録が
+    # 行われるため、vegapunk が未登録属性を含む UpsertNodes を拒否する実装だと、
+    # その間の書き込みが失敗する窓がある。
+    # 回避策: schema/** を変更した PR は、merge 前に手で
+    #   gcloud run jobs execute ingest-rules --project ... --region ... --wait
+    # を実行してスキーマを先に登録しておくこと。
+    # 恒久対応（未実施）: build と deploy を job 分割し、ingest を deploy の前に
+    # 差し込む。条件付き job の skip 伝播（needs 先が skip されると後続も skip される）
+    # の扱いが要るため、CI 単体で検証できる別 PR で行う。
     needs: build-deploy
     if: github.event_name == 'push'
     runs-on: ubuntu-latest

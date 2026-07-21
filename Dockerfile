@@ -8,7 +8,7 @@ WORKDIR /app/server
 COPY server/Cargo.toml server/Cargo.lock server/build.rs ./
 COPY server/proto ./proto
 COPY server/src ./src
-RUN cargo build --release \
+RUN cargo build --release --locked \
     --bin cs-support-mcp \
     --bin ingest_demo \
     --bin verify_demo \
