@@ -207,10 +207,18 @@ cs-support-mcp/
 - cross-schema 検索はしない。
 - MCP endpoint は `/{project_id}/mcp`。
 - `project_id` から schema を解決し、vegapunk 呼び出しへ注入する。
-- 認証は Google OAuth 2.1 とする。`cs-support-mcp` は OAuth リソースサーバとして動作し、認可サーバは Google（`accounts.google.com`）。無トークンアクセスは `401` + `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/{project_id}/mcp"` を返し、クライアントはこのメタデータ経由で認可サーバ（Google）を発見する。プロジェクトごとの静的 Bearer token・静的 JWT は撤去済み。
+- 認証は OAuth 2.1 とする。`cs-support-mcp` は**認可サーバ（AS）兼リソースサーバ（RS）**として動作し、内部で Google（`accounts.google.com`）に委譲する（OAuth フェデレーション）。無トークンアクセスは `401` + `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/{project_id}/mcp"` を返し、クライアントはこのメタデータ経由で認可サーバ（= このサービス自身）を発見する。プロジェクトごとの静的 Bearer token・静的 JWT は撤去済み。
+- **AS を自前化した理由**: Google は RFC 7591 の DCR（動的クライアント登録）に対応していない。認可サーバを Google 自身にすると、claude.ai は利用者ごとに Google の Client ID / Secret を詳細設定へ手入力させる必要があり、運用不能かつ Client Secret がクライアント側に置かれる。現行は Google の client_id / secret をサーバ側 env に閉じ込め、claude.ai は MCP endpoint の URL のみで接続できる。実装は `server/src/oauth/authserver.rs`、署名基盤は `server/src/oauth/signing.rs`。
+- **トークンは自前発行しない。** 一時期は自前のアクセス/リフレッシュトークンを署名付きで発行していたが、デモに対して寿命・失効・鍵管理を自前で抱える設計が過剰と判断され撤回した。現行の `/oauth/token` は **Google が発行した access_token / refresh_token / expires_in をそのままクライアントへ返し**、`grant_type=refresh_token` は受け取った refresh_token を **Google の token endpoint へ中継する**だけである。AS の外殻（DCR / authorize / callback / token / 同意画面）は claude.ai の DCR と confused deputy 対策のために残している。
+- **失効は Google 側で行う。** このサーバは失効台帳を持たないため、個別のトークン失効手段が無い。利用者単位の失効は Google アカウントのアクセス権限管理から行う。
+- 署名が必要なのは client_id / state / 認可コード / 同意ブロブだけ（改竄されると redirect_uri の書き換えや認可コード偽造が成立するため）。**署名鍵は起動時に CSPRNG で生成してメモリに保持する**（`SigningKey::generate`）。env にも Secret Manager にも鍵は無い。
+- **再起動時の影響**: 進行中のログインフロー（state / 認可コード、最長 600 秒）と DCR 登録は無効になる。DCR は claude.ai が再登録すれば自動的に回復する。**アクセストークンとリフレッシュトークンは Google 発行なので、再起動しても利用者はログアウトしない。**
+- リクエスト経路の Bearer 検証は `GoogleTokenVerifier`（tokeninfo 照会）。`aud` の完全一致・`email_verified`・安定した `sub` の取得・TTL キャッシュを行う。Google に到達できない場合は **503** を返す（401 に倒すと Google 障害が全利用者の強制ログアウトに化けるため）。
 - **警告**: 現状、Google アカウントで認証さえ通れば誰でも supervisor として `add_known_resolution` を含む全操作を実行できる（`server/src/harness/authn.rs` の `lookup_by_identity` が突合を行わず無条件に supervisor 解決するため）。actor 突合表の DB 実装が入るまで、アクセス制御としては不十分と扱うこと。詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
 - **警告（上記の規模）**: Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済みで、テストユーザによる制限は無い。したがって上記「誰でも」の母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。OAuth クライアントが Internal（組織限定）だと仮定しないこと。
 - 本番 Cloud Run の project 定義は `urtect` の 1 件のみ（`server/config.cloudrun.toml`）。レガシーの `sivira-cs-demo` は露出面を最小化するため外した。`allowed_schemas` は config 全 project の複製で解決されるため（`server/src/harness/authn.rs`）、**project を追加するとその schema も既存の全 Google 利用者へ自動的に公開される**。テナント分離を成立させる認可境界が無い間は、project を安易に増やさないこと。
+- **警告: アクセストークンに project 束縛は無い。** 自前トークンを廃止した結果、クライアントが持つのは Google 発行のトークンであり、こちらの project_id を載せる余地が無い。したがって **ある project 向けに取得したトークンは、このサーバの全 project の endpoint で通る**。旧実装が持っていた `aud` 完全一致の境界は失われている。RFC 8707 の `resource` は `/oauth/authorize` と `/oauth/token` で「設定済み project を指しているか」の入力検証にしか使っていない（`server/src/oauth/authserver.rs` の `resolve_resource`）。
+- **project を 2 件目以降に増やすと、OAuth の挙動が破壊的に変わる。** `/oauth/authorize` は project が 1 件のときだけ `resource` 省略を許す。2 件以上になると **`resource` が必須**になり、送らないクライアントは `invalid_target` で拒否される（起動時に `tracing::warn!` で 1 回警告する）。ただし上記のとおり `resource` を送っても**テナント分離にはならない**ので、project を増やす前に認可境界そのものを設計し直すこと。
 - mapping は 1 件でも、将来別 schema を引ける構造にする。
 
 ## Ingest
@@ -309,14 +317,22 @@ token が無い場合だけ、既存 `vegapunk` ホストから取得する。
 ssh vegapunk 'ruby -ryaml -e "c=YAML.load_file(File.expand_path(%q[~/.config/vegapunk/config.yml])); print c.dig(%q[server],%q[auth],%q[token])"' > /private/tmp/vegapunk-bearer-token
 ```
 
-ローカル MCP サーバを起動する。`CS_SUPPORT_PUBLIC_DOMAIN` と `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は
-`main.rs` の起動時 fail-closed チェック（`CS_SUPPORT_PUBLIC_DOMAIN`: main.rs:85-88、
-`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`: main.rs:105-107）で必須。無いと起動に失敗する。
-`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は Google Cloud Console で発行済みの OAuth Client ID を設定する
-（本番と同一のものを使ってよい。client_id は公開識別子で aud 照合にのみ使うため、コマンド例に値を
-直書きせず各自の値に置き換えること）。ただし localhost 向け redirect URI は Google 側に未登録のため、
-ブラウザ経由の OAuth ログインフローそのものはローカルで完結しない。ローカルでの疎通確認は
-Bearer 無しアクセスに対する 401 応答の確認までに留まる。
+ローカル MCP サーバを起動する。次の 3 つは `main.rs` の起動時 fail-closed チェックで必須。
+無いと起動に失敗する。
+
+- `CS_SUPPORT_PUBLIC_DOMAIN`
+- `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`
+- `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`
+
+`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` / `..._SECRET` は Google Cloud Console で発行済みの
+OAuth クライアントの値を設定する（本番と同一のものを使ってよい。client_id は公開識別子だが
+**client_secret は真の秘密**なので、コマンド例に直書きせず各自の値に置き換えること）。
+
+OAuth 署名鍵の env は無い。起動時に CSPRNG で生成される。
+
+ただし `https://127.0.0.1:3443/oauth/callback` は Google 側に未登録のため、ブラウザ経由の
+OAuth ログインフローそのものはローカルで完結しない。ローカルでの疎通確認は、Bearer 無し
+アクセスに対する 401 応答と、`/.well-known/oauth-authorization-server` の 200 応答までに留まる。
 
 ```sh
 cd server
@@ -326,6 +342,7 @@ env -u RUSTC_WRAPPER \
   VEGAPUNK_BEARER_TOKEN_FILE=/private/tmp/vegapunk-bearer-token \
   CS_SUPPORT_PUBLIC_DOMAIN=127.0.0.1:3443 \
   CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID=<Google Cloud Console で発行済みの OAuth Client ID> \
+  CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET=<同 OAuth クライアントの Client Secret> \
   cargo run --bin cs-support-mcp -- --config config.local-https.toml
 ```
 
@@ -347,10 +364,11 @@ curl -kNsS -H 'Accept: application/json, text/event-stream' \
 ```
 
 Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` が返るのが正常（`require_google_auth`
-ミドルウェア、main.rs:136-144。Cloud Run 節の「認証（Google OAuth 2.1、実測済み）」と同じ挙動）。
+ミドルウェア。Cloud Run 節の「認証（OAuth 2.1 フェデレーション、実測済み）」と同じ挙動）。
 `initialize` が `200` で通ることを期待するコマンドではない。MCP サーバ自体の疎通確認をしたいだけなら
-`curl -ksS https://127.0.0.1:3443/livez` や
-`curl -ksS https://127.0.0.1:3443/.well-known/oauth-protected-resource/sivira-cs-demo/mcp` を使う。
+`curl -ksS https://127.0.0.1:3443/livez`、
+`curl -ksS https://127.0.0.1:3443/.well-known/oauth-protected-resource/sivira-cs-demo/mcp`、
+`curl -ksS https://127.0.0.1:3443/.well-known/oauth-authorization-server` を使う。
 
 `search_manual` がクライアント側で失敗する場合は、まずクライアントが古い MCP セッションを掴んでいないか確認し、MCP 接続を再読み込みする。サーバ側の直叩きで `structuredContent.hits` が返るなら、MCP サーバ本体ではなくクライアントの接続状態を疑う。
 
@@ -366,9 +384,12 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 - MCP endpoint: `https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp`
 - Cloud Run jobs（service と同一イメージ）: `ingest-rules`, `ingest-urtect`
 - env（fail-closed 境界で2群に分けて扱うこと）:
-  - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`（`main.rs:85-88`）、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`（`main.rs:105-107`）、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs:54` で起動時 fail closed）
+  - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs:54` で起動時 fail closed）
   - **未設定でも起動する**: `VEGAPUNK_ENDPOINT`（`config.cloudrun.toml:13` の値にフォールバック。env があれば `config.rs:218` が上書き）、`VEGAPUNK_BEARER_TOKEN`
-- Secret Manager injection で注入するのは **`VEGAPUNK_BEARER_TOKEN` と `CS_SUPPORT_LLM_API_KEY` のみ**（真に秘密の値）。`CS_SUPPORT_PUBLIC_DOMAIN` は公開ホスト名、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は公開識別子（aud 照合にのみ使う）であり、平文 env で構わない。非機密値まで Secret Manager に入れると「どれが本当の秘密か」の判断基準が失われる。
+  - **そもそも env が無い**: OAuth の署名鍵。起動時に CSPRNG で生成してメモリに置く（`server/src/oauth/signing.rs` の `SigningKey::generate`）。Secret Manager にも置かない。
+- Secret Manager injection で注入するのは **`VEGAPUNK_BEARER_TOKEN` / `CS_SUPPORT_LLM_API_KEY` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET` の 3 つのみ**（真に秘密の値）。`CS_SUPPORT_PUBLIC_DOMAIN` は公開ホスト名、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は公開識別子であり、平文 env で構わない。非機密値まで Secret Manager に入れると「どれが本当の秘密か」の判断基準が失われる。
+- **再デプロイ・再起動で利用者はログアウトしない。** アクセストークンとリフレッシュトークンは Google が発行した値をそのまま中継しているため、こちらのプロセス状態に依存しない。再起動で失われるのは進行中のログインフロー（最長 600 秒）と DCR 登録だけで、後者は claude.ai の再登録で自動的に回復する。
+- **一括失効手段は無い。** 旧構成では署名鍵の差し替えが全トークンの一括失効になっていたが、自前トークンを廃止した現在その手段は存在しない。失効は Google 側（アカウントのアクセス権限管理）で行う。
 - `[llm] enabled = true` のため、**顧客問い合わせ本文が Anthropic API へ送信される**。運用上の注意点として認識しておくこと。
   `VEGAPUNK_BEARER_TOKEN` 未設定時は起動自体は成功するが、vegapunk 呼び出し（`search_manual` 等）だけが
   失敗する（`main.rs:192-202`。空文字がそのまま使われるため fail-closed にならない点に注意）。
@@ -387,22 +408,26 @@ gcloud run jobs update ingest-urtect --project sivira-cs-support --region asia-n
 
 `<tag>` は service と両 job で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。
 
-### 認証（Google OAuth 2.1、実測済み）
+### 認証（OAuth 2.1 フェデレーション、実測済み）
 
 > **AuthN は機能しているが AuthZ は実質無い。** 以下は「認証が正しく動いている」証跡であって、
 > 認可が効いていることの証跡ではない。同意画面は External（本番公開）で、認証を通した任意の
 > Google アカウントが supervisor 全権を得る。デプロイや公開範囲を触る前に、上記
 > 「Project Routing and Auth」節の警告2点を必ず読むこと。
 
-静的 Bearer token・静的 JWT は撤去済み。`cs-support-mcp` は OAuth 2.1 リソースサーバとして動作し、認可サーバは Google（`accounts.google.com`）。
+静的 Bearer token・静的 JWT は撤去済み。`cs-support-mcp` は OAuth 2.1 の**認可サーバ兼リソースサーバ**として動作し、内部で Google（`accounts.google.com`）へ委譲する。
 
 - 無トークン `POST /urtect/mcp` → `401` + `WWW-Authenticate: Bearer resource_metadata="https://cs-support-mcp-235108918288.asia-northeast1.run.app/.well-known/oauth-protected-resource/urtect/mcp"`
-- `GET /.well-known/oauth-protected-resource/urtect/mcp` → `200 application/json`:
+- `GET /.well-known/oauth-protected-resource/urtect/mcp` → `200 application/json`。`authorization_servers` は Google ではなく**このサービス自身**:
   ```json
-  {"resource":"https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp","authorization_servers":["https://accounts.google.com"]}
+  {"resource":"https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp","authorization_servers":["https://cs-support-mcp-235108918288.asia-northeast1.run.app"]}
   ```
-- `GET /.well-known/oauth-authorization-server` → **404 が正常**。認可サーバは Google 自身であり、このリソースサーバが認可サーバのメタデータを自前で持つ必要はないため。壊れていると早合点しないこと。
+- `GET /.well-known/oauth-authorization-server` → **200 が正常**（RFC 8414 AS メタデータ）。旧構成では 404 が正常だったが、DCR 非対応の Google を AS にすると claude.ai が接続できないため、このサービス自身が AS になった。**404 が返るなら旧イメージが動いている**と疑うこと。
+  ```json
+  {"issuer":"https://cs-support-mcp-235108918288.asia-northeast1.run.app","authorization_endpoint":"…/oauth/authorize","token_endpoint":"…/oauth/token","registration_endpoint":"…/oauth/register","response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"]}
+  ```
 - `GET /livez` → `200`
+- Google Cloud Console の OAuth クライアントには、承認済みリダイレクト URI として `https://cs-support-mcp-235108918288.asia-northeast1.run.app/oauth/callback` を**必ず登録する**（未登録だとログインが `redirect_uri_mismatch` で必ず失敗する）。claude.ai 側の redirect URI を Google に登録する必要はもう無い。
 
 ### 確認コマンド
 
@@ -413,10 +438,16 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://cs-support-mcp-2351089
 
 curl -sS https://cs-support-mcp-235108918288.asia-northeast1.run.app/.well-known/oauth-protected-resource/urtect/mcp
 
-curl -sS -o /dev/null -w '%{http_code}\n' https://cs-support-mcp-235108918288.asia-northeast1.run.app/.well-known/oauth-authorization-server
+# 200 が正常（旧構成では 404 が正常だった。404 なら旧イメージを疑う）
+curl -sS https://cs-support-mcp-235108918288.asia-northeast1.run.app/.well-known/oauth-authorization-server
+
+# DCR が動くことの確認（201 + client_id が返る。client_secret は返らないのが正しい）
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"client_name":"probe"}' \
+  https://cs-support-mcp-235108918288.asia-northeast1.run.app/oauth/register
 ```
 
-MCP tool 呼び出しは claude.ai のカスタムコネクタ（URL = 上記 MCP endpoint、詳細設定に Google の Client ID/Secret を入力）経由で行う。E2E のクライアントは claude.ai。
+MCP tool 呼び出しは claude.ai のカスタムコネクタ経由で行う。**URL = 上記 MCP endpoint を入力するだけでよい**（Client ID / Secret の手入力は不要になった。claude.ai が DCR で自動登録する）。E2E のクライアントは claude.ai。
 
 ## 旧構成（参考、Cloud Run へ移行済み）
 

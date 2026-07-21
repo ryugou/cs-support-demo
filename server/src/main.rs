@@ -110,20 +110,78 @@ async fn main() -> Result<()> {
         ))
         .layer(TraceLayer::new_for_http());
 
-    // `/{project_id}/mcp` は Google OAuth ミドルウェアで包む（RFC 9728 の 401 発見トリガを
-    // 成立させるため）。verifier は project 間で共有できる（Google 検証は project 非依存）ので
-    // 1 個作って Arc で配る。client_id 未設定は「MCP が丸ごと無認証で公開される」という
-    // 重大な設定不備になるため、起動時に fail-closed で落とす。
-    // `env::var` は「変数が設定されているが空文字」を `Ok(String::new())` として返すため、
-    // `.context(...)` だけでは空文字がそのまま通過してしまう（fail-closed の抜け穴）。
-    // `require_nonempty_env` で未設定・空文字の両方を同じ扱いで拒否する。
+    // `/{project_id}/mcp` は認証ミドルウェアで包む（RFC 9728 の 401 発見トリガを
+    // 成立させるため）。
+    //
+    // 2026-07 改訂 / AS 自前化と、その後の自前トークン発行の廃止:
+    // このサービス自身が OAuth 2.1 認可サーバとして DCR と同意画面を引き受けるが、
+    // **トークンは自前発行せず Google のものを中継する**
+    // （理由は `oauth::authserver` のモジュールコメント）。したがって
+    // - リクエスト経路の Bearer 検証は Google tokeninfo への照会
+    // - Google の client_id / client_secret はサーバ側 env に閉じ込め、
+    //   `/oauth/callback` と `/oauth/token` のトークン交換・中継にだけ使う
+    //
+    // 署名鍵は env から取らない。起動時に CSPRNG で生成してメモリに置く
+    // （`SigningKey::generate`）。守る対象が client_id / state / 認可コードに
+    // 限られ、再起動の影響が「最長 600 秒のログインフロー」と「自動回復する
+    // DCR 登録」だけになったため、鍵を運用物として抱える理由が無くなった。
+    // **アクセストークンは Google 発行なので、再起動で利用者はログアウトしない。**
+    //
+    // 以下 2 つの env は未設定・空文字なら起動を止める（fail closed）。
+    // `env::var` は「設定されているが空文字」を `Ok(String::new())` で返すため、
+    // `.context(...)` だけでは空文字が素通りする。`require_nonempty_env` で
+    // 未設定・空文字・空白のみを同じ扱いで拒否する。
+    // - client_id 未設定: Google への authorize / aud 照合が成立しない
+    // - client_secret 未設定: Google の token 交換が必ず失敗し、誰もログインできない
     let google_client_id = require_nonempty_env(
         "CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID",
         env::var("CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID").ok(),
         "set it to the Google OAuth Client ID from Google Cloud Console before starting the server",
     )?;
+    let google_client_secret = require_nonempty_env(
+        "CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET",
+        env::var("CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET").ok(),
+        "set it to the Google OAuth Client Secret from Google Cloud Console (inject it via Secret Manager; it never leaves this server) before starting the server",
+    )?;
+    // 署名鍵はプロセス限り。env / Secret Manager からは読まない（上のコメント参照）。
+    let signing_key = Arc::new(cs_support_mcp::oauth::signing::SigningKey::generate());
     let verifier = Arc::new(cs_support_mcp::oauth::verifier::GoogleTokenVerifier::new(
-        google_client_id,
+        google_client_id.clone(),
+    ));
+
+    // 認可サーバの endpoint 群（/oauth/authorize, /oauth/callback, /oauth/token,
+    // /oauth/register）は **無認証** で公開する。ここに認証をかけると、
+    // 認証を得るための経路そのものが閉じてしまう。
+    // C5: project が 2 件以上あると、`resource` パラメータが **必須** になる
+    // （`resolve_resource` は束縛先を推測せず `invalid_target` で拒否する）。
+    // これは fail closed として正しい向きだが、無警告だと「project を足した瞬間に
+    // resource を送らない既存クライアントが全滅する」という障害として現れる。
+    // config を触った時点で運用者が気づけるよう、起動時に 1 回警告する。
+    if config.projects.len() > 1 {
+        tracing::warn!(
+            project_count = config.projects.len(),
+            "more than one project is configured, so the RFC 8707 `resource` parameter is now \
+             REQUIRED on /oauth/authorize; clients that omit it will be rejected with \
+             invalid_target (see the project-routing notes in CLAUDE.md)"
+        );
+    }
+
+    let auth_server = Arc::new(cs_support_mcp::oauth::authserver::AuthServerState::new(
+        cs_support_mcp::oauth::authserver::AuthServerConfig::new(
+            public_host.clone(),
+            google_client_id,
+            google_client_secret,
+            config
+                .projects
+                .iter()
+                .map(|p| p.project_id.clone())
+                .collect(),
+        ),
+        signing_key,
+        verifier.clone(),
+    ));
+    app = app.merge(cs_support_mcp::oauth::authserver::auth_server_router(
+        auth_server,
     ));
 
     for project in config.projects.iter() {

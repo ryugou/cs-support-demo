@@ -470,7 +470,7 @@ PunkRecord 側の Step 1 実装方針は別紙『PunkRecord Step 1 前方互換�
 
 ## 未決事項
 
-- ~~認証方式: bearer token / JWT / session token / OIDC のどれを採用するか。~~ → 解決（2026-07-21）: Google OAuth 2.1（IdP = Google）。詳細は S1-11 追記および「AuthN 現状」節を参照。
+- ~~認証方式: bearer token / JWT / session token / OIDC のどれを採用するか。~~ → 解決（2026-07-21）: OAuth 2.1 フェデレーション（`cs-support-mcp` が AS 兼 RS、内部で Google に委譲）。詳細は S1-11 追記および「AuthN 現状」節を参照。
 - actor / tenant / role / entitlement の保存場所。
 - AccessPolicy を PunkRecord に置くか、別の policy store に置くか。Cedar を入れる場合の policy 配置。
 - PunkRecord の record model と vegapunk graph schema の境界。
@@ -804,11 +804,53 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
 
 ### AuthN 現状（2026-07-21 更新、実測済み）
 
-- **AuthN = Google OAuth 2.1**。IdP は Google（`accounts.google.com`）、`cs-support-mcp` は OAuth リソースサーバとして動作する。無トークンアクセスは `401` + `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource/{project_id}/mcp"` を返し、`GET /.well-known/oauth-protected-resource/{project_id}/mcp` が `200` でリソースメタデータ（`authorization_servers: ["https://accounts.google.com"]`）を返す。`/.well-known/oauth-authorization-server` は 404 が正常（認可サーバが Google 自身のため、このリソースサーバ側にメタデータを持たない）。
+- **AuthN = OAuth 2.1 フェデレーション**。`cs-support-mcp` 自身が**認可サーバ（AS）兼リソースサーバ（RS）**として動作し、内部で Google（`accounts.google.com`）に委譲する。無トークンアクセスは `401` + `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource/{project_id}/mcp"` を返し、`GET /.well-known/oauth-protected-resource/{project_id}/mcp` が `200` でリソースメタデータを返す。`authorization_servers` は **Google ではなくこのサービス自身**（`https://{public_host}`）。`/.well-known/oauth-authorization-server` は **200 が正常**（RFC 8414 AS メタデータ）。**旧記述の「404 が正常」は撤回**。
+  - **AS を自前化した理由**: Google は RFC 7591 の DCR（動的クライアント登録）に対応していない。認可サーバを Google 自身にすると、claude.ai は利用者ごとに Google の Client ID / Secret を詳細設定へ手入力させる必要があり、CS 担当者に配れず、かつ Client Secret がクライアント側に置かれて秘密として成立しない。現行は Google の client_id / secret をサーバ側 env（`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`）に閉じ込め、claude.ai は MCP endpoint の URL のみで接続できる。
+  - **経路**: `claude.ai --DCR/authorize/token--> cs-support-mcp (AS) --authorize/token--> Google`。実装は `server/src/oauth/authserver.rs`（`/oauth/register` `/oauth/authorize` `/oauth/callback` `/oauth/consent` `/oauth/token`）、署名・封緘基盤は `server/src/oauth/signing.rs`。
+  - **トークンは自前発行しない（2026-07-22 方針転換）**: 一時期この AS は自前のアクセス/リフレッシュトークンを署名付きで発行していたが、デモという位置づけに対し寿命・失効・鍵管理を自前で抱える設計が過剰と判断され撤回した。現行は **Google が発行したトークンをそのままクライアントへ渡す**。`authorization_code` グラントは Google の `access_token` / `refresh_token` / `expires_in` をそのまま返し、`refresh_token` グラントはクライアントから来た refresh_token を **Google の token endpoint へ中継**して応答をそのまま返す（`client_secret` はサーバ側から添える）。リクエスト経路の Bearer 検証も `GoogleTokenVerifier`（tokeninfo 照会）へ戻した。AS が引き受けるのは **DCR の成立**と **confused deputy 対策の同意画面**の 2 点だけである。
+  - **失効手段はこちらに無い**: 発行済みトークンの台帳も失効リストも持たないため、個別失効・一括失効のいずれもこのサーバでは行えない。失効は Google 側（アカウントのアクセス権限管理）で行う。Google 側の停止・取消は、リクエスト経路の tokeninfo 照会（キャッシュ TTL 分の遅延あり）とリフレッシュ中継の両方で拒否に変わる。
+  - **署名鍵はプロセス限り（env / Secret Manager から読まない）**: 署名が必要なのは client_id（DCR 登録）・state・認可コード・同意ブロブだけになった。改竄されると `redirect_uri` の書き換えによる認可コード横取りや、任意 identity の認可コード偽造が成立するため署名自体は残す。鍵は **起動時に OS CSPRNG から 32 バイトを生成してメモリに保持する**（`SigningKey::generate`）。env も Secret Manager も使わないため、鍵の運用作業は存在しない。
+  - **再起動時の影響範囲**: 進行中のログインフロー（state / 認可コード、最長 600 秒）と DCR 登録は無効になる。DCR は claude.ai が再登録すれば自動的に回復する。**アクセストークンとリフレッシュトークンは Google 発行なので、再起動しても利用者はログアウトしない。** これが自前発行を廃止したことの直接の利点であり、鍵を使い捨てにできる根拠でもある。
+  - **ステートレス設計**: Cloud Run は `maxScale=1` かつ `minScale` 未設定でゼロスケールするため、インメモリ状態はアイドルのたびに消える。外部ストア（Firestore / Redis）は追加せず、DCR 登録・state・認可コード・同意ブロブを**署名付きの値そのものに埋め込む**。
+  - **上流の秘密を運ぶブロブは暗号化する**: 認可コード・同意ブロブ（**Google の access_token と refresh_token を運ぶ**）と **state**（AS 用の PKCE verifier を運び、Google の authorize URL にクエリとして載る）は、HMAC 署名に加えて **ChaCha20-Poly1305 で封緘**する（`SigningKey::seal` / `open`）。署名だけのブロブは base64 された平文であり、通り道にいる誰でも中身を読める。認可コードはクライアントの `redirect_uri` へ**クエリ文字列として**渡る（ブラウザ履歴・Referer・中間ログに残る）ため、自前トークン発行をやめて Google のトークンを運ぶようになったことで、この経路の危険度はむしろ上がった。暗号鍵は署名鍵からドメイン分離文字列付き HMAC で派生させ、追加の env は設けない。nonce は毎回 OS CSPRNG から生成する。
+  - **PKCE**: クライアント側は S256 必須（`plain` は拒否）。AS 自身も Google に対して PKCE を使う。`redirect_uri` は DCR 登録値との**完全一致**のみ許可（前方一致・部分一致は不可）。
+  - **自前の同意画面（confused deputy 対策）**: `/oauth/register` は無認証で任意の HTTPS `redirect_uri` を受理するため、攻撃者は自分のクライアントを登録し、本サービスを信頼する利用者を authorize URL へ誘導するだけで認可コードを自分側へ受け取れる。Google が見せる同意画面は本サービスに対するものであって、動的登録された下流クライアントの素性を示さない。したがって **Google のコールバックで identity を確定した後、認可コードを発行する前に、本サービス自身の同意画面（`/oauth/consent`）を挟む**。表示するのは登録クライアントの `client_name`（**未検証の攻撃者制御値**。HTML エスケープした上で「検証されていません」と明示する）、認可コードの配送先 `redirect_uri`、許可される操作。承認された場合のみ認可コードを発行し、拒否は `access_denied` として扱う。**認可コードを発行する経路はこの同意ハンドラのみで、同意をスキップする経路は存在しない**。同意ブロブは封緘し TTL は 300 秒、単回使用。
+  - **同意画面は 1 ログインにつき 2 枚出る（仕様）**: 1 枚目は Google の同意画面（`prompt=consent` を常に付けるため既存同意済み利用者にも毎回出る。`access_type=offline` だけでは同意済み利用者に refresh_token が返らず、下記の失効伝播が成立しないため）。2 枚目が上記の自前同意画面。運用者が「二重に出るのは故障」と誤解しないこと。
+  - **上流失効の伝播とエラー分類**: `refresh_token` グラントは毎回 Google の token endpoint へ中継されるため、**Google が拒否すればこちらも拒否する**。中継に変わってもエラー分類は維持する —— fail closed の分類は **「失効したと確信できる場合だけ拒否する」**方針で決める。`invalid_grant` を返すと OAuth クライアントはリフレッシュトークンを破棄する＝利用者が再ログインを強いられるため、判断が非対称である。**`invalid_grant` を伴う 400 / 401 だけが `invalid_grant`**。**429 / 408 / 5xx / 到達不能 / 本文不正、および `invalid_client` 等を伴う 400 / 401（＝こちらの設定不備）、その他の 4xx はすべて `503`**（`Retry-After` が示されていればクライアントへ転送する。こちらでスリープして待つことはしない ―― `maxScale=1` のインスタンスを掴んだまま待つと、避けたい飽和を自分で起こすため）。**429 を失効として扱わないのが要点**で、扱うと Google の一時的な流量制限だけで利用者が一斉に再ログインさせられる。同様に `invalid_client` を失効と区別することで、`client_secret` の設定ミス 1 つで全利用者のセッションを壊さない。Google が refresh_token を返さなかった場合はクライアントにも refresh_token を渡さず access_token のみ返す（期限切れ後は再認可に落ちる）。Google が `expires_in` を返さなかった場合は短い値（600 秒）を仮定して申告する（長く仮定すると「切れているのに使い続けて 401」になるため、早めのリフレッシュに倒す）。`expires_in` は同意画面での滞留分を差し引いてクライアントへ返す。
+  - **警告: トークンに project 束縛は無い（自前トークン廃止に伴う縮退）**: 旧実装のアクセストークンは `aud` に project_id を持ち、`/{project_id}/mcp` のミドルウェアが完全一致を検証していた。Google 発行のトークンにはこちらの project_id を載せられないため、**この境界は失われている**。すなわち **ある project 向けに取得したトークンは、このサーバの全 project の endpoint で通る**。RFC 8707 の `resource` は `/oauth/authorize` と `/oauth/token` で「設定済み project を指しているか」の入力検証にしか使っていない。**`resource` 未指定時は config の project が 1 件のときのみ許し、2 件以上なら `invalid_target` で拒否する** —— したがって project を 2 件目以降に増やすと `resource` が必須になり、送らない既存クライアントは authorize に失敗する（起動時に警告ログを 1 回出す）。ただし `resource` を送ってもテナント分離にはならないため、**project を増やす前に認可境界そのものを設計し直すこと**。
+  - **state も単回使用にする**: `Blob::State` は `jti` を持ち、`callback` の入口（**Google を叩く前**）で消費する。`/oauth/register` も `/oauth/authorize` も無認証なので、state が再利用可能だと、認証情報を持たない相手が有効な state を 1 つ入手するだけで `callback?state=<有効>&code=<任意>` を `STATE_TTL_SECS`（600 秒）にわたり任意レートで送り、**こちらから Google の token endpoint への外向きリクエストを無制限に発生させられる**。結果として (a) Google がこの OAuth クライアントをレート制限すれば、失効伝播の要である上流照会が他人の濫用で止まる（上流キャッシュで塞いだのと同じ状態が、クレデンシャル不要のより低いコストで成立する）、(b) `maxScale=1` かつ外向き timeout 5 秒のため、少数の並行 callback でインスタンスを飽和させ MCP endpoint ごと停止させられる。Google がエラーを返した経路でも state は消費する（フローが終了しているため再利用させる理由が無い）。
+  - **単回使用の担保は best-effort**: 使用済み state・認可コード・同意ブロブの jti 集合はプロセスメモリにのみ持つ。`maxScale=1` によりプロセス生存中の再利用は確実に弾けるが、コンテナ再起動をまたぐと弾けない。残存窓はコードの寿命 60 秒（同意ブロブは 300 秒）に限られ、かつコードは PKCE の `code_verifier` に束縛されるため、すり抜けても正規クライアント以外は交換できない。**使用済み記録は「記録時刻 + 固定窓」ではなく、そのブロブ自身の `exp` まで保持する**。固定窓（旧実装は `CODE_TTL_SECS` = 60 秒）だと、それより寿命の長い同意ブロブ（300 秒）が t=60..300 の窓で再利用でき、しかも消費は `action` 判定より前に行われるため**一度「拒否」した同意をブラウザバックして承認に覆せた**。ブロブ自身の `exp` を保持することで、TTL の異なる種別が増えてもこの不整合は再発しない。**OAuth 2.1 への非準拠点（意図的）**: OAuth 2.1 は認可コードの再利用を検出した際、そのコード由来の発行済みトークンを失効させることを求めるが、トークンが署名付きの自己完結値で台帳も失効リストも持たないため、**再利用を検出しても既発行トークンを取り消せない**。できるのは 2 回目以降の交換を拒否するところまでで、緩和はコードの寿命 60 秒と PKCE 束縛に限られる。**自前トークンを廃止した現在、この非準拠は Google 側の問題になっている**（発行主体が Google なので、失効も Google 側でしか行えない）。解消には外部ストアが要る。
+  - **DCR は登録の合計サイズにも上限（2KB）を課す**。件数（10）と 1 件あたりの長さ（2048）だけでは、登録が client_id（base64 で約 1.35 倍）→ 封緘 state（さらに約 1.35 倍）と二重に増幅されて authorize URL に載る経路を制御できない。実測で合計 4KB の登録は authorize URL を 9399 バイトまで押し上げ、実用的な上限（おおむね 8KB）を超えて**そのクライアントのログインが恒久的に失敗する**。登録時点で弾き、原因が authorize のリダイレクト先で初めて現れる事態を避ける。
+  - **同意画面のクリックジャッキング対策**: 同意画面には `X-Frame-Options: DENY` と CSP `frame-ancestors 'none'; default-src 'none'; style-src 'unsafe-inline'` を付ける。この画面は confused deputy に対する唯一の防御であり、フレーム可能なままだと透明オーバーレイで「許可」を押させられて対策が丸ごと無意味になる。外部リソースはインライン `<style>` のみなので CSP は素直に締められる。
+  - **キャッシュ抑止**: RFC 6749 §5.1 に従い、トークン応答・エラー応答・同意画面に `Cache-Control: no-store` / `Pragma: no-cache` を付ける。
+  - **クライアント指紋（`client_fp`）は発行ログにのみ残す**。「どのクライアント経由の操作か」を監査で切り分けるための短い識別子（client_id の SHA-256 先頭 16 桁。秘密ではない）。旧実装はこれをアクセストークンにも載せていたが、Google 発行のトークンには載せられないため、**現在はトークンからではなく `/oauth/token` の発行ログから辿る**。
+  - **クライアント登録の期限は authorize とリフレッシュの両方で検証する**。上流トークンは不透明で期限も分からないため、こちらが課せる期限はクライアント登録の有効期限（90 日）だけになった。`authorize` にだけ課していると、登録失効後もそのクライアントが Google のリフレッシュを中継させ続けられる。
+  - **`authorize` の入力検証**: `code_challenge` は S256 の形（base64url 43 文字・パディング無し）を入口で検証する。`state` は 1 KiB を上限とする（署名対象ブロブとリダイレクト URL のクエリに載るため）。
+  - **DCR 登録には 90 日の有効期限がある**（`Blob::Client` の `iat` を検証）。登録簿を持たないステートレス設計では個別失効ができないため、期限で自然に切れるようにしている。claude.ai は再登録で回復する。`redirect_uris` は 10 件・1 件あたり 2048 文字、`client_name` は 256 文字を上限とする。
+  - **リクエスト経路の Bearer 検証はネットワーク非依存の署名検証**に変わった（`server/src/oauth/middleware.rs`）。Google tokeninfo 照会（`GoogleTokenVerifier`）は `/oauth/callback` での identity 確定（aud 完全一致・`email_verified == "true"`・安定した `sub` の必須化）にのみ使う。
+  - **この変更は AuthN の配管のみで、AuthZ は一切変わっていない**。下記の「無条件 supervisor」はそのまま残っている。
 - **actor 突合のホワイトリストは廃止済み**（`server/src/harness/authn.rs`）。config `[[actors]]` による email ホワイトリスト、およびその後継として一時導入された `[default_actor]` フォールバック（commit aa9e3d8）も同じ理由で revert 済み（commit e90ef59）。config と DB の二重の正本を避けるため、config 側にホワイトリスト相当を足す実装は再度行わない。
 - **`Authenticator::lookup_by_identity` は突合を一切行わず、任意の検証済み email を無条件に `Role::Supervisor` かつ config 全 project の `allowed_schemas` で `Actor` に解決する**（`server/src/harness/authn.rs:87-104`）。supervisor は `add_known_resolution` 等の権限ゲート（`server/src/harness/mod.rs:315`）を無条件に通過する。
 - **Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済み**。テストユーザ登録による制限は外れているため、認証到達可能な母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。下記の「無条件 supervisor」と組み合わせて読むこと ―― 片方だけではリスクの規模を誤る。
 - **actor 突合表の DB 移行は未実装**。現状の歯止めは「Google 認証を通過したか」のみであり、実質的なアクセス制御は無い ―― 言い換えると、現状は Google アカウントで認証さえ通れば誰でも supervisor 権限の全操作（`add_known_resolution` を含む）が可能であり、実質的な認可（誰が何をできるか）は「Google 認証を通過したか」以上には絞られていない。`Authenticator::lookup_by_identity`（同ファイル doc comment に「DB 実装時の差し替え seam」と明記）を DB 参照に差し替えるまで、本番運用でのアクセス制御としては不十分と扱うこと。
+
+### OAuth AS の残存リスク（2026-07-21、意識的に受容したもの）
+
+以下はレビューで指摘され、**対応しないことを判断した**項目である。「気づいていない」のではなく「アプリ層では解けない、または複雑性に見合わない」と整理した結果なので、環境（前段の防御・スケール設定）を変える際は必ず読み直すこと。
+
+- **`/oauth/authorize` は無認証・回数無制限であり、素の DoS を防げない。** `register` → `authorize` は Google を叩かずに応答するため、攻撃者は任意レートで state を発行させられる。アプリ層で消せない理由は 3 つ: (1) `maxScale=1` かつインメモリ状態はゼロスケールで消えるため、レート制限の記録が保たない、(2) Cloud Run の前段ではクライアント IP を `X-Forwarded-For` 経由でしか得られず、偽装可能な値に基づく制限は攻撃者に効かない一方で NAT 配下の正規利用者を巻き込む、(3) 上限を設ければ設けたで、それ自体が正規ログインの拒否に転化する。**対応は Cloud Armor など Cloud Run 手前の信頼できるレイヤーで行うこと。** アプリ側で担保しているのは「攻撃者のリクエスト数に対して防御側コストが線形を超えないこと」までであり、その線形性は使用済み jti 集合の上限と刈り取りの償却（`MAX_USED_JTIS` / `PRUNE_THRESHOLD`）が支えている。
+- **使用済み jti 集合が満杯のときは fail closed で新規ログインを拒否する。** 単回使用を担保できない状態でブロブを通すより、その要求を拒否する方を選んだ。代償として、集合を埋められると**正規のログインを妨害できる**（可用性の低下）。ただし単回使用の回避やトークン偽造には繋がらない。可用性側の防御は上記のとおり前段の領分である。
+- **上流呼び出しの single-flight（同時リクエストの集約）は実装しない。** `maxScale=1` かつ上流リフレッシュキャッシュの TTL が 60 秒で、キャッシュミスが並行して重なる窓が狭く、集約機構の複雑性に見合わないと判断した。
+- **`/oauth/callback` の一時障害は再試行できない。** state は Google を叩く前に消費される（増幅対策）ため、上流が一時的に失敗すると同じ callback URL では再開できず、利用者は認可フローをやり直す必要がある。単回使用と再試行可能性を両立させるには消費済み state に対する上流交換結果の短期保存が要り、増幅を防ぐという単回使用の目的に対して複雑性が見合わない。エラー応答（`temporarily_unavailable`）の文言でやり直しが必要である旨を明示している。
+- **時刻源の統一は `authserver.rs` 内に限る。** `verifier.rs` のトークン単位キャッシュは `Instant`（実時計）のままで `Clock` を注入できず、期限切れをテストで固定できない。許容理由は、`refresh_upstream` が毎回新しい Google access token を検証するため**このキャッシュは同経路では原理的にヒットしない**こと。副作用として、上流リフレッシュキャッシュの TTL 経過後のリフレッシュは Google への 2 往復（token endpoint + tokeninfo）になる。
+
+#### 運用手順: リフレッシュが 503 を返し続けるとき
+
+`invalid_grant` 以外の 4xx（典型的には `invalid_client`）は、利用者のセッションを壊さないために `503 temporarily_unavailable` へ倒している。この設計上、**クライアントは再認証の合図を受け取れず 503 を再試行し続ける**。自前トークンを廃止した現在、リフレッシュトークンは Google 発行で既定では期限切れしないため、**自然回復は期待できない**。したがって 503 の継続は運用者が介入すべき信号である。
+
+1. Cloud Logging で `google refused the upstream refresh for a reason that is not a revocation` の `tracing::error!` を確認する（`oauth_error` フィールドに `invalid_client` 等が出る）。
+2. **`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET` が Google Cloud Console の現行値と一致しているかを確認する。** client_secret のローテーション・失効がこの状態の最頻の原因である。
+3. 一致していない場合は Secret Manager の値を更新して再デプロイする。利用者側の操作は不要で、次のリフレッシュから回復する。
 
 ### 実装状況（2026-07-04）
 

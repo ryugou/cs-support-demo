@@ -11,8 +11,21 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+# OAuth の署名ブロブ（client_id / state / 認可コード / トークン）を URL・クエリに
+# 載せるため、base64url（パディング無し）符号化が要る。
+base64 = "0.22"
+# Google の refresh_token を含むブロブ（認可コード・同意ブロブ・リフレッシュトークン）の
+# AEAD 封緘に使う。これらはクライアントのブラウザ・URL・トークンストアに渡るため、
+# HMAC 署名だけでは中身が base64 平文で読めてしまう（`signing.rs` の `seal` を参照）。
+# 既存の `hmac` / `sha2` と同じ RustCrypto 系統で揃えるため aes-gcm ではなくこちらを選ぶ。
+# `getrandom` は nonce を OS CSPRNG から引くために必要。
+chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+# 署名ブロブの HMAC-SHA256。`verify_slice` の定数時間比較を使うために、
+# sha2 だけで手組みせずこのクレートを使う（`==` 比較は署名の先頭一致長が
+# 応答時間に漏れる）。
+hmac = "0.12"
 http = "1"
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
