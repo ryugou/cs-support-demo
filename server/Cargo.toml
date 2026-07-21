@@ -78,3 +78,7 @@ path = "src/bin/ingest_urtect.rs"
 [[bin]]
 name = "ingest_products"
 path = "src/bin/ingest_products.rs"
+
+[[bin]]
+name = "ingest_alarmcom"
+path = "src/bin/ingest_alarmcom.rs"

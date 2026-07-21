@@ -13,6 +13,12 @@ pub struct ManualSectionInput {
     pub parent_slug: Option<String>,
     pub product_models: Vec<String>,
     pub signal_values: Vec<String>,
+    /// 英語原文の本文（`body` は検索対象の日本語訳）。`Some` のときだけ
+    /// ManualSection の `body_original` 属性として書き出す。原文を持たない
+    /// ソース（urtect Google Sites 等）は `None` を渡し、属性自体を書かない。
+    pub body_original: Option<String>,
+    /// 英語原文本文の hash。`Some` のときだけ `original_hash` 属性を書く。
+    pub original_hash: Option<String>,
 }
 
 pub struct ManualProductInput {
@@ -58,7 +64,11 @@ pub fn build_product_node(schema: &str, p: &ManualProductInput) -> GraphNode {
 }
 
 /// ManualSection ノード + HAS_SECTION/PARENT_OF/DESCRIBES/MENTIONS_SIGNAL 辺 + Signal ノード。
-/// 翻訳予約 body_original/original_hash は書かない（純予約）。
+///
+/// 多言語予約属性 body_original / original_hash は `Some` のときだけ書き出す
+/// （`None` のときは属性自体を書かず、従来の純予約動作を維持する）。source_lang は
+/// body_original が `Some`（= 英語原文を持ち日本語訳を body に載せた alarm.com 等）なら
+/// `"en"`、`None`（= urtect Google Sites 等の原文が日本語のソース）なら従来どおり `"ja"`。
 pub fn build_section_graph(
     schema: &str,
     doc_key: &str,
@@ -66,24 +76,37 @@ pub fn build_section_graph(
     content_hash_hex: &str,
 ) -> GraphBuild {
     let sec_id = manual_node_id(schema, KIND_SECTION, &s.slug);
+    let source_lang = if s.body_original.is_some() {
+        "en"
+    } else {
+        "ja"
+    };
+    let mut attributes = vec![
+        ("section_key".to_string(), s.slug.clone()),
+        ("doc_key".to_string(), doc_key.to_string()),
+        ("title".to_string(), s.title.clone()),
+        ("body".to_string(), s.body.clone()),
+        ("source_url".to_string(), s.source_url.clone()),
+        ("breadcrumb".to_string(), s.breadcrumb.clone()),
+        (
+            "section_no".to_string(),
+            s.section_no.clone().unwrap_or_default(),
+        ),
+        ("order".to_string(), s.order.to_string()),
+        ("source_lang".to_string(), source_lang.to_string()),
+        ("content_hash".to_string(), content_hash_hex.to_string()),
+    ];
+    // 予約属性は Some のときだけ書く（None は属性を書かず純予約のまま）。
+    if let Some(body_original) = &s.body_original {
+        attributes.push(("body_original".to_string(), body_original.clone()));
+    }
+    if let Some(original_hash) = &s.original_hash {
+        attributes.push(("original_hash".to_string(), original_hash.clone()));
+    }
     let mut nodes = vec![GraphNode {
         id: sec_id.clone(),
         node_type: KIND_SECTION.to_string(),
-        attributes: vec![
-            ("section_key".to_string(), s.slug.clone()),
-            ("doc_key".to_string(), doc_key.to_string()),
-            ("title".to_string(), s.title.clone()),
-            ("body".to_string(), s.body.clone()),
-            ("source_url".to_string(), s.source_url.clone()),
-            ("breadcrumb".to_string(), s.breadcrumb.clone()),
-            (
-                "section_no".to_string(),
-                s.section_no.clone().unwrap_or_default(),
-            ),
-            ("order".to_string(), s.order.to_string()),
-            ("source_lang".to_string(), "ja".to_string()),
-            ("content_hash".to_string(), content_hash_hex.to_string()),
-        ],
+        attributes,
     }];
     let mut edges = vec![GraphEdge {
         from_id: manual_node_id(schema, KIND_DOC, doc_key),
@@ -140,6 +163,8 @@ mod tests {
             parent_slug: Some("sec-1-4".into()),
             product_models: vec!["ADC-V724".into()],
             signal_values: vec!["sd_not_recognized".into()],
+            body_original: None,
+            original_hash: None,
         }
     }
 
@@ -168,8 +193,10 @@ mod tests {
             .attributes
             .iter()
             .any(|(k, v)| k == "source_lang" && v == "ja"));
-        assert!(sec.attributes.iter().any(|(k, _)| k == "body_original") == false); // 純予約は書かない
-                                                                                    // 辺: PARENT_OF（親）/ DESCRIBES（Product）/ MENTIONS_SIGNAL（Signal）
+        // body_original / original_hash が None のとき属性自体を書かない
+        assert!(!sec.attributes.iter().any(|(k, _)| k == "body_original"));
+        assert!(!sec.attributes.iter().any(|(k, _)| k == "original_hash"));
+        // 辺: PARENT_OF（親）/ DESCRIBES（Product）/ MENTIONS_SIGNAL（Signal）
         assert_eq!(
             build
                 .edges
@@ -203,6 +230,33 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn section_graph_writes_body_original_and_marks_source_lang_en_when_present() {
+        // 英語原文を持つソース（alarm.com）は body_original/original_hash を Some で渡す。
+        // このとき両属性が正しい値で出力され、source_lang は "en" になる。
+        let mut s = sample();
+        s.body_original = Some("Please reinsert the SD card.".into());
+        s.original_hash = Some("deadbeef".into());
+        let build = build_section_graph("urtect", "doc-alarmcom", &s, "abc123");
+        let sec = build
+            .nodes
+            .iter()
+            .find(|n| n.node_type == "ManualSection")
+            .unwrap();
+        assert!(sec
+            .attributes
+            .iter()
+            .any(|(k, v)| k == "body_original" && v == "Please reinsert the SD card."));
+        assert!(sec
+            .attributes
+            .iter()
+            .any(|(k, v)| k == "original_hash" && v == "deadbeef"));
+        assert!(sec
+            .attributes
+            .iter()
+            .any(|(k, v)| k == "source_lang" && v == "en"));
     }
 
     #[test]

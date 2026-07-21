@@ -5,6 +5,10 @@ use clap::Parser;
 use cs_support_mcp::{
     harness::signal::{LexiconNormalizer, SignalNormalizer},
     manual::{
+        crawl::{
+            build_product_lexicon, detect_product_models, extract_text_excluding_noise,
+            normalize_body,
+        },
         ingest_model::{
             build_document_node, build_section_graph, content_hash, ManualSectionInput,
         },
@@ -12,7 +16,6 @@ use cs_support_mcp::{
         vectors::{embed_all, vector_entry, EMBED_CONCURRENCY},
     },
     model::GraphBuild,
-    proto::graphrag::NodeResult,
     vegapunk::VegapunkClient,
 };
 use scraper::{Html, Selector};
@@ -64,6 +67,8 @@ fn extract_title(document: &Html) -> String {
 /// HTML から `<title>` とメイン本文テキストを抽出する純関数。
 /// `<main>`（無ければ document ルート）を対象に、入れ子の nav/header/footer と
 /// 定型免責文を除去する。空白正規化は行わない（`normalize_body` の責務）。
+/// nav/header/footer/script/style 除外の共通ロジックは `crawl::extract_text_excluding_noise`
+/// に集約し、ここでは `<main>` の選択と urtect 固有の定型免責文除去だけを行う。
 fn extract_main_text(html: &str) -> (String, String) {
     let document = Html::parse_document(html);
     let title = extract_title(&document);
@@ -74,98 +79,13 @@ fn extract_main_text(html: &str) -> (String, String) {
         .next()
         .unwrap_or_else(|| document.root_element());
 
-    // script/style/noscript/nav/header/footer 配下のテキストは本文でないため除外して収集する。
-    // `.text()` をそのまま使うと inline JS/CSS を拾い、Google Sites では本文が JS で汚染される。
-    let mut raw = String::new();
-    for node in container.descendants() {
-        let scraper::Node::Text(text) = node.value() else {
-            continue;
-        };
-        let under_noise = node.ancestors().any(|anc| {
-            matches!(anc.value(), scraper::Node::Element(el)
-                if matches!(el.name(), "script" | "style" | "noscript" | "nav" | "header" | "footer"))
-        });
-        if !under_noise {
-            let chunk: &str = text;
-            raw.push_str(chunk);
-            raw.push(' ');
-        }
-    }
+    let mut raw = extract_text_excluding_noise(container);
 
     for boilerplate in BOILERPLATE_SENTENCES {
         raw = raw.replace(boilerplate, "");
     }
 
     (title, raw)
-}
-
-/// 空白（改行・タブ・全角スペース含む）を単一の半角スペースへ正規化する純関数。
-fn normalize_body(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// needle が haystack 中に「英数字境界で」出現するか（前後が英数字でない位置のみ一致とみなす）。
-/// "ADC-V724" が "ADC-V724X" の内部に前方一致してしまう誤爆を防ぐために使う。
-fn contains_as_token(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    haystack.match_indices(needle).any(|(pos, _)| {
-        let end = pos + needle.len();
-        let before_ok = haystack[..pos]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_ascii_alphanumeric());
-        let after_ok = haystack[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_ascii_alphanumeric());
-        before_ok && after_ok
-    })
-}
-
-/// vegapunk から取得した Product ノード一覧を検出語彙（表層形 → product_key）に変換する。
-/// 表層形は `model` 属性自身と `aliases` 属性（カンマ区切り・trim・空要素除去）の両方を含み、
-/// 大文字化して保持する（detect_product_models 側は body を大文字化するだけで比較できる）。
-/// `model` 属性が空/欠落の Product ノードは検出語彙に加えない（fail closed にはしない。
-/// ingest_products 側の投入時点バリデーションで既に弾かれているはずだが、直接 vegapunk に
-/// 投入された不正データで crawl 全体を止めないための防御的スキップ）。
-fn build_product_lexicon(products: &[NodeResult]) -> HashMap<String, String> {
-    let mut lexicon = HashMap::new();
-    for product in products {
-        let model = match product.attributes.get("model") {
-            Some(m) if !m.trim().is_empty() => m.clone(),
-            _ => continue,
-        };
-        lexicon.insert(model.to_uppercase(), model.clone());
-        if let Some(aliases) = product.attributes.get("aliases") {
-            for alias in aliases.split(',') {
-                let trimmed = alias.trim();
-                if !trimmed.is_empty() {
-                    lexicon.insert(trimmed.to_uppercase(), model.clone());
-                }
-            }
-        }
-    }
-    lexicon
-}
-
-/// body に出現する型番を検出する（DESCRIBES 辺のもとになる）。`lexicon` は
-/// `build_product_lexicon` が組み立てた表層形（大文字）→ product_key の対応表。
-/// 同一 product が model と alias の両方でヒットしても 1 回だけ返す。戻り値の順序は
-/// product_key の文字列昇順で決定論的にする（差分 ingest のハッシュ計算に混ぜるため
-/// 安定した順序が必須）。
-fn detect_product_models(body: &str, lexicon: &HashMap<String, String>) -> Vec<String> {
-    let upper = body.to_uppercase();
-    let mut hit_keys: HashSet<String> = HashSet::new();
-    for (surface_form, product_key) in lexicon {
-        if contains_as_token(&upper, surface_form) {
-            hit_keys.insert(product_key.clone());
-        }
-    }
-    let mut result: Vec<String> = hit_keys.into_iter().collect();
-    result.sort();
-    result
 }
 
 /// nav リンク 1 件（同一ホスト・manual 配下のみ列挙。列挙順を保つ Vec）。
@@ -704,6 +624,10 @@ async fn main() -> Result<()> {
             parent_slug,
             product_models,
             signal_values,
+            // urtect の原文は日本語（Google Sites）なので英語原文予約は使わない。
+            // source_lang は build_section_graph 側で従来どおり "ja" になる。
+            body_original: None,
+            original_hash: None,
         };
         let build = build_section_graph(&args.schema, DOC_KEY, &input, &hash);
         nodes.extend(build.nodes);
@@ -841,7 +765,8 @@ mod tests {
           <body><nav>目次</nav><main><h1>SDカードが認識されない</h1><p>抜き差し。</p>
           <script>var Symbol=typeof window!=="undefined";function noise(){return 42}</script>
           <footer>マニュアルの内容や画面は予告なく変更になる場合があります</footer></main></body></html>"#;
-        let (title, body) = extract_main_text(html);
+        let (title, raw) = extract_main_text(html);
+        let body = normalize_body(&raw);
         assert_eq!(title, "SDカードが認識されない");
         assert!(body.contains("抜き差し"));
         assert!(!body.contains("予告なく変更"));
@@ -852,104 +777,6 @@ mod tests {
         assert!(!body.contains("color:red"));
     }
 
-    /// テスト用の型番検出語彙: ADC-V724 / ADC-V724X / ADC-VC727P の 3 型番を、
-    /// それぞれ自分自身を表層形として登録する（現行 products.json の seed と同じ形）。
-    fn sample_lexicon() -> HashMap<String, String> {
-        let mut lexicon = HashMap::new();
-        lexicon.insert("ADC-V724".to_string(), "ADC-V724".to_string());
-        lexicon.insert("ADC-V724X".to_string(), "ADC-V724X".to_string());
-        lexicon.insert("ADC-VC727P".to_string(), "ADC-VC727P".to_string());
-        lexicon
-    }
-
-    #[test]
-    fn detects_model_without_false_positive_on_prefix() {
-        // "ADC-V724X" は "ADC-V724" の前方一致だが、V724 単体としては誤検出しない。
-        let models = detect_product_models("この設定は ADC-V724X 専用です。", &sample_lexicon());
-        assert_eq!(models, vec!["ADC-V724X".to_string()]);
-    }
-
-    #[test]
-    fn detects_multiple_models_when_both_mentioned() {
-        let models = detect_product_models(
-            "ADC-V724 と ADC-V724X の両方に対応します。",
-            &sample_lexicon(),
-        );
-        assert_eq!(
-            models,
-            vec!["ADC-V724".to_string(), "ADC-V724X".to_string()]
-        );
-    }
-
-    #[test]
-    fn detects_model_directly_via_exact_match() {
-        let models = detect_product_models("ADC-VC727P の設定手順です。", &sample_lexicon());
-        assert_eq!(models, vec!["ADC-VC727P".to_string()]);
-    }
-
-    #[test]
-    fn resolves_alias_hit_to_product_key() {
-        // alias は product_key（= model）と異なる表層形になり得る。ヒットは alias の
-        // 文字列ではなく product_key（対応表の値）で返す。
-        let mut lexicon = HashMap::new();
-        lexicon.insert("ADC-V724".to_string(), "ADC-V724".to_string());
-        lexicon.insert("V724 PRO".to_string(), "ADC-V724".to_string());
-        let models = detect_product_models("V724 PRO の設定について。", &lexicon);
-        assert_eq!(models, vec!["ADC-V724".to_string()]);
-    }
-
-    #[test]
-    fn dedupes_when_model_and_alias_both_hit_same_product() {
-        // 本文中に model と alias の両方が出現しても、同一 product は 1 回だけ返す。
-        let mut lexicon = HashMap::new();
-        lexicon.insert("ADC-V724".to_string(), "ADC-V724".to_string());
-        lexicon.insert("V724 PRO".to_string(), "ADC-V724".to_string());
-        let models = detect_product_models("ADC-V724（別名 V724 PRO）です。", &lexicon);
-        assert_eq!(models, vec!["ADC-V724".to_string()]);
-    }
-
-    #[test]
-    fn detection_is_case_insensitive() {
-        // body 側だけ大文字化して比較するため、小文字表記の本文でもヒットする。
-        let models = detect_product_models("adc-v724 は防水です。", &sample_lexicon());
-        assert_eq!(models, vec!["ADC-V724".to_string()]);
-    }
-
-    fn node_result(model: &str, aliases: &str) -> NodeResult {
-        let mut attributes = HashMap::new();
-        attributes.insert("model".to_string(), model.to_string());
-        attributes.insert("aliases".to_string(), aliases.to_string());
-        NodeResult {
-            node_id: format!("urtect:gen1:Product:{model}"),
-            node_type: "Product".to_string(),
-            attributes,
-        }
-    }
-
-    #[test]
-    fn lexicon_includes_model_and_aliases_uppercased() {
-        let products = vec![node_result("ADC-V724", "V724 Pro, 旧型番V724")];
-        let lexicon = build_product_lexicon(&products);
-        assert_eq!(lexicon.get("ADC-V724"), Some(&"ADC-V724".to_string()));
-        assert_eq!(lexicon.get("V724 PRO"), Some(&"ADC-V724".to_string()));
-        assert_eq!(lexicon.get("旧型番V724"), Some(&"ADC-V724".to_string()));
-    }
-
-    #[test]
-    fn lexicon_skips_empty_alias_segments() {
-        // "A,,B" のような空要素混じりの aliases でも trim・空要素除去して安全に扱う。
-        let products = vec![node_result("ADC-V724", " , ,")];
-        let lexicon = build_product_lexicon(&products);
-        // aliases 側は全部空なので、model 自身のキーしか登録されない。
-        assert_eq!(lexicon.len(), 1);
-        assert_eq!(lexicon.get("ADC-V724"), Some(&"ADC-V724".to_string()));
-    }
-
-    #[test]
-    fn lexicon_skips_product_with_empty_model_attribute() {
-        // model 属性が空/欠落の Product ノードは検出語彙に加えない（防御的スキップ）。
-        let products = vec![node_result("", "")];
-        let lexicon = build_product_lexicon(&products);
-        assert!(lexicon.is_empty());
-    }
+    // 型番検出・製品語彙のユニットテストは `manual::crawl` へ移設した
+    // （build_product_lexicon / detect_product_models / contains_as_token の定義先）。
 }
