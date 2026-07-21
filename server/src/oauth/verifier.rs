@@ -1,5 +1,6 @@
 use super::{AuthError, VerifiedIdentity};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -306,23 +307,39 @@ impl GoogleTokenVerifier {
     }
 
     fn cached(&self, token: &str) -> Option<VerifiedIdentity> {
+        let key = cache_key(token);
         // lock 保持は HashMap 参照のみの短時間。await をまたがないので poison 化のリスクは実質ない。
         let cache = self.cache.lock().unwrap();
         cache
-            .get(token)
+            .get(&key)
             .filter(|(_, exp)| *exp > Instant::now())
             .map(|(identity, _)| identity.clone())
     }
 
     fn store(&self, token: &str, identity: &VerifiedIdentity, ttl: Duration) {
+        let key = cache_key(token);
         let mut cache = self.cache.lock().unwrap();
         // insert 前に期限切れエントリを purge する。TTL は実トークンの exp 由来（`cache_ttl`）
         // なので、これで「有効なトークン数」に比例した大きさに有界化される
         // （TTL 無視の固定 300 秒だと、失効済みトークンのエントリが最大 300 秒分溜まり続けていた）。
         let now = Instant::now();
         cache.retain(|_, (_, exp)| *exp > now);
-        cache.insert(token.to_string(), (identity.clone(), now + ttl));
+        cache.insert(key, (identity.clone(), now + ttl));
     }
+}
+
+/// キャッシュキーを生トークンではなく SHA-256 ハッシュから導く。
+///
+/// Copilot コードレビュー2巡目指摘: キャッシュのキーに生の Bearer トークン文字列を
+/// そのまま使うと、TTL（最大 `MAX_CACHE_TTL` = 5 分）の間、プロセスメモリ上に有効な
+/// トークンが平文で残り続ける。メモリダンプが取れれば有効な認証情報がそのまま得られて
+/// しまうため、キーはハッシュへ倒す。
+///
+/// `cached` / `store` の両方が必ずこの関数だけを経由するようにする（呼び出し口で直接
+/// `token.to_string()` をキーに使わない）。片方だけ生トークンを使ってしまう事故を、
+/// 呼び出し規約ではなく構造で防ぐのが目的。
+fn cache_key(token: &str) -> String {
+    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 #[cfg(test)]
@@ -620,6 +637,69 @@ mod tests {
             hits.load(Ordering::SeqCst),
             2,
             "response without expires_in must not be cached"
+        );
+    }
+
+    /// Copilot コードレビュー2巡目指摘: キャッシュのキーとして生の Bearer トークン文字列を
+    /// 保持すると、プロセスのメモリダンプが取れた場合に有効なトークンが平文で得られてしまう。
+    /// キャッシュキーは SHA-256 ハッシュでなければならず、生トークンが部分文字列としても
+    /// 現れてはいけない。
+    #[tokio::test]
+    async fn cache_key_never_contains_the_raw_bearer_token() {
+        let (url, _hits, _requests) = spawn_tokeninfo_stub(STUB_WITH_EXPIRES).await;
+        let verifier = stub_verifier(url);
+        verifier.verify(SECRET_TOKEN).await.expect("verify");
+
+        let cache = verifier.cache.lock().unwrap();
+        assert!(
+            !cache.is_empty(),
+            "verify with expires_in must populate the cache"
+        );
+        for key in cache.keys() {
+            assert!(
+                !key.contains(SECRET_TOKEN),
+                "raw bearer token leaked into cache key: {key}"
+            );
+        }
+    }
+
+    /// キャッシュキーをハッシュ化しても、異なるトークンが同一キーへ衝突してはいけない
+    /// （衝突すると別ユーザの検証結果を誤って返しかねない）。2 種のトークンをそれぞれ
+    /// 2 回ずつ検証し、tokeninfo への実リクエスト数が初回の 2 回のまま増えないことで、
+    /// 各トークンが自分自身のキャッシュエントリにヒットしていることを確認する。
+    #[tokio::test]
+    async fn distinct_tokens_do_not_collide_in_cache() {
+        let (url, hits, _requests) = spawn_tokeninfo_stub(STUB_WITH_EXPIRES).await;
+        let verifier = stub_verifier(url);
+        let token_a = SECRET_TOKEN;
+        let token_b = "ya29.ANOTHER-DIFFERENT-TOKEN-zzz";
+
+        verifier
+            .verify(token_a)
+            .await
+            .expect("verify token_a first");
+        verifier
+            .verify(token_b)
+            .await
+            .expect("verify token_b first");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "two distinct tokens must each cause one tokeninfo request"
+        );
+
+        verifier
+            .verify(token_a)
+            .await
+            .expect("verify token_a second");
+        verifier
+            .verify(token_b)
+            .await
+            .expect("verify token_b second");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "repeat verification of two distinct tokens must be served from cache without collision"
         );
     }
 
