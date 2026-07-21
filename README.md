@@ -34,13 +34,27 @@ Tool 一覧（S1-7 の 12 本）:
 - 記録: `record_answer_attempt`（出口ゲート適用。pass = 担当者へ応答可）/ `record_answer_outcome`（grade 昇格・降格）/ `record_operator_feedback`（訂正インテーク）/ `create_escalation_event`
 - 知識追加: `add_known_resolution`（supervisor / admin のみ）
 
-### Actor 認証（JWT HS256）
+### Actor 認証（Google OAuth 2.1）
 
-`Authorization: Bearer <JWT>`（`Claims { sub, role, exp, iss }`）を HS256 で検証し、
-config の `[[actors]]` 表（sub → role / allowed_schemas）で AccessScope を導出する。
+`cs-support-mcp` は OAuth リソースサーバであり、認可サーバ（IdP）は Google
+（`accounts.google.com`）である。トークン無しでアクセスすると `401` と
+`WWW-Authenticate: Bearer resource_metadata="https://{public_host}/.well-known/oauth-protected-resource/{project_id}/mcp"`
+ヘッダを返す（無効・期限切れ・aud 不一致・email 未検証のトークンでも同様に 401）。
 
-- 共有鍵: `[auth] jwt_secret_file` または env `CS_SUPPORT_JWT_SECRET_FILE`（平文を config に置かない）
-- ローカル開発: 鍵未設定時は `[auth] default_actor` にフォールバック（warn ログ付き。GCE では鍵必須）
+> **警告:** 現状は検証済み Google アカウントで認証さえ通れば、突合表を経由せず
+> 無条件で `Role::Supervisor` として扱われる（`server/src/harness/authn.rs`
+> `Authenticator::lookup_by_email`）。`add_known_resolution` を含む全操作が
+> Google アカウントを持つ任意のユーザーから実行可能であり、actor 突合表の
+> DB 実装が完了するまでアクセス制御としては不十分。
+>
+> さらに Google OAuth 同意画面は 2026-07-21 に **External（本番公開）** へ切替済みで、
+> テストユーザによる制限は無い。したがって上記「任意のユーザー」の母集団は
+> sivira.co 内部ではなく**全世界の任意の Google アカウント**である。
+> 詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
+
+JWT HS256 の共有鍵検証や config `[[actors]]` / `[auth] default_actor` による
+role 導出は**撤去済みの旧方式**（commit 1809b8e / e90ef59 で撤去）であり、
+現行実装には存在しない。
 
 ### Step 1 ルール・語彙の投入
 
@@ -61,14 +75,10 @@ VEGAPUNK_BEARER_TOKEN_FILE=/private/tmp/vegapunk-bearer-token \
 ## Prerequisites
 
 - Rust toolchain
-- Running vegapunk gRPC endpoint
+- Reachable vegapunk gRPC endpoint（例: `http://vegapunk.local:6840`。ローカルで
+  `vegapunk` を起動しない。SSH tunnel も不要。詳細はリポジトリルート
+  `CLAUDE.md` の「ローカル MCP 起動手順」節を参照）
 - Bearer token for vegapunk
-
-For the current shared vegapunk host, an SSH tunnel can expose gRPC locally:
-
-```sh
-ssh -i ~/.ssh/macmini-connect-key -L 16840:127.0.0.1:6840 -N agent@192.168.0.128
-```
 
 ## Ingest Demo Data
 
@@ -76,7 +86,7 @@ ssh -i ~/.ssh/macmini-connect-key -L 16840:127.0.0.1:6840 -N agent@192.168.0.128
 cd server
 export VEGAPUNK_BEARER_TOKEN=...
 cargo run --bin ingest_demo -- \
-  --endpoint http://127.0.0.1:16840 \
+  --endpoint http://vegapunk.local:6840 \
   --schema sivira-cs-demo \
   --schema-file ../schema/cs-schema.yml \
   --manual-file data/manual.sample.json \
@@ -101,7 +111,7 @@ Expected result:
 cd server
 export VEGAPUNK_BEARER_TOKEN=...
 cargo run --bin verify_demo -- \
-  --endpoint http://127.0.0.1:16840 \
+  --endpoint http://vegapunk.local:6840 \
   --schema sivira-cs-demo
 ```
 

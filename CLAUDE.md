@@ -40,7 +40,7 @@ TypeScript も使用しない。tsx / npm / package.json を追加しない。
 
 ## 現行サンプル実装メモ
 
-この節以降の既存 schema / ingest / tool / acceptance / 起動手順のうち、`sivira-cs-demo`、サンプル商品、fixture、`ingest_demo`、`verify_demo`、検証用 GCE domain に依存するものは、現行サンプル実装の記録である。
+この節以降の既存 schema / ingest / tool / acceptance / 起動手順のうち、`sivira-cs-demo`、サンプル商品、fixture、`ingest_demo`、`verify_demo`、検証用 GCE domain（旧構成、参考。Cloud Run へ移行済み）に依存するものは、現行サンプル実装の記録である。
 
 Production CS MCP の設計判断では `specs/production-cs-mcp.md` を優先する。現行サンプル実装から流用する場合も、AuthN / AuthZ Harness、scope enforcement、ノウハウ蓄積、確実なエスカレーションを前提に再設計する。
 
@@ -207,8 +207,10 @@ cs-support-mcp/
 - cross-schema 検索はしない。
 - MCP endpoint は `/{project_id}/mcp`。
 - `project_id` から schema を解決し、vegapunk 呼び出しへ注入する。
-- 認証はプロジェクトごとの静的 Bearer token とする。
-- 現行サンプル project は `sivira-cs-demo` の 1 件のみ。
+- 認証は Google OAuth 2.1 とする。`cs-support-mcp` は OAuth リソースサーバとして動作し、認可サーバは Google（`accounts.google.com`）。無トークンアクセスは `401` + `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/{project_id}/mcp"` を返し、クライアントはこのメタデータ経由で認可サーバ（Google）を発見する。プロジェクトごとの静的 Bearer token・静的 JWT は撤去済み。
+- **警告**: 現状、Google アカウントで認証さえ通れば誰でも supervisor として `add_known_resolution` を含む全操作を実行できる（`server/src/harness/authn.rs` の `lookup_by_email` が突合を行わず無条件に supervisor 解決するため）。actor 突合表の DB 実装が入るまで、アクセス制御としては不十分と扱うこと。詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
+- **警告（上記の規模）**: Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済みで、テストユーザによる制限は無い。したがって上記「誰でも」の母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。OAuth クライアントが Internal（組織限定）だと仮定しないこと。
+- 本番 Cloud Run の project 定義は `sivira-cs-demo` と `urtect` の 2 件（`server/config.cloudrun.toml`）。本番 MCP endpoint は `urtect` 側。`allowed_schemas` は config 全 project の複製で解決されるため（`server/src/harness/authn.rs`）、project 数の把握を誤ると認可範囲の誤解に直結する。
 - mapping は 1 件でも、将来別 schema を引ける構造にする。
 
 ## Ingest
@@ -256,12 +258,10 @@ cs-support-mcp/
 - issue / トラブルログの蓄積や活用
 - issue node / edge のスキーマ追加
 - 訳の手動オーバーライド保護
-- OIDC
 - ウォレット認証
 - 管理 UI
 - プロビジョニング自動化
 - 10 万ノード超のスケール最適化
-- 監査ログ
 
 ## Agent Working Rules
 
@@ -292,18 +292,8 @@ cs-support-mcp/
 - 禁止: ローカルで `vegapunk` を起動しない
 - 禁止: `ssh -L 16840:...` の tunnel を張らない
 
-`.mcp.json` は次を指す。
-
-```json
-{
-  "mcpServers": {
-    "cs-support-demo": {
-      "type": "http",
-      "url": "https://127.0.0.1:3443/sivira-cs-demo/mcp"
-    }
-  }
-}
-```
+`.mcp.json` は使わない（demo 開発時の localhost 登録ごと削除済み）。MCP クライアントからの接続は
+claude.ai のカスタムコネクタ経由に一本化する。ローカルサーバへ疎通確認するときは、下記の `curl` を使う。
 
 前提:
 
@@ -311,7 +301,7 @@ cs-support-mcp/
 - TLS 証明書は `server/certs/cert.pem` と `server/certs/key.pem`
 - vegapunk bearer token は `/private/tmp/vegapunk-bearer-token` に置く
 - `vegapunk` をローカルで起動しない。SSH tunnel も不要
-- `server/config.toml` の HTTP `127.0.0.1:3000` 起動は `.mcp.json` と一致しないため使わない
+- `server/config.toml` の HTTP `127.0.0.1:3000` 起動は使わない（ローカルは `3443` の HTTPS に統一する）
 
 token が無い場合だけ、既存 `vegapunk` ホストから取得する。
 
@@ -319,7 +309,14 @@ token が無い場合だけ、既存 `vegapunk` ホストから取得する。
 ssh vegapunk 'ruby -ryaml -e "c=YAML.load_file(File.expand_path(%q[~/.config/vegapunk/config.yml])); print c.dig(%q[server],%q[auth],%q[token])"' > /private/tmp/vegapunk-bearer-token
 ```
 
-ローカル MCP サーバを起動する。
+ローカル MCP サーバを起動する。`CS_SUPPORT_PUBLIC_DOMAIN` と `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は
+`main.rs` の起動時 fail-closed チェック（`CS_SUPPORT_PUBLIC_DOMAIN`: main.rs:85-88、
+`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`: main.rs:105-107）で必須。無いと起動に失敗する。
+`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は Google Cloud Console で発行済みの OAuth Client ID を設定する
+（本番と同一のものを使ってよい。client_id は公開識別子で aud 照合にのみ使うため、コマンド例に値を
+直書きせず各自の値に置き換えること）。ただし localhost 向け redirect URI は Google 側に未登録のため、
+ブラウザ経由の OAuth ログインフローそのものはローカルで完結しない。ローカルでの疎通確認は
+Bearer 無しアクセスに対する 401 応答の確認までに留まる。
 
 ```sh
 cd server
@@ -327,10 +324,12 @@ env -u RUSTC_WRAPPER \
   CARGO_BUILD_RUSTC_WRAPPER= \
   RUST_LOG=info \
   VEGAPUNK_BEARER_TOKEN_FILE=/private/tmp/vegapunk-bearer-token \
+  CS_SUPPORT_PUBLIC_DOMAIN=127.0.0.1:3443 \
+  CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID=<Google Cloud Console で発行済みの OAuth Client ID> \
   cargo run --bin cs-support-mcp -- --config config.local-https.toml
 ```
 
-すでに別の `cs-support-mcp` が `3443` を掴んでいる場合は、古いプロセスを止めてから上記で起動し直す。`3000` で起動しているプロセスがあれば、それは `.mcp.json` から使われない古い起動なので止める。
+すでに別の `cs-support-mcp` が `3443` を掴んでいる場合は、古いプロセスを止めてから上記で起動し直す。`3000` で起動しているプロセスがあれば、それは古い起動なので止める。
 
 起動確認:
 
@@ -347,115 +346,78 @@ curl -kNsS -H 'Accept: application/json, text/event-stream' \
   https://127.0.0.1:3443/sivira-cs-demo/mcp
 ```
 
+Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` が返るのが正常（`require_google_auth`
+ミドルウェア、main.rs:136-144。Cloud Run 節の「認証（Google OAuth 2.1、実測済み）」と同じ挙動）。
+`initialize` が `200` で通ることを期待するコマンドではない。MCP サーバ自体の疎通確認をしたいだけなら
+`curl -ksS https://127.0.0.1:3443/livez` や
+`curl -ksS https://127.0.0.1:3443/.well-known/oauth-protected-resource/sivira-cs-demo/mcp` を使う。
+
 `search_manual` がクライアント側で失敗する場合は、まずクライアントが古い MCP セッションを掴んでいないか確認し、MCP 接続を再読み込みする。サーバ側の直叩きで `structuredContent.hits` が返るなら、MCP サーバ本体ではなくクライアントの接続状態を疑う。
 
-## GCE デプロイ手順
+## Cloud Run デプロイ手順
 
-このリポジトリは、共有 GCE VM `llm-memory` 上の既存 `llm-memory-extention` stack に `cs-support-mcp` service としてデプロイする。Caddy も同じ stack に同居している。
+このリポジトリは GCP Cloud Run 上に `cs-support-mcp` service としてデプロイされている（GCE VM `llm-memory` 上の旧構成から移行済み。旧構成は下記「旧構成（参考）」を参照）。
 
-- VM: `llm-memory`
-- zone: `asia-northeast1-a`
-- remote source dir: `/home/ryugo/cs-support-demo`
-- stack dir: `/home/ryugo/llm-memory-extention/docker`
-- deploy wrapper: `/home/ryugo/llm-memory-extention/deploy/gce/run.sh`
-- public domain: `cs-support-136-110-78-245.nip.io`
-- public MCP endpoint: `https://cs-support-136-110-78-245.nip.io/sivira-cs-demo/mcp`
-- internal port: `8080`
-- bind addr: `BIND_ADDR=0.0.0.0:8080`
-- config file in container: `/app/server/config.gce.toml`
-- required env: `VEGAPUNK_BEARER_TOKEN`, `VEGAPUNK_ENDPOINT`, `CS_SUPPORT_PUBLIC_DOMAIN`
-- vegapunk endpoint on GCE: `VEGAPUNK_ENDPOINT=${VEGAPUNK_GRPC_ENDPOINT}`
-- secret source: 既存 stack の Secret Manager injection。平文 token を `.env` に置かない
-- 禁止: `docker compose` を直接実行しない
+- GCP project: `sivira-cs-support`
+- region: `asia-northeast1`
+- service: `cs-support-mcp`
+- image: `asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>`（`<tag>` は git short SHA を使う運用）
+- public URL: `https://cs-support-mcp-235108918288.asia-northeast1.run.app`
+- MCP endpoint: `https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp`
+- Cloud Run jobs（service と同一イメージ）: `ingest-rules`, `ingest-urtect`
+- env（fail-closed 境界で2群に分けて扱うこと）:
+  - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`（`main.rs:85-88`）、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`（`main.rs:105-107`）、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs:54` で起動時 fail closed）
+  - **未設定でも起動する**: `VEGAPUNK_ENDPOINT`（`config.cloudrun.toml:13` の値にフォールバック。env があれば `config.rs:218` が上書き）、`VEGAPUNK_BEARER_TOKEN`
+- Secret Manager injection で注入するのは **`VEGAPUNK_BEARER_TOKEN` と `CS_SUPPORT_LLM_API_KEY` のみ**（真に秘密の値）。`CS_SUPPORT_PUBLIC_DOMAIN` は公開ホスト名、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は公開識別子（aud 照合にのみ使う）であり、平文 env で構わない。非機密値まで Secret Manager に入れると「どれが本当の秘密か」の判断基準が失われる。
+- `[llm] enabled = true` のため、**顧客問い合わせ本文が Anthropic API へ送信される**。運用上の注意点として認識しておくこと。
+  `VEGAPUNK_BEARER_TOKEN` 未設定時は起動自体は成功するが、vegapunk 呼び出し（`search_manual` 等）だけが
+  失敗する（`main.rs:192-202`。空文字がそのまま使われるため fail-closed にならない点に注意）。
 
-既存 stack 側の設定:
-
-- `/home/ryugo/llm-memory-extention/docker/docker-compose.override.yml`
-  - `cs-support-mcp` service を定義する
-  - `BIND_ADDR=0.0.0.0:8080`
-  - `VEGAPUNK_ENDPOINT=${VEGAPUNK_GRPC_ENDPOINT:?VEGAPUNK_GRPC_ENDPOINT is required}`
-  - `CS_SUPPORT_PUBLIC_DOMAIN=${CS_SUPPORT_PUBLIC_DOMAIN}`
-  - `VEGAPUNK_BEARER_TOKEN` は Secret Manager injection で渡す
-- `/home/ryugo/llm-memory-extention/docker/Caddyfile`
-  - `{$CS_SUPPORT_PUBLIC_DOMAIN}` の site block を追加する
-  - `reverse_proxy cs-support-mcp:8080`
-- `/home/ryugo/llm-memory-extention/.env`
-  - `VEGAPUNK_GRPC_ENDPOINT=http://10.10.0.2:6840`
-  - `CS_SUPPORT_PUBLIC_DOMAIN=cs-support-136-110-78-245.nip.io`
-
-ローカルの作業ツリーを VM に転送して service を build / restart する。デプロイ/再起動は必ず wrapper を使う。
+ビルド & デプロイ:
 
 ```sh
-COPYFILE_DISABLE=1 tar \
-  --exclude .git \
-  --exclude server/target \
-  --exclude .DS_Store \
-  --exclude server/certs \
-  -czf /private/tmp/cs-support-demo-src.tar.gz .
+gcloud builds submit --project sivira-cs-support --region asia-northeast1 --tag asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag> .
 
-gcloud compute scp \
-  --zone asia-northeast1-a \
-  /private/tmp/cs-support-demo-src.tar.gz \
-  llm-memory:~/cs-support-demo-src.tar.gz
+gcloud run services update cs-support-mcp --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
 
-gcloud compute ssh llm-memory --zone asia-northeast1-a --command '
-set -e
-rm -rf ~/cs-support-demo
-mkdir -p ~/cs-support-demo
-tar -xzf ~/cs-support-demo-src.tar.gz -C ~/cs-support-demo
-rm -f ~/cs-support-demo-src.tar.gz
-~/llm-memory-extention/deploy/gce/run.sh up -d --build cs-support-mcp
-'
+gcloud run jobs update ingest-rules --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
+
+gcloud run jobs update ingest-urtect --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
 ```
 
-Caddyfile または Caddy service 側の env / depends_on を変えた場合だけ、Caddy も wrapper で反映する。
+`<tag>` は service と両 job で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。
+
+### 認証（Google OAuth 2.1、実測済み）
+
+> **AuthN は機能しているが AuthZ は実質無い。** 以下は「認証が正しく動いている」証跡であって、
+> 認可が効いていることの証跡ではない。同意画面は External（本番公開）で、認証を通した任意の
+> Google アカウントが supervisor 全権を得る。デプロイや公開範囲を触る前に、上記
+> 「Project Routing and Auth」節の警告2点を必ず読むこと。
+
+静的 Bearer token・静的 JWT は撤去済み。`cs-support-mcp` は OAuth 2.1 リソースサーバとして動作し、認可サーバは Google（`accounts.google.com`）。
+
+- 無トークン `POST /urtect/mcp` → `401` + `WWW-Authenticate: Bearer resource_metadata="https://cs-support-mcp-235108918288.asia-northeast1.run.app/.well-known/oauth-protected-resource/urtect/mcp"`
+- `GET /.well-known/oauth-protected-resource/urtect/mcp` → `200 application/json`:
+  ```json
+  {"resource":"https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp","authorization_servers":["https://accounts.google.com"]}
+  ```
+- `GET /.well-known/oauth-authorization-server` → **404 が正常**。認可サーバは Google 自身であり、このリソースサーバが認可サーバのメタデータを自前で持つ必要はないため。壊れていると早合点しないこと。
+- `GET /livez` → `200`
+
+### 確認コマンド
 
 ```sh
-gcloud compute ssh llm-memory --zone asia-northeast1-a --command '
-set -e
-~/llm-memory-extention/deploy/gce/run.sh up -d --build caddy
-'
+curl -sS https://cs-support-mcp-235108918288.asia-northeast1.run.app/livez
+
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp
+
+curl -sS https://cs-support-mcp-235108918288.asia-northeast1.run.app/.well-known/oauth-protected-resource/urtect/mcp
+
+curl -sS -o /dev/null -w '%{http_code}\n' https://cs-support-mcp-235108918288.asia-northeast1.run.app/.well-known/oauth-authorization-server
 ```
 
-初回またはサンプルデータを入れ直すときは、起動済み container 内の CLI で ingest / verify する。`VEGAPUNK_ENDPOINT` は container 内で展開させるため、必ず `/bin/sh -lc` を使う。
+MCP tool 呼び出しは claude.ai のカスタムコネクタ（URL = 上記 MCP endpoint、詳細設定に Google の Client ID/Secret を入力）経由で行う。E2E のクライアントは claude.ai。
 
-```sh
-gcloud compute ssh llm-memory --zone asia-northeast1-a --command '
-set -e
-docker exec llm-memory-extention-cs-support-mcp-1 /bin/sh -lc '\''/usr/local/bin/ingest_demo --endpoint "$VEGAPUNK_ENDPOINT" --schema sivira-cs-demo --schema-file /app/schema/cs-schema.yml --manual-file /app/server/data/manual.sample.json --glossary-file /app/server/data/glossary.json'\''
-docker exec llm-memory-extention-cs-support-mcp-1 /bin/sh -lc '\''/usr/local/bin/verify_demo --endpoint "$VEGAPUNK_ENDPOINT" --schema sivira-cs-demo'\''
-'
-```
+## 旧構成（参考、Cloud Run へ移行済み）
 
-デプロイ後の公開確認:
-
-```sh
-curl -sS https://cs-support-136-110-78-245.nip.io/healthz
-```
-
-MCP の確認は `Accept: application/json, text/event-stream` を付ける。`initialize` の response header `mcp-session-id` を、以降の `tools/list` / `tools/call` に渡す。
-
-```sh
-curl -NsS -D /private/tmp/cs-support-public-headers.txt \
-  -H 'Accept: application/json, text/event-stream' \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' \
-  https://cs-support-136-110-78-245.nip.io/sivira-cs-demo/mcp
-
-SESSION=$(awk 'BEGIN{IGNORECASE=1} /^mcp-session-id:/ {gsub("\r", "", $2); print $2}' /private/tmp/cs-support-public-headers.txt)
-
-curl -NsS \
-  -H 'Accept: application/json, text/event-stream' \
-  -H 'Content-Type: application/json' \
-  -H "mcp-session-id: $SESSION" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_manual","arguments":{"product_key":"SVR-HB100","query_ja":"ボタンが反応しない 無反応 再起動 電源 トラブルシューティング","top_k":5}}}' \
-  https://cs-support-136-110-78-245.nip.io/sivira-cs-demo/mcp
-```
-
-現在の正常系確認結果:
-
-- `healthz`: `200 ok`
-- `ingest_demo`: `upserted_nodes=42`, `upserted_edges=54`
-- `verify_demo`: `products=3`, `sections=27`, `specs=9`, `snapshot_nodes=42`, `snapshot_edges=54`
-- `resolve_product("SVR-HB100")`: `SVR-HB100` が `normalized_match`, score `1.0`
-- `search_manual` の SVR-HB100 問い合わせ: `structuredContent.hits` が返る
+本番は GCE VM `llm-memory` 上の既存 `llm-memory-extention` stack（Caddy 同居、`cs-support-136-110-78-245.nip.io`）から、上記 Cloud Run 構成へ移行済み。GCE 版のサービス定義・Caddyfile 差分・デプロイ手順の詳細は git 履歴（このファイルの旧版）を参照すること。VM `llm-memory` 自体は他サービスと共用で存在し続けているが、`cs-support-mcp` はもう乗っていない。
