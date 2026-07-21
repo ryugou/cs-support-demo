@@ -384,6 +384,9 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 - public URL: `https://cs-support-mcp-235108918288.asia-northeast1.run.app`
 - MCP endpoint: `https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp`
 - Cloud Run jobs（service と同一イメージ）: `ingest-rules`, `ingest-urtect`
+- **製品マスタの正本は vegapunk の Product ノード**（Issue #6: `KNOWN_MODELS` 定数は廃止済み）。`server/data/urtect/products.json` はコードではなく、`ingest_products` CLI に渡す seed 投入の入力記録である。
+  - 製品を追加する手順: `products.json` に `{ "model", "name", "aliases" }` を追記 → `ingest_products` を実行する。**サービスの再ビルド・再デプロイは不要**（Product ノードは vegapunk 側にしか存在しないため）。
+  - 全体リセット後の ingest 実行順序は **`ingest_products` → `ingest_urtect`** の順を必ず守ること。`ingest_urtect` は起動時に vegapunk の Product ノード一覧を取得し、0 件なら「製品マスタが空。先に `ingest_products` を実行せよ」という fail closed で止まる。
 - env（fail-closed 境界で2群に分けて扱うこと）:
   - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs:54` で起動時 fail closed）
   - **未設定でも起動する**: `VEGAPUNK_ENDPOINT`（`config.cloudrun.toml:13` の値にフォールバック。env があれば `config.rs:218` が上書き）、`VEGAPUNK_BEARER_TOKEN`
