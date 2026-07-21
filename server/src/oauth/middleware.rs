@@ -38,7 +38,7 @@ pub async fn require_google_auth(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
+        .and_then(parse_bearer)
         .map(str::to_string);
 
     let token = match bearer {
@@ -74,6 +74,35 @@ pub async fn require_google_auth(
             unauthorized(&state.resource_metadata_url)
         }
     }
+}
+
+/// Authorization ヘッダ値から Bearer トークンを取り出す純粋関数（ネットワーク非依存）。
+///
+/// RFC 9110 により auth-scheme は case-insensitive。旧実装は
+/// `strip_prefix("Bearer ")`（大文字 `B` 固定・単一スペース固定）の文字列一致
+/// だったため、`bearer x` / `BEARER x` や、スキームとトークンの間がタブ・
+/// 複数スペースの正当なヘッダを誤って拒否していた。
+///
+/// ヘッダ値を最初の空白文字（space または tab）で2分割し、前半を `"bearer"`
+/// と大小文字を無視して比較する。一致すれば後半の前後の空白列（space/tab）を
+/// trim して返す。RFC 9110 は field value 末尾の OWS（optional whitespace）を
+/// 許容するため、先頭だけでなく末尾も trim しないと `"Bearer abc "` のような
+/// 正当なヘッダのトークンに余分な空白が残ってしまう。
+/// トークン部分が空文字になるケース（例: `"Bearer "`）も
+/// そのまま `Some("")` として返す —「スキームは合っているがトークンが空」を
+/// 呼び出し側（`require_google_auth`）が区別できるようにするため。空トークンは
+/// Google tokeninfo へ問い合わせず即 401 にする既存の短絡があり、この関数が
+/// `None` に潰すとその短絡が働かなくなる。
+///
+/// スキームが `bearer` 以外、または区切りとなる空白が無い場合（`"Bearer"` 単体
+/// など、スキームの後にトークンが続かない）は `None`。
+fn parse_bearer(header_value: &str) -> Option<&str> {
+    let idx = header_value.find([' ', '\t'])?;
+    let (scheme, rest) = header_value.split_at(idx);
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    Some(rest.trim_matches([' ', '\t']))
 }
 
 /// 401 + RFC 9728 の発見用 `WWW-Authenticate: Bearer resource_metadata="..."` を組み立てる。
@@ -162,5 +191,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// auth-scheme が `bearer` 以外（例: `Basic`）の場合は、旧実装と同じく
+    /// verifier を呼ばず即 401 になることを保証する（退行防止）。
+    #[tokio::test]
+    async fn basic_scheme_yields_401_without_calling_verifier() {
+        let res = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/urtect/mcp")
+                    .header(header::AUTHORIZATION, "Basic x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- parse_bearer: ネットワーク非依存の純粋関数ユニットテスト ---
+    //
+    // RFC 9110 では auth-scheme は case-insensitive。しかし旧実装は
+    // `strip_prefix("Bearer ")` という固定文字列一致だったため、`bearer x` /
+    // `BEARER x` や、スキームとトークンの間がタブ・複数スペースの正当な
+    // ヘッダを誤って 401 で拒否していた。
+    //
+    // 「200 相当」を実際の HTTP ステータスとして確認するには本物の Google
+    // tokeninfo に到達させる必要があり、外部ネットワーク依存になってテストが
+    // 不安定になる（到達できれば 401/503、到達できなければ 503 になり得て、
+    // どちらも「200 が返る」ことの確認にならない）。パース結果が
+    // `Some(token)`（= verifier まで到達する形）になることを、ネットワークを
+    // 一切使わないこのユニットテストで直接保証する。
+
+    #[test]
+    fn parse_bearer_accepts_canonical_scheme() {
+        assert_eq!(parse_bearer("Bearer x"), Some("x"));
+    }
+
+    #[test]
+    fn parse_bearer_accepts_lowercase_scheme() {
+        assert_eq!(parse_bearer("bearer x"), Some("x"));
+    }
+
+    #[test]
+    fn parse_bearer_accepts_uppercase_scheme() {
+        assert_eq!(parse_bearer("BEARER x"), Some("x"));
+    }
+
+    #[test]
+    fn parse_bearer_accepts_tab_separated_token() {
+        assert_eq!(parse_bearer("Bearer\tx"), Some("x"));
+    }
+
+    #[test]
+    fn parse_bearer_accepts_multiple_spaces_before_token() {
+        assert_eq!(parse_bearer("Bearer   x"), Some("x"));
+    }
+
+    /// スキームは合っているがトークンが空文字のケース。`require_google_auth` 側の
+    /// 「空トークンは verifier を呼ばず即 401」短絡が機能するために、ここで
+    /// `None` に潰さず `Some("")` を返すことが必須。
+    #[test]
+    fn parse_bearer_returns_empty_string_for_blank_token() {
+        assert_eq!(parse_bearer("Bearer "), Some(""));
+    }
+
+    /// W3（reviewer 指摘）: 空トークン短絡の生死を分ける最重要ケース。
+    /// 複数スペース/タブが続くだけの「空白のみのトークン」も `Some("")` に
+    /// 潰れることを保証する。将来 `split_once` 等へ書き換えた際に `Some(" ")`
+    /// を返す実装が混入すると、`is_empty()` が false になり短絡をすり抜けて
+    /// 空白トークンのまま Google tokeninfo に投げてしまうため、これを防ぐ。
+    #[test]
+    fn parse_bearer_returns_empty_string_for_multiple_spaces_only_token() {
+        assert_eq!(parse_bearer("Bearer   "), Some(""));
+    }
+
+    #[test]
+    fn parse_bearer_returns_empty_string_for_tabs_only_token() {
+        assert_eq!(parse_bearer("Bearer\t\t"), Some(""));
+    }
+
+    /// W1（reviewer 指摘）: RFC 9110 は field value 末尾の OWS を許容するため、
+    /// `"Bearer abc "`（トークン末尾に空白）は `Some("abc")` になるべきで、
+    /// 末尾空白付きトークンをそのまま Google tokeninfo に送ってはならない。
+    #[test]
+    fn parse_bearer_trims_trailing_whitespace_from_token() {
+        assert_eq!(parse_bearer("Bearer abc "), Some("abc"));
+    }
+
+    #[test]
+    fn parse_bearer_rejects_non_bearer_scheme() {
+        assert_eq!(parse_bearer("Basic x"), None);
+    }
+
+    /// 区切りとなる空白が無い（`"Bearer"` 単体、トークンが続かない）場合は
+    /// 分割できないため `None`。旧実装の `strip_prefix("Bearer ")` でも
+    /// 一致せず `None` になっていた経路と同じ扱い。
+    #[test]
+    fn parse_bearer_rejects_scheme_without_separator() {
+        assert_eq!(parse_bearer("Bearer"), None);
     }
 }
