@@ -57,39 +57,43 @@ Client ID / Secret を手入力させる必要があり、CS 担当者に配れ�
 | `GET /.well-known/oauth-protected-resource/{project_id}/mcp` | RFC 9728 RS メタデータ。`authorization_servers` は**自分自身** |
 | `POST /oauth/register` | RFC 7591 DCR。public client + PKCE（`client_secret` は発行しない） |
 | `GET /oauth/authorize` | 検証後に Google の同意画面へリダイレクト |
-| `GET /oauth/callback` | Google からの戻り。token 交換と identity 確定 → **自前の同意画面を表示** |
-| `POST /oauth/consent` | 自前の同意画面からの応答。**認可コードを発行する唯一の経路** |
+| `GET /oauth/callback` | Google からの戻り。token 交換と identity 確定 → **その場で認可コードを発行し、クライアントの redirect_uri へリダイレクト** |
 | `POST /oauth/token` | `authorization_code` / `refresh_token` グラント |
 
 トークン無しで `/{project_id}/mcp` にアクセスすると `401` と
 `WWW-Authenticate: Bearer resource_metadata="https://{public_host}/.well-known/oauth-protected-resource/{project_id}/mcp"`
 ヘッダを返す（署名不正・期限切れ・種別違い・**別 project 向け**のトークンでも同様に 401）。
 
-#### ログイン 1 回につき同意画面が 2 枚出る（仕様。故障ではない）
+#### ログインごとに Google の同意画面が出る（仕様。故障ではない）
 
-利用者が 1 回ログインすると、同意画面が**続けて 2 枚**表示される。順に:
+利用者が 1 回ログインすると、**Google の同意画面**が毎回表示される。
+`/oauth/authorize` が Google へ `prompt=consent` を常に付けてリダイレクトするため、
+既に同意済みの利用者にも毎回出る。これは Google の refresh_token を確実に受け取るために
+必要である（`access_type=offline` だけでは、同意済み利用者に refresh_token が返らない）。
+refresh_token が無いと、下記の「上流失効の伝播」が成立しない。
 
-1. **Google の同意画面**。`/oauth/authorize` が Google へ `prompt=consent` を常に付けて
-   リダイレクトするため、既に同意済みの利用者にも毎回出る。これは Google の
-   refresh_token を確実に受け取るために必要である（`access_type=offline` だけでは、
-   同意済み利用者に refresh_token が返らない）。refresh_token が無いと、
-   下記の「上流失効の伝播」が成立しない。
-2. **cs-support-mcp 自身の同意画面**（`/oauth/consent`）。接続元クライアントの名称と
-   **認可コードの送信先 URL** を利用者に提示し、承認 / 拒否を選ばせる。
+#### confused deputy 対策は redirect_uri の許可リスト
 
-2 枚目が必要な理由は confused deputy 対策である。`POST /oauth/register` は無認証で、
-攻撃者は任意の HTTPS `redirect_uri` を持つクライアントを登録できる。Google が見せる
-同意画面は「cs-support-mcp」に対するものであって、動的登録された下流クライアントの
-素性を一切示さない。自前の同意画面が無いと、利用者は認可コードの配送先を認識しないまま
-攻撃者のクライアントを承認できてしまう（`redirect_uri` の完全一致検証では防げない）。
+`POST /oauth/register`（DCR）は無認証で、redirect_uri を無制限に受け付けると攻撃者が
+任意ホストの `redirect_uri` を持つクライアントを登録でき、`/oauth/callback` が識別済みの
+identity に対する認可コードをその攻撃者へ配送してしまう。Google が見せる同意画面は
+「cs-support-mcp」に対するものであって、動的登録された下流クライアントの素性を
+一切示さない。
 
-同意画面に表示するクライアント名は **登録者が自由に設定した未検証の値**であるため、
-HTML エスケープした上で「検証されていません」と明示している。
-また、この画面が唯一の防御であることから `X-Frame-Options: DENY` と CSP
-`frame-ancestors 'none'` を付け、透明オーバーレイのクリックジャッキングで「許可」を
-押させられる経路を塞いでいる。同意ブロブは承認・拒否のどちらであっても即座に消費され、
-**その記録はブロブ自身の有効期限まで残る**（一度拒否した同意をブラウザバックで
-承認に覆せない）。
+これを防ぐため、`is_acceptable_redirect_uri`（`server/src/oauth/authserver.rs`）が
+DCR 登録時点で `redirect_uri` をホストで絞る:
+
+- `https` は `claude.ai` への**ホスト完全一致**でのみ許可する（`ends_with` のような
+  サフィックス一致ではない。`evil-claude.ai` のような別ドメインを通さないため）。
+- `http` は loopback（`localhost` / `127.0.0.1` / `[::1]`）のみ許可し、ポートは任意。
+- それ以外はすべて拒否する。
+
+一時期はこれを cs-support-mcp 自身の同意画面（`/oauth/consent`）で塞いでいたが、
+許可リスト導入により配送先が閉じたため撤去した。**このサーバから動的登録クライアントへの
+リダイレクトは、Google Cloud Console 側の redirect_uri 登録（`https://<host>/oauth/callback`）
+では一切守られない**点に注意すること。守っているのはあくまで
+`is_acceptable_redirect_uri` である。詳細:
+`docs/superpowers/specs/2026-07-22-restrict-redirect-uri-design.md`。
 
 #### トークンは自前発行しない
 
@@ -103,7 +107,8 @@ HTML エスケープした上で「検証されていません」と明示して
   （これを添えられることが、クライアントに secret を持たせずに済ませる唯一の理由である）。
 - リクエスト経路の Bearer 検証は Google tokeninfo への照会（`GoogleTokenVerifier`）。
 
-AS が引き受けるのは **DCR の成立**と **confused deputy 対策の同意画面**の 2 点だけになった。
+AS が引き受けるのは **DCR の成立**の 1 点だけになった。confused deputy 対策は、上記の
+redirect_uri の許可リスト（`is_acceptable_redirect_uri`）で行う。
 
 **失効**: このサーバは失効台帳を持たないため、個別のトークン失効手段が無い。失効は Google 側
 （アカウントのアクセス権限管理）で行う。Google 側でアカウント停止・グラント取消が行われると、
@@ -120,9 +125,9 @@ AS が引き受けるのは **DCR の成立**と **confused deputy 対策の同�
 状態は外部ストアに持たず、**署名付きの値そのものに埋め込む**
 （Cloud Run がゼロスケールするため。`server/src/oauth/signing.rs` 参照）。
 
-上流の秘密を運ぶブロブ（**state・認可コード・同意ブロブ**）は署名に加えて
-**ChaCha20-Poly1305 で暗号化**する（`SigningKey::seal` / `open`）。認可コードと同意ブロブは
-Google の access_token / refresh_token を運び、しかも認可コードはクライアントの redirect_uri へ
+上流の秘密を運ぶブロブ（**state・認可コード**）は署名に加えて
+**ChaCha20-Poly1305 で暗号化**する（`SigningKey::seal` / `open`）。認可コードは
+Google の access_token / refresh_token を運び、しかもクライアントの redirect_uri へ
 **クエリ文字列として**渡る（ブラウザ履歴・Referer・中間ログに残る）。署名だけだと中身は
 base64 された平文なので、上流クレデンシャルがそれらすべてに残ることになる。state を含めるのは、
 Google の authorize URL に載る `state` の中に AS 用の PKCE verifier が入っており、署名だけだと
@@ -131,7 +136,7 @@ Google の authorize URL に載る `state` の中に AS 用の PKCE verifier が
 
 **署名鍵に env は無い。** 起動時に OS の CSPRNG から 32 バイトを生成してメモリに保持する
 （`SigningKey::generate`）。Secret Manager にも置かない。守る対象が client_id / state /
-認可コード / 同意ブロブに限られ、鍵を運用物として抱える理由が無くなったため。
+認可コードに限られ、鍵を運用物として抱える理由が無くなったため。
 
 **再起動時の影響**:
 
@@ -180,16 +185,16 @@ Google が refresh_token を返さなかった場合は、クライアントに�
 
 Google が `expires_in` を返さなかった場合は、寿命不明のまま渡さず短い値（600 秒）を仮定して
 申告する。長く仮定すると「切れているのに使い続けて 401 を踏む」になるため、早めのリフレッシュに
-倒す。`expires_in` は同意画面での滞留分を差し引いた値をクライアントへ返す。
+倒す。`expires_in` は認可コードの発行から token 交換までの滞留分を差し引いた値をクライアントへ返す。
 
-**state・認可コード・同意ブロブはいずれも単回使用**（`AuthServerState::consume_jti`）。
+**state・認可コードはいずれも単回使用**（`AuthServerState::consume_jti`）。
 使用済み記録は各ブロブ自身の有効期限まで保持される。state を単回使用にしているのは、
 `/oauth/register` と `/oauth/authorize` が無認証であるため、有効な state を 1 つ入手した
 相手が `callback` を連打して **Google への外向きリクエストを無制限に増幅できる**のを
 防ぐため（`maxScale=1` なのでインスタンス飽和にも直結する）。
 
 単回使用の担保はプロセス内メモリでの **best-effort**。コンテナ再起動をまたぐと弾けないが、
-コードの寿命は 60 秒（同意ブロブ 300 秒、state 600 秒）で、かつコードは PKCE の
+コードの寿命は 60 秒（state 600 秒）で、かつコードは PKCE の
 `code_verifier` に束縛されている。
 
 > **OAuth 2.1 への非準拠点（意図的）**: OAuth 2.1 は認可コードの再利用を検出した際、

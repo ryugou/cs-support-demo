@@ -6,3 +6,7 @@ server/data/*/audit.jsonl
 .env
 *.env
 !.env.example
+
+.vibepod/
+
+.worktrees/

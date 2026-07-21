@@ -20,12 +20,21 @@
 //! 設計が過剰と判断されたため撤回した。**現在は Google が発行したトークンを
 //! そのままクライアントへ渡し、リフレッシュも Google へ中継するだけ**である。
 //!
-//! この AS が引き受けるのは次の 2 点だけになった。
+//! この AS が引き受けるのは次の 1 点だけになった。
 //! 1. **DCR の成立**: Google は RFC 7591 に対応しないので、claude.ai が接続時に
 //!    行う動的クライアント登録をこちらで受ける。
-//! 2. **confused deputy 対策の同意画面**: 誰でも無認証で任意 redirect_uri の
-//!    クライアントを登録できる以上、認可コードの配送先を利用者に見せる画面が要る
-//!    （`/oauth/consent`）。
+//!
+//! # confused deputy 対策は redirect_uri の許可リスト（2026-07 改訂）
+//!
+//! `/oauth/register`（DCR）は無認証なので、redirect_uri を無制限に受け付けると
+//! 第三者が任意ホストの redirect_uri を登録でき、`callback` がその第三者へ
+//! 認可コードを配送してしまう（confused deputy）。一時期はこれを自前の同意画面
+//! （`/oauth/consent`）で塞いでいたが、**redirect_uri を許可リストで縛れば経路
+//! 自体が消えるため、同意画面は不要**と判断して撤去した。`is_acceptable_redirect_uri`
+//! が https を `claude.ai` へのホスト完全一致に限定し、http は loopback のみを許す。
+//! 2 段目のリダイレクト（AS → 動的登録クライアント）は Google 側の redirect_uri
+//! 設定では一切守られない点に注意（詳細:
+//! docs/superpowers/specs/2026-07-22-restrict-redirect-uri-design.md）。
 //!
 //! 帰結として、この AS 自身は**トークンの失効手段を持たない**。個別失効は
 //! Google 側（アカウントのアクセス権限管理）で行う。裏返せば、こちらの再起動や
@@ -63,12 +72,6 @@ const STATE_TTL_SECS: u64 = 600;
 /// クライアントが即座に交換する前提で 60 秒に切り詰める。
 /// 単回使用の担保が best-effort であること（`consume_code` 参照）の主たる補償がこれ。
 const CODE_TTL_SECS: u64 = 60;
-
-/// 自前の同意ブロブ（C2）の寿命。同意画面を読んでボタンを押すのに十分で、
-/// かつ盗まれた同意ブロブが使い回せる窓を短く保てる値。
-/// この間だけ Google の access_token / refresh_token が（封緘された形で）
-/// ブラウザ上に存在する。
-const CONSENT_TTL_SECS: u64 = 300;
 
 /// Google が `expires_in` を返さなかったときに仮定する access_token の寿命。
 ///
@@ -170,7 +173,7 @@ const GOOGLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// 「署名は正しいので通す」という事故（典型的にはリフレッシュトークンを
 /// アクセストークンとして受理してしまう）を、呼び出し規約ではなく型で防ぐのが狙い。
 /// **`Debug` は手で実装する（S2）。** derive すると、`Blob::State` の
-/// `google_verifier`、`Blob::Code` / `Blob::Consent` の `jti` / `code_challenge`
+/// `google_verifier`、`Blob::Code` の `jti` / `code_challenge`
 /// および **Google の access_token / refresh_token** が、将来
 /// `tracing::debug!(?blob)` を 1 行足された瞬間に平文で Cloud Logging へ落ちる。
 /// `SigningKey` / `AuthServerConfig` が既に同じ方針なので揃える。
@@ -182,7 +185,7 @@ pub enum Blob {
     Client {
         redirect_uris: Vec<String>,
         /// 登録時にクライアントが名乗った表示名。**未検証の攻撃者制御値**であり、
-        /// 同意画面（C2）に出すときは必ずエスケープし、検証済みだと見せない。
+        /// 検証済みの名称であるかのように扱わないこと。
         client_name: Option<String>,
         iat: u64,
     },
@@ -208,24 +211,6 @@ pub enum Blob {
         /// これが無いと、1 回の `authorize` で得た state を `STATE_TTL_SECS`（600 秒）
         /// にわたって再利用でき、**無認証のまま Google への外向きリクエストを
         /// 任意レートで発生させられる**（`callback` の消費処理を参照）。
-        jti: String,
-        exp: u64,
-    },
-    /// 自前の同意画面（C2）をまたいで identity を保持するブロブ。
-    ///
-    /// **必ず `seal` で封緘する**（Google の access_token / refresh_token を運ぶため）。
-    /// 同意フォームの hidden field に載って利用者のブラウザを経由する。
-    #[serde(rename = "consent")]
-    Consent {
-        sub: String,
-        email: String,
-        client_id: String,
-        redirect_uri: String,
-        client_state: Option<String>,
-        code_challenge: String,
-        /// Google が発行したトークン群。`/oauth/token` でそのままクライアントへ渡す。
-        upstream: UpstreamTokens,
-        /// 同意ブロブの単回使用判定（`consume_code` と同じ集合を使う）。
         jti: String,
         exp: u64,
     },
@@ -295,7 +280,6 @@ impl fmt::Debug for Blob {
         let kind = match self {
             Blob::Client { .. } => "client",
             Blob::State { .. } => "state",
-            Blob::Consent { .. } => "consent",
             Blob::Code { .. } => "code",
         };
         write!(f, "Blob::{kind}(<redacted>)")
@@ -421,9 +405,6 @@ pub fn auth_server_router(state: Arc<AuthServerState>) -> Router {
         .route("/oauth/register", post(register))
         .route("/oauth/authorize", get(authorize))
         .route("/oauth/callback", get(callback))
-        // C2: 自前の同意画面。GET は無く、callback が 200 で描画したフォームからの
-        // POST だけを受ける（同意ブロブを持たない者は到達できない）。
-        .route("/oauth/consent", post(consent))
         .route("/oauth/token", post(token))
         .with_state(state)
 }
@@ -507,29 +488,6 @@ fn is_valid_s256_challenge(challenge: &str) -> bool {
         && challenge
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-/// HTML の特殊文字を実体参照へ置換する（C2）。
-///
-/// 同意画面には `client_name` と `redirect_uri` という **DCR で攻撃者が任意に
-/// 設定できる未検証の値**を表示する。エスケープを怠ると、同意画面そのものに
-/// スクリプトやマークアップを注入され、「配送先を利用者に認識させる」という
-/// 同意画面の目的が土台から崩れる。
-///
-/// 属性値にも本文にも同じ関数で入れられるよう、引用符も両方置換する。
-fn html_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -664,15 +622,6 @@ pub struct CallbackQuery {
     error: Option<String>,
 }
 
-/// 同意画面（C2）からの POST。
-#[derive(Debug, Deserialize)]
-pub struct ConsentForm {
-    /// 封緘済みの `Blob::Consent`。同意画面の hidden field で持ち回る。
-    consent: Option<String>,
-    /// `approve` のときだけ認可コードを発行する。それ以外はすべて拒否として扱う。
-    action: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
     grant_type: Option<String>,
@@ -747,9 +696,24 @@ fn signing_failed(what: &str, err: &serde_json::Error) -> Response {
     )
 }
 
+/// DCR の https コールバックとして許可する唯一のホスト。
+///
+/// 確定値は `https://claude.ai/api/mcp/auth_callback`（本番の DCR で実際に送られてくる
+/// 値）。値が変わったときにここ 1 箇所だけ直せばよいように定数へ切り出す。
+const ALLOWED_HTTPS_CALLBACK_HOST: &str = "claude.ai";
+
 /// redirect_uri として受け入れてよい形か検証する。
 ///
-/// `https` は無条件で許可。`http` は loopback（localhost / 127.0.0.1 / ::1）に限る
+/// `/oauth/register`（DCR）は無認証のため、ここでホストを絞らないと第三者が
+/// 任意ホストの redirect_uri を登録でき、`callback` がその第三者へ認可コードを
+/// 配送してしまう（confused deputy。設計:
+/// docs/superpowers/specs/2026-07-22-restrict-redirect-uri-design.md）。
+///
+/// `https` は `ALLOWED_HTTPS_CALLBACK_HOST` への**ホスト完全一致**でだけ許可する。
+/// **サフィックス一致（`ends_with`）にしない。** それだと `evil-claude.ai` のような
+/// 別ドメインが通ってしまう。
+///
+/// `http` は loopback（localhost / 127.0.0.1 / ::1）に限る（ポートは任意）
 /// — ネイティブクライアントのローカル受け口を塞がないためだが、平文で認可コードが
 /// 流れる経路を LAN・インターネットへ広げないため loopback 以外は拒否する。
 fn is_acceptable_redirect_uri(uri: &str) -> bool {
@@ -757,7 +721,7 @@ fn is_acceptable_redirect_uri(uri: &str) -> bool {
         return false;
     };
     match parsed.scheme() {
-        "https" => true,
+        "https" => parsed.host_str() == Some(ALLOWED_HTTPS_CALLBACK_HOST),
         "http" => matches!(
             parsed.host_str(),
             Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
@@ -851,7 +815,8 @@ async fn register(
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_redirect_uri",
-            "each redirect_uri must be an absolute https URI (http is allowed for loopback only)",
+            "each redirect_uri must be an https URI to an allowed callback host, or an http URI \
+             to loopback",
         );
     }
 
@@ -1327,206 +1292,22 @@ async fn callback(
         }
     };
 
-    // C2（confused deputy）: identity が確定したが、**まだ認可コードは発行しない**。
+    // confused deputy 対策は redirect_uri の許可リスト（`is_acceptable_redirect_uri`）が
+    // 担う。`redirect_uri` はここまでに以下を満たしている:
+    // - authorize 時点で登録済み redirect_uris との完全一致を確認済み（state に格納）
+    // - 登録（DCR）時点で `is_acceptable_redirect_uri` の許可リストを通過済み
+    // したがって配送先は claude.ai（または http loopback）に限られており、
+    // 第三者へ認可コードが渡る経路自体が無い。よって Google の identity が
+    // 確定した時点でそのまま認可コードを発行してよい。
     //
-    // `/oauth/register` は無認証で、攻撃者は任意の HTTPS redirect_uri を持つ
-    // クライアントを登録できる。Google が見せる同意画面は「本サービス」に対する
-    // ものであって、動的登録された下流クライアントの素性は一切示さない。
-    // したがってここで自前の同意画面を挟まないと、利用者は認可コードの配送先を
-    // 認識しないまま攻撃者のクライアントを承認できてしまう（redirect_uri の
-    // 完全一致検証では防げない。MCP の認可仕様が名指しで警告している問題）。
+    // 旧実装はここで自前の同意画面（`/oauth/consent`）を挟んでいたが、上記の
+    // 許可リスト導入により経路自体が閉じたため撤去した（設計:
+    // docs/superpowers/specs/2026-07-22-restrict-redirect-uri-design.md）。
     //
-    // 同意ブロブは **封緘**する（Google の refresh_token を運ぶため）。
-    let consent_blob = match state.signing_key.seal(&Blob::Consent {
-        sub: identity.sub,
-        email: identity.email.clone(),
-        client_id: client_id.clone(),
-        redirect_uri: redirect_uri.clone(),
-        client_state,
-        code_challenge,
-        upstream,
-        jti: uuid::Uuid::new_v4().to_string(),
-        exp: state.expires_in(CONSENT_TTL_SECS),
-    }) {
-        Ok(v) => v,
-        Err(e) => return signing_failed("consent", &e),
-    };
-
-    // 表示名は client_id ブロブ（署名済み）から取り直す。state に複製して持ち回ると
-    // 登録内容と表示内容がずれる余地ができるため、常に登録の実体から引く。
-    let client_name = match state.signing_key.verify::<Blob>(&client_id) {
-        Ok(Blob::Client { client_name, .. }) => client_name,
-        _ => None,
-    };
-    render_consent_page(
-        &consent_blob,
-        client_name.as_deref(),
-        &redirect_uri,
-        &identity.email,
-    )
-}
-
-/// 自前の同意画面（C2）を描画する。
-///
-/// 表示する `client_name` と `redirect_uri` は **DCR で攻撃者が任意に設定できる
-/// 未検証の値**なので、
-/// - 必ず `html_escape` を通す
-/// - 「検証されていない」旨を明示し、ブランド偽装（"Google" 等を名乗る登録）が
-///   本サービスの保証のように見えないようにする
-/// - 配送先（redirect_uri）を省略せずそのまま見せる
-/// の 3 点を守る。ここが崩れると同意画面を置いた意味が無くなる。
-///
-/// さらに 2026-07 改訂 / reviewer 指摘 W1・W2 により、次のヘッダを必ず付ける:
-/// - `X-Frame-Options: DENY` / CSP `frame-ancestors 'none'`:
-///   この画面は confused deputy に対する**唯一の防御**であり、フレーム可能なままだと
-///   透明オーバーレイのクリックジャッキングで「許可」を押させられ、C2 対策が丸ごと
-///   無意味になる。両方付けるのは、古いブラウザが CSP の `frame-ancestors` を
-///   解さない場合に `X-Frame-Options` が受け皿になるため。
-/// - CSP `default-src 'none'; style-src 'unsafe-inline'`:
-///   このページの外部リソースはインライン `<style>` のみで、スクリプト・画像・
-///   フォント・フェッチを一切使わないため、素直に締められる。
-/// - `Cache-Control: no-store` / `Pragma: no-cache`:
-///   封緘済みとはいえ同意ブロブを含む HTML を共有キャッシュに残さない。
-fn render_consent_page(
-    consent_blob: &str,
-    client_name: Option<&str>,
-    redirect_uri: &str,
-    email: &str,
-) -> Response {
-    let name = html_escape(client_name.unwrap_or("(no name provided)"));
-    let uri = html_escape(redirect_uri);
-    let email = html_escape(email);
-    // consent_blob は封緘済みで base64url + '.' のみからなるが、hidden 属性値に
-    // 入る以上、他の表示値と同じ経路でエスケープする（例外を作らない）。
-    let blob = html_escape(consent_blob);
-    let html = format!(
-        r#"<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>アクセスの許可 - cs-support-mcp</title>
-<style>
-body {{ font-family: system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; line-height: 1.7; }}
-.warn {{ background: #fff4e5; border: 1px solid #d98324; border-radius: 6px; padding: .75rem 1rem; }}
-dl {{ background: #f5f5f5; border-radius: 6px; padding: 1rem; }}
-dt {{ font-weight: 600; margin-top: .5rem; }}
-dd {{ margin: 0 0 .25rem; word-break: break-all; font-family: ui-monospace, monospace; }}
-button {{ font-size: 1rem; padding: .6rem 1.4rem; border-radius: 6px; border: 1px solid #888; cursor: pointer; }}
-button.approve {{ background: #1a73e8; color: #fff; border-color: #1a73e8; }}
-</style>
-</head>
-<body>
-<h1>アクセスの許可</h1>
-<p><strong>{email}</strong> として、以下のアプリケーションに cs-support-mcp へのアクセスを許可しようとしています。</p>
-<p class="warn"><strong>このアプリケーションは検証されていません。</strong>
-以下の名称と送信先は、アプリケーションの登録者が自由に設定した値であり、
-cs-support-mcp が確認したものではありません。心当たりがない場合は「拒否」してください。</p>
-<dl>
-<dt>アプリケーション名（自己申告）</dt><dd>{name}</dd>
-<dt>認可コードの送信先</dt><dd>{uri}</dd>
-<dt>許可される操作</dt><dd>あなたとして cs-support-mcp のツールを実行（ナレッジの参照および登録）</dd>
-</dl>
-<form method="post" action="/oauth/consent">
-<input type="hidden" name="consent" value="{blob}">
-<button type="submit" name="action" value="deny">拒否</button>
-<button type="submit" name="action" value="approve" class="approve">許可</button>
-</form>
-</body>
-</html>"#
-    );
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            // W1: クリックジャッキング対策。この画面が枠に嵌められると C2 が無効化される。
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                "frame-ancestors 'none'; default-src 'none'; style-src 'unsafe-inline'",
-            ),
-            // W2: 同意ブロブを含む HTML をキャッシュに残さない。
-            (header::CACHE_CONTROL, NO_STORE),
-            (header::PRAGMA, NO_CACHE),
-        ],
-        html,
-    )
-        .into_response()
-}
-
-/// 同意画面（C2）からの POST。**認可コードを発行する唯一の経路**。
-///
-/// `callback` はもうコードを発行しない。したがって同意画面を飛ばして認可コードを
-/// 得る経路は存在せず、ここへ到達するには封緘済みの同意ブロブが要る。
-/// 同意ブロブは `callback` が Google の identity 確定後にしか作らない。
-async fn consent(
-    State(state): State<Arc<AuthServerState>>,
-    Form(form): Form<ConsentForm>,
-) -> Response {
-    let Some(blob) = form.consent.filter(|s| !s.is_empty()) else {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "the consent form was submitted without a consent value",
-        );
-    };
-    // 封緘の解除。`sign` された別種のブロブを持ち込んでも AEAD で落ちる。
-    let Ok(Blob::Consent {
-        sub,
-        email,
-        client_id,
-        redirect_uri,
-        client_state,
-        code_challenge,
-        upstream,
-        jti,
-        exp,
-    }) = state.signing_key.open::<Blob>(&blob)
-    else {
-        tracing::info!(reason = "unverifiable_consent", "consent rejected");
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "the consent value is not a valid value issued by this server",
-        );
-    };
-    if exp <= state.now() {
-        // ここは 400 のまま。同意ブロブは検証できたが、期限切れの同意で
-        // リダイレクトを起こすより、やり直しを促す方が誤解が無い。
-        tracing::info!(reason = "expired_consent", "consent rejected");
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "this consent request has expired; start the login again",
-        );
-    }
-    // 同意ブロブの単回使用。認可コードと同じ best-effort 集合を使う
-    // （根拠と限界は `consume_jti` のコメントを参照）。同意 1 回につき
-    // 認可コードは 1 本だけにする。
-    //
-    // **消費は `action` 判定より前に行う**。承認・拒否のどちらであっても、
-    // 一度応答した同意ブロブは二度と使えないようにするため
-    // （ブラウザバックして拒否を承認に覆す経路を塞ぐ）。ブロブ自身の `exp` まで
-    // 記録が残ることは `consume_jti` が保証する。
-    if !state.consume_jti(&jti, exp) {
-        tracing::info!(reason = "consent_already_used", "consent rejected");
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "this consent request has already been used; start the login again",
-        );
-    }
-
-    // W1: 拒否は `access_denied` としてクライアントへリダイレクトする。
-    // `approve` 以外（`deny`、値なし、未知の値）はすべて拒否に倒す（fail closed）。
-    if form.action.as_deref() != Some("approve") {
-        tracing::info!(sub = %sub, "user denied the consent request");
-        return redirect_error(&redirect_uri, "access_denied", client_state.as_deref());
-    }
-
+    // 認可コードは **封緘**する（Google の access_token / refresh_token を運ぶため）。
     let code_blob = match state.signing_key.seal(&Blob::Code {
-        sub,
-        email,
+        sub: identity.sub,
+        email: identity.email,
         client_id,
         redirect_uri: redirect_uri.clone(),
         code_challenge,
@@ -1541,7 +1322,7 @@ async fn consent(
     let mut target = match url::Url::parse(&redirect_uri) {
         Ok(u) => u,
         Err(e) => {
-            // 封緘済み同意ブロブに入っていた値なので、ここに来るのは登録時の検証を
+            // 署名済み state 由来の値なので、ここに来るのは登録時の検証を
             // すり抜けた場合のみ。クライアントへ戻せないため 400 で止める。
             tracing::error!(error = %e, "registered redirect_uri is not parseable");
             return oauth_error(
@@ -1570,7 +1351,8 @@ impl AuthServerState {
     ///
     /// 2026-07 改訂 / reviewer 指摘 C1:
     /// 旧実装は「記録時刻」を保存し、刈り取り窓を `CODE_TTL_SECS`（60 秒）**固定**に
-    /// していた。一方 `Blob::Consent` の寿命は `CONSENT_TTL_SECS`（300 秒）であり、
+    /// していた。一方、当時あった自前の同意ブロブ（`Blob::Consent`。confused deputy
+    /// 対策の同意画面ごと後日撤去済み）の寿命は 300 秒であり、
     /// **使用済み記録が 60 秒で消えるのにブロブは 300 秒有効**という不整合があった。
     /// この t=60..300 の窓では同じ同意ブロブを再 POST すると認可コードが再発行でき、
     /// さらに `consume` が `action` 判定より前にあるため、**一度「拒否」を押した認可を
@@ -2433,16 +2215,6 @@ mod tests {
         post_form(app, "/oauth/token", form).await
     }
 
-    /// callback が返した同意画面 HTML から、hidden field の同意ブロブを取り出す。
-    /// 実際のブラウザがフォームを submit するのと同じ値を使うため。
-    fn consent_blob_from(html: &str) -> String {
-        let marker = r#"<input type="hidden" name="consent" value=""#;
-        let start = html.find(marker).expect("consent hidden field") + marker.len();
-        let rest = &html[start..];
-        let end = rest.find('"').expect("closing quote");
-        rest[..end].to_string()
-    }
-
     fn enc(s: &str) -> String {
         url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
     }
@@ -2498,6 +2270,87 @@ mod tests {
         let h = harness().await;
         let res = post_register(&h.app, serde_json::json!({"redirect_uris": ["/relative"]})).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ------------------------------------------------------------------
+    // redirect_uri の許可リスト（confused deputy 対策）
+    //
+    // `/oauth/register` は無認証なので、ここでホストを絞らないと第三者が
+    // 任意ホストの redirect_uri を登録でき、callback が認可コードをそこへ
+    // 配送してしまう（詳細:
+    // docs/superpowers/specs/2026-07-22-restrict-redirect-uri-design.md）。
+    // ------------------------------------------------------------------
+
+    /// 許可ホスト（claude.ai）への https は関数レベルで通ること。
+    #[test]
+    fn is_acceptable_redirect_uri_allows_the_registered_https_host() {
+        assert!(is_acceptable_redirect_uri(CLIENT_REDIRECT));
+    }
+
+    /// 第三者ホストへの https は拒否されること。confused deputy の核心。
+    #[test]
+    fn is_acceptable_redirect_uri_rejects_a_third_party_https_host() {
+        assert!(!is_acceptable_redirect_uri("https://attacker.example/cb"));
+    }
+
+    /// サフィックス一致では通らないこと。`ends_with` 判定への退行を検出する。
+    #[test]
+    fn is_acceptable_redirect_uri_rejects_a_suffix_matching_host() {
+        assert!(!is_acceptable_redirect_uri("https://evil-claude.ai/cb"));
+    }
+
+    /// http は loopback ならポートによらず許可されること。
+    #[test]
+    fn is_acceptable_redirect_uri_allows_http_loopback_on_any_port() {
+        for uri in [
+            "http://localhost:8080/cb",
+            "http://localhost:51823/cb",
+            "http://127.0.0.1:9000/cb",
+            "http://[::1]:12345/cb",
+        ] {
+            assert!(is_acceptable_redirect_uri(uri), "{uri}");
+        }
+    }
+
+    /// http は loopback 以外だと拒否されること（LAN・インターネットへ平文コードを流さない）。
+    #[test]
+    fn is_acceptable_redirect_uri_rejects_non_loopback_http() {
+        assert!(!is_acceptable_redirect_uri("http://claude.ai/cb"));
+        assert!(!is_acceptable_redirect_uri("http://example.com:8080/cb"));
+    }
+
+    /// DCR レベルでも第三者ホストの登録が拒否されること。
+    #[tokio::test]
+    async fn register_rejects_a_third_party_https_redirect_uri() {
+        let h = harness().await;
+        let res = post_register(
+            &h.app,
+            serde_json::json!({"redirect_uris": ["https://attacker.example/cb"]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// DCR レベルでもサフィックス一致では登録が通らないこと。
+    #[tokio::test]
+    async fn register_rejects_a_suffix_matching_https_redirect_uri() {
+        let h = harness().await;
+        let res = post_register(
+            &h.app,
+            serde_json::json!({"redirect_uris": ["https://evil-claude.ai/cb"]}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// DCR レベルで http loopback は複数ポートで登録できること。
+    #[tokio::test]
+    async fn register_accepts_http_loopback_redirect_uris_on_different_ports() {
+        let h = harness().await;
+        for uri in ["http://localhost:8080/cb", "http://127.0.0.1:54321/cb"] {
+            let res = post_register(&h.app, serde_json::json!({"redirect_uris": [uri]})).await;
+            assert_eq!(res.status(), StatusCode::CREATED, "{uri}");
+        }
     }
 
     /// S4: redirect_uri の件数上限。無認証 endpoint なので上限が無いと、
@@ -3274,33 +3127,12 @@ mod tests {
         .unwrap()
     }
 
-    /// callback を通して同意画面まで進み、その HTML を返す。
-    async fn reach_consent_page(h: &Harness, client_id: &str) -> String {
-        let state = state_blob(&h.key, client_id, 300);
-        let res = get_uri(
-            &h.app,
-            &format!("/oauth/callback?code=google-code&state={}", enc(&state)),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::OK, "expected the consent page");
-        body_text(res).await
-    }
-
-    /// 同意画面で「許可」を押した後のレスポンス（クライアントへのリダイレクト）。
-    async fn approve_consent(h: &Harness, client_id: &str) -> Response {
-        let html = reach_consent_page(h, client_id).await;
-        let blob = consent_blob_from(&html);
-        post_form(
-            &h.app,
-            "/oauth/consent",
-            &format!("consent={}&action=approve", enc(&blob)),
-        )
-        .await
-    }
-
-    /// C2: callback は **認可コードを発行せず**、自前の同意画面を返す。
+    /// redirect_uri の許可リストが confused deputy を防ぐため、callback は
+    /// 同意画面を経由せず、Google の identity 確定後にその場で認可コードを発行して
+    /// クライアントの redirect_uri へリダイレクトする（設計:
+    /// docs/superpowers/specs/2026-07-22-restrict-redirect-uri-design.md）。
     #[tokio::test]
-    async fn callback_exchanges_google_code_and_renders_the_consent_page() {
+    async fn callback_issues_an_authorization_code_directly_and_redirects_to_the_client() {
         let h = harness().await;
         let client_id = register_client(&h.app).await;
         let state = state_blob(&h.key, &client_id, 300);
@@ -3309,20 +3141,13 @@ mod tests {
             &format!("/oauth/callback?code=google-code&state={}", enc(&state)),
         )
         .await;
-        assert_eq!(res.status(), StatusCode::OK);
-        assert!(res
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("text/html"));
-        let html = body_text(res).await;
-        // 配送先と identity を利用者に見せること。
-        assert!(html.contains(CLIENT_REDIRECT), "{html}");
-        assert!(html.contains("cs@example.com"), "{html}");
-        // 未検証である旨の明示（ブランド偽装対策の要）。
-        assert!(html.contains("検証されていません"), "{html}");
+        assert_eq!(res.status(), StatusCode::FOUND);
+        let loc = url::Url::parse(&location(&res)).unwrap();
+        assert!(location(&res).starts_with(CLIENT_REDIRECT), "{loc}");
+        let q: HashMap<_, _> = loc.query_pairs().into_owned().collect();
+        // クライアントの元の state をそのまま返す（CSRF 対策が成立する条件）。
+        assert_eq!(q["state"], "client-state");
+
         // Google の client_secret はサーバ側 env から取り、token endpoint に送る。
         let sent = h.google_token_log.lock().unwrap().join("\n");
         assert!(
@@ -3330,41 +3155,7 @@ mod tests {
             "{sent}"
         );
         assert!(sent.contains("code_verifier=google-verifier"), "{sent}");
-    }
 
-    /// C2 の要。**同意画面をスキップして認可コードを得る経路が存在しない**こと。
-    /// callback のレスポンスは 200 HTML であり、Location ヘッダも `code` も持たない。
-    #[tokio::test]
-    async fn callback_never_issues_an_authorization_code_without_consent() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let state = state_blob(&h.key, &client_id, 300);
-        let res = get_uri(
-            &h.app,
-            &format!("/oauth/callback?code=google-code&state={}", enc(&state)),
-        )
-        .await;
-        assert!(
-            res.headers().get(header::LOCATION).is_none(),
-            "callback must not redirect to the client before consent"
-        );
-        let html = body_text(res).await;
-        // 同意ブロブ以外に `code=` が現れないこと（クライアントへ渡る形が無い）。
-        assert!(!html.contains("code="), "{html}");
-    }
-
-    /// 同意を経て初めて認可コードが発行され、クライアントへリダイレクトされる。
-    #[tokio::test]
-    async fn approving_consent_redirects_to_the_client_with_a_code() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let res = approve_consent(&h, &client_id).await;
-        assert_eq!(res.status(), StatusCode::FOUND);
-        let loc = url::Url::parse(&location(&res)).unwrap();
-        assert!(location(&res).starts_with(CLIENT_REDIRECT), "{loc}");
-        let q: HashMap<_, _> = loc.query_pairs().into_owned().collect();
-        // クライアントの元の state をそのまま返す（CSRF 対策が成立する条件）。
-        assert_eq!(q["state"], "client-state");
         // 認可コードは封緘済み（`open` でしか読めない）。
         let blob: Blob = h.key.open(&q["code"]).unwrap();
         match blob {
@@ -3396,139 +3187,7 @@ mod tests {
         assert!(!q["code"].contains(GOOGLE_ACCESS_TOKEN), "{}", q["code"]);
     }
 
-    /// W1 + C2: 同意画面で「拒否」を押すと `access_denied` でクライアントへ戻る。
-    #[tokio::test]
-    async fn denying_consent_redirects_with_access_denied() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let html = reach_consent_page(&h, &client_id).await;
-        let blob = consent_blob_from(&html);
-        let res = post_form(
-            &h.app,
-            "/oauth/consent",
-            &format!("consent={}&action=deny", enc(&blob)),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::FOUND);
-        let loc = url::Url::parse(&location(&res)).unwrap();
-        let q: HashMap<_, _> = loc.query_pairs().into_owned().collect();
-        assert_eq!(q["error"], "access_denied");
-        assert_eq!(q["state"], "client-state");
-        assert!(!q.contains_key("code"), "{loc}");
-    }
-
-    /// `action` が未知の値・欠落のときは拒否に倒す（fail closed）。
-    /// 「approve 以外はすべて拒否」が崩れると、フォームの改変で同意を迂回できる。
-    #[tokio::test]
-    async fn consent_treats_anything_other_than_approve_as_denial() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        for action in ["", "&action=", "&action=APPROVE", "&action=yes"] {
-            let html = reach_consent_page(&h, &client_id).await;
-            let blob = consent_blob_from(&html);
-            let res = post_form(
-                &h.app,
-                "/oauth/consent",
-                &format!("consent={}{action}", enc(&blob)),
-            )
-            .await;
-            assert_eq!(res.status(), StatusCode::FOUND, "action={action:?}");
-            let loc = url::Url::parse(&location(&res)).unwrap();
-            let q: HashMap<_, _> = loc.query_pairs().into_owned().collect();
-            assert_eq!(q["error"], "access_denied", "action={action:?}");
-        }
-    }
-
-    /// C1(a): **`CODE_TTL_SECS` を超え `CONSENT_TTL_SECS` 未満**の経過時間で
-    /// 同じ同意ブロブを再送しても認可コードは再発行されない。
-    ///
-    /// 旧実装は使用済み記録の刈り取り窓が `CODE_TTL_SECS`（60 秒）固定で、同意ブロブの
-    /// 寿命は 300 秒だったため、この窓（t=60..300）で記録だけが先に消えて再利用できた。
-    /// 既存の即時再送テストでは検出できない領域なので、論理時計で明示的に踏む。
-    #[tokio::test]
-    async fn consent_blob_cannot_be_replayed_after_the_code_ttl_has_passed() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let html = reach_consent_page(&h, &client_id).await;
-        let blob = consent_blob_from(&html);
-        let form = format!("consent={}&action=approve", enc(&blob));
-
-        let first = post_form(&h.app, "/oauth/consent", &form).await;
-        assert_eq!(first.status(), StatusCode::FOUND);
-
-        // 認可コードの寿命は過ぎたが、同意ブロブ自体はまだ有効な時点まで進める。
-        h.clock.advance(CODE_TTL_SECS + 10);
-        assert!(
-            CODE_TTL_SECS + 10 < CONSENT_TTL_SECS,
-            "窓の前提が崩れている"
-        );
-
-        let replay = post_form(&h.app, "/oauth/consent", &form).await;
-        assert_eq!(
-            replay.status(),
-            StatusCode::BAD_REQUEST,
-            "the consent blob must stay consumed for its own lifetime, not for CODE_TTL_SECS"
-        );
-    }
-
-    /// C1(b): **一度「拒否」した同意を、後から `approve` で再送して覆せない。**
-    ///
-    /// 消費は `action` 判定より前に行われるため拒否でも jti は消費されるが、旧実装では
-    /// その記録が 60 秒で消えていた。ブラウザバックして承認し直すと認可が成立してしまう。
-    #[tokio::test]
-    async fn a_denied_consent_cannot_be_approved_later_by_replaying_the_blob() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let html = reach_consent_page(&h, &client_id).await;
-        let blob = consent_blob_from(&html);
-
-        // 利用者が「拒否」を押す。
-        let denied = post_form(
-            &h.app,
-            "/oauth/consent",
-            &format!("consent={}&action=deny", enc(&blob)),
-        )
-        .await;
-        let loc = url::Url::parse(&location(&denied)).unwrap();
-        let q: HashMap<_, _> = loc.query_pairs().into_owned().collect();
-        assert_eq!(q["error"], "access_denied");
-
-        // 旧実装が再利用を許した窓まで時間を進めてから、同じブロブを承認で再送する。
-        h.clock.advance(CODE_TTL_SECS + 10);
-        let approved = post_form(
-            &h.app,
-            "/oauth/consent",
-            &format!("consent={}&action=approve", enc(&blob)),
-        )
-        .await;
-        assert_eq!(
-            approved.status(),
-            StatusCode::BAD_REQUEST,
-            "a denial must not be reversible by replaying the consent blob"
-        );
-        // 認可コードが発行されていないこと（リダイレクトごと起きていない）。
-        assert!(approved.headers().get(header::LOCATION).is_none());
-    }
-
-    /// 同意ブロブ自身の寿命を過ぎれば、`exp` 検証で落ちる（記録の有無に関わらず）。
-    #[tokio::test]
-    async fn consent_blob_is_rejected_after_its_own_expiry() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let html = reach_consent_page(&h, &client_id).await;
-        let blob = consent_blob_from(&html);
-
-        h.clock.advance(CONSENT_TTL_SECS + 1);
-        let res = post_form(
-            &h.app,
-            "/oauth/consent",
-            &format!("consent={}&action=approve", enc(&blob)),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// 認可コードも、自身の `exp` まで使用済み記録が残ること（C1 の対称確認）。
+    /// 認可コードは、自身の `exp` まで使用済み記録が残ること。
     #[tokio::test]
     async fn an_authorization_code_stays_consumed_for_its_own_lifetime() {
         let h = harness().await;
@@ -3542,71 +3201,6 @@ mod tests {
             post_token(&h.app, &form).await.status(),
             StatusCode::BAD_REQUEST
         );
-    }
-
-    /// 同意ブロブは単回使用。捕捉されたブロブの再提示で認可コードを増産できない。
-    #[tokio::test]
-    async fn consent_blob_cannot_be_replayed() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let html = reach_consent_page(&h, &client_id).await;
-        let blob = consent_blob_from(&html);
-        let form = format!("consent={}&action=approve", enc(&blob));
-        let first = post_form(&h.app, "/oauth/consent", &form).await;
-        assert_eq!(first.status(), StatusCode::FOUND);
-        let second = post_form(&h.app, "/oauth/consent", &form).await;
-        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// 署名のみの（封緘されていない）同意ブロブは受け付けない。
-    /// 封緘を外す退行が起きたらここで落ちる。
-    #[tokio::test]
-    async fn consent_rejects_a_merely_signed_blob() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let signed = h
-            .key
-            .sign(&Blob::Consent {
-                sub: "1122334455".into(),
-                email: "cs@example.com".into(),
-                client_id,
-                redirect_uri: CLIENT_REDIRECT.into(),
-                client_state: None,
-                code_challenge: s256("client-verifier"),
-                upstream: test_upstream(),
-                jti: "j".into(),
-                exp: now_secs() + 300,
-            })
-            .unwrap();
-        let res = post_form(
-            &h.app,
-            "/oauth/consent",
-            &format!("consent={}&action=approve", enc(&signed)),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// C2: 同意画面に出す `client_name` は攻撃者が任意に設定できる未検証の値。
-    /// マークアップとして解釈されないようエスケープすること。
-    #[tokio::test]
-    async fn consent_page_escapes_the_attacker_controlled_client_name() {
-        let h = harness().await;
-        let res = post_register(
-            &h.app,
-            serde_json::json!({
-                "redirect_uris": [CLIENT_REDIRECT],
-                "client_name": "<script>alert('x')</script>Google",
-            }),
-        )
-        .await;
-        let client_id = body_json(res).await["client_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let html = reach_consent_page(&h, &client_id).await;
-        assert!(!html.contains("<script>alert"), "{html}");
-        assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
     #[tokio::test]
@@ -3707,9 +3301,9 @@ mod tests {
         let state = state_blob(&h.key, &client_id, 300);
         let uri = format!("/oauth/callback?code=google-code&state={}", enc(&state));
 
-        // 1 回目は正常に処理され、同意画面まで進む。
+        // 1 回目は正常に処理され、認可コード付きでクライアントへリダイレクトされる。
         let first = get_uri(&h.app, &uri).await;
-        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.status(), StatusCode::FOUND);
         let hits_after_first = h.google_token_hits.load(Ordering::SeqCst);
         assert_eq!(hits_after_first, 1, "1 回目は Google を叩く");
 
@@ -3822,9 +3416,14 @@ mod tests {
     // token
     // ------------------------------------------------------------------
 
-    /// callback → 同意 → 認可コード、と本番と同じ経路を通してコードを得る。
+    /// callback → 認可コード、と本番と同じ経路を通してコードを得る。
     async fn issue_code(h: &Harness, client_id: &str) -> String {
-        let res = approve_consent(h, client_id).await;
+        let state = state_blob(&h.key, client_id, 300);
+        let res = get_uri(
+            &h.app,
+            &format!("/oauth/callback?code=google-code&state={}", enc(&state)),
+        )
+        .await;
         let loc = url::Url::parse(&location(&res)).unwrap();
         loc.query_pairs()
             .find(|(k, _)| k == "code")
@@ -4000,28 +3599,26 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// 別種のブロブ（同意ブロブ）を認可コードとして持ち込む試み。`Blob` の tag が
+    /// 別種のブロブ（state ブロブ）を認可コードとして持ち込む試み。`Blob` の tag が
     /// 一致しないため deserialize 段階で落ちる。「署名は正しいので通す」という
     /// 事故を、呼び出し規約ではなく型で防いでいることの確認。
     #[tokio::test]
-    async fn token_rejects_a_consent_blob_presented_as_an_authorization_code() {
+    async fn token_rejects_a_state_blob_presented_as_an_authorization_code() {
         let h = harness().await;
         let client_id = register_client(&h.app).await;
-        let consent = h
+        let state = h
             .key
-            .seal(&Blob::Consent {
-                sub: "1122334455".into(),
-                email: "cs@example.com".into(),
+            .seal(&Blob::State {
                 client_id: client_id.clone(),
                 redirect_uri: CLIENT_REDIRECT.into(),
                 client_state: None,
                 code_challenge: s256("client-verifier"),
-                upstream: test_upstream(),
+                google_verifier: "google-verifier".into(),
                 jti: "j".into(),
                 exp: now_secs() + 3600,
             })
             .unwrap();
-        let res = post_token(&h.app, &code_form(&consent, &client_id, "client-verifier")).await;
+        let res = post_token(&h.app, &code_form(&state, &client_id, "client-verifier")).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -4417,7 +4014,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // W1 / W2: 同意画面とトークン応答のセキュリティヘッダ
+    // W2: トークン応答のキャッシュ抑止ヘッダ
     // ------------------------------------------------------------------
 
     fn header_of(res: &Response, name: header::HeaderName) -> String {
@@ -4427,40 +4024,6 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
-    }
-
-    /// W1: 同意画面はフレーム禁止。この画面は confused deputy への唯一の防御であり、
-    /// フレーム可能だと透明オーバーレイで「許可」を押させられて C2 対策が無意味になる。
-    #[tokio::test]
-    async fn the_consent_page_forbids_framing() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let state = state_blob(&h.key, &client_id, 300);
-        let res = get_uri(
-            &h.app,
-            &format!("/oauth/callback?code=google-code&state={}", enc(&state)),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(header_of(&res, header::X_FRAME_OPTIONS), "DENY");
-        let csp = header_of(&res, header::CONTENT_SECURITY_POLICY);
-        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
-        assert!(csp.contains("default-src 'none'"), "{csp}");
-    }
-
-    /// W2: 同意画面をキャッシュに残さない（同意ブロブを含むため）。
-    #[tokio::test]
-    async fn the_consent_page_is_not_cacheable() {
-        let h = harness().await;
-        let client_id = register_client(&h.app).await;
-        let state = state_blob(&h.key, &client_id, 300);
-        let res = get_uri(
-            &h.app,
-            &format!("/oauth/callback?code=google-code&state={}", enc(&state)),
-        )
-        .await;
-        assert_eq!(header_of(&res, header::CACHE_CONTROL), "no-store");
-        assert_eq!(header_of(&res, header::PRAGMA), "no-cache");
     }
 
     /// W2: RFC 6749 §5.1 はトークン応答に `no-store` を MUST で要求している。
