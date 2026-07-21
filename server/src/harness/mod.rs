@@ -90,6 +90,35 @@ pub struct RelatedCase {
     pub last_decision: String,
 }
 
+/// outcome 確定時に answer_attempt へ書き戻す全属性を組み立てる純関数。
+///
+/// read-merge-write: 既存属性（draft / case_id / known_resolution_id / 起票者の
+/// actor・actor_email 等）を土台に、outcome 側の属性を重ねる。
+///
+/// 承認者は安定 ID（`outcome_actor`）と email（`outcome_actor_email`）の両方を書く。
+/// ID だけだと、同じノード上に隣接する起票者の `actor_email` が承認者の email と
+/// 誤読される。承認者は昇格・降格を駆動するガバナンス上の主体であり、
+/// 「誰が承認したか」を人間が読める形で残す必要がある。
+/// なお email は「認証時点の当時の値」であり、同一人物判定には使わない（authn.rs）。
+fn merge_outcome_attributes(
+    attempt: &std::collections::HashMap<String, String>,
+    attempt_id: &str,
+    outcome: grading::AnswerOutcome,
+    actor: &authn::Actor,
+    note: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = attempt.clone();
+    merged.insert("attempt_id".to_string(), attempt_id.to_string());
+    merged.insert("outcome".to_string(), outcome.as_str().to_string());
+    merged.insert("outcome_actor".to_string(), actor.sub.clone());
+    merged.insert("outcome_actor_email".to_string(), actor.email.clone());
+    merged.insert(
+        "outcome_note".to_string(),
+        note.unwrap_or_default().to_string(),
+    );
+    merged
+}
+
 impl Harness {
     pub fn build(
         config: &AppConfig,
@@ -189,6 +218,7 @@ impl Harness {
             request_id: ctx.request_id.clone(),
             schema: ctx.schema.clone(),
             actor: ctx.actor.sub.clone(),
+            actor_email: ctx.actor.email.clone(),
             used_scope: ctx.scope.clone(),
             retrieved_node_ids,
             decision: decision.into(),
@@ -239,14 +269,7 @@ impl Harness {
         } else {
             // read-merge-write: 既存属性（draft / case_id / known_resolution_id 等）を
             // ベースに outcome を重ねて全属性を再送する（全属性置換セマンティクスでも安全）。
-            let mut merged = attempt.clone();
-            merged.insert("attempt_id".to_string(), attempt_id.to_string());
-            merged.insert("outcome".to_string(), outcome.as_str().to_string());
-            merged.insert("outcome_actor".to_string(), ctx.actor.sub.clone());
-            merged.insert(
-                "outcome_note".to_string(),
-                note.unwrap_or_default().to_string(),
-            );
+            let merged = merge_outcome_attributes(&attempt, attempt_id, outcome, &ctx.actor, note);
             store
                 .record(
                     &ctx.schema,
@@ -278,22 +301,39 @@ impl Harness {
             .find(|kr| kr.id == kr_id)
             .ok_or_else(|| anyhow!("known_resolution not found: {kr_id}"))?;
         let attempts = store.load_attempts_for_kr(&ctx.schema, kr_id).await?;
-        let (approval_count, rejection_count, approver_set) =
-            grading::derive_outcome_counts(&attempts);
+        let counts = grading::derive_outcome_counts(&attempts);
+        // 旧形式 actor は名寄せ不能なため昇格判定の母集団から外している（grading.rs）。
+        // 除外が無音だと「承認は積んだのに昇格しない」理由を運用者が辿れないので、
+        // 除外が起きた回だけ kr_id と件数を残す。
+        if counts.legacy_excluded_count > 0 {
+            tracing::warn!(
+                kr_id = %kr_id,
+                schema = %ctx.schema,
+                legacy_excluded_approvers = counts.legacy_excluded_count,
+                approver_count = counts.approver_count,
+                approver_set_len = counts.approver_set.len(),
+                promote_approvers = self.grading.promote_approvers,
+                "legacy google:{{email}} approvers are excluded from approver diversity; \
+                 promotion may be blocked. approver_set is persisted in full; only the \
+                 diversity count is reduced."
+            );
+        }
         let regraded = grading::regrade(
             kr.grade,
-            approval_count,
-            rejection_count,
-            approver_set.len(),
+            counts.approval_count,
+            counts.rejection_count,
+            counts.approver_count,
             &self.grading,
         );
+        // 永続化には除外前の全承認者を渡す。除外後の集合を書き戻すと、cutover 前に
+        // 記録済みの承認者が次の outcome 記録で静かに消える（W2）。
         store
             .update_known_resolution_grade(
                 &ctx.schema,
                 kr_id,
-                approval_count,
-                rejection_count,
-                &approver_set,
+                counts.approval_count,
+                counts.rejection_count,
+                &counts.approver_set,
                 regraded,
             )
             .await?;
@@ -400,14 +440,15 @@ impl Harness {
     }
 
     /// S1-1 パイプライン前半: [認証] → [(A) 権限]。全 tool がここを通る。
-    /// `email` は Google OAuth ミドルウェアが検証済みの Google email（`oauth::VerifiedEmail`）。
+    /// `identity` は Google OAuth ミドルウェアが検証済みの Google identity
+    /// （`oauth::VerifiedIdentity`。安定した `sub` + 認証時点の email）。
     pub fn begin(
         &self,
-        email: &str,
+        identity: &crate::oauth::VerifiedIdentity,
         project_schema: &str,
         project_manual_schema: crate::config::ManualSchemaKind,
     ) -> Result<RequestContext> {
-        let actor = self.authenticator.lookup_by_email(email)?;
+        let actor = self.authenticator.lookup_by_identity(identity)?;
         let access = scope::resolve_scope(&actor, project_schema)?;
         Ok(RequestContext {
             schema: access.enforced_schema().to_string(),
@@ -476,6 +517,9 @@ impl Harness {
                     ("case_id".to_string(), new_id.clone()),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
+                    // actor は安定 ID（google-sub:{sub}）で人間には読めないため、
+                    // case を追う担当者向けに当時の email も併記する（加算属性）。
+                    ("actor_email".to_string(), ctx.actor.email.clone()),
                     ("question".to_string(), question.to_string()),
                     (
                         "product_key".to_string(),
@@ -824,6 +868,9 @@ impl Harness {
             "request_id": ctx.request_id,
             "schema": ctx.schema,
             "actor": ctx.actor.sub,
+            // actor は安定 ID（google-sub:{sub}）で人間には読めないため、
+            // エスカレーションを処理する担当者向けに当時の email も併記する。
+            "actor_email": ctx.actor.email,
             "corrected_answer": corrected_answer,
             "queued_at": chrono::Utc::now().to_rfc3339(),
         });
@@ -874,20 +921,99 @@ mod tests {
         }
     }
 
+    fn test_identity() -> crate::oauth::VerifiedIdentity {
+        crate::oauth::VerifiedIdentity {
+            sub: "101572111487015263315".to_string(),
+            email: "op@sivira.co".to_string(),
+        }
+    }
+
     #[test]
     fn begin_produces_request_context_with_enforced_schema() {
         let harness = harness_for_test();
         let ctx = harness
             .begin(
-                "op@sivira.co",
+                &test_identity(),
                 "sivira-cs-demo",
                 crate::config::ManualSchemaKind::LegacySection,
             )
             .expect("begin");
         assert_eq!(ctx.schema, "sivira-cs-demo");
-        // ホワイトリスト廃止に伴い sub は "google:{email}" 導出になる（authn.rs 参照）。
-        assert_eq!(ctx.actor.sub, "google:op@sivira.co");
+        // F4: actor の主識別子は安定した Google sub 由来（authn.rs 参照）。
+        // email は当時の値として別フィールドに載る。
+        assert_eq!(ctx.actor.sub, "google-sub:101572111487015263315");
+        assert_eq!(ctx.actor.email, "op@sivira.co");
         assert!(!ctx.request_id.is_empty());
+    }
+
+    /// W1 回帰: 起票者（attempt.actor_email）と承認者（outcome_actor_email）が別人のとき、
+    /// それぞれの email が別フィールドへ入ること。両者が隣接して載るため、承認者側に email が
+    /// 無いと起票者の email が承認者のものと誤読される。
+    #[test]
+    fn outcome_records_approver_email_separately_from_author_email() {
+        let attempt: std::collections::HashMap<String, String> = [
+            ("attempt_id", "att-001"),
+            ("actor", "google-sub:author-sub"),
+            ("actor_email", "author@sivira.co"),
+            ("draft", "元の回答案"),
+            ("known_resolution_id", "kr-001"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let approver = authn::Actor {
+            sub: "google-sub:approver-sub".to_string(),
+            email: "approver@sivira.co".to_string(),
+            role: authn::Role::Supervisor,
+            allowed_schemas: vec![],
+        };
+        let merged = merge_outcome_attributes(
+            &attempt,
+            "att-001",
+            grading::AnswerOutcome::Resolved,
+            &approver,
+            Some("確認済み"),
+        );
+        // 起票者の記録は書き換わらない
+        assert_eq!(merged["actor"], "google-sub:author-sub");
+        assert_eq!(merged["actor_email"], "author@sivira.co");
+        // 承認者は安定 ID と email の両方が承認者側フィールドに載る
+        assert_eq!(merged["outcome_actor"], "google-sub:approver-sub");
+        assert_eq!(merged["outcome_actor_email"], "approver@sivira.co");
+        assert_eq!(merged["outcome"], "resolved");
+        assert_eq!(merged["outcome_note"], "確認済み");
+        // 既存属性（draft / KR 紐づけ）は read-merge-write で保持される
+        assert_eq!(merged["draft"], "元の回答案");
+        assert_eq!(merged["known_resolution_id"], "kr-001");
+    }
+
+    /// 境界: 起票者と承認者が同一人物でも、両フィールドに同じ値が入るだけで破綻しない。
+    #[test]
+    fn outcome_by_author_themselves_fills_both_email_fields() {
+        let attempt: std::collections::HashMap<String, String> = [
+            ("actor", "google-sub:same-sub"),
+            ("actor_email", "same@sivira.co"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let actor = authn::Actor {
+            sub: "google-sub:same-sub".to_string(),
+            email: "same@sivira.co".to_string(),
+            role: authn::Role::Supervisor,
+            allowed_schemas: vec![],
+        };
+        let merged = merge_outcome_attributes(
+            &attempt,
+            "att-002",
+            grading::AnswerOutcome::WrongAnswer,
+            &actor,
+            None,
+        );
+        assert_eq!(merged["actor_email"], "same@sivira.co");
+        assert_eq!(merged["outcome_actor_email"], "same@sivira.co");
+        assert_eq!(merged["outcome_note"], "");
+        assert_eq!(merged["attempt_id"], "att-002");
     }
 
     // admission 層（Harness::admit_known_resolution）が legacy schema の rationale_text を
@@ -900,6 +1026,7 @@ mod tests {
         let ctx = RequestContext {
             actor: authn::Actor {
                 sub: "sup-001".to_string(),
+                email: "sup@sivira.co".to_string(),
                 role: authn::Role::Supervisor,
                 allowed_schemas: vec!["sivira-cs-demo".to_string()],
             },
@@ -934,7 +1061,7 @@ mod tests {
         let harness = harness_for_test();
         assert!(harness
             .begin(
-                "op@sivira.co",
+                &test_identity(),
                 "other-tenant",
                 crate::config::ManualSchemaKind::LegacySection,
             )

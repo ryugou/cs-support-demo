@@ -11,10 +11,11 @@ bind_addr = "0.0.0.0:8080"
 # VPC peering 越しの punkrecord-egghead 実 IP。Cloud Run では env VEGAPUNK_ENDPOINT で上書きする。
 vegapunk_endpoint = "http://10.10.0.2:6840"
 
-[[projects]]
-project_id = "sivira-cs-demo"
-schema = "sivira-cs-demo"
-
+# project は urtect 1 件に絞る。`Authenticator` は `allowed_schemas` に config 全 project の
+# schema を複製するため（server/src/harness/authn.rs）、project を増やすとその schema も
+# 既存の全 Google 利用者へ自動的に公開される。email ホワイトリスト廃止後はこれを止める
+# 認可境界が無いので、露出面を最小化するためレガシーの sivira-cs-demo を外した。
+# 新しい project を足すときは、テナント分離が成立しているかを先に確認すること。
 [[projects]]
 project_id = "urtect"
 schema = "urtect"
@@ -24,8 +25,6 @@ manual_schema = "manual_v1"
 # audit_log_path / search_improvement_queue_path は GCS ボリュームマウント先の絶対パスにする
 # （resolve_path は絶対パスをそのまま使う。config_dir 基準の相対解決をしない）。
 # lexicon / ng は urtect 用（イメージ内 data/urtect/... 、WORKDIR /app/server からの相対）を使う。
-# sivira-cs-demo はレガシー据え置きのため urtect 語彙下でも動作に支障はない
-# （signal 抽出は urtect 側の運用強化が目的で、sivira 側は従来どおり lexicon_fallback で動く）。
 [harness]
 audit_log_path = "/data/audit/audit.jsonl"
 search_improvement_queue_path = "/data/audit/search-improvement-queue.jsonl"

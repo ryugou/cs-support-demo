@@ -211,6 +211,10 @@ pub struct NewKnownResolution {
     pub answer: String,
     pub origin: String,
     pub created_by: String,
+    /// `created_by` は安定 ID（`google-sub:{sub}`）で人間には読めないため、
+    /// ノウハウの出所を追う担当者向けに登録時点の email も併記する。
+    /// 主識別子はあくまで `created_by`（email は変更・再割当てされうる「当時の値」）。
+    pub created_by_email: String,
     /// 担当者の判断理由（任意）。BECAUSE → Rationale で残す
     pub rationale_text: Option<String>,
     /// マニュアル出典 section（BASED_ON → ManualSection で結線）
@@ -253,6 +257,7 @@ pub fn build_known_resolution_graph(
             ("approver_set".to_string(), String::new()),
             ("origin".to_string(), kr.origin.clone()),
             ("created_by".to_string(), kr.created_by.clone()),
+            ("created_by_email".to_string(), kr.created_by_email.clone()),
             ("verified_at".to_string(), chrono::Utc::now().to_rfc3339()),
             // --- 予約（空で存在させる。S1-8 条件 6）---
             ("error_axis".to_string(), String::new()),
@@ -768,6 +773,7 @@ mod tests {
             answer: "推奨は東芝製です。".to_string(),
             origin: "escalation:esc-1".to_string(),
             created_by: "sup-001".to_string(),
+            created_by_email: "sup-001@sivira.co".to_string(),
             rationale_text: Some("メーカー動作確認リストに基づく".to_string()),
             manual_section_keys: vec!["sec-sd-not-recognized".to_string()],
         };
@@ -829,6 +835,7 @@ mod tests {
             answer: "y".to_string(),
             origin: "manual".to_string(),
             created_by: "sup".to_string(),
+            created_by_email: "sup@sivira.co".to_string(),
             rationale_text: None,
             manual_section_keys: vec![],
         };
@@ -856,6 +863,51 @@ mod tests {
         );
     }
 
+    /// W2: `created_by` は安定 ID（`google-sub:{sub}`）で人間には読めない。
+    /// ノウハウの出所を担当者が追えるよう、登録時点の email も併記する。
+    /// 加算属性であり、`created_by` を置き換えない（主識別子は安定 ID のまま）。
+    #[test]
+    fn known_resolution_node_records_creator_email_alongside_stable_id() {
+        let new_kr = NewKnownResolution {
+            signal_set: [Signal::new("mold")].into_iter().collect(),
+            applicability: "全ロット".to_string(),
+            answer: "廃棄してください".to_string(),
+            origin: "manual".to_string(),
+            created_by: "google-sub:101572111487015263315".to_string(),
+            created_by_email: "alice@sivira.co".to_string(),
+            rationale_text: None,
+            manual_section_keys: Vec::new(),
+        };
+        let build = build_known_resolution_graph(
+            "urtect",
+            "kr-test",
+            &new_kr,
+            crate::config::ManualSchemaKind::ManualV1,
+        );
+        let kr_node = build
+            .nodes
+            .iter()
+            .find(|n| n.node_type == "KnownResolution")
+            .expect("kr node");
+        let attr = |key: &str| {
+            kr_node
+                .attributes
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            attr("created_by"),
+            Some("google-sub:101572111487015263315".to_string()),
+            "stable actor id must remain the primary identifier"
+        );
+        assert_eq!(
+            attr("created_by_email"),
+            Some("alice@sivira.co".to_string()),
+            "creator email must be recorded alongside the stable id"
+        );
+    }
+
     #[test]
     fn known_resolution_node_build_uses_signal_nodes_not_json_attr() {
         // I2 / アンチパターン 3: signal_set が KR ノード属性に存在しないこと
@@ -867,6 +919,7 @@ mod tests {
             answer: "廃棄してください".to_string(),
             origin: "escalation:esc-1".to_string(),
             created_by: "sup-001".to_string(),
+            created_by_email: "sup-001@sivira.co".to_string(),
             rationale_text: Some("doc-1#storage の保管条件に基づく".to_string()),
             manual_section_keys: vec!["doc-1#storage".to_string()],
         };
@@ -991,6 +1044,7 @@ mod tests {
             answer: "廃棄してください".to_string(),
             origin: "escalation:esc-1".to_string(),
             created_by: "sup-001".to_string(),
+            created_by_email: "sup-001@sivira.co".to_string(),
             rationale_text: None,
             manual_section_keys: vec!["doc-1#storage".to_string()],
         };

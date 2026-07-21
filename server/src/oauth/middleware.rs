@@ -1,5 +1,5 @@
 use super::verifier::GoogleTokenVerifier;
-use super::{AuthError, VerifiedEmail};
+use super::AuthError;
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -23,7 +23,8 @@ pub struct AuthState {
 ///   （Claude 側の OAuth 発見フローのトリガ。RFC 9728 準拠）。
 /// - Google tokeninfo 到達不能 → 503（クライアント側のトークン不備ではなく運用側の障害だと
 ///   運用者が切り分けられるよう、401 とは区別する）。
-/// - 成功 → 検証済み email を `request.extensions` に注入して次のハンドラへ渡す。
+/// - 成功 → 検証済み identity（安定した `sub` + 当時の email）を `request.extensions` に
+///   注入して次のハンドラへ渡す。
 ///   下流の `Harness::begin` はこの extensions を読み、Authorization ヘッダを直接見ない。
 ///
 /// 失敗理由は分類（missing_bearer / invalid_token / google_unreachable）のみを
@@ -56,8 +57,8 @@ pub async fn require_google_auth(
     };
 
     match state.verifier.verify(&token).await {
-        Ok(email) => {
-            request.extensions_mut().insert(VerifiedEmail(email));
+        Ok(identity) => {
+            request.extensions_mut().insert(identity);
             next.run(request).await
         }
         Err(AuthError::Unreachable(msg)) => {

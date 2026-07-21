@@ -43,7 +43,7 @@ Tool 一覧（S1-7 の 12 本）:
 
 > **警告:** 現状は検証済み Google アカウントで認証さえ通れば、突合表を経由せず
 > 無条件で `Role::Supervisor` として扱われる（`server/src/harness/authn.rs`
-> `Authenticator::lookup_by_email`）。`add_known_resolution` を含む全操作が
+> `Authenticator::lookup_by_identity`）。`add_known_resolution` を含む全操作が
 > Google アカウントを持つ任意のユーザーから実行可能であり、actor 突合表の
 > DB 実装が完了するまでアクセス制御としては不十分。
 >

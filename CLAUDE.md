@@ -208,9 +208,9 @@ cs-support-mcp/
 - MCP endpoint は `/{project_id}/mcp`。
 - `project_id` から schema を解決し、vegapunk 呼び出しへ注入する。
 - 認証は Google OAuth 2.1 とする。`cs-support-mcp` は OAuth リソースサーバとして動作し、認可サーバは Google（`accounts.google.com`）。無トークンアクセスは `401` + `WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/{project_id}/mcp"` を返し、クライアントはこのメタデータ経由で認可サーバ（Google）を発見する。プロジェクトごとの静的 Bearer token・静的 JWT は撤去済み。
-- **警告**: 現状、Google アカウントで認証さえ通れば誰でも supervisor として `add_known_resolution` を含む全操作を実行できる（`server/src/harness/authn.rs` の `lookup_by_email` が突合を行わず無条件に supervisor 解決するため）。actor 突合表の DB 実装が入るまで、アクセス制御としては不十分と扱うこと。詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
+- **警告**: 現状、Google アカウントで認証さえ通れば誰でも supervisor として `add_known_resolution` を含む全操作を実行できる（`server/src/harness/authn.rs` の `lookup_by_identity` が突合を行わず無条件に supervisor 解決するため）。actor 突合表の DB 実装が入るまで、アクセス制御としては不十分と扱うこと。詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
 - **警告（上記の規模）**: Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済みで、テストユーザによる制限は無い。したがって上記「誰でも」の母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。OAuth クライアントが Internal（組織限定）だと仮定しないこと。
-- 本番 Cloud Run の project 定義は `sivira-cs-demo` と `urtect` の 2 件（`server/config.cloudrun.toml`）。本番 MCP endpoint は `urtect` 側。`allowed_schemas` は config 全 project の複製で解決されるため（`server/src/harness/authn.rs`）、project 数の把握を誤ると認可範囲の誤解に直結する。
+- 本番 Cloud Run の project 定義は `urtect` の 1 件のみ（`server/config.cloudrun.toml`）。レガシーの `sivira-cs-demo` は露出面を最小化するため外した。`allowed_schemas` は config 全 project の複製で解決されるため（`server/src/harness/authn.rs`）、**project を追加するとその schema も既存の全 Google 利用者へ自動的に公開される**。テナント分離を成立させる認可境界が無い間は、project を安易に増やさないこと。
 - mapping は 1 件でも、将来別 schema を引ける構造にする。
 
 ## Ingest

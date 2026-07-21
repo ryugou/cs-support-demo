@@ -277,26 +277,31 @@ impl CsSupportRmcpServer {
     }
 
     /// 全 tool の共通入口。認証 → scope 強制 → RequestContext（S1-1 前半）。
-    /// email は axum の Google OAuth ミドルウェア（`oauth::middleware::require_google_auth`）が
-    /// 検証済みで `http::request::Parts` の extensions に注入している（`oauth::VerifiedEmail`）。
+    /// identity は axum の Google OAuth ミドルウェア（`oauth::middleware::require_google_auth`）が
+    /// 検証済みで `http::request::Parts` の extensions に注入している
+    /// （`oauth::VerifiedIdentity`。安定した `sub` + 認証時点の email）。
     /// ここに値が無いのはミドルウェアの配線漏れ・構成ミスであり、fail closed で拒否する。
     fn begin(&self, extensions: &rmcp::model::Extensions) -> Result<RequestContext, ErrorData> {
-        let email = extensions
+        let identity = extensions
             .get::<http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<crate::oauth::VerifiedEmail>())
-            .map(|v| v.0.clone());
-        let email = email.ok_or_else(|| {
-            tracing::warn!(reason = "missing_verified_email", "auth rejected at begin");
+            .and_then(|parts| parts.extensions.get::<crate::oauth::VerifiedIdentity>())
+            .cloned();
+        let identity = identity.ok_or_else(|| {
+            tracing::warn!(
+                reason = "missing_verified_identity",
+                "auth rejected at begin"
+            );
             ErrorData::invalid_request("unauthenticated".to_string(), None)
         })?;
         self.harness
-            .begin(&email, &self.schema, self.manual_schema)
+            .begin(&identity, &self.schema, self.manual_schema)
             .map_err(|err| {
-                // allowlist 外 / scope 外の拒否は無音にしない。email は actor 識別に必要な
-                // 監査情報でありログ可（token 本体ではない）。token は絶対にログしない。
+                // allowlist 外 / scope 外の拒否は無音にしない。sub / email は actor 識別に
+                // 必要な監査情報でありログ可（token 本体ではない）。token は絶対にログしない。
                 tracing::warn!(
                     reason = "unregistered_or_unscoped",
-                    email = %email,
+                    sub = %identity.sub,
+                    email = %identity.email,
                     error = %err,
                     "authorization denied"
                 );
@@ -776,6 +781,9 @@ impl CsSupportRmcpServer {
                     ("case_id".to_string(), req.case_id.clone()),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
+                    // actor は安定 ID（google-sub:{sub}）で人間には読めないため、
+                    // 回答履歴を追う担当者向けに当時の email も併記する（加算属性）。
+                    ("actor_email".to_string(), ctx.actor.email.clone()),
                     ("draft".to_string(), req.draft.clone()),
                     (
                         "evaluation_request_id".to_string(),
@@ -931,6 +939,9 @@ impl CsSupportRmcpServer {
                     ),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
+                    // actor は安定 ID（google-sub:{sub}）で人間には読めないため、
+                    // 訂正の出所を追う担当者向けに当時の email も併記する（加算属性）。
+                    ("actor_email".to_string(), ctx.actor.email.clone()),
                     (
                         "feedback_source".to_string(),
                         req.feedback_source.as_str().to_string(),
@@ -1007,6 +1018,9 @@ impl CsSupportRmcpServer {
                     ),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
+                    // エスカレーションを受け取る担当者が読む対象そのもの。安定 ID だけでは
+                    // 「誰が上げたか」が引けないため、当時の email を併記する（加算属性）。
+                    ("actor_email".to_string(), ctx.actor.email.clone()),
                     ("layer".to_string(), req.layer.to_string()),
                     ("reason".to_string(), req.reason.clone()),
                     ("route_to".to_string(), req.route_to.clone()),
@@ -1064,6 +1078,7 @@ impl CsSupportRmcpServer {
                 .map(|id| format!("escalation:{id}"))
                 .unwrap_or_else(|| "manual".to_string()),
             created_by: ctx.actor.sub.clone(),
+            created_by_email: ctx.actor.email.clone(),
             rationale_text: req.rationale_text.clone(),
             manual_section_keys: req.manual_section_keys.clone(),
         };

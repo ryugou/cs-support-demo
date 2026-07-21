@@ -806,9 +806,9 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
 
 - **AuthN = Google OAuth 2.1**。IdP は Google（`accounts.google.com`）、`cs-support-mcp` は OAuth リソースサーバとして動作する。無トークンアクセスは `401` + `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource/{project_id}/mcp"` を返し、`GET /.well-known/oauth-protected-resource/{project_id}/mcp` が `200` でリソースメタデータ（`authorization_servers: ["https://accounts.google.com"]`）を返す。`/.well-known/oauth-authorization-server` は 404 が正常（認可サーバが Google 自身のため、このリソースサーバ側にメタデータを持たない）。
 - **actor 突合のホワイトリストは廃止済み**（`server/src/harness/authn.rs`）。config `[[actors]]` による email ホワイトリスト、およびその後継として一時導入された `[default_actor]` フォールバック（commit aa9e3d8）も同じ理由で revert 済み（commit e90ef59）。config と DB の二重の正本を避けるため、config 側にホワイトリスト相当を足す実装は再度行わない。
-- **`Authenticator::lookup_by_email` は突合を一切行わず、任意の検証済み email を無条件に `Role::Supervisor` かつ config 全 project の `allowed_schemas` で `Actor` に解決する**（`server/src/harness/authn.rs:70-85`）。supervisor は `add_known_resolution` 等の権限ゲート（`server/src/harness/mod.rs:313-316`）を無条件に通過する。
+- **`Authenticator::lookup_by_identity` は突合を一切行わず、任意の検証済み email を無条件に `Role::Supervisor` かつ config 全 project の `allowed_schemas` で `Actor` に解決する**（`server/src/harness/authn.rs:87-104`）。supervisor は `add_known_resolution` 等の権限ゲート（`server/src/harness/mod.rs:315`）を無条件に通過する。
 - **Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済み**。テストユーザ登録による制限は外れているため、認証到達可能な母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。下記の「無条件 supervisor」と組み合わせて読むこと ―― 片方だけではリスクの規模を誤る。
-- **actor 突合表の DB 移行は未実装**。現状の歯止めは「Google 認証を通過したか」のみであり、実質的なアクセス制御は無い ―― 言い換えると、現状は Google アカウントで認証さえ通れば誰でも supervisor 権限の全操作（`add_known_resolution` を含む）が可能であり、実質的な認可（誰が何をできるか）は「Google 認証を通過したか」以上には絞られていない。`Authenticator::lookup_by_email`（同ファイル doc comment に「DB 実装時の差し替え seam」と明記）を DB 参照に差し替えるまで、本番運用でのアクセス制御としては不十分と扱うこと。
+- **actor 突合表の DB 移行は未実装**。現状の歯止めは「Google 認証を通過したか」のみであり、実質的なアクセス制御は無い ―― 言い換えると、現状は Google アカウントで認証さえ通れば誰でも supervisor 権限の全操作（`add_known_resolution` を含む）が可能であり、実質的な認可（誰が何をできるか）は「Google 認証を通過したか」以上には絞られていない。`Authenticator::lookup_by_identity`（同ファイル doc comment に「DB 実装時の差し替え seam」と明記）を DB 参照に差し替えるまで、本番運用でのアクセス制御としては不十分と扱うこと。
 
 ### 実装状況（2026-07-04）
 
@@ -837,7 +837,7 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
 
 ### 本番運用時の課題（デモでは保留）
 
-- **actor 突合表の DB 化（B6、旧: JWT 認証の本番化）**: AuthN は Google OAuth 2.1 に移行済み（上記「AuthN 現状」参照）。残る課題は認可側で、`Authenticator::lookup_by_email` が突合なしに任意の検証済み email を supervisor へ無条件解決する現状を、DB ベースの actor 表（sub/email → role / allowed_schemas）に差し替えること。払い出し・失効運用も本番で確定する。
+- **actor 突合表の DB 化（B6、旧: JWT 認証の本番化）**: AuthN は Google OAuth 2.1 に移行済み（上記「AuthN 現状」参照）。残る課題は認可側で、`Authenticator::lookup_by_identity` が突合なしに任意の検証済み email を supervisor へ無条件解決する現状を、DB ベースの actor 表（sub/email → role / allowed_schemas）に差し替えること。払い出し・失効運用も本番で確定する。
 - **デモ商材と signal 語彙のドメイン整合**: 現行サンプルマニュアルは `SVR-HB100`（スマートホームハブ＝電子機器）だが、signal 語彙初版は化粧品・健康食品向け。納品対象の商材を確定し、マニュアルと語彙のドメインを揃える（電子機器なら安全語彙を発熱・発火・感電系に作り直す）。
 
 ---
