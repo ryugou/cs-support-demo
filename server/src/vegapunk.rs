@@ -2,9 +2,10 @@ use crate::{
     model::{GraphBuild, GraphEdge, GraphNode},
     proto::graphrag::{
         create_schema_request, graph_rag_engine_client::GraphRagEngineClient, AttributeFilter,
-        CreateSchemaRequest, Edge, EmbedRequest, GetGraphSnapshotRequest, GetSchemaRequest, Node,
-        NodeAttribute, QueryNodesRequest, SearchRequest, UpdateSchemaRequest, UpsertEdgesRequest,
-        UpsertNodesRequest, UpsertVectorsRequest, VectorEntry,
+        CreateSchemaRequest, Edge, EdgeTraversal, EmbedRequest, GetGraphSnapshotRequest,
+        GetSchemaRequest, Node, NodeAttribute, QueryNodesRequest, SearchRequest,
+        UpdateSchemaRequest, UpsertEdgesRequest, UpsertNodesRequest, UpsertVectorsRequest,
+        VectorEntry,
     },
 };
 use anyhow::{Context, Result};
@@ -327,6 +328,124 @@ impl VegapunkClient {
         .context("query nodes")
     }
 
+    /// `query_nodes` を offset ページングで最後まで読み切り、一致ノードを全件返す。
+    ///
+    /// `GetGraphSnapshot` は `max_nodes` に backend 側ハード上限 5000 があり、数万ノード規模の
+    /// schema では truncate して差分/stale 判定を壊す。`QueryNodes` は `offset`/`limit`(max 1000)
+    /// で任意件数までページングできるため、既存状態の全件ロードはこちらを使う。
+    /// 1 ページが `page_size` 未満になった時点で終端とみなす（`page_is_last`）。読み取り中に
+    /// グラフを書き換えない前提で使うこと（ingest は書き込みより前にこれで読み切る）。
+    pub async fn query_nodes_paged(
+        &self,
+        schema: &str,
+        node_type: &str,
+        filters: Vec<(&str, &str, &str)>,
+        page_size: i32,
+    ) -> Result<Vec<crate::proto::graphrag::NodeResult>> {
+        anyhow::ensure!(
+            page_size > 0,
+            "query_nodes_paged page_size must be positive (got {page_size})"
+        );
+        let proto_filters: Vec<AttributeFilter> = filters
+            .into_iter()
+            .map(|(key, op, value)| AttributeFilter {
+                key: key.to_string(),
+                op: op.to_string(),
+                value: value.to_string(),
+            })
+            .collect();
+        let mut all: Vec<crate::proto::graphrag::NodeResult> = Vec::new();
+        let mut offset = 0i32;
+        loop {
+            let req = QueryNodesRequest {
+                schema: schema.to_string(),
+                node_type: node_type.to_string(),
+                filters: proto_filters.clone(),
+                sort_by: None,
+                sort_order: None,
+                limit: Some(page_size),
+                offset: Some(offset),
+                traverse: None,
+            };
+            let page = self
+                .call(
+                    |mut client, request| async move {
+                        client
+                            .query_nodes(request)
+                            .await
+                            .map(|resp| resp.into_inner().nodes)
+                    },
+                    req,
+                )
+                .await
+                .with_context(|| format!("query nodes (paged {node_type}, offset {offset})"))?;
+            let returned = page.len();
+            all.extend(page);
+            if page_is_last(returned, page_size as usize) {
+                break;
+            }
+            // offset は毎ページ page_size 進むため必ず前進し、総数を超えれば空ページで終端する。
+            offset = offset
+                .checked_add(page_size)
+                .context("query_nodes_paged offset overflowed i32")?;
+        }
+        Ok(all)
+    }
+
+    /// `source_node_id` から `edge_type` を `direction`（"outgoing"|"incoming"）へ 1-hop 辿った
+    /// 隣接ノードの node_id 一覧を返す（`QueryNodes` の `traverse`）。
+    ///
+    /// stale-edge 検出で、`graph_snapshot` の全件依存を避けて「変更のあった既存 section 1 件」の
+    /// 現行 edge だけをピンポイントに引くために使う。呼び出しは再 ingest で内容が変わった既存
+    /// section にだけ発生するため、グラフ規模ではなく変更件数にスケールする。
+    /// 返却件数が `limit` に達したら silent truncation の疑いがあるため fail closed
+    /// （stale 検出を取りこぼすと除去漏れ edge が検索を汚し続けるため、fail-open を許さない）。
+    pub async fn traverse_neighbor_ids(
+        &self,
+        schema: &str,
+        neighbor_node_type: &str,
+        edge_type: &str,
+        direction: &str,
+        source_node_id: &str,
+        limit: i32,
+    ) -> Result<Vec<String>> {
+        let req = QueryNodesRequest {
+            schema: schema.to_string(),
+            node_type: neighbor_node_type.to_string(),
+            filters: Vec::new(),
+            sort_by: None,
+            sort_order: None,
+            limit: Some(limit),
+            offset: Some(0),
+            traverse: Some(EdgeTraversal {
+                edge_type: edge_type.to_string(),
+                direction: direction.to_string(),
+                source_node_id: source_node_id.to_string(),
+            }),
+        };
+        let nodes = self
+            .call(
+                |mut client, request| async move {
+                    client
+                        .query_nodes(request)
+                        .await
+                        .map(|resp| resp.into_inner().nodes)
+                },
+                req,
+            )
+            .await
+            .with_context(|| format!("traverse {edge_type} {direction} from {source_node_id}"))?;
+        if nodes.len() as i32 >= limit {
+            anyhow::bail!(
+                "traverse {edge_type} {direction} from {source_node_id} returned {} node(s) at the \
+                 limit ({limit}); refusing to proceed with a possibly-truncated neighbor set for \
+                 stale-edge detection",
+                nodes.len()
+            );
+        }
+        Ok(nodes.into_iter().map(|n| n.node_id).collect())
+    }
+
     pub async fn graph_snapshot(
         &self,
         schema: &str,
@@ -395,6 +514,13 @@ impl VegapunkClient {
     }
 }
 
+/// offset ページングの終端判定: 1 ページで返った件数が要求 `page_size` 未満なら最終ページ。
+/// `<`（`<=` ではない）である点が重要 — ちょうど `page_size` 件返ったときはさらに次ページが
+/// 存在しうるため継続する。境界を誤ると早期終了（取りこぼし）か無限ループを招く。
+fn page_is_last(returned: usize, page_size: usize) -> bool {
+    returned < page_size
+}
+
 fn to_proto_node(node: GraphNode) -> Node {
     Node {
         id: node.id,
@@ -417,5 +543,21 @@ fn to_proto_edge(edge: GraphEdge) -> Edge {
             .into_iter()
             .map(|(key, value)| NodeAttribute { key, value })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_is_last;
+
+    #[test]
+    fn page_is_last_is_true_only_when_returned_below_page_size() {
+        // 半端ページ（< page_size）＝最終ページ。
+        assert!(page_is_last(0, 1000));
+        assert!(page_is_last(999, 1000));
+        // ちょうど埋まったページはさらに続きがありうるので継続する。
+        assert!(!page_is_last(1000, 1000));
+        // 空グラフ（1 ページ目が 0 件）も即終端する。
+        assert!(page_is_last(0, 1));
     }
 }

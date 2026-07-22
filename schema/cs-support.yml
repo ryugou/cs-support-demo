@@ -141,6 +141,15 @@ nodes:
       # 多言語予約（純予約・空可・駆動コードは読まない）
       body_original: { type: string }
       original_hash: { type: string }
+  # Issue #8 v2: answers.alarm.com の概念クエリ（型番なしの自然文）・記事横断 join の拠り所。
+  Concept:
+    attributes:
+      concept_key: { type: string, required: true }
+      name_en: { type: string, required: true }
+      name_ja: { type: string }
+      # 表記揺れ辞書（カタカナ等）。JSON 配列文字列で保持する（型は string 固定のため）。
+      aliases_ja: { type: string }
+      kind: { type: string } # feature / rule / setting / term
 
 edges:
   HAS_SIGNAL: { from: [KnownResolution, support_case], to: Signal }
@@ -149,6 +158,7 @@ edges:
   PARENT_OF: { from: ManualSection, to: ManualSection }
   DESCRIBES: { from: ManualSection, to: Product }
   MENTIONS_SIGNAL: { from: ManualSection, to: Signal }
+  MENTIONS_CONCEPT: { from: ManualSection, to: Concept }
   BASED_ON: { from: KnownResolution, to: ManualSection }
 
 traceable_pairs:

@@ -1,37 +1,45 @@
 /// answers.alarm.com（MindTouch KB）マニュアルクローラ / ingest CLI。
 ///
 /// 第 2 のマニュアルソース。設計・検証記録は
-/// `docs/superpowers/specs/2026-07-22-ingest-alarmcom-design.md` を参照。
+/// `docs/superpowers/specs/2026-07-22-ingest-alarmcom-design.md`（v2）を参照。v2 で
+/// family-hub 選別・製品マスタ fail closed・英日 2 fetch は全廃し、以下の設計へ改めた:
 ///
-/// urtect（Google Sites）との差分:
-/// - 対象記事は sitemap.xml + vegapunk 製品マスタ（Product ノード）駆動で絞る。全 3,490 記事は
-///   取り込まない。製品の型番/別名が「ファミリーハブ URL」に現れる記事群だけをクロールする。
+/// - 対象記事は sitemap.xml 駆動で `/Customer` + `/Partner` 配下の**全 URL**（製品フィルタ無し）。
+/// - **英語版のみ 1 fetch/記事**。`?mt-language=JA` の機械翻訳は使わず、
+///   `translate::translate_and_extract`（Gemini Flash 3.6 想定、現時点は stub）で自前翻訳する。
 /// - 本文は完全 SSR。`#elm-main-content` 配下から抽出する。パンくずは `.mt-breadcrumbs`。
-/// - 検索対象は日本語（`?mt-language=JA` の機械翻訳）。英語原文は body_original に保存し、
-///   差分 ingest（content_hash）は英語原文で駆動する。
-/// - robots.txt の Crawl-delay=5 を守るため、全 HTTP リクエストを 5 秒以上空けて逐次実行する。
+/// - **alarm.com は製品非依存**（DESCRIBES を張らない）。parent_slug は URL パス階層
+///   （1 階層上のパスが今回のクロール対象に実在するか）から導出する。
+/// - 翻訳と同じ 1 LLM パスで Concept を抽出し、`manual::concept` で正規化・fuzzy マージして
+///   MENTIONS_CONCEPT 辺を張る（概念クエリ・記事横断 join の拠り所）。
+/// - **記事単位でインクリメンタル upsert**（embed → vector upsert → node/edge upsert の順、
+///   fail closed）。クラッシュ耐性のため、全記事を溜め込んでからの一括 upsert はしない。
+/// - robots.txt の Crawl-delay=5 を守るため、全 HTTP リクエスト（sitemap 含む）を 5 秒以上
+///   空けて逐次実行する。
 use anyhow::{Context, Result};
 use clap::Parser;
 use cs_support_mcp::{
     harness::signal::{LexiconNormalizer, SignalNormalizer},
     manual::{
-        crawl::{
-            build_product_lexicon, detect_product_models, extract_text_excluding_noise,
-            normalize_body,
+        concept::{
+            build_concept_node, build_mentions_concept_edge, merge_concept,
+            restore_registry_from_nodes, ConceptRecord,
         },
+        crawl::{extract_text_excluding_noise, normalize_body},
         ingest_model::{
             build_document_node, build_section_graph, content_hash, ManualSectionInput,
         },
-        schema_ids::{manual_node_id, section_slug, with_schema_name, KIND_PRODUCT, KIND_SECTION},
-        vectors::{embed_all, vector_entry, EMBED_CONCURRENCY},
+        schema_ids::{manual_node_id, section_slug, with_schema_name, KIND_CONCEPT, KIND_SECTION},
+        vectors::vector_entry,
     },
-    model::GraphBuild,
+    model::{GraphEdge, GraphNode},
+    translate::{load_glossary, translate_and_extract, Glossary, TranslationContext},
     vegapunk::VegapunkClient,
 };
 use scraper::{ElementRef, Html, Selector};
 use serde_json::json;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     env, fs,
     path::PathBuf,
     time::Duration,
@@ -46,12 +54,20 @@ const DOC_KEY: &str = "doc-alarmcom";
 /// robots.txt の Crawl-delay。これ未満を指定されても切り上げる（規約遵守をコードで強制）。
 const MIN_CRAWL_DELAY_SECS: u64 = 5;
 
-/// クロール対象のうち fetch 失敗・本文空で skip した割合の上限。これを超えたら upsert 前に
-/// bail する（サイト構造・抽出セレクタ変化の疑い）。
+/// site-structure 由来 skip（fetch 失敗・本文空・breadcrumb 欠落・翻訳失敗）の割合上限。これを
+/// 超えたら bail する（サイト構造・抽出セレクタ変化の疑い）。**parent-not-ingested の cascade
+/// skip はこの比率に含めない**（Warning 2: 空ハブ配下 subtree の巻き添え skip で誤発火するため。
+/// 判定は `site_skip_bail` を参照）。
 const MAX_SKIP_RATIO: f64 = 0.2;
 
-/// query_nodes の limit。ちょうど limit 件返ったら silent truncation を疑い fail closed。
-const PRODUCT_QUERY_LIMIT: i32 = 1000;
+/// MAX_SKIP_RATIO の判定を開始する最小処理件数。記事単位インクリメンタル upsert に伴い、
+/// この閾値判定は「全件処理後に一括判定」ではなく「処理するたびに判定」する
+/// （既存 upsert 済みデータを守りつつ、なるべく早く異常を検知して残りのクロールを止めるため）。
+/// 件数が少ないうちは 1 件の失敗で比率が跳ね上がるため、最低サンプル数を設ける。
+const MIN_SKIP_SAMPLE: usize = 20;
+
+/// クロール対象を絞る URL パスプレフィックス（sitemap 全体のうち、この配下だけが対象）。
+const TARGETED_PATH_PREFIXES: [&str; 2] = ["/Customer", "/Partner"];
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -77,6 +93,9 @@ struct Args {
     schema_file: PathBuf,
     #[arg(long, default_value = "data/urtect/signal-lexicon.json")]
     lexicon_file: PathBuf,
+    /// 翻訳 glossary（型番・製品名・専門語の訳ブレ防止）。`translate_and_extract` に渡す。
+    #[arg(long, default_value = "data/glossary.json")]
+    glossary_file: PathBuf,
     /// embed / upsert_vectors を一切呼ばずスキップする（ベクトル基盤未整備な環境向けの
     /// 明示的な opt-out）。未指定時は embed 失敗を fail closed で扱う。
     #[arg(long)]
@@ -157,16 +176,6 @@ async fn throttled_fetch(
     fetch(client, url).await
 }
 
-/// ASCII 英数字だけを残して大文字化する緩和正規化。**URL 選別専用**。
-/// ハイフン・アンダースコア・括弧・空白・非 ASCII は全て捨てる。本文からの型番検出は
-/// 別（`detect_product_models` の厳密境界チェック）で行い、意味論を混ぜない。
-fn relaxed_normalize(s: &str) -> String {
-    s.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect::<String>()
-        .to_uppercase()
-}
-
 /// URL のフラグメント/クエリを外し、末尾スラッシュを揃えた正準形（dedup キー）。
 /// `ingest_urtect.rs` の同名関数と同じ考え方（URL 構造非依存なのでローカルに複製する）。
 fn canonical_url(u: &Url) -> String {
@@ -187,149 +196,57 @@ fn alarmcom_slug(url: &str) -> String {
     format!("alarmcom-{}", section_slug(url))
 }
 
-/// URL の末尾パスセグメント（末尾スラッシュ由来の空セグメントは無視）。取れなければ None。
-fn last_path_segment(u: &Url) -> Option<String> {
-    u.path_segments()?
-        .filter(|s| !s.is_empty())
-        .next_back()
-        .map(str::to_string)
+/// パスが `/Customer` または `/Partner` 配下か（境界一致。`/CustomerXYZ` のような
+/// 前方一致誤爆を避けるため、完全一致か `/prefix/` で始まる場合のみ true とする）。
+fn is_targeted_path(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    TARGETED_PATH_PREFIXES
+        .iter()
+        .any(|prefix| trimmed == *prefix || trimmed.starts_with(&format!("{prefix}/")))
 }
 
-/// `?mt-language=JA` を付与した日本語版 URL を組み立てる純関数。既存クエリがあれば `&` 連結。
-fn japanese_url(url: &str) -> String {
-    if url.contains('?') {
-        format!("{url}&mt-language=JA")
-    } else {
-        format!("{url}?mt-language=JA")
-    }
+/// sitemap 由来 URL を `/Customer` + `/Partner` 配下だけに絞る純関数。
+fn filter_targeted_urls(urls: &[String]) -> Vec<String> {
+    urls.iter()
+        .filter(|raw| {
+            Url::parse(raw)
+                .map(|u| is_targeted_path(u.path()))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
 }
 
-/// `hub_path` が `url_path` のセグメント境界プレフィックスか（同一、または `hub_path/` で始まる）。
-/// 素の文字列プレフィックスだと `.../foo` が `.../fooBar` に誤一致するため境界で比較する。
-fn is_segment_prefix(hub_path: &str, url_path: &str) -> bool {
-    let hp = hub_path.trim_end_matches('/');
-    let up = url_path.trim_end_matches('/');
-    up == hp || up.starts_with(&format!("{hp}/"))
-}
-
-/// 製品ファミリーのハブ URL 1 件（sitemap 出現順で確定）。
-#[derive(Debug, Clone, PartialEq)]
-struct FamilyHub {
-    /// canonical（英語版）URL。
-    url: String,
-    /// alarmcom section slug。
-    slug: String,
-    /// canonical パス（配下 URL のセグメント境界プレフィックス判定に使う）。
-    path: String,
-    /// このハブにマッチした product_key の集合（決定論のため BTreeSet）。
-    matched_product_keys: BTreeSet<String>,
-}
-
-/// クロール対象 URL 1 件。
+/// クロール対象 URL 1 件（sitemap 出現順で確定。製品マスタ・ファミリーハブには一切依存しない）。
 #[derive(Debug, Clone, PartialEq)]
 struct CrawlTarget {
     /// canonical（英語版）URL。
     url: String,
     /// alarmcom section slug。
     slug: String,
-    /// 所属ハブの slug。ハブ自身は None（親なし）。
-    parent_slug: Option<String>,
-    /// sitemap 出現順の 0 始まり連番。
+    /// canonical パス（parent_slug 導出・処理順序決定に使う）。
+    path: String,
+    /// sitemap 出現順（フィルタ・重複排除後）の 0 始まり連番。
     order: i32,
 }
 
-/// クロール計画（ハブ一覧・クロール対象一覧・未マッチ製品）。全て sitemap 出現順で決定論的。
-#[derive(Debug)]
-struct CrawlPlan {
-    hubs: Vec<FamilyHub>,
-    targets: Vec<CrawlTarget>,
-    /// どのハブにもマッチしなかった製品 product_key（昇順）。空でなければ呼び出し側で bail。
-    unmatched_product_keys: Vec<String>,
-}
-
-/// sitemap URL とハブ末尾セグメントの緩和正規化一致で「製品ファミリーハブ」を特定する。
-/// ハブ一覧は sitemap 出現順（HashMap の非決定イテレーションに依存しない）。
-fn detect_family_hubs(
-    sitemap_urls: &[String],
-    product_lexicon: &HashMap<String, String>,
-) -> Vec<FamilyHub> {
-    // 表層形（大文字）→ product_key を緩和正規化した対応。空になるものは除外。
-    let relaxed_surfaces: Vec<(String, String)> = product_lexicon
-        .iter()
-        .filter_map(|(surface, key)| {
-            let relaxed = relaxed_normalize(surface);
-            if relaxed.is_empty() {
-                None
-            } else {
-                Some((relaxed, key.clone()))
-            }
-        })
-        .collect();
-
-    let mut hubs = Vec::new();
-    let mut seen_hub_canonical: HashSet<String> = HashSet::new();
-    for raw in sitemap_urls {
-        let Ok(u) = Url::parse(raw) else {
-            continue;
-        };
-        let Some(segment) = last_path_segment(&u) else {
-            continue;
-        };
-        let relaxed_seg = relaxed_normalize(&segment);
-        if relaxed_seg.is_empty() {
-            continue;
-        }
-        let mut matched: BTreeSet<String> = BTreeSet::new();
-        for (relaxed_surface, product_key) in &relaxed_surfaces {
-            if relaxed_seg.contains(relaxed_surface.as_str()) {
-                matched.insert(product_key.clone());
-            }
-        }
-        if matched.is_empty() {
-            continue;
-        }
-        let canonical = canonical_url(&u);
-        if !seen_hub_canonical.insert(canonical.clone()) {
-            continue; // 同一 canonical のハブ重複（末尾スラッシュ差など）は最初の 1 件のみ
-        }
-        hubs.push(FamilyHub {
-            slug: alarmcom_slug(&canonical),
-            path: canonical_path(&u),
-            url: canonical,
-            matched_product_keys: matched,
-        });
-    }
-    hubs
-}
-
-/// ハブ配下のクロール対象を確定する。各 URL はハブ一覧（sitemap 順）で最初に一致したハブへ
-/// 割り当てる（1 URL につき所属ハブは 1 つ）。ハブ URL 自身は親なし。canonical で重複排除する。
-fn build_crawl_targets(sitemap_urls: &[String], hubs: &[FamilyHub]) -> Vec<CrawlTarget> {
-    let hub_canonical: HashSet<&str> = hubs.iter().map(|h| h.url.as_str()).collect();
-    let mut targets = Vec::new();
+/// フィルタ済み URL 一覧から、canonical 化・重複排除済みのクロール対象一覧を組み立てる。
+/// 順序は入力の出現順を保つ（`order` フィールドの元になる）。
+fn build_crawl_targets(urls: &[String]) -> Vec<CrawlTarget> {
     let mut seen: HashSet<String> = HashSet::new();
-    for raw in sitemap_urls {
+    let mut targets = Vec::new();
+    for raw in urls {
         let Ok(u) = Url::parse(raw) else {
             continue;
         };
         let canonical = canonical_url(&u);
-        let parent_slug = if hub_canonical.contains(canonical.as_str()) {
-            None // ハブ自身は親なし（別ハブのプレフィックスに含まれても自ハブとして扱う）
-        } else {
-            let url_path = canonical_path(&u);
-            match hubs.iter().find(|h| is_segment_prefix(&h.path, &url_path)) {
-                Some(hub) => Some(hub.slug.clone()),
-                None => continue, // どのハブ配下でもない URL は対象外
-            }
-        };
         if !seen.insert(canonical.clone()) {
             continue;
         }
-        let slug = alarmcom_slug(&canonical);
         targets.push(CrawlTarget {
+            slug: alarmcom_slug(&canonical),
+            path: canonical_path(&u),
             url: canonical,
-            slug,
-            parent_slug,
             order: 0,
         });
     }
@@ -339,22 +256,61 @@ fn build_crawl_targets(sitemap_urls: &[String], hubs: &[FamilyHub]) -> Vec<Crawl
     targets
 }
 
-/// ハブ検出 + クロール対象確定 + 製品マスタ完全性チェックをまとめた純関数。
-fn plan_crawl(sitemap_urls: &[String], product_lexicon: &HashMap<String, String>) -> CrawlPlan {
-    let hubs = detect_family_hubs(sitemap_urls, product_lexicon);
-    let targets = build_crawl_targets(sitemap_urls, &hubs);
-    // 製品マスタ由来の distinct product_key 全体（build_product_lexicon が空 model を弾く基準と
-    // 同じく lexicon.values() を採る）。1 つでもハブ未マッチなら呼び出し側で bail する。
-    let all_keys: BTreeSet<String> = product_lexicon.values().cloned().collect();
-    let matched: BTreeSet<String> = hubs
+/// canonical パス → slug の対応表（parent_slug 導出用）。
+fn build_path_slug_map(targets: &[CrawlTarget]) -> HashMap<String, String> {
+    targets
         .iter()
-        .flat_map(|h| h.matched_product_keys.iter().cloned())
-        .collect();
-    let unmatched_product_keys: Vec<String> = all_keys.difference(&matched).cloned().collect();
-    CrawlPlan {
-        hubs,
-        targets,
-        unmatched_product_keys,
+        .map(|t| (t.path.clone(), t.slug.clone()))
+        .collect()
+}
+
+/// URL パス階層の 1 つ上のパスを返す（`/a/b/c` → `/a/b`）。トップレベル（`/a`）や
+/// 空パスには親が無いので None。この親パスが実際のクロール対象に存在するかどうかは
+/// 呼び出し側が `build_path_slug_map` の結果と突き合わせて判定する
+/// （sitemap 上に親ページが無いこともあるため、存在しない親は「親なし」= root section にする）。
+fn parent_path_of(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    let (parent, _) = trimmed.rsplit_once('/')?;
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent.to_string())
+    }
+}
+
+/// URL パスのセグメント数（`/a/b/c` → 3）。`depth_first_order` の並べ替えキーに使う。
+fn segment_count(path: &str) -> usize {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .count()
+}
+
+/// `targets` をパス階層の浅い順（セグメント数昇順）に安定並べ替えした参照列を返す。
+/// 親は常に子よりセグメント数が少ないため、この順序で処理すれば「子を処理する時点で
+/// 親のクロール対象は必ず処理済み」が保証される（孤児 PARENT_OF 辺の判定に使う）。
+/// 同じセグメント数の中では元の並び（sitemap 出現順）を保つ（安定ソート）。
+fn depth_first_order(targets: &[CrawlTarget]) -> Vec<&CrawlTarget> {
+    let mut ordered: Vec<&CrawlTarget> = targets.iter().collect();
+    ordered.sort_by_key(|t| segment_count(&t.path));
+    ordered
+}
+
+/// 子記事（`parent_slug = Some(parent)`）の親が「過去の ingest 実行で既に upsert 済み
+/// （`existing_hash` に slug が存在）」または「今回の実行で既に ingest 済み
+/// （`ingested_this_run` に slug が存在）」のいずれかであるかを判定する純関数。親なしは常に true。
+///
+/// どちらの集合にも無い場合、そのハブは今回も過去にも一度も upsert されていない ＝ 実在しない
+/// 親ノードを指す孤児 PARENT_OF 辺を生成しうる状態なので false を返す（呼び出し側で子記事を
+/// fetch 前に skip する）。
+fn parent_is_known(
+    parent_slug: Option<&str>,
+    existing_hash: &HashMap<String, String>,
+    ingested_this_run: &HashSet<String>,
+) -> bool {
+    match parent_slug {
+        None => true,
+        Some(parent) => existing_hash.contains_key(parent) || ingested_this_run.contains(parent),
     }
 }
 
@@ -393,44 +349,83 @@ fn breadcrumb_title(crumbs: &[String]) -> String {
     crumbs.last().cloned().unwrap_or_default()
 }
 
-/// `plan.targets` を「ハブ（`parent_slug` が None）を先に、子（Some）を後に」の 2 群へ安定並べ替え
-/// した処理順序（参照列）にする純関数。各群内の相対順序（sitemap 出現順）は保持する。
-///
-/// これによりループ内で「親ハブがまだ処理されていない」と「親ハブの処理が失敗した」を区別する
-/// 必要が無くなる（子を処理する時点で対応するハブは必ず処理済みのため）。`target.order`（表示用の
-/// sitemap 出現順連番、ManualSection の `order` 属性のもと）はここでは一切変更しない — 変更するのは
-/// 反復順序だけで、`order` フィールドの値そのものは元のまま各 `CrawlTarget` に残る。
-fn hub_first_order(targets: &[CrawlTarget]) -> Vec<&CrawlTarget> {
-    let mut hubs: Vec<&CrawlTarget> = Vec::new();
-    let mut children: Vec<&CrawlTarget> = Vec::new();
-    for target in targets {
-        if target.parent_slug.is_none() {
-            hubs.push(target);
-        } else {
-            children.push(target);
-        }
-    }
-    hubs.extend(children);
-    hubs
+/// 1 記事分の upsert 対象一式。`commit_article` の引数を束ねる（借用フィールドは記事ごとの
+/// String 再確保を避けるため。nodes/edges は所有権を移して upsert に渡す）。
+struct ArticleCommit<'a> {
+    schema: &'a str,
+    slug: &'a str,
+    body_ja: &'a str,
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+    vectors_skipped: bool,
+    ingest_timestamp_ms: &'a str,
 }
 
-/// 子記事（`parent_slug = Some(parent)`）の親ハブが「過去の ingest 実行で既に upsert 済み
-/// （`existing_hash` に slug が存在）」または「今回の実行で既に ingest 済み（`ingested_this_run`
-/// に slug が存在）」のいずれかであるかを判定する純関数。親なし（ハブ自身）は常に ingestable
-/// として true を返す。
+/// 1 記事分の embed/vector upsert → node upsert → edge upsert をこの順で実行する
+/// （ingest_urtect と同じ fail-closed 順序: embed が先に失敗すれば content_hash は
+/// 旧値のまま残り、次回の差分 ingest がこの section を再検出して再試行する。逆順だと
+/// vector 欠落のまま content_hash だけ確定し、以後永久に skip される）。
+async fn commit_article(
+    client: &VegapunkClient,
+    commit: ArticleCommit<'_>,
+) -> Result<(i32, i32, i32)> {
+    let ArticleCommit {
+        schema,
+        slug,
+        body_ja,
+        nodes,
+        edges,
+        vectors_skipped,
+        ingest_timestamp_ms,
+    } = commit;
+    let upserted_vectors = if vectors_skipped {
+        0
+    } else {
+        let vector = client
+            .embed(body_ja)
+            .await
+            .with_context(|| format!("embed section {slug}"))?;
+        let id = manual_node_id(schema, KIND_SECTION, slug);
+        let entry = vector_entry(id, vector, body_ja, KIND_SECTION, ingest_timestamp_ms);
+        client
+            .upsert_vectors(vec![entry])
+            .await
+            .with_context(|| format!("upsert vector for section {slug}"))?
+    };
+    let upserted_nodes = client
+        .upsert_nodes(nodes)
+        .await
+        .with_context(|| format!("upsert nodes for section {slug}"))?;
+    let upserted_edges = client
+        .upsert_edges(edges)
+        .await
+        .with_context(|| format!("upsert edges for section {slug}"))?;
+    Ok((upserted_vectors, upserted_nodes, upserted_edges))
+}
+
+/// site-structure 由来の skip（fetch 失敗 / 本文空 / breadcrumb 欠落 / 翻訳失敗 など「サイトが
+/// 変わった」ことを示す skip）だけで早期 bail 比率を判定する純関数。
 ///
-/// どちらの集合にも無い場合、そのハブは今回も過去にも一度も upsert されていない ＝ 実在しない
-/// 親ノードを指す孤児 PARENT_OF 辺を生成しうる状態なので false を返す（呼び出し側で子記事を
-/// fetch 前に skip する）。
-fn parent_is_known(
-    parent_slug: Option<&str>,
-    existing_hash: &HashMap<String, String>,
-    ingested_this_run: &HashSet<String>,
-) -> bool {
-    match parent_slug {
-        None => true,
-        Some(parent) => existing_hash.contains_key(parent) || ingested_this_run.contains(parent),
+/// **parent-not-ingested による cascade skip は分子にも分母にも入れない**（Warning 2）。
+/// 空ハブが 1 件でもあると健全なサイトでも配下の subtree が丸ごと「親未 ingest」で skip され、
+/// これを比率に混ぜると 4.8h の full run を途中 bail させ、しかも「selector が変わった」と
+/// 誤誘導するため。呼び出し側は site-structure skip 件数だけを `site_skips` として渡す。
+///
+/// 返り値 `Some(ratio)` は「site 異常比率が閾値超過 = bail すべき」の意。サンプルが少ないうちの
+/// 誤検知を避けるため `min_sample` 未満では常に `None`。
+fn site_skip_bail(
+    site_skips: usize,
+    ingested: usize,
+    skipped_unchanged: usize,
+    min_sample: usize,
+    max_ratio: f64,
+) -> Option<f64> {
+    let processed = ingested + skipped_unchanged + site_skips;
+    if processed < min_sample {
+        return None;
     }
+    let ratio = site_skips as f64 / processed as f64;
+    (ratio > max_ratio).then_some(ratio)
 }
 
 #[tokio::main]
@@ -447,17 +442,16 @@ async fn main() -> Result<()> {
     let token = read_token(&args)?;
 
     // robots.txt Crawl-delay=5 未満の指定は 5 に切り上げる（規約遵守をコードで強制）。
-    let crawl_delay_secs = if args.crawl_delay_secs < MIN_CRAWL_DELAY_SECS {
+    // 下限クランプは `.max()` で表現し、切り上げが起きたときだけ warn する。
+    let crawl_delay_secs = args.crawl_delay_secs.max(MIN_CRAWL_DELAY_SECS);
+    if crawl_delay_secs > args.crawl_delay_secs {
         tracing::warn!(
             requested = args.crawl_delay_secs,
-            enforced = MIN_CRAWL_DELAY_SECS,
+            enforced = crawl_delay_secs,
             "requested crawl delay is below answers.alarm.com robots.txt Crawl-delay=5; \
              raising to 5s to honor the site's stated rate limit"
         );
-        MIN_CRAWL_DELAY_SECS
-    } else {
-        args.crawl_delay_secs
-    };
+    }
     let crawl_delay = Duration::from_secs(crawl_delay_secs);
 
     let base_url =
@@ -474,53 +468,13 @@ async fn main() -> Result<()> {
     )?;
     let lexicon = LexiconNormalizer::from_path(&args.lexicon_file)
         .with_context(|| format!("load signal lexicon {}", args.lexicon_file.display()))?;
+    let glossary: Glossary = load_glossary(&args.glossary_file)
+        .with_context(|| format!("load glossary {}", args.glossary_file.display()))?;
 
     let client = VegapunkClient::connect(&args.endpoint, &token).await?;
     client
         .create_or_update_schema(&args.schema, schema_yaml)
         .await?;
-
-    // 製品マスタは vegapunk の Product ノードが正本（Issue #6）。crawl 前に取得し、型番検出語彙
-    // （表層形 → product_key）とファミリーハブ選別のもとにする。0 件 / limit 到達で fail closed。
-    let product_nodes = client
-        .query_nodes(&args.schema, "Product", Vec::new(), PRODUCT_QUERY_LIMIT)
-        .await
-        .context("query existing Product nodes (product master lookup)")?;
-    if product_nodes.is_empty() {
-        anyhow::bail!(
-            "no Product nodes found in schema {}; the product master is empty — run \
-             `ingest_products` first to seed it before running ingest_alarmcom",
-            args.schema
-        );
-    }
-    if product_nodes.len() as i32 == PRODUCT_QUERY_LIMIT {
-        anyhow::bail!(
-            "Product node query returned exactly the limit ({PRODUCT_QUERY_LIMIT}); this may \
-             indicate silent truncation and an incomplete product master — aborting ingest \
-             (raise the limit or investigate the product count in schema {})",
-            args.schema
-        );
-    }
-    let product_lexicon = build_product_lexicon(&product_nodes);
-    if product_lexicon.is_empty() {
-        anyhow::bail!(
-            "product master in schema {} has no usable model attributes; cannot derive crawl \
-             targets — fix products.json (each product needs a non-empty model) and re-run \
-             ingest_products",
-            args.schema
-        );
-    }
-    // 未マッチ製品の警告に使う product_key -> name（build_product_lexicon と同じ空 model 除外基準）。
-    let name_by_key: HashMap<String, String> = product_nodes
-        .iter()
-        .filter_map(|n| {
-            let model = n.attributes.get("model").filter(|m| !m.trim().is_empty())?;
-            Some((
-                model.clone(),
-                n.attributes.get("name").cloned().unwrap_or_default(),
-            ))
-        })
-        .collect();
 
     // redirect は base_url と同一 scheme/host のみ追従（意図しない外部フェッチ/SSRF 防止）。
     let allowed_scheme = base_url.scheme().to_string();
@@ -544,9 +498,32 @@ async fn main() -> Result<()> {
         .build()
         .context("build http client")?;
 
-    // sitemap fetch（HTTP、スロットル起点）と graph_snapshot（gRPC、スロットル対象外）は
-    // 互いに依存しないので並行に発行する。
-    let (sitemap_xml, existing_snapshot) = tokio::try_join!(
+    // operator 指定の --sitemap-url も base_url と同一 origin に制限する（crawl 対象 URL は
+    // filter_same_origin で守られているが、sitemap fetch 自体の SSRF 面も同じ境界で塞ぐ）。
+    let sitemap_parsed =
+        Url::parse(&sitemap_url).with_context(|| format!("parse sitemap url {sitemap_url}"))?;
+    if sitemap_parsed.scheme() != base_url.scheme()
+        || sitemap_parsed.host_str() != base_url.host_str()
+    {
+        anyhow::bail!(
+            "--sitemap-url {sitemap_url} is not same-origin with --base-url {} (scheme+host must \
+             match); refusing to fetch a cross-origin sitemap",
+            args.base_url
+        );
+    }
+
+    // 既存状態のロード（差分 hash マップ・parent title・Concept registry・stale edge 検出）は
+    // graph_snapshot ではなく query_nodes の offset ページングで行う。graph_snapshot は max_nodes
+    // に backend ハード上限 5000 があり、約 3,490 ManualSection + Concept 数千 + urtect +
+    // Product/Signal の合算はこれを超えるため、2 回目以降の差分 re-ingest で truncate → stale
+    // 判定破綻 → bail していた（Warning 1）。ページングなら任意件数へスケールする。
+    //
+    // ManualSection は DOC_KEY（alarmcom）配下だけを読む。この doc_key フィルタで urtect 側
+    // section を絶対に触らないことを構造的に保証する。Concept は doc スコープを持たない共有
+    // ノードなので全件読む。sitemap fetch（HTTP）と 2 本の query_nodes（gRPC）は互いに依存
+    // しないので並行に発行する。
+    const PAGE_SIZE: i32 = 1000;
+    let (sitemap_xml, existing_sections, existing_concepts) = tokio::try_join!(
         async {
             fetch(&http, &sitemap_url)
                 .await
@@ -554,21 +531,25 @@ async fn main() -> Result<()> {
         },
         async {
             client
-                .graph_snapshot(&args.schema, 5000)
+                .query_nodes_paged(
+                    &args.schema,
+                    KIND_SECTION,
+                    vec![("doc_key", "eq", DOC_KEY)],
+                    PAGE_SIZE,
+                )
                 .await
-                .context("snapshot existing graph (diff + stale-edge check)")
+                .context("load existing alarmcom ManualSection nodes (diff + parent context)")
+        },
+        async {
+            client
+                .query_nodes_paged(&args.schema, KIND_CONCEPT, Vec::new(), PAGE_SIZE)
+                .await
+                .context("load existing Concept nodes (registry restore)")
         },
     )?;
     // sitemap fetch をスロットルトラッカーの起点として記録する（後続の記事 fetch はここから
     // crawl_delay 以上空ける）。
     let mut last_request: Option<tokio::time::Instant> = Some(tokio::time::Instant::now());
-
-    if existing_snapshot.truncated {
-        anyhow::bail!(
-            "existing graph snapshot truncated at node limit; \
-             cannot verify diff/stale-edge state — aborting ingest"
-        );
-    }
 
     let sitemap_urls_raw = parse_sitemap_urls(&sitemap_xml);
     if sitemap_urls_raw.is_empty() {
@@ -578,9 +559,9 @@ async fn main() -> Result<()> {
         );
     }
     // ハブ判定・実フェッチより前に、base_url と同一 origin の URL だけへ絞る（外部ホストへの
-    // 意図しないフェッチ = SSRF/資格情報漏洩の経路を crawl 前に閉じる。filter_same_origin 参照）。
-    let sitemap_urls = filter_same_origin(&sitemap_urls_raw, &base_url);
-    let off_origin_dropped = sitemap_urls_raw.len() - sitemap_urls.len();
+    // 意図しないフェッチ = SSRF/資格情報漏洩の経路を crawl 前に閉じる）。
+    let same_origin_urls = filter_same_origin(&sitemap_urls_raw, &base_url);
+    let off_origin_dropped = sitemap_urls_raw.len() - same_origin_urls.len();
     if off_origin_dropped > 0 {
         tracing::warn!(
             dropped = off_origin_dropped,
@@ -589,81 +570,56 @@ async fn main() -> Result<()> {
              scheme+host are crawled (external hosts are never fetched)"
         );
     }
-    if sitemap_urls.is_empty() {
+
+    // R1: 製品フィルタ無しで /Customer + /Partner 配下の全 URL を対象にする。
+    let targeted_urls = filter_targeted_urls(&same_origin_urls);
+    let off_prefix_dropped = same_origin_urls.len() - targeted_urls.len();
+    if targeted_urls.is_empty() {
         anyhow::bail!(
-            "all {} <loc> URL(s) in sitemap {} are off-origin (not matching {}); refusing to \
-             crawl external hosts — aborting ingest",
-            sitemap_urls_raw.len(),
-            sitemap_url,
-            args.base_url
+            "none of the {} same-origin sitemap URL(s) fall under {:?}; the sitemap layout may \
+             have changed — aborting ingest",
+            same_origin_urls.len(),
+            TARGETED_PATH_PREFIXES
         );
     }
 
-    let plan = plan_crawl(&sitemap_urls, &product_lexicon);
-    if !plan.unmatched_product_keys.is_empty() {
-        let named: Vec<String> = plan
-            .unmatched_product_keys
-            .iter()
-            .map(|key| match name_by_key.get(key) {
-                Some(name) if !name.is_empty() => format!("{key} ({name})"),
-                _ => key.clone(),
-            })
-            .collect();
-        tracing::warn!(
-            unmatched = ?named,
-            "one or more product master entries matched no family hub URL in the sitemap"
-        );
+    let targets = build_crawl_targets(&targeted_urls);
+    if targets.is_empty() {
         anyhow::bail!(
-            "{} product(s) in the product master have no matching family hub URL in {}: {:?}; \
-             add the URL-surface spelling to each product's aliases in products.json (then re-run \
-             ingest_products) so their alarm.com manuals are not silently omitted",
-            plan.unmatched_product_keys.len(),
-            sitemap_url,
-            named
+            "no crawl targets derived from sitemap {sitemap_url} after filtering; \
+             aborting ingest"
         );
     }
-    if plan.targets.is_empty() {
-        anyhow::bail!(
-            "no crawl targets derived from sitemap {sitemap_url} despite a non-empty product \
-             master; the sitemap or product URL spellings may have changed — aborting ingest"
-        );
-    }
+    let path_slug_map = build_path_slug_map(&targets);
+    let target_count = targets.len();
 
-    // 差分 ingest 用の既存 hash マップ（DOC_KEY 配下の ManualSection のみ）。この doc_key フィルタで
-    // urtect 側 section を絶対に触らないことを構造的に保証する。
-    let existing_hash: HashMap<String, String> = existing_snapshot
-        .nodes
-        .iter()
-        .filter(|n| n.node_type == "ManualSection")
-        .filter(|n| n.attributes.get("doc_key").map(String::as_str) == Some(DOC_KEY))
-        .filter_map(|n| {
-            let key = n.attributes.get("section_key")?.clone();
-            let hash = n.attributes.get("content_hash")?.clone();
-            Some((key, hash))
-        })
-        .collect();
-
-    // 既存の派生 edge / 親 edge を索引する（stale 検出用。alarmcom の sec_id でしか引かれないため
-    // urtect 側には影響しない）。ingest_urtect と同じ構造。
-    let mut old_derived: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut old_parents: HashMap<String, HashSet<String>> = HashMap::new();
-    for e in &existing_snapshot.edges {
-        if e.edge_type == "DESCRIBES" || e.edge_type == "MENTIONS_SIGNAL" {
-            old_derived
-                .entry(e.from_id.clone())
-                .or_default()
-                .insert(e.to_id.clone());
-        } else if e.edge_type == "PARENT_OF" {
-            old_parents
-                .entry(e.to_id.clone())
-                .or_default()
-                .insert(e.from_id.clone());
+    // 差分 ingest 用の既存 hash マップ + parent 文脈用の title マップ。query_nodes_paged が
+    // 既に DOC_KEY 配下の ManualSection だけを返すため、ここでの再フィルタは不要
+    // （urtect 側 section は構造的に混ざらない）。
+    let mut existing_hash: HashMap<String, String> = HashMap::new();
+    let mut titles_by_slug: HashMap<String, String> = HashMap::new();
+    for n in &existing_sections {
+        let Some(key) = n.attributes.get("section_key").cloned() else {
+            continue;
+        };
+        if let Some(hash) = n.attributes.get("content_hash") {
+            existing_hash.insert(key.clone(), hash.clone());
+        }
+        if let Some(title) = n.attributes.get("title") {
+            titles_by_slug.insert(key, title.clone());
         }
     }
+    // Concept registry を過去の ingest 実行から復元する（差分 ingest をまたいだ fuzzy マージ）。
+    let mut concept_registry: Vec<ConceptRecord> = restore_registry_from_nodes(&existing_concepts);
+
+    // 既存の派生/親 edge は graph_snapshot の全件ロードではなく、変更のあった既存 section 1 件
+    // ごとに query_nodes の 1-hop traverse で引く（stale 検出用。`traverse_neighbor_ids` を参照）。
+    // これにより 5000 ノード上限に縛られず、呼び出し回数はグラフ規模ではなく再 ingest での
+    // 変更件数にスケールする。実際の traverse はループ内で lazy に発行する。
 
     // disappeared 検出: 既存 DOC_KEY section のうち今回のクロール対象一覧に無いものは削除/非公開化
     // とみなし fail closed（backend に delete が無く、stale な本文/edge が検索候補に残り続ける）。
-    let target_slugs: HashSet<String> = plan.targets.iter().map(|t| t.slug.clone()).collect();
+    let target_slugs: HashSet<String> = targets.iter().map(|t| t.slug.clone()).collect();
     let disappeared: Vec<&String> = existing_hash
         .keys()
         .filter(|k| !target_slugs.contains(*k))
@@ -678,276 +634,332 @@ async fn main() -> Result<()> {
         );
     }
 
+    // document ノード（Alarm.com Answers）を最初に確定させる。各記事の HAS_SECTION 辺は
+    // このノードを参照するため、記事単位インクリメンタル upsert を始める前に単独で upsert する。
     let fetched_at = chrono::Utc::now().to_rfc3339();
+    let doc_node = build_document_node(
+        &args.schema,
+        DOC_KEY,
+        "Alarm.com Answers",
+        &args.base_url,
+        &fetched_at,
+    );
+    let upserted_doc_nodes = client.upsert_nodes(vec![doc_node]).await?;
 
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
     let mut ingested = 0usize;
     let mut skipped_unchanged = 0usize;
-    // fetch 失敗・本文空で skip した (url, reason)。全記事共通で skip+warn（urtect の既存 section
-    // fail-closed 出し分けはしない。安全弁は MAX_SKIP_RATIO のみ）。
+    // site-structure 由来の skip（fetch 失敗 / 本文空 / breadcrumb 欠落 / 翻訳失敗）。早期 bail
+    // 比率の分子はこれだけ（Warning 2）。
     let mut skip_records: Vec<(String, String)> = Vec::new();
+    // parent-not-ingested による cascade skip。空ハブ配下の subtree が丸ごと入りうるため
+    // site-structure skip とは別勘定にし、bail 比率には一切含めない（記録は残す）。
+    let mut parent_skip_records: Vec<(String, String)> = Vec::new();
     let mut zero_signal_sections: Vec<String> = Vec::new();
-    let mut describes_by_model: HashMap<String, usize> = HashMap::new();
-    // embed 対象（実際に ingest された section の (slug, body_ja)）。
-    let mut section_bodies: Vec<(String, String)> = Vec::new();
-    // 今回の実行で ingest 対象として確定した slug（親ハブ実在性チェック用）。
     let mut ingested_this_run: HashSet<String> = HashSet::new();
+    let mut total_nodes_upserted = upserted_doc_nodes;
+    let mut total_edges_upserted = 0i32;
+    let mut total_vectors_upserted = 0i32;
+    let mut concepts_new_count = 0usize;
+    let mut concept_mentions_total = 0usize;
+    let vectors_skipped = args.no_vectors;
 
-    for target in hub_first_order(&plan.targets) {
+    for target in depth_first_order(&targets) {
         let slug = target.slug.clone();
 
-        // 親ハブがこれまでも今回も一度も ingest されていない子記事は孤児 PARENT_OF 辺を生む
-        // ため、fetch する前に skip する（ハブ自身はこのチェックの対象外）。
-        if !parent_is_known(
-            target.parent_slug.as_deref(),
-            &existing_hash,
-            &ingested_this_run,
-        ) {
-            let parent = target.parent_slug.as_deref().unwrap_or("");
+        let parent_slug = parent_path_of(&target.path).and_then(|p| path_slug_map.get(&p).cloned());
+
+        // 親がこれまでも今回も一度も ingest されていない子記事は孤児 PARENT_OF 辺を生む
+        // ため、fetch する前に skip する。
+        if !parent_is_known(parent_slug.as_deref(), &existing_hash, &ingested_this_run) {
+            let parent = parent_slug.as_deref().unwrap_or("");
             tracing::warn!(
                 url = %target.url,
                 parent_slug = %parent,
-                "parent hub was never ingested (fetch/extraction failed or not yet upserted); \
-                 skipping child article to avoid a PARENT_OF edge pointing at a non-existent node"
+                "parent article was never ingested (fetch/extraction/translation failed or not yet \
+                 upserted); skipping child article to avoid a PARENT_OF edge pointing at a \
+                 non-existent node"
             );
-            skip_records.push((
+            // site-structure skip とは別勘定（Warning 2: bail 比率に混ぜない）。
+            parent_skip_records.push((
                 target.url.clone(),
-                format!(
-                    "parent hub {parent} not ingested (skipped to avoid orphan PARENT_OF edge)"
-                ),
+                format!("parent {parent} not ingested (skipped to avoid orphan PARENT_OF edge)"),
             ));
             continue;
         }
 
-        // 英語版（canonical、クエリなし）。失敗したらこの記事を skip し日本語版は取りに行かない。
         let en_html = match throttled_fetch(&http, &target.url, crawl_delay, &mut last_request)
             .await
         {
             Ok(html) => html,
             Err(err) => {
                 tracing::warn!(url = %target.url, error = %err, "english fetch failed; skipping article");
-                skip_records.push((target.url.clone(), format!("english fetch failed: {err}")));
+                skip_records.push((target.url.clone(), format!("fetch failed: {err}")));
                 continue;
             }
         };
-        let body_en = normalize_body(&extract_main_body(&Html::parse_document(&en_html)));
+        let en_document = Html::parse_document(&en_html);
+        let body_en = normalize_body(&extract_main_body(&en_document));
         if body_en.is_empty() {
-            tracing::warn!(url = %target.url, "english body empty after extraction; skipping article");
-            skip_records.push((target.url.clone(), "english body empty".to_string()));
+            tracing::warn!(url = %target.url, "body empty after extraction; skipping article");
+            skip_records.push((
+                target.url.clone(),
+                "body empty after extraction".to_string(),
+            ));
             continue;
         }
-
-        // 日本語版（?mt-language=JA）。英語版が成功したときだけ取りに行く。
-        let ja_url = japanese_url(&target.url);
-        let ja_html = match throttled_fetch(&http, &ja_url, crawl_delay, &mut last_request).await {
-            Ok(html) => html,
-            Err(err) => {
-                tracing::warn!(url = %ja_url, error = %err, "japanese fetch failed; skipping article");
-                skip_records.push((ja_url.clone(), format!("japanese fetch failed: {err}")));
-                continue;
-            }
-        };
-        let ja_document = Html::parse_document(&ja_html);
-        let body_ja = normalize_body(&extract_main_body(&ja_document));
-        if body_ja.is_empty() {
-            tracing::warn!(url = %ja_url, "japanese body empty after extraction; skipping article");
-            skip_records.push((ja_url.clone(), "japanese body empty".to_string()));
-            continue;
-        }
-        let crumbs = breadcrumb_crumbs(&ja_document);
+        let crumbs = breadcrumb_crumbs(&en_document);
         let breadcrumb = breadcrumb_string(&crumbs);
-        let title = breadcrumb_title(&crumbs);
-        if title.is_empty() {
+        let title_en = breadcrumb_title(&crumbs);
+        if title_en.is_empty() {
             tracing::warn!(
-                url = %ja_url,
+                url = %target.url,
                 "breadcrumb title empty (.mt-breadcrumbs absent or last crumb empty); skipping article"
             );
-            skip_records.push((ja_url.clone(), "breadcrumb title empty".to_string()));
+            skip_records.push((target.url.clone(), "breadcrumb title empty".to_string()));
             continue;
         }
 
-        // content_hash は英語原文（source of truth）のみで駆動する。差分 ingest は英語原文の
-        // 変化だけを見る。
-        //
-        // 【既知の制約（設計 spec が意図的に選んだ簡略化）】ingest_urtect は複合ハッシュ
-        // （本文 + 検出型番 + signal + order/parent 等を全てハッシュに含める）で、本文以外の
-        // 派生要素が変わっても再検出できる安全弁を持つ。alarmcom はこの安全弁を落としており、
-        // 英語本文が不変な限り product_lexicon / 製品マスタの変更で detect_product_models /
-        // signal_values の結果（DESCRIBES / MENTIONS_SIGNAL 辺のもと）が変化しても、当該 section は
-        // 「変更なし」と判定され再 upsert されない。例: ingest_products で新型番を追加し、既存の
-        // 英語記事が偶然その型番に言及していても、本文が変わっていなければ新しい DESCRIBES 辺は
-        // 張られない。運用上の回避策: lexicon / 製品マスタを大きく変更したら alarmcom の tenant
-        // schema を作り直して全件再 ingest する（backend に delete が無く、部分更新では派生辺を
-        // 張り直せないため）。ロジックは spec の選択どおり本文のみのハッシュに保つ。
+        // content_hash / en_hash は英語原文（source of truth）のみで駆動する。差分 ingest は
+        // 英語原文の変化だけを見る。英語が不変なら Gemini（translate_and_extract）は呼ばない。
         let hash = content_hash(&body_en);
         if existing_hash.get(&slug) == Some(&hash) {
             skipped_unchanged += 1;
             continue;
         }
 
-        // 型番検出は英語+日本語本文の連結に対して行う（型番は機械翻訳でも残るが取りこぼし防止）。
-        let combined = format!("{body_en} {body_ja}");
-        let product_models = detect_product_models(&combined, &product_lexicon);
+        let context = TranslationContext {
+            breadcrumb: breadcrumb.clone(),
+            parent_title: parent_slug
+                .as_deref()
+                .and_then(|p| titles_by_slug.get(p).cloned()),
+        };
+        let translation = match translate_and_extract(&body_en, &context, &glossary) {
+            Ok(t) => t,
+            Err(err) => {
+                tracing::warn!(url = %target.url, error = %err, "translation failed; skipping article");
+                skip_records.push((target.url.clone(), format!("translation failed: {err}")));
+                continue;
+            }
+        };
+        if translation.body_ja.trim().is_empty() {
+            tracing::warn!(url = %target.url, "translated body_ja empty; skipping article");
+            skip_records.push((target.url.clone(), "translated body_ja empty".to_string()));
+            continue;
+        }
+
+        // MENTIONS_SIGNAL は既存 lexicon 抽出を日本語本文に適用する。alarm.com は product
+        // 非依存なので product_models は常に空（DESCRIBES を張らない）。
         let signal_values: Vec<String> = lexicon
-            .normalize(&body_ja)
+            .normalize(&translation.body_ja)
             .iter()
             .map(|s| s.as_str().to_string())
             .collect();
 
-        // 変更された既存 section の stale 派生/親 edge 検出（ingest_urtect と同じ。backend に
-        // delete が無く、除去が必要な edge が残ると検索を誤らせるため fail closed）。
-        if existing_hash.contains_key(&slug) {
-            let sec_id = manual_node_id(&args.schema, KIND_SECTION, &slug);
-            if let Some(old_targets) = old_derived.get(&sec_id) {
-                let new_targets: HashSet<String> = product_models
-                    .iter()
-                    .map(|m| manual_node_id(&args.schema, KIND_PRODUCT, m))
-                    .chain(
-                        signal_values
-                            .iter()
-                            .map(|s| manual_node_id(&args.schema, "Signal", s)),
-                    )
-                    .collect();
-                let stale: Vec<&String> = old_targets
-                    .iter()
-                    .filter(|t| !new_targets.contains(*t))
-                    .collect();
-                if !stale.is_empty() {
-                    anyhow::bail!(
-                        "section {slug} requires removing derived edges ({stale:?}) but the \
-                         backend exposes no delete; recreate the tenant schema and re-ingest \
-                         from scratch"
-                    );
+        // Concept 抽出結果を registry へマージし、この記事が言及する concept_key の集合を作る
+        // （同一記事内の重複抽出は 1 辺に畳む）。
+        let mut concept_keys: Vec<String> = Vec::new();
+        for extract in &translation.concepts {
+            let before_len = concept_registry.len();
+            if let Some(key) = merge_concept(&mut concept_registry, extract) {
+                if concept_registry.len() > before_len {
+                    concepts_new_count += 1;
                 }
-            }
-            if let Some(old_parent_ids) = old_parents.get(&sec_id) {
-                let new_parent_id = target
-                    .parent_slug
-                    .as_deref()
-                    .map(|p| manual_node_id(&args.schema, KIND_SECTION, p));
-                let stale_parents: Vec<&String> = old_parent_ids
-                    .iter()
-                    .filter(|p| Some(p.as_str()) != new_parent_id.as_deref())
-                    .collect();
-                if !stale_parents.is_empty() {
-                    anyhow::bail!(
-                        "section {slug} changed parent (old {stale_parents:?} vs new \
-                         {new_parent_id:?}) which requires removing PARENT_OF edges, but the \
-                         backend exposes no delete; recreate the tenant schema and re-ingest \
-                         from scratch"
-                    );
+                if !concept_keys.contains(&key) {
+                    concept_keys.push(key);
                 }
+            } else {
+                tracing::warn!(
+                    url = %target.url,
+                    name_en = %extract.name_en,
+                    "concept name_en normalizes to empty; skipping this concept mention"
+                );
             }
         }
 
-        for model in &product_models {
-            *describes_by_model.entry(model.clone()).or_insert(0) += 1;
+        // 変更された既存 section の stale 派生/親 edge 検出（backend に delete が無く、除去が
+        // 必要な edge が残ると検索を誤らせるため fail closed）。既存 edge は graph_snapshot の
+        // 全件ロードではなく、この section 1 件について query_nodes の 1-hop traverse で引く
+        // （Warning 1: 5000 ノード上限回避）。呼び出しは「既存かつ内容が変わった section」に
+        // だけ発生する（上の未変更 skip を通過しているため）。
+        //
+        // traverse の向き: MENTIONS_SIGNAL/MENTIONS_CONCEPT/DESCRIBES は section→対象の
+        // outgoing、PARENT_OF は 親→子 なので子（この section）から見て incoming の from 側が
+        // 親。返却は隣接ノードの node_id で、`manual_node_id(...)` と同じ id 体系。
+        // DESCRIBES を含めるのは v1 時代の残存 DESCRIBES を「除去が必要な stale edge」として
+        // 検出するため（v2 alarm.com は product 非依存で新規 DESCRIBES を張らない）。
+        if existing_hash.contains_key(&slug) {
+            const NEIGHBOR_LIMIT: i32 = 1000;
+            let sec_id = manual_node_id(&args.schema, KIND_SECTION, &slug);
+
+            let mut old_derived: HashSet<String> = HashSet::new();
+            for (neighbor_type, edge_type) in [
+                ("Product", "DESCRIBES"),
+                ("Signal", "MENTIONS_SIGNAL"),
+                (KIND_CONCEPT, "MENTIONS_CONCEPT"),
+            ] {
+                let neighbors = client
+                    .traverse_neighbor_ids(
+                        &args.schema,
+                        neighbor_type,
+                        edge_type,
+                        "outgoing",
+                        &sec_id,
+                        NEIGHBOR_LIMIT,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("load existing {edge_type} edges for changed section {slug}")
+                    })?;
+                old_derived.extend(neighbors);
+            }
+            let new_targets: HashSet<String> = signal_values
+                .iter()
+                .map(|s| manual_node_id(&args.schema, "Signal", s))
+                .chain(
+                    concept_keys
+                        .iter()
+                        .map(|k| manual_node_id(&args.schema, "Concept", k)),
+                )
+                .collect();
+            let stale: Vec<&String> = old_derived
+                .iter()
+                .filter(|t| !new_targets.contains(*t))
+                .collect();
+            if !stale.is_empty() {
+                anyhow::bail!(
+                    "section {slug} requires removing derived edges ({stale:?}) but the \
+                     backend exposes no delete; recreate the tenant schema and re-ingest \
+                     from scratch"
+                );
+            }
+
+            let old_parent_ids = client
+                .traverse_neighbor_ids(
+                    &args.schema,
+                    KIND_SECTION,
+                    "PARENT_OF",
+                    "incoming",
+                    &sec_id,
+                    NEIGHBOR_LIMIT,
+                )
+                .await
+                .with_context(|| {
+                    format!("load existing PARENT_OF edges for changed section {slug}")
+                })?;
+            let new_parent_id = parent_slug
+                .as_deref()
+                .map(|p| manual_node_id(&args.schema, KIND_SECTION, p));
+            let stale_parents: Vec<&String> = old_parent_ids
+                .iter()
+                .filter(|p| Some(p.as_str()) != new_parent_id.as_deref())
+                .collect();
+            if !stale_parents.is_empty() {
+                anyhow::bail!(
+                    "section {slug} changed parent (old {stale_parents:?} vs new \
+                     {new_parent_id:?}) which requires removing PARENT_OF edges, but the \
+                     backend exposes no delete; recreate the tenant schema and re-ingest \
+                     from scratch"
+                );
+            }
         }
+
         if signal_values.is_empty() {
             zero_signal_sections.push(slug.clone());
         }
 
-        section_bodies.push((slug.clone(), body_ja.clone()));
         let input = ManualSectionInput {
             slug: slug.clone(),
-            title,
-            body: body_ja,
+            // NOTE(#8 Phase A stub): title は現時点で英語のまま保持する。`translate_and_extract`
+            // の seam は body の翻訳のみを契約しており（title 翻訳は含まない）、Gemini
+            // 実装時に別途 title 翻訳を配線するまでの既知の暫定挙動。body_ja は正しく
+            // 翻訳済み（stub 期間は passthrough）になる。
+            title: title_en,
+            body: translation.body_ja.clone(),
             source_url: target.url.clone(),
             breadcrumb,
             section_no: None,
             order: target.order,
-            parent_slug: target.parent_slug.clone(),
-            product_models,
+            parent_slug: parent_slug.clone(),
+            product_models: Vec::new(),
             signal_values,
-            // 英語原文とその hash を書く。content_hash（upsert 判定）も同じ英語原文 hash。
             body_original: Some(body_en),
             original_hash: Some(hash.clone()),
         };
         let build = build_section_graph(&args.schema, DOC_KEY, &input, &hash);
-        nodes.extend(build.nodes);
-        edges.extend(build.edges);
-        ingested += 1;
-        ingested_this_run.insert(slug);
-    }
-
-    // 安全弁: skip 割合が閾値超なら upsert 前に bail（サイト構造/セレクタ変化の疑い）。
-    let skipped_fetch_or_empty = skip_records.len();
-    let target_count = plan.targets.len();
-    let skip_ratio = skipped_fetch_or_empty as f64 / target_count as f64;
-    if skip_ratio > MAX_SKIP_RATIO {
-        anyhow::bail!(
-            "skipped {skipped_fetch_or_empty}/{target_count} articles ({:.1}%) due to fetch \
-             failure or empty body, exceeding the {:.0}% safety threshold; the site structure or \
-             extraction selector (#elm-main-content) may have changed — aborting before upsert \
-             (inspect the skipped URLs)",
-            skip_ratio * 100.0,
-            MAX_SKIP_RATIO * 100.0
-        );
-    }
-
-    // document ノード（Alarm.com Answers）を 1 件集約する。
-    nodes.push(build_document_node(
-        &args.schema,
-        DOC_KEY,
-        "Alarm.com Answers",
-        &args.base_url,
-        &fetched_at,
-    ));
-
-    // 同一 id のノード重複を除去（Signal ノードが節ごとに重複しやすい）。順序は保持する。
-    let mut seen_node_ids = HashSet::new();
-    nodes.retain(|n| seen_node_ids.insert(n.id.clone()));
-
-    // embedding → vector upsert を node/edge upsert より必ず先に行う（ingest_urtect と同じ
-    // fail-closed 順序）。ここで失敗して bail しても content_hash は旧値のまま残るため、次回の
-    // 差分 ingest が当該 section を再検出し embedding ごと再試行する。逆順だと vector 欠落のまま
-    // 永久 skip される。embed は fail closed（1 件でも失敗で abort）。
-    let vectors_skipped = args.no_vectors;
-    let upserted_vectors = if vectors_skipped {
-        0
-    } else {
-        let mut section_slugs: Vec<String> = Vec::with_capacity(section_bodies.len());
-        let mut section_texts: Vec<String> = Vec::with_capacity(section_bodies.len());
-        let section_items: Vec<(String, String)> = section_bodies
-            .into_iter()
-            .map(|(slug, body)| {
-                let label = format!("section {slug}");
-                section_slugs.push(slug);
-                section_texts.push(body.clone());
-                (label, body)
-            })
-            .collect();
-        let section_vectors = embed_all(&client, section_items, EMBED_CONCURRENCY).await?;
-        let mut entries: Vec<(String, Vec<f32>, Vec<(String, String)>)> =
-            Vec::with_capacity(section_slugs.len());
-        for ((slug, text), vector) in section_slugs
-            .iter()
-            .zip(section_texts.iter())
-            .zip(section_vectors)
-        {
-            let id = manual_node_id(&args.schema, KIND_SECTION, slug);
-            entries.push(vector_entry(
-                id,
-                vector,
-                text,
-                KIND_SECTION,
-                &ingest_timestamp_ms,
-            ));
+        let mut article_nodes = build.nodes;
+        let mut article_edges = build.edges;
+        concept_mentions_total += concept_keys.len();
+        for key in &concept_keys {
+            if let Some(record) = concept_registry.iter().find(|r| &r.concept_key == key) {
+                article_nodes.push(build_concept_node(&args.schema, record));
+            }
+            article_edges.push(build_mentions_concept_edge(&args.schema, &slug, key));
         }
-        let entries_len = entries.len();
-        client
-            .upsert_vectors(entries)
-            .await
-            .with_context(|| format!("upsert vectors (entries={entries_len})"))?
+        let mut seen_node_ids = HashSet::new();
+        article_nodes.retain(|n| seen_node_ids.insert(n.id.clone()));
+
+        let (upserted_vectors, upserted_nodes, upserted_edges) = commit_article(
+            &client,
+            ArticleCommit {
+                schema: &args.schema,
+                slug: &slug,
+                body_ja: &input.body,
+                nodes: article_nodes,
+                edges: article_edges,
+                vectors_skipped,
+                ingest_timestamp_ms: &ingest_timestamp_ms,
+            },
+        )
+        .await?;
+        total_vectors_upserted += upserted_vectors;
+        total_nodes_upserted += upserted_nodes;
+        total_edges_upserted += upserted_edges;
+        ingested += 1;
+        ingested_this_run.insert(slug.clone());
+        titles_by_slug.insert(slug, input.title.clone());
+
+        // 安全弁: 記事単位インクリメンタル upsert に伴い、全件処理後ではなく処理するたびに
+        // skip 比率を判定する（既に upsert 済みの記事は守りつつ、なるべく早く異常を検知して
+        // 残りのクロールを止める）。parent-not-ingested の cascade skip は分子・分母とも除外
+        // （Warning 2: 空ハブ配下 subtree の巻き添えで誤発火するため。判定は site_skip_bail）。
+        if let Some(running_ratio) = site_skip_bail(
+            skip_records.len(),
+            ingested,
+            skipped_unchanged,
+            MIN_SKIP_SAMPLE,
+            MAX_SKIP_RATIO,
+        ) {
+            let processed_so_far = ingested + skipped_unchanged + skip_records.len();
+            anyhow::bail!(
+                "site-structure skips {}/{processed_so_far} articles fetched so far ({:.1}%), \
+                 exceeding the {:.0}% safety threshold; the site structure or extraction selector \
+                 (#elm-main-content / .mt-breadcrumbs) may have changed — aborting before \
+                 crawling further (this ratio excludes {} parent-not-ingested cascade skips; \
+                 articles already upserted this run remain committed; inspect the skipped URLs)",
+                skip_records.len(),
+                running_ratio * 100.0,
+                MAX_SKIP_RATIO * 100.0,
+                parent_skip_records.len()
+            );
+        }
+    }
+
+    let skipped_fetch_or_empty = skip_records.len();
+    let parent_skipped = parent_skip_records.len();
+    // skip_ratio は「fetch を試みた記事に対する site-structure skip の割合」。分母から
+    // parent-not-ingested の cascade skip（fetch 未試行）を除く（Warning 2 と一貫させる）。
+    let fetch_attempted = target_count.saturating_sub(parent_skipped);
+    let skip_ratio = if fetch_attempted == 0 {
+        0.0
+    } else {
+        skipped_fetch_or_empty as f64 / fetch_attempted as f64
     };
 
-    let graph = GraphBuild { nodes, edges };
-    let expected_nodes = graph.nodes.len();
-    let expected_edges = graph.edges.len();
-    let (upserted_nodes, upserted_edges) = client.upsert_graph_low_level(graph).await?;
-
     let fetch_or_empty_skipped_urls: Vec<serde_json::Value> = skip_records
+        .iter()
+        .map(|(url, reason)| json!({ "url": url, "reason": reason }))
+        .collect();
+    let parent_skipped_urls: Vec<serde_json::Value> = parent_skip_records
         .iter()
         .map(|(url, reason)| json!({ "url": url, "reason": reason }))
         .collect();
@@ -957,23 +969,25 @@ async fn main() -> Result<()> {
             "schema": args.schema,
             "base_url": args.base_url,
             "sitemap_url": sitemap_url,
-            "sitemap_url_count": sitemap_urls.len(),
+            "sitemap_url_count": sitemap_urls_raw.len(),
             "off_origin_urls_dropped": off_origin_dropped,
-            "matched_family_hub_count": plan.hubs.len(),
+            "off_targeted_prefix_urls_dropped": off_prefix_dropped,
             "crawl_target_count": target_count,
             "ingested_manual_sections": ingested,
             "skipped_unchanged": skipped_unchanged,
             "skipped_fetch_or_empty": skipped_fetch_or_empty,
+            "skipped_parent_not_ingested": parent_skipped,
+            "fetch_attempted": fetch_attempted,
             "skip_ratio": skip_ratio,
-            "expected_nodes": expected_nodes,
-            "expected_edges": expected_edges,
-            "upserted_nodes": upserted_nodes,
-            "upserted_edges": upserted_edges,
-            "upserted_vectors": upserted_vectors,
+            "upserted_nodes": total_nodes_upserted,
+            "upserted_edges": total_edges_upserted,
+            "upserted_vectors": total_vectors_upserted,
             "vectors_skipped": vectors_skipped,
-            "describes_by_model": describes_by_model,
+            "concepts_created": concepts_new_count,
+            "concept_mentions": concept_mentions_total,
             "sections_with_zero_signal_matches": zero_signal_sections,
             "fetch_or_empty_skipped_urls": fetch_or_empty_skipped_urls,
+            "parent_skipped_urls": parent_skipped_urls,
         }))?
     );
     Ok(())
@@ -994,11 +1008,10 @@ fn parse_sitemap_urls(xml: &str) -> Vec<String> {
 /// sitemap 由来 URL を base_url と同一 origin（scheme + host）のものだけに絞る純関数。
 ///
 /// sitemap.xml 自体は answers.alarm.com から取得する信頼済みソースだが、そこに紛れ込んだ
-/// （改竄・設定ミス由来の）外部 URL が、末尾セグメントの緩和正規化マッチで偶然ファミリーハブと
-/// 誤認されると、実フェッチが外部ホスト（例: `http://169.254.169.254/...` の cloud metadata
-/// endpoint）へ飛び、Cloud Run 環境ではサービスアカウント資格情報の漏洩につながりうる。
-/// 既存の redirect policy は「リダイレクト」にしか効かず**初期 fetch 先 URL 自体**の origin を
-/// 検証しないため、ハブ判定より前のこの段階で同じ「同一 scheme/host のみ」境界を課す。
+/// （改竄・設定ミス由来の）外部 URL を実フェッチしてしまうと、Cloud Run 環境では
+/// サービスアカウント資格情報の漏洩につながりうる（例: cloud metadata endpoint）。既存の
+/// redirect policy は「リダイレクト」にしか効かず**初期 fetch 先 URL 自体**の origin を
+/// 検証しないため、クロール対象確定より前のこの段階で同じ「同一 scheme/host のみ」境界を課す。
 /// パース不能な URL も除外する。
 fn filter_same_origin(urls: &[String], base_url: &Url) -> Vec<String> {
     urls.iter()
@@ -1014,113 +1027,30 @@ fn filter_same_origin(urls: &[String], base_url: &Url) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// ADC-V724（model）、ADC-VC727P（model）、VC727PRO（ADC-VC727P の別名）の 3 表層形。
-    fn sample_lexicon() -> HashMap<String, String> {
-        let mut lexicon = HashMap::new();
-        lexicon.insert("ADC-V724".to_string(), "ADC-V724".to_string());
-        lexicon.insert("ADC-VC727P".to_string(), "ADC-VC727P".to_string());
-        lexicon.insert("VC727PRO".to_string(), "ADC-VC727P".to_string());
-        lexicon
-    }
-
-    const HUB_V724: &str =
-        "https://answers.alarm.com/Partner/Video_Devices/1080p_Outdoor_Camera_ADC-V724_724X";
-    const CHILD_WIFI: &str = "https://answers.alarm.com/Partner/Video_Devices/1080p_Outdoor_Camera_ADC-V724_724X/Wi-Fi_Setup";
-    const HUB_VC727PRO: &str =
-        "https://answers.alarm.com/Partner/Video_Devices/Mini_Bullet_Camera_VC727PRO";
-    const UNRELATED_THERMOSTAT: &str =
-        "https://answers.alarm.com/Partner/Thermostats/Smart_Thermostat_ADC-T2000";
-
-    fn sample_sitemap_urls() -> Vec<String> {
-        vec![
-            HUB_V724.to_string(),
-            CHILD_WIFI.to_string(),
-            UNRELATED_THERMOSTAT.to_string(),
-            HUB_VC727PRO.to_string(),
-        ]
-    }
-
     #[test]
-    fn relaxed_normalize_keeps_only_ascii_alnum_uppercased() {
+    fn site_skip_bail_ignores_parent_skips_and_respects_min_sample() {
+        // 分子・分母は site-structure skip / (ingested + unchanged + site skips) のみ。
+        // parent-not-ingested の cascade skip は引数に現れない ＝ 構造的に比率へ寄与しない
+        // （Warning 2 の核心）。健全なサイトの例: 空ハブ 1 件配下で 100 件が親未 ingest で
+        // skip されても、実 fetch した 30 件中 site skip が 2 件なら bail しない。
         assert_eq!(
-            relaxed_normalize("1080p_Outdoor_ADC-V724_724X"),
-            "1080POUTDOORADCV724724X"
+            site_skip_bail(2, 25, 3, 20, 0.2),
+            None,
+            "6.7% site-skip must not bail even alongside many parent-cascade skips"
         );
-        assert_eq!(relaxed_normalize("ADC-V724"), "ADCV724");
-        // 非 ASCII・記号・空白は全て捨てる
-        assert_eq!(relaxed_normalize("（型番）V724 テスト"), "V724");
-    }
-
-    #[test]
-    fn detect_family_hubs_matches_model_and_alias_but_not_unrelated() {
-        let hubs = detect_family_hubs(&sample_sitemap_urls(), &sample_lexicon());
-        // ハブは V724（model 一致）と VC727PRO（alias 一致）の 2 件、sitemap 出現順。
-        let hub_urls: Vec<&str> = hubs.iter().map(|h| h.url.as_str()).collect();
-        assert_eq!(hub_urls, vec![HUB_V724, HUB_VC727PRO]);
-        // model 一致は ADC-V724 のみ
+        // site-structure skip が閾値超過なら Some（bail）。
+        assert!(
+            site_skip_bail(10, 20, 0, 20, 0.2).is_some(),
+            "33% site-skip must bail"
+        );
+        // サンプル不足（processed < min_sample）では常に None。
         assert_eq!(
-            hubs[0].matched_product_keys,
-            BTreeSet::from(["ADC-V724".to_string()])
+            site_skip_bail(5, 2, 0, 20, 0.2),
+            None,
+            "below min_sample must never bail regardless of ratio"
         );
-        // alias（VC727PRO）経由で ADC-VC727P にマッチ
-        assert_eq!(
-            hubs[1].matched_product_keys,
-            BTreeSet::from(["ADC-VC727P".to_string()])
-        );
-        // 無関係ファミリー（サーモスタット）はハブにならない
-        assert!(!hubs.iter().any(|h| h.url == UNRELATED_THERMOSTAT));
-    }
-
-    #[test]
-    fn detect_family_hubs_ignores_url_matching_no_product() {
-        // 製品語彙に一致しない URL はハブ扱いされない。
-        let sitemap = vec![UNRELATED_THERMOSTAT.to_string()];
-        let hubs = detect_family_hubs(&sitemap, &sample_lexicon());
-        assert!(hubs.is_empty());
-    }
-
-    #[test]
-    fn is_segment_prefix_respects_path_boundaries() {
-        assert!(is_segment_prefix("/a/b", "/a/b")); // 同一
-        assert!(is_segment_prefix("/a/b", "/a/b/c")); // 配下
-        assert!(!is_segment_prefix("/a/b", "/a/bc")); // 素の前方一致は境界外なので不一致
-        assert!(!is_segment_prefix("/a/b", "/a")); // 親は配下でない
-    }
-
-    #[test]
-    fn build_crawl_targets_selects_hub_and_children_excludes_siblings() {
-        let hubs = detect_family_hubs(&sample_sitemap_urls(), &sample_lexicon());
-        let targets = build_crawl_targets(&sample_sitemap_urls(), &hubs);
-        // クロール対象は V724 ハブ・その配下 Wi-Fi・VC727PRO ハブの 3 件。
-        // 無関係サーモスタットは除外される。
-        let urls: Vec<&str> = targets.iter().map(|t| t.url.as_str()).collect();
-        assert_eq!(urls, vec![HUB_V724, CHILD_WIFI, HUB_VC727PRO]);
-        // order は sitemap 出現順の 0 始まり連番
-        assert_eq!(targets[0].order, 0);
-        assert_eq!(targets[1].order, 1);
-        assert_eq!(targets[2].order, 2);
-        // ハブ自身は親なし
-        assert_eq!(targets[0].parent_slug, None);
-        assert_eq!(targets[2].parent_slug, None);
-        // 配下 URL の親はハブ自身の slug（フラット 2 階層）
-        assert_eq!(targets[1].parent_slug, Some(alarmcom_slug(HUB_V724)));
-    }
-
-    #[test]
-    fn plan_crawl_flags_products_without_a_matching_hub() {
-        // ADC-DB772 は sitemap にファミリー URL が無い → unmatched に出る。
-        let mut lexicon = sample_lexicon();
-        lexicon.insert("ADC-DB772".to_string(), "ADC-DB772".to_string());
-        let plan = plan_crawl(&sample_sitemap_urls(), &lexicon);
-        assert_eq!(plan.unmatched_product_keys, vec!["ADC-DB772".to_string()]);
-    }
-
-    #[test]
-    fn plan_crawl_has_no_unmatched_when_all_products_have_hubs() {
-        let plan = plan_crawl(&sample_sitemap_urls(), &sample_lexicon());
-        assert!(plan.unmatched_product_keys.is_empty());
-        assert_eq!(plan.hubs.len(), 2);
-        assert_eq!(plan.targets.len(), 3);
+        // ちょうど閾値は超過ではないので None（> 判定）。
+        assert_eq!(site_skip_bail(4, 16, 0, 20, 0.2), None);
     }
 
     #[test]
@@ -1146,177 +1076,130 @@ mod tests {
     fn filter_same_origin_keeps_only_base_scheme_and_host() {
         let base = Url::parse("https://answers.alarm.com").unwrap();
         let urls = vec![
-            HUB_V724.to_string(), // 同一 origin
+            "https://answers.alarm.com/Partner/A".to_string(),
             // cloud metadata endpoint（host も scheme も違う）は除外される
-            "http://169.254.169.254/latest/meta-data/ADC-V724_724X".to_string(),
-            // host 違いは除外
-            "https://evil.example.com/Partner/ADC-V724_724X".to_string(),
-            // scheme 違い（http vs https）も除外
-            "http://answers.alarm.com/Partner/ADC-V724_724X".to_string(),
-            // パース不能な文字列も除外
+            "http://169.254.169.254/latest/meta-data/foo".to_string(),
+            "https://evil.example.com/Partner/A".to_string(),
+            "http://answers.alarm.com/Partner/A".to_string(),
             "not a url".to_string(),
-            HUB_VC727PRO.to_string(), // 同一 origin
+            "https://answers.alarm.com/Customer/B".to_string(),
         ];
         let filtered = filter_same_origin(&urls, &base);
         assert_eq!(
             filtered,
-            vec![HUB_V724.to_string(), HUB_VC727PRO.to_string()]
+            vec![
+                "https://answers.alarm.com/Partner/A".to_string(),
+                "https://answers.alarm.com/Customer/B".to_string(),
+            ]
         );
     }
 
     #[test]
-    fn filter_same_origin_is_noop_for_all_same_origin_fixture() {
-        // 既存の 14 件テストが使う fixture は全て同一 origin。フィルタで欠落しないことを固定する
-        // （フィルタ導入による既存挙動への影響が無いことの担保）。
-        let base = Url::parse("https://answers.alarm.com").unwrap();
-        let filtered = filter_same_origin(&sample_sitemap_urls(), &base);
-        assert_eq!(filtered, sample_sitemap_urls());
-    }
-
-    #[test]
-    fn japanese_url_appends_mt_language_param() {
-        assert_eq!(
-            japanese_url("https://answers.alarm.com/Partner/A"),
-            "https://answers.alarm.com/Partner/A?mt-language=JA"
-        );
-        // 既存クエリがあれば & で連結する
-        assert_eq!(
-            japanese_url("https://answers.alarm.com/Partner/A?foo=bar"),
-            "https://answers.alarm.com/Partner/A?foo=bar&mt-language=JA"
-        );
-    }
-
-    /// `#elm-main-content` 本文と `.mt-breadcrumbs` を含む最小 HTML fixture。
-    const SAMPLE_ARTICLE_HTML: &str = r#"<html><body>
-      <div class="mt-breadcrumbs">
-        <span><a href="/Partner">Partner</a></span>
-        <span><a href="/Partner/Video">ビデオ機器</a></span>
-        <span class="mt-breadcrumbs-current-page">Wi-Fi設定</span>
-      </div>
-      <article class="elm-content-container" id="elm-main-content">
-        <nav>パンくずナビ</nav>
-        <h1>Wi-Fi設定</h1>
-        <p>カメラをWi-Fiに接続します。</p>
-        <script>var noise = 1;</script>
-        <style>.x{color:red}</style>
-      </article>
-    </body></html>"#;
-
-    #[test]
-    fn extract_main_body_collects_content_and_excludes_noise() {
-        let document = Html::parse_document(SAMPLE_ARTICLE_HTML);
-        let body = normalize_body(&extract_main_body(&document));
-        assert!(body.contains("Wi-Fi設定"));
-        assert!(body.contains("カメラをWi-Fiに接続します。"));
-        // nav / script / style は本文に取り込まない
-        assert!(!body.contains("パンくずナビ"));
-        assert!(!body.contains("noise"));
-        assert!(!body.contains("color:red"));
-    }
-
-    #[test]
-    fn extract_main_body_empty_when_container_absent() {
-        let document = Html::parse_document("<html><body><p>本文</p></body></html>");
-        assert_eq!(extract_main_body(&document), "");
-    }
-
-    #[test]
-    fn breadcrumb_crumbs_lists_direct_children_and_title_is_last() {
-        let document = Html::parse_document(SAMPLE_ARTICLE_HTML);
-        let crumbs = breadcrumb_crumbs(&document);
-        assert_eq!(crumbs, vec!["Partner", "ビデオ機器", "Wi-Fi設定"]);
-        assert_eq!(
-            breadcrumb_string(&crumbs),
-            "Partner > ビデオ機器 > Wi-Fi設定"
-        );
-        assert_eq!(breadcrumb_title(&crumbs), "Wi-Fi設定");
-    }
-
-    #[test]
-    fn breadcrumb_absent_yields_empty() {
-        let document = Html::parse_document("<html><body><p>本文</p></body></html>");
-        assert!(breadcrumb_crumbs(&document).is_empty());
-        assert_eq!(breadcrumb_title(&breadcrumb_crumbs(&document)), "");
-    }
-
-    #[test]
-    fn hub_first_order_moves_hubs_before_children_preserving_relative_order() {
-        // 子が sitemap 上ハブより先に出現するケース（ハブ側の実処理順序をこの関数が正す）。
-        let child_a = CrawlTarget {
-            url: "https://x/child-a".to_string(),
-            slug: "child-a".to_string(),
-            parent_slug: Some("hub".to_string()),
-            order: 0,
-        };
-        let hub = CrawlTarget {
-            url: "https://x/hub".to_string(),
-            slug: "hub".to_string(),
-            parent_slug: None,
-            order: 1,
-        };
-        let child_b = CrawlTarget {
-            url: "https://x/child-b".to_string(),
-            slug: "child-b".to_string(),
-            parent_slug: Some("hub".to_string()),
-            order: 2,
-        };
-        let other_hub = CrawlTarget {
-            url: "https://x/other-hub".to_string(),
-            slug: "other-hub".to_string(),
-            parent_slug: None,
-            order: 3,
-        };
-        let targets = vec![
-            child_a.clone(),
-            hub.clone(),
-            child_b.clone(),
-            other_hub.clone(),
+    fn filter_targeted_urls_keeps_only_customer_and_partner_paths() {
+        let urls = vec![
+            "https://answers.alarm.com/Partner/A".to_string(),
+            "https://answers.alarm.com/Customer/B".to_string(),
+            "https://answers.alarm.com/About/Contact".to_string(),
+            // 境界一致（前方一致誤爆を避ける）
+            "https://answers.alarm.com/CustomerService/X".to_string(),
         ];
-        let ordered = hub_first_order(&targets);
-        let slugs: Vec<&str> = ordered.iter().map(|t| t.slug.as_str()).collect();
-        // ハブ群（hub, other-hub、元の相対順序を保持）が先、子群（child-a, child-b）が後。
-        assert_eq!(slugs, vec!["hub", "other-hub", "child-a", "child-b"]);
-        // order フィールド自体は並べ替えの影響を受けない（表示用の sitemap 出現順連番のまま）。
-        assert_eq!(hub.order, 1);
-        assert_eq!(child_a.order, 0);
-        assert_eq!(child_b.order, 2);
-        assert_eq!(other_hub.order, 3);
+        let filtered = filter_targeted_urls(&urls);
+        assert_eq!(
+            filtered,
+            vec![
+                "https://answers.alarm.com/Partner/A".to_string(),
+                "https://answers.alarm.com/Customer/B".to_string(),
+            ]
+        );
     }
 
     #[test]
-    fn hub_first_order_is_noop_when_all_hubs_already_precede_all_children() {
-        // 「全ハブが全子より先」という 2 群構造そのままの入力は並べ替えても変化しない。
-        // `sample_sitemap_urls()`（ハブ・子・ハブの順）はこの意味では「既にハブ優先」ではない点に
-        // 注意（hub_first_order_moves_hubs_before_children_preserving_relative_order が検証する
-        // ケース）。ここでは 2 群構造が既に成立している入力そのものを固定する。
-        let hub_a = CrawlTarget {
-            url: "https://x/hub-a".to_string(),
-            slug: "hub-a".to_string(),
-            parent_slug: None,
-            order: 0,
-        };
-        let hub_b = CrawlTarget {
-            url: "https://x/hub-b".to_string(),
-            slug: "hub-b".to_string(),
-            parent_slug: None,
-            order: 1,
-        };
-        let child_a = CrawlTarget {
-            url: "https://x/child-a".to_string(),
-            slug: "child-a".to_string(),
-            parent_slug: Some("hub-a".to_string()),
-            order: 2,
-        };
-        let child_b = CrawlTarget {
-            url: "https://x/child-b".to_string(),
-            slug: "child-b".to_string(),
-            parent_slug: Some("hub-b".to_string()),
-            order: 3,
-        };
-        let targets = vec![hub_a, hub_b, child_a, child_b];
-        let ordered = hub_first_order(&targets);
-        let slugs: Vec<&str> = ordered.iter().map(|t| t.slug.as_str()).collect();
-        assert_eq!(slugs, vec!["hub-a", "hub-b", "child-a", "child-b"]);
+    fn is_targeted_path_matches_exact_and_nested_but_not_prefix_collision() {
+        assert!(is_targeted_path("/Customer"));
+        assert!(is_targeted_path("/Customer/"));
+        assert!(is_targeted_path("/Partner/Video/A"));
+        assert!(!is_targeted_path("/CustomerService"));
+        assert!(!is_targeted_path("/About"));
+    }
+
+    #[test]
+    fn build_crawl_targets_canonicalizes_dedupes_and_orders() {
+        let urls = vec![
+            "https://answers.alarm.com/Partner/A/".to_string(),
+            "https://answers.alarm.com/Partner/A".to_string(), // 末尾スラッシュ違いの重複
+            "https://answers.alarm.com/Partner/A/B".to_string(),
+        ];
+        let targets = build_crawl_targets(&urls);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].url, "https://answers.alarm.com/Partner/A");
+        assert_eq!(targets[0].order, 0);
+        assert_eq!(targets[1].url, "https://answers.alarm.com/Partner/A/B");
+        assert_eq!(targets[1].order, 1);
+    }
+
+    #[test]
+    fn parent_path_of_derives_one_level_up() {
+        assert_eq!(
+            parent_path_of("/Partner/A/B"),
+            Some("/Partner/A".to_string())
+        );
+        assert_eq!(parent_path_of("/Partner/A"), Some("/Partner".to_string()));
+        assert_eq!(parent_path_of("/Partner"), None);
+        assert_eq!(parent_path_of(""), None);
+    }
+
+    #[test]
+    fn build_path_slug_map_and_parent_lookup_yields_none_when_parent_not_crawled() {
+        let urls = vec![
+            "https://answers.alarm.com/Partner/A".to_string(),
+            "https://answers.alarm.com/Partner/A/B".to_string(),
+            // C の親 "/Partner/Missing" は sitemap に無い → 親なし扱い
+            "https://answers.alarm.com/Partner/Missing/C".to_string(),
+        ];
+        let targets = build_crawl_targets(&urls);
+        let map = build_path_slug_map(&targets);
+        let b = &targets[1];
+        let parent_of_b = parent_path_of(&b.path).and_then(|p| map.get(&p).cloned());
+        assert_eq!(parent_of_b, Some(targets[0].slug.clone()));
+
+        let c = &targets[2];
+        let parent_of_c = parent_path_of(&c.path).and_then(|p| map.get(&p).cloned());
+        assert_eq!(parent_of_c, None);
+    }
+
+    #[test]
+    fn segment_count_counts_non_empty_segments() {
+        assert_eq!(segment_count("/Partner"), 1);
+        assert_eq!(segment_count("/Partner/A"), 2);
+        assert_eq!(segment_count("/Partner/A/B/"), 3);
+        assert_eq!(segment_count(""), 0);
+    }
+
+    #[test]
+    fn depth_first_order_processes_shallower_paths_before_deeper_ones() {
+        let urls = vec![
+            "https://x/a/b/c".to_string(), // depth 3, sitemap 出現順 0
+            "https://x/a".to_string(),     // depth 1, sitemap 出現順 1
+            "https://x/a/b".to_string(),   // depth 2, sitemap 出現順 2
+        ];
+        let targets = build_crawl_targets(&urls);
+        let ordered = depth_first_order(&targets);
+        let paths: Vec<&str> = ordered.iter().map(|t| t.path.as_str()).collect();
+        assert_eq!(paths, vec!["/a", "/a/b", "/a/b/c"]);
+    }
+
+    #[test]
+    fn depth_first_order_preserves_relative_order_within_same_depth() {
+        let urls = vec![
+            "https://x/b".to_string(),
+            "https://x/a".to_string(),
+            "https://x/c".to_string(),
+        ];
+        let targets = build_crawl_targets(&urls);
+        let ordered = depth_first_order(&targets);
+        // 同じ depth(1) 同士は sitemap 出現順（b, a, c）を保つ。
+        let paths: Vec<&str> = ordered.iter().map(|t| t.path.as_str()).collect();
+        assert_eq!(paths, vec!["/b", "/a", "/c"]);
     }
 
     #[test]
@@ -1326,21 +1209,17 @@ mod tests {
         let mut ingested_this_run = HashSet::new();
         ingested_this_run.insert("hub-this-run".to_string());
 
-        // 親なし（ハブ自身）は常に true。
         assert!(parent_is_known(None, &existing_hash, &ingested_this_run));
-        // 親が過去の ingest 実行で既に upsert 済み（existing_hash に存在）。
         assert!(parent_is_known(
             Some("hub-existing"),
             &existing_hash,
             &ingested_this_run
         ));
-        // 親が今回の実行で既に ingest 済み。
         assert!(parent_is_known(
             Some("hub-this-run"),
             &existing_hash,
             &ingested_this_run
         ));
-        // どちらの集合にも無い親は false（孤児 PARENT_OF 辺を防ぐため skip 対象）。
         assert!(!parent_is_known(
             Some("hub-never-ingested"),
             &existing_hash,
@@ -1350,11 +1229,62 @@ mod tests {
 
     #[test]
     fn alarmcom_slug_is_prefixed_and_stable() {
-        let slug = alarmcom_slug(HUB_V724);
+        let url = "https://answers.alarm.com/Partner/Video_Devices/1080p_Outdoor_Camera_ADC-V724";
+        let slug = alarmcom_slug(url);
         assert!(slug.starts_with("alarmcom-sec-"));
-        // 同一 URL は同一 slug（冪等キー）
-        assert_eq!(slug, alarmcom_slug(HUB_V724));
-        // urtect の section slug（sec-...）と衝突しない
-        assert_ne!(slug, section_slug(HUB_V724));
+        assert_eq!(slug, alarmcom_slug(url));
+        assert_ne!(slug, section_slug(url));
+    }
+
+    /// `#elm-main-content` 本文と `.mt-breadcrumbs` を含む最小 HTML fixture（英語版）。
+    const SAMPLE_ARTICLE_HTML: &str = r#"<html><body>
+      <div class="mt-breadcrumbs">
+        <span><a href="/Partner">Partner</a></span>
+        <span><a href="/Partner/Video">Video Devices</a></span>
+        <span class="mt-breadcrumbs-current-page">Wi-Fi Setup</span>
+      </div>
+      <article class="elm-content-container" id="elm-main-content">
+        <nav>breadcrumb nav noise</nav>
+        <h1>Wi-Fi Setup</h1>
+        <p>Connect the camera to Wi-Fi.</p>
+        <script>var noise = 1;</script>
+        <style>.x{color:red}</style>
+      </article>
+    </body></html>"#;
+
+    #[test]
+    fn extract_main_body_collects_content_and_excludes_noise() {
+        let document = Html::parse_document(SAMPLE_ARTICLE_HTML);
+        let body = normalize_body(&extract_main_body(&document));
+        assert!(body.contains("Wi-Fi Setup"));
+        assert!(body.contains("Connect the camera to Wi-Fi."));
+        assert!(!body.contains("breadcrumb nav noise"));
+        assert!(!body.contains("noise"));
+        assert!(!body.contains("color:red"));
+    }
+
+    #[test]
+    fn extract_main_body_empty_when_container_absent() {
+        let document = Html::parse_document("<html><body><p>body</p></body></html>");
+        assert_eq!(extract_main_body(&document), "");
+    }
+
+    #[test]
+    fn breadcrumb_crumbs_lists_direct_children_and_title_is_last() {
+        let document = Html::parse_document(SAMPLE_ARTICLE_HTML);
+        let crumbs = breadcrumb_crumbs(&document);
+        assert_eq!(crumbs, vec!["Partner", "Video Devices", "Wi-Fi Setup"]);
+        assert_eq!(
+            breadcrumb_string(&crumbs),
+            "Partner > Video Devices > Wi-Fi Setup"
+        );
+        assert_eq!(breadcrumb_title(&crumbs), "Wi-Fi Setup");
+    }
+
+    #[test]
+    fn breadcrumb_absent_yields_empty() {
+        let document = Html::parse_document("<html><body><p>body</p></body></html>");
+        assert!(breadcrumb_crumbs(&document).is_empty());
+        assert_eq!(breadcrumb_title(&breadcrumb_crumbs(&document)), "");
     }
 }
