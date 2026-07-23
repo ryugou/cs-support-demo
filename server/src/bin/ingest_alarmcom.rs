@@ -6,7 +6,7 @@
 ///
 /// - 対象記事は sitemap.xml 駆動で `/Customer` + `/Partner` 配下の**全 URL**（製品フィルタ無し）。
 /// - **英語版のみ 1 fetch/記事**。`?mt-language=JA` の機械翻訳は使わず、
-///   `translate::translate_and_extract`（Gemini Flash 3.6 想定、現時点は stub）で自前翻訳する。
+///   `translate::translate_and_extract`（Gemini Flash 3.6 `generateContent`）で自前翻訳する。
 /// - 本文は完全 SSR。`#elm-main-content` 配下から抽出する。パンくずは `.mt-breadcrumbs`。
 /// - **alarm.com は製品非依存**（DESCRIBES を張らない）。parent_slug は URL パス階層
 ///   （1 階層上のパスが今回のクロール対象に実在するか）から導出する。
@@ -33,7 +33,10 @@ use cs_support_mcp::{
         vectors::vector_entry,
     },
     model::{GraphEdge, GraphNode},
-    translate::{load_glossary, translate_and_extract, Glossary, TranslationContext},
+    translate::{
+        load_glossary, translate_and_extract, GeminiClient, GeminiConfig, Glossary,
+        TranslationContext,
+    },
     vegapunk::VegapunkClient,
 };
 use scraper::{ElementRef, Html, Selector};
@@ -96,6 +99,18 @@ struct Args {
     /// 翻訳 glossary（型番・製品名・専門語の訳ブレ防止）。`translate_and_extract` に渡す。
     #[arg(long, default_value = "data/glossary.json")]
     glossary_file: PathBuf,
+    /// Gemini モデル ID（翻訳 + Concept 抽出、design spec 2026-07-22 で確定済み）。
+    #[arg(long, default_value = "gemini-3.6-flash")]
+    gemini_model: String,
+    /// Gemini API のベース URL（`/models/{model}:generateContent` を末尾に補完する）。
+    #[arg(
+        long,
+        default_value = "https://generativelanguage.googleapis.com/v1beta"
+    )]
+    gemini_api_base: String,
+    /// Gemini API 呼び出しの timeout（秒）。
+    #[arg(long, default_value_t = 30)]
+    gemini_timeout_secs: u64,
     /// embed / upsert_vectors を一切呼ばずスキップする（ベクトル基盤未整備な環境向けの
     /// 明示的な opt-out）。未指定時は embed 失敗を fail closed で扱う。
     #[arg(long)]
@@ -470,6 +485,16 @@ async fn main() -> Result<()> {
         .with_context(|| format!("load signal lexicon {}", args.lexicon_file.display()))?;
     let glossary: Glossary = load_glossary(&args.glossary_file)
         .with_context(|| format!("load glossary {}", args.glossary_file.display()))?;
+    // 翻訳はこの CLI の中心機能であり、鍵が無ければ何もできない。3,490 記事のクロールを
+    // 何時間も走らせた後に毎記事で翻訳失敗するのを避けるため、クロール開始前に fail closed
+    // で構築する（`GeminiClient::from_config` は鍵を解決できなければ Err を返す）。
+    let gemini_config = GeminiConfig {
+        model: args.gemini_model.clone(),
+        api_base: args.gemini_api_base.clone(),
+        timeout_secs: args.gemini_timeout_secs,
+    };
+    let gemini_client = GeminiClient::from_config(&gemini_config)
+        .context("construct gemini client (check CS_SUPPORT_GEMINI_API_KEY)")?;
 
     let client = VegapunkClient::connect(&args.endpoint, &token).await?;
     client
@@ -733,7 +758,15 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .and_then(|p| titles_by_slug.get(p).cloned()),
         };
-        let translation = match translate_and_extract(&body_en, &context, &glossary) {
+        let translation = match translate_and_extract(
+            &gemini_client,
+            &title_en,
+            &body_en,
+            &context,
+            &glossary,
+        )
+        .await
+        {
             Ok(t) => t,
             Err(err) => {
                 tracing::warn!(url = %target.url, error = %err, "translation failed; skipping article");
@@ -744,6 +777,11 @@ async fn main() -> Result<()> {
         if translation.body_ja.trim().is_empty() {
             tracing::warn!(url = %target.url, "translated body_ja empty; skipping article");
             skip_records.push((target.url.clone(), "translated body_ja empty".to_string()));
+            continue;
+        }
+        if translation.title_ja.trim().is_empty() {
+            tracing::warn!(url = %target.url, "translated title_ja empty; skipping article");
+            skip_records.push((target.url.clone(), "translated title_ja empty".to_string()));
             continue;
         }
 
@@ -869,11 +907,7 @@ async fn main() -> Result<()> {
 
         let input = ManualSectionInput {
             slug: slug.clone(),
-            // NOTE(#8 Phase A stub): title は現時点で英語のまま保持する。`translate_and_extract`
-            // の seam は body の翻訳のみを契約しており（title 翻訳は含まない）、Gemini
-            // 実装時に別途 title 翻訳を配線するまでの既知の暫定挙動。body_ja は正しく
-            // 翻訳済み（stub 期間は passthrough）になる。
-            title: title_en,
+            title: translation.title_ja.clone(),
             body: translation.body_ja.clone(),
             source_url: target.url.clone(),
             breadcrumb,
