@@ -393,13 +393,82 @@ impl VegapunkClient {
     }
 
     /// `source_node_id` から `edge_type` を `direction`（"outgoing"|"incoming"）へ 1-hop 辿った
-    /// 隣接ノードの node_id 一覧を返す（`QueryNodes` の `traverse`）。
+    /// 隣接ノードを **offset ページングで全件** 返す（`QueryNodes` の `traverse`）。
     ///
-    /// stale-edge 検出で、`graph_snapshot` の全件依存を避けて「変更のあった既存 section 1 件」の
-    /// 現行 edge だけをピンポイントに引くために使う。呼び出しは再 ingest で内容が変わった既存
-    /// section にだけ発生するため、グラフ規模ではなく変更件数にスケールする。
-    /// 返却件数が `limit` に達したら silent truncation の疑いがあるため fail closed
-    /// （stale 検出を取りこぼすと除去漏れ edge が検索を汚し続けるため、fail-open を許さない）。
+    /// `QueryNodesResponse.total_count`（フィルタ後・ページング前の全件数）を完全性の権威として使い、
+    /// 収集数がそれに届かないまま短ページで終端したら fail closed する。旧実装は非ページングで
+    /// `limit` 到達を truncation とみなして即エラーにしていたが、これは hot signal（3000 辺 等）で
+    /// 常にエラーになり読み取りを止めていた。offset ページングで取り切ることで、辺数がグラフ規模に
+    /// 依存して大きくても全件を欠落なく得る。
+    pub async fn traverse_neighbors_paged(
+        &self,
+        schema: &str,
+        neighbor_node_type: &str,
+        edge_type: &str,
+        direction: &str,
+        source_node_id: &str,
+        page_size: i32,
+    ) -> Result<Vec<crate::proto::graphrag::NodeResult>> {
+        anyhow::ensure!(
+            (1..=1000).contains(&page_size),
+            "traverse page_size must be in 1..=1000 (got {page_size})"
+        );
+        let mut all: Vec<crate::proto::graphrag::NodeResult> = Vec::new();
+        let mut offset = 0i32;
+        loop {
+            let req = QueryNodesRequest {
+                schema: schema.to_string(),
+                node_type: neighbor_node_type.to_string(),
+                filters: Vec::new(),
+                sort_by: None,
+                sort_order: None,
+                limit: Some(page_size),
+                offset: Some(offset),
+                traverse: Some(EdgeTraversal {
+                    edge_type: edge_type.to_string(),
+                    direction: direction.to_string(),
+                    source_node_id: source_node_id.to_string(),
+                }),
+            };
+            let resp = self
+                .call(
+                    |mut client, request| async move {
+                        client.query_nodes(request).await.map(|r| r.into_inner())
+                    },
+                    req,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "traverse {edge_type} {direction} from {source_node_id} (offset {offset})"
+                    )
+                })?;
+            let total_count = resp.total_count;
+            let returned = resp.nodes.len();
+            all.extend(resp.nodes);
+            // 半端ページ（要求 page_size 未満、0 件を含む）＝最終ページ。
+            if page_is_last(returned, page_size as usize) {
+                // backend 申告の全件数に収集数が届かないなら、ページングが不完全＝辺を取りこぼしている。
+                // stale 検出・材料組み立てを不完全データで進めると fail-open するため fail closed。
+                if !traverse_is_complete(all.len(), total_count) {
+                    anyhow::bail!(
+                        "traverse {edge_type} {direction} from {source_node_id} collected {} \
+                         neighbor(s) but backend reported total_count={total_count}; pagination is \
+                         incomplete, refusing to proceed on a truncated neighbor set",
+                        all.len()
+                    );
+                }
+                break;
+            }
+            offset = offset
+                .checked_add(page_size)
+                .context("traverse offset overflowed i32")?;
+        }
+        Ok(all)
+    }
+
+    /// [`traverse_neighbors_paged`] の node_id だけを返す薄いラッパ。stale-edge 検出や
+    /// 材料 corpus の辺復元のように、隣接ノードの属性ではなく id 集合だけが要る呼び出し用。
     pub async fn traverse_neighbor_ids(
         &self,
         schema: &str,
@@ -407,43 +476,21 @@ impl VegapunkClient {
         edge_type: &str,
         direction: &str,
         source_node_id: &str,
-        limit: i32,
+        page_size: i32,
     ) -> Result<Vec<String>> {
-        let req = QueryNodesRequest {
-            schema: schema.to_string(),
-            node_type: neighbor_node_type.to_string(),
-            filters: Vec::new(),
-            sort_by: None,
-            sort_order: None,
-            limit: Some(limit),
-            offset: Some(0),
-            traverse: Some(EdgeTraversal {
-                edge_type: edge_type.to_string(),
-                direction: direction.to_string(),
-                source_node_id: source_node_id.to_string(),
-            }),
-        };
-        let nodes = self
-            .call(
-                |mut client, request| async move {
-                    client
-                        .query_nodes(request)
-                        .await
-                        .map(|resp| resp.into_inner().nodes)
-                },
-                req,
+        Ok(self
+            .traverse_neighbors_paged(
+                schema,
+                neighbor_node_type,
+                edge_type,
+                direction,
+                source_node_id,
+                page_size,
             )
-            .await
-            .with_context(|| format!("traverse {edge_type} {direction} from {source_node_id}"))?;
-        if nodes.len() as i32 >= limit {
-            anyhow::bail!(
-                "traverse {edge_type} {direction} from {source_node_id} returned {} node(s) at the \
-                 limit ({limit}); refusing to proceed with a possibly-truncated neighbor set for \
-                 stale-edge detection",
-                nodes.len()
-            );
-        }
-        Ok(nodes.into_iter().map(|n| n.node_id).collect())
+            .await?
+            .into_iter()
+            .map(|n| n.node_id)
+            .collect())
     }
 
     pub async fn graph_snapshot(
@@ -521,6 +568,14 @@ fn page_is_last(returned: usize, page_size: usize) -> bool {
     returned < page_size
 }
 
+/// ページング traverse の完全性判定: 収集件数 `collected` が backend 申告の `total_count`
+/// （フィルタ後・ページング前の全件数）以上なら完全。`total_count` が負（backend が値を
+/// 埋めない異常時）は検証をスキップして完全とみなす（`returned < page_size` の終端に委ねる）。
+/// `i128` 経由で比較し `usize`/`i32` の境界で溢れさせない。
+fn traverse_is_complete(collected: usize, total_count: i32) -> bool {
+    total_count < 0 || collected as i128 >= total_count as i128
+}
+
 fn to_proto_node(node: GraphNode) -> Node {
     Node {
         id: node.id,
@@ -548,7 +603,7 @@ fn to_proto_edge(edge: GraphEdge) -> Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::page_is_last;
+    use super::{page_is_last, traverse_is_complete};
 
     #[test]
     fn page_is_last_is_true_only_when_returned_below_page_size() {
@@ -559,5 +614,19 @@ mod tests {
         assert!(!page_is_last(1000, 1000));
         // 空グラフ（1 ページ目が 0 件）も即終端する。
         assert!(page_is_last(0, 1));
+    }
+
+    #[test]
+    fn traverse_is_complete_requires_reaching_total_count() {
+        // 収集が申告全件に届いていれば完全（3000 辺の hot signal を 3 ページで取り切ったケース）。
+        assert!(traverse_is_complete(3000, 3000));
+        assert!(traverse_is_complete(3001, 3000));
+        // 届かないまま終端したら不完全（取りこぼし）。
+        assert!(!traverse_is_complete(2999, 3000));
+        // 空（total 0）は完全。
+        assert!(traverse_is_complete(0, 0));
+        // total_count が負（backend 未設定）なら検証スキップ＝完全扱い。
+        assert!(traverse_is_complete(0, -1));
+        assert!(traverse_is_complete(5, -1));
     }
 }
