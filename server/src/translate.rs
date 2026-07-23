@@ -79,25 +79,64 @@ pub struct TranslationOutput {
 
 /// Gemini 応答本体の期待 JSON 形状
 /// `{ "title_ja": "...", "body_ja": "...", "concepts": [...] }` のパース。
-/// 壊れた JSON / 必須フィールド欠落は Err で返す。呼び出し側（ingest_alarmcom）は
-/// これを記事 skip の判断に使う。
+///
+/// 翻訳の主目的は `body_ja` / `title_ja`（検索対象の日本語本文）であり、これらの欠落・
+/// 壊れた JSON は Err で返す。呼び出し側（ingest_alarmcom）はこれを記事 skip の判断に使う。
+///
+/// 一方 `concepts` は Phase B の community 材料であり副次的なので**寛容にパースする**:
+/// 個別 concept が不正（`kind` 欠落・object でない等）でも、その 1 件だけを捨てて残りを採用し、
+/// 記事全体を Err にしない（良翻訳の巻き添え skip を防ぐ）。捨てた件数は `warn` で可視化する
+/// （黙って落とさない）。
 pub fn parse_translation_response(json: &str) -> Result<TranslationOutput> {
     #[derive(Deserialize)]
     struct RawResponse {
         title_ja: String,
         body_ja: String,
+        // concepts は寛容パースのため、いったん生の Value 配列として受ける。個別要素の
+        // 型不一致（kind 欠落など）でこの段階の deserialize を失敗させない（`Vec<ConceptExtract>`
+        // だと 1 件の不正で配列全体が Err になり、記事ごと巻き添え skip する）。
         #[serde(default)]
-        concepts: Vec<ConceptExtract>,
+        concepts: Vec<Value>,
     }
     let raw: RawResponse = serde_json::from_str(json).context(
         "parse translation response JSON (expected \
          {\"title_ja\": ..., \"body_ja\": ..., \"concepts\": [...]})",
     )?;
+    let (concepts, dropped) = parse_concepts_lenient(raw.concepts);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            kept = concepts.len(),
+            "dropped malformed concept(s) from translation response; \
+             body_ja/title_ja and valid concepts are kept (concepts are Phase B community \
+             material and are parsed leniently to avoid skipping an otherwise-good article)"
+        );
+    }
     Ok(TranslationOutput {
         title_ja: raw.title_ja,
         body_ja: raw.body_ja,
-        concepts: raw.concepts,
+        concepts,
     })
+}
+
+/// `concepts` 配列を寛容にパースする純関数。個別 concept を 1 件ずつ `ConceptExtract` へ
+/// 変換し、必須フィールド欠落・型不一致で失敗したものは捨てて残りを採用する。返り値は
+/// (採用できた concept 列, 捨てた件数)。捨てた件数を返すことで、呼び出し側は黙殺せず件数を
+/// ログに出せる（テストからも件数を直接検証できる）。
+fn parse_concepts_lenient(values: Vec<Value>) -> (Vec<ConceptExtract>, usize) {
+    let mut kept = Vec::with_capacity(values.len());
+    let mut dropped = 0usize;
+    for value in values {
+        match serde_json::from_value::<ConceptExtract>(value) {
+            Ok(concept) => kept.push(concept),
+            Err(err) => {
+                dropped += 1;
+                // 個別の落とした理由は debug に残す（top-level の warn は集計件数のみ）。
+                tracing::debug!(error = %err, "dropped a malformed concept during lenient parse");
+            }
+        }
+    }
+    (kept, dropped)
 }
 
 /// Gemini Flash 3.6 モデル・エンドポイントの設定境界。
@@ -481,6 +520,65 @@ mod translation_seam_tests {
         assert_eq!(out.title_ja, "タイトル");
         assert_eq!(out.body_ja, "本文のみ");
         assert!(out.concepts.is_empty());
+    }
+
+    #[test]
+    fn parse_translation_response_keeps_body_and_valid_concepts_when_one_concept_is_malformed() {
+        // 副次的な concept が 1 件不正（kind 欠落）でも、翻訳の主目的である body_ja/title_ja は
+        // 生き残り、良い concept も残る（不正な 1 件だけ捨てる）。
+        let json = r#"{
+            "title_ja": "タイトル",
+            "body_ja": "本文",
+            "concepts": [
+                {
+                    "name_en": "First Person In rule",
+                    "name_ja": "ファーストパーソンインルール",
+                    "kind": "rule"
+                },
+                {
+                    "name_en": "Broken concept",
+                    "name_ja": "壊れた概念"
+                }
+            ]
+        }"#;
+        let out =
+            parse_translation_response(json).expect("malformed concept must not fail article");
+        assert_eq!(out.title_ja, "タイトル");
+        assert_eq!(out.body_ja, "本文");
+        assert_eq!(out.concepts.len(), 1, "only the valid concept survives");
+        assert_eq!(out.concepts[0].name_en, "First Person In rule");
+        assert_eq!(out.concepts[0].kind, "rule");
+    }
+
+    #[test]
+    fn parse_concepts_lenient_drops_invalid_and_counts_them() {
+        let values: Vec<Value> = vec![
+            json!({ "name_en": "A", "name_ja": "あ", "kind": "term" }),
+            // kind 欠落（必須フィールド欠落）→ 捨てる
+            json!({ "name_en": "B", "name_ja": "い" }),
+            // object ですらない → 捨てる
+            json!("not an object"),
+            json!({ "name_en": "C", "name_ja": "う", "kind": "feature" }),
+        ];
+        let (kept, dropped) = parse_concepts_lenient(values);
+        assert_eq!(
+            dropped, 2,
+            "the two malformed entries are counted as dropped"
+        );
+        let kept_names: Vec<&str> = kept.iter().map(|c| c.name_en.as_str()).collect();
+        assert_eq!(kept_names, vec!["A", "C"]);
+    }
+
+    #[test]
+    fn parse_concepts_lenient_keeps_all_when_all_valid() {
+        let values: Vec<Value> = vec![
+            json!({ "name_en": "A", "name_ja": "あ", "kind": "term" }),
+            json!({ "name_en": "B", "name_ja": "い", "aliases_ja": ["いい"], "kind": "rule" }),
+        ];
+        let (kept, dropped) = parse_concepts_lenient(values);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].aliases_ja, vec!["いい".to_string()]);
     }
 
     #[test]

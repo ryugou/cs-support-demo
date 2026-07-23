@@ -3098,7 +3098,14 @@ mod tests {
             assert!(exp <= now, "exp {exp} must be treated as expired");
         }
         // 旧実装の `0` では、逆に何ひとつ期限切れにならなかったことを対比で示す。
-        assert!(!(1_700_000_000u64 <= 0));
+        // broken clock を 0 に潰していたため、正の `exp` は `exp <= now(=0)` が常に false ＝
+        // 期限切れにならなかった。「exp が broken now を上回る」形で同じ意味を表す
+        // （u64 の `<= 0` リテラル比較は absurd_extreme_comparisons に触れるため避ける）。
+        let old_broken_now: u64 = 0;
+        assert!(
+            1_700_000_000u64 > old_broken_now,
+            "old impl (now=0) treated a positive exp as not-yet-expired"
+        );
     }
 
     /// 時計異常時に `exp` の計算が桁溢れしないこと（飽和して「常に期限切れ」になる）。

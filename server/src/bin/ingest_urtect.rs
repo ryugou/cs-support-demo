@@ -12,7 +12,8 @@ use cs_support_mcp::{
         ingest_model::{
             build_document_node, build_section_graph, content_hash, ManualSectionInput,
         },
-        schema_ids::section_slug,
+        reingest::assert_no_stale_section_edges,
+        schema_ids::{manual_node_id, section_slug, KIND_PRODUCT, KIND_SECTION},
         vectors::{embed_all, vector_entry, EMBED_CONCURRENCY},
     },
     model::GraphBuild,
@@ -332,10 +333,17 @@ async fn main() -> Result<()> {
         .context("build http client")?;
 
     // 1. top ページ fetch → nav からページ一覧を列挙する。
-    // 2. 既存グラフ snapshot（差分 ingest の hash マップと派生 edge の stale 検出の両方に使う。
-    //    query_nodes は limit=1000 で取りこぼすと stale 検出が fail open になるため使わない）。
-    // 互いに依存しない読み取りなので並行に発行する。
-    let (top_html, existing_snapshot) = tokio::try_join!(
+    // 2. 既存 ManualSection（差分 ingest の hash マップの元）を query_nodes の offset ページングで
+    //    読み切る。旧実装は graph_snapshot(5000) の全件ロードに依存していたが、これは backend の
+    //    5000 ノード上限で truncate → 差分/stale 判定破綻を招く。alarm.com を同一 schema に投入
+    //    すると urtect 側の再 ingest まで巻き添えで破綻するため、書き込み側の 5000 依存を撤去した。
+    //    既存の派生/親 edge（stale 検出用）は全件ロードせず、「変更のあった section 1 件ごと」に
+    //    1-hop traverse で引く（`assert_no_stale_section_edges`。呼び出し回数はグラフ規模ではなく
+    //    変更件数にスケールする）。ManualSection は DOC_KEY（doc-manual）配下だけを読むため、
+    //    同一 schema に同居する alarm.com（alarmcom-）側の section は構造的に一切触らない。
+    //    互いに依存しない読み取り（HTTP / gRPC）なので並行に発行する。
+    const PAGE_SIZE: i32 = 1000;
+    let (top_html, existing_sections) = tokio::try_join!(
         async {
             fetch(&http, top_url.as_str())
                 .await
@@ -343,40 +351,16 @@ async fn main() -> Result<()> {
         },
         async {
             client
-                .graph_snapshot(&args.schema, 5000)
+                .query_nodes_paged(
+                    &args.schema,
+                    KIND_SECTION,
+                    vec![("doc_key", "eq", DOC_KEY)],
+                    PAGE_SIZE,
+                )
                 .await
-                .context("snapshot existing graph (diff + stale-edge check)")
+                .context("load existing doc-manual ManualSection nodes (diff + stale-edge check)")
         },
     )?;
-    // snapshot が不完全だと差分判定・stale 検出の両方が信頼できないため fail closed。
-    if existing_snapshot.truncated {
-        anyhow::bail!(
-            "existing graph snapshot truncated at node limit; \
-             cannot verify diff/stale-edge state — aborting ingest"
-        );
-    }
-    // 既存の派生 edge（DESCRIBES / MENTIONS_SIGNAL）を from_id ごとに索引する。
-    // backend に delete API が無いため、再 ingest で「除去が必要になる」edge 変化
-    // （旧 edge が新しい派生集合に含まれない）を検出したら fail closed にする
-    // （検索側は snapshot 上の全 DESCRIBES を信頼するため、stale edge は誤回答に直結する）。
-    // PARENT_OF（親→子）も同様: 親が変わった/root になった section に旧 PARENT_OF が残ると
-    // 1 section に複数 parent が付き、TOC・ancestor traversal・breadcrumb が不整合になる。
-    let mut old_derived: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut old_parents: HashMap<String, HashSet<String>> = HashMap::new();
-    for e in &existing_snapshot.edges {
-        if e.edge_type == "DESCRIBES" || e.edge_type == "MENTIONS_SIGNAL" {
-            old_derived
-                .entry(e.from_id.clone())
-                .or_default()
-                .insert(e.to_id.clone());
-        } else if e.edge_type == "PARENT_OF" {
-            // key = 子 section の node_id、value = 親 section の node_id 集合
-            old_parents
-                .entry(e.to_id.clone())
-                .or_default()
-                .insert(e.from_id.clone());
-        }
-    }
 
     // top ページは 1 度だけ parse し、タイトル抽出と nav 列挙の両方で使い回す。
     let top_document = Html::parse_document(&top_html);
@@ -392,14 +376,11 @@ async fn main() -> Result<()> {
     // 実質フラットになる。ページが複数あるのに全 depth 0 なら要目視確認（レポートに出す）。
     let nav_hierarchy_flat = enumerated_url_count > 1 && nav_entries.iter().all(|e| e.depth == 0);
 
-    // 差分 ingest 用の既存 hash マップ。snapshot（完全性は上で fail closed 済み）から構築する。
-    // 同一 schema に別 document の ManualSection が同居しても誤って disappeared 判定しないよう、
-    // 今回 ingest 対象の document（DOC_KEY）に限定する。
-    let existing_hash: HashMap<String, String> = existing_snapshot
-        .nodes
+    // 差分 ingest 用の既存 hash マップ。query_nodes_paged が既に DOC_KEY 配下の ManualSection
+    // だけを返すため（node_type=ManualSection + doc_key=DOC_KEY でフィルタ済み）、ここでの
+    // 再フィルタは不要。同一 schema に同居する alarm.com 側 section は構造的に混ざらない。
+    let existing_hash: HashMap<String, String> = existing_sections
         .iter()
-        .filter(|n| n.node_type == "ManualSection")
-        .filter(|n| n.attributes.get("doc_key").map(String::as_str) == Some(DOC_KEY))
         .filter_map(|n| {
             let key = n.attributes.get("section_key")?.clone();
             let hash = n.attributes.get("content_hash")?.clone();
@@ -542,67 +523,30 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // 変更された既存 section について、旧 DESCRIBES / MENTIONS_SIGNAL の宛先が
-        // 新しい派生集合に全て含まれるか検証する。含まれない（= 除去が必要な）edge が
+        // 変更された既存 section について、旧 DESCRIBES / MENTIONS_SIGNAL / PARENT_OF の宛先が
+        // 新しい派生集合・新しい親に全て含まれるか検証する。含まれない（= 除去が必要な）edge が
         // あれば fail closed（upsert は追加しかできず、stale edge が検索を誤らせるため）。
+        // 既存 edge は graph_snapshot の全件ロードではなく、この section 1 件について 1-hop
+        // traverse で引く（`assert_no_stale_section_edges`。5000 ノード上限を回避）。
         if existing_hash.contains_key(&slug) {
-            let sec_id = cs_support_mcp::manual::schema_ids::manual_node_id(
+            let new_targets: HashSet<String> = product_models
+                .iter()
+                .map(|m| manual_node_id(&args.schema, KIND_PRODUCT, m))
+                .chain(
+                    signal_values
+                        .iter()
+                        .map(|s| manual_node_id(&args.schema, "Signal", s)),
+                )
+                .collect();
+            assert_no_stale_section_edges(
+                &client,
                 &args.schema,
-                cs_support_mcp::manual::schema_ids::KIND_SECTION,
                 &slug,
-            );
-            if let Some(old_targets) = old_derived.get(&sec_id) {
-                let new_targets: HashSet<String> = product_models
-                    .iter()
-                    .map(|m| {
-                        cs_support_mcp::manual::schema_ids::manual_node_id(
-                            &args.schema,
-                            cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
-                            m,
-                        )
-                    })
-                    .chain(signal_values.iter().map(|s| {
-                        cs_support_mcp::manual::schema_ids::manual_node_id(
-                            &args.schema,
-                            "Signal",
-                            s,
-                        )
-                    }))
-                    .collect();
-                let stale: Vec<&String> = old_targets
-                    .iter()
-                    .filter(|t| !new_targets.contains(*t))
-                    .collect();
-                if !stale.is_empty() {
-                    anyhow::bail!(
-                        "section {slug} requires removing derived edges ({stale:?}) but the \
-                         backend exposes no delete; recreate the tenant schema and re-ingest \
-                         from scratch"
-                    );
-                }
-            }
-            // PARENT_OF: 旧親が新しい親（root なら「親なし」）と一致しない場合も除去が必要。
-            if let Some(old_parent_ids) = old_parents.get(&sec_id) {
-                let new_parent_id = parent_slug.as_deref().map(|p| {
-                    cs_support_mcp::manual::schema_ids::manual_node_id(
-                        &args.schema,
-                        cs_support_mcp::manual::schema_ids::KIND_SECTION,
-                        p,
-                    )
-                });
-                let stale_parents: Vec<&String> = old_parent_ids
-                    .iter()
-                    .filter(|p| Some(p.as_str()) != new_parent_id.as_deref())
-                    .collect();
-                if !stale_parents.is_empty() {
-                    anyhow::bail!(
-                        "section {slug} changed parent (old {stale_parents:?} vs new \
-                         {new_parent_id:?}) which requires removing PARENT_OF edges, but the \
-                         backend exposes no delete; recreate the tenant schema and re-ingest \
-                         from scratch"
-                    );
-                }
-            }
+                &[("Product", "DESCRIBES"), ("Signal", "MENTIONS_SIGNAL")],
+                &new_targets,
+                parent_slug.as_deref(),
+            )
+            .await?;
         }
 
         for model in &product_models {

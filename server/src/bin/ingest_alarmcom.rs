@@ -29,6 +29,7 @@ use cs_support_mcp::{
         ingest_model::{
             build_document_node, build_section_graph, content_hash, ManualSectionInput,
         },
+        reingest::assert_no_stale_section_edges,
         schema_ids::{manual_node_id, section_slug, with_schema_name, KIND_CONCEPT, KIND_SECTION},
         vectors::vector_entry,
     },
@@ -817,39 +818,11 @@ async fn main() -> Result<()> {
         // 変更された既存 section の stale 派生/親 edge 検出（backend に delete が無く、除去が
         // 必要な edge が残ると検索を誤らせるため fail closed）。既存 edge は graph_snapshot の
         // 全件ロードではなく、この section 1 件について query_nodes の 1-hop traverse で引く
-        // （Warning 1: 5000 ノード上限回避）。呼び出しは「既存かつ内容が変わった section」に
-        // だけ発生する（上の未変更 skip を通過しているため）。
-        //
-        // traverse の向き: MENTIONS_SIGNAL/MENTIONS_CONCEPT/DESCRIBES は section→対象の
-        // outgoing、PARENT_OF は 親→子 なので子（この section）から見て incoming の from 側が
-        // 親。返却は隣接ノードの node_id で、`manual_node_id(...)` と同じ id 体系。
+        // （Warning 1: 5000 ノード上限回避）。urtect と共有する `assert_no_stale_section_edges`
+        // に委譲する（呼び出しは「既存かつ内容が変わった section」だけ通る。上の未変更 skip 済み）。
         // DESCRIBES を含めるのは v1 時代の残存 DESCRIBES を「除去が必要な stale edge」として
         // 検出するため（v2 alarm.com は product 非依存で新規 DESCRIBES を張らない）。
         if existing_hash.contains_key(&slug) {
-            const NEIGHBOR_LIMIT: i32 = 1000;
-            let sec_id = manual_node_id(&args.schema, KIND_SECTION, &slug);
-
-            let mut old_derived: HashSet<String> = HashSet::new();
-            for (neighbor_type, edge_type) in [
-                ("Product", "DESCRIBES"),
-                ("Signal", "MENTIONS_SIGNAL"),
-                (KIND_CONCEPT, "MENTIONS_CONCEPT"),
-            ] {
-                let neighbors = client
-                    .traverse_neighbor_ids(
-                        &args.schema,
-                        neighbor_type,
-                        edge_type,
-                        "outgoing",
-                        &sec_id,
-                        NEIGHBOR_LIMIT,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("load existing {edge_type} edges for changed section {slug}")
-                    })?;
-                old_derived.extend(neighbors);
-            }
             let new_targets: HashSet<String> = signal_values
                 .iter()
                 .map(|s| manual_node_id(&args.schema, "Signal", s))
@@ -859,46 +832,19 @@ async fn main() -> Result<()> {
                         .map(|k| manual_node_id(&args.schema, "Concept", k)),
                 )
                 .collect();
-            let stale: Vec<&String> = old_derived
-                .iter()
-                .filter(|t| !new_targets.contains(*t))
-                .collect();
-            if !stale.is_empty() {
-                anyhow::bail!(
-                    "section {slug} requires removing derived edges ({stale:?}) but the \
-                     backend exposes no delete; recreate the tenant schema and re-ingest \
-                     from scratch"
-                );
-            }
-
-            let old_parent_ids = client
-                .traverse_neighbor_ids(
-                    &args.schema,
-                    KIND_SECTION,
-                    "PARENT_OF",
-                    "incoming",
-                    &sec_id,
-                    NEIGHBOR_LIMIT,
-                )
-                .await
-                .with_context(|| {
-                    format!("load existing PARENT_OF edges for changed section {slug}")
-                })?;
-            let new_parent_id = parent_slug
-                .as_deref()
-                .map(|p| manual_node_id(&args.schema, KIND_SECTION, p));
-            let stale_parents: Vec<&String> = old_parent_ids
-                .iter()
-                .filter(|p| Some(p.as_str()) != new_parent_id.as_deref())
-                .collect();
-            if !stale_parents.is_empty() {
-                anyhow::bail!(
-                    "section {slug} changed parent (old {stale_parents:?} vs new \
-                     {new_parent_id:?}) which requires removing PARENT_OF edges, but the \
-                     backend exposes no delete; recreate the tenant schema and re-ingest \
-                     from scratch"
-                );
-            }
+            assert_no_stale_section_edges(
+                &client,
+                &args.schema,
+                &slug,
+                &[
+                    ("Product", "DESCRIBES"),
+                    ("Signal", "MENTIONS_SIGNAL"),
+                    (KIND_CONCEPT, "MENTIONS_CONCEPT"),
+                ],
+                &new_targets,
+                parent_slug.as_deref(),
+            )
+            .await?;
         }
 
         if signal_values.is_empty() {
