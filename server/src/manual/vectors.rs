@@ -2,7 +2,7 @@
 /// `ingest_products` の Product の両方が同じ vector 投入契約に従うため、ここに集約する
 /// （2026-07-22 Issue #6: KNOWN_MODELS 廃止に伴い ingest_urtect から product embed を
 /// 分離した際、embed_all/vector_entry/vector_metadata は挙動を変えずこちらへ移設した）。
-use crate::vegapunk::VegapunkClient;
+use crate::vegapunk::{VectorUpsertEntry, VegapunkClient};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
@@ -47,7 +47,7 @@ pub fn vector_entry(
     text: &str,
     source_type: &str,
     timestamp_ms: &str,
-) -> (String, Vec<f32>, Vec<(String, String)>) {
+) -> VectorUpsertEntry {
     let metadata = vector_metadata(&id, text, source_type, timestamp_ms);
     (id, vector, metadata)
 }

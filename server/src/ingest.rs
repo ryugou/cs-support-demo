@@ -55,6 +55,10 @@ pub fn build_graph(
     Ok(GraphBuild { nodes, edges })
 }
 
+// 再帰的な section ツリー構築器。schema/product/doc/親キー/section/glossary と 2 つの
+// 出力バッファを引き回す性質上 8 引数になる（LegacySection 専用・本番外）。入力構造体への
+// 集約は挙動不変の範囲を超える再設計になるため、意図した引数数として許可する。
+#[allow(clippy::too_many_arguments)]
 fn add_section_tree(
     schema: &str,
     product: &ProductInput,

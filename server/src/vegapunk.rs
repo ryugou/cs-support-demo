@@ -16,6 +16,12 @@ use tonic::{
     Code, Request,
 };
 
+/// `upsert_vectors` に渡す 1 ベクトル分の投入単位: `(node_id, vector, metadata)`。
+/// metadata は proto の `map<string, string>` に落ちる `(key, value)` 群。
+/// `vector_entry` ヘルパの戻り値・各 ingest CLI の組み立てバッファと型を共有し、
+/// 同じ 3 段ネストのタプルが複数箇所に散らばる（clippy::type_complexity）のを避ける。
+pub type VectorUpsertEntry = (String, Vec<f32>, Vec<(String, String)>);
+
 #[derive(Clone)]
 pub struct VegapunkClient {
     inner: GraphRagEngineClient<Channel>,
@@ -261,10 +267,7 @@ impl VegapunkClient {
     /// `(id, vector, metadata)` のタプルを `VectorEntry`（`metadata` は proto の
     /// `map<string, string>`）へ変換して一括 upsert する。空なら RPC を発行せず 0 を返す
     /// （`upsert_nodes` / `upsert_edges` と同じ規約）。
-    pub async fn upsert_vectors(
-        &self,
-        entries: Vec<(String, Vec<f32>, Vec<(String, String)>)>,
-    ) -> Result<i32> {
+    pub async fn upsert_vectors(&self, entries: Vec<VectorUpsertEntry>) -> Result<i32> {
         if entries.is_empty() {
             return Ok(0);
         }
@@ -335,6 +338,13 @@ impl VegapunkClient {
     /// で任意件数までページングできるため、既存状態の全件ロードはこちらを使う。
     /// 1 ページが `page_size` 未満になった時点で終端とみなす（`page_is_last`）。読み取り中に
     /// グラフを書き換えない前提で使うこと（ingest は書き込みより前にこれで読み切る）。
+    ///
+    /// 完全性は 2 系統で担保し `traverse_neighbors_paged` と対称化する:
+    /// (1) 短ページ終端（`page_is_last`）、(2) backend 申告の `QueryNodesResponse.total_count`
+    /// （post-filter・pre-pagination の全件数）と収集数の最終照合（`pagination_is_complete`）。
+    /// backend が「まだ残るのに短ページ」を返すと (1) だけでは取りこぼしを検出できず、差分/stale
+    /// 判定が fail-open するため、届かないまま終端したら bail する。`total_count` が非正
+    /// （backend 未申告）の場合は (2) を skip し、従来どおり (1) の短ページ終端に委ねる。
     pub async fn query_nodes_paged(
         &self,
         schema: &str,
@@ -367,21 +377,30 @@ impl VegapunkClient {
                 offset: Some(offset),
                 traverse: None,
             };
-            let page = self
+            let resp = self
                 .call(
                     |mut client, request| async move {
-                        client
-                            .query_nodes(request)
-                            .await
-                            .map(|resp| resp.into_inner().nodes)
+                        client.query_nodes(request).await.map(|r| r.into_inner())
                     },
                     req,
                 )
                 .await
                 .with_context(|| format!("query nodes (paged {node_type}, offset {offset})"))?;
-            let returned = page.len();
-            all.extend(page);
+            let total_count = resp.total_count;
+            let returned = resp.nodes.len();
+            all.extend(resp.nodes);
             if page_is_last(returned, page_size as usize) {
+                // backend 申告の全件数（post-filter・pre-pagination）に収集数が届かないまま
+                // 短ページで終端したら、ページングが不完全＝ノードを取りこぼしている。差分/stale
+                // 判定を不完全データで進めると fail-open するため fail closed（traverse と対称）。
+                if !pagination_is_complete(all.len(), total_count) {
+                    anyhow::bail!(
+                        "query_nodes_paged for {node_type} collected {} node(s) but backend \
+                         reported total_count={total_count}; pagination is incomplete, refusing \
+                         to proceed on a truncated node set",
+                        all.len()
+                    );
+                }
                 break;
             }
             // offset は毎ページ page_size 進むため必ず前進し、総数を超えれば空ページで終端する。
@@ -450,7 +469,7 @@ impl VegapunkClient {
             if page_is_last(returned, page_size as usize) {
                 // backend 申告の全件数に収集数が届かないなら、ページングが不完全＝辺を取りこぼしている。
                 // stale 検出・材料組み立てを不完全データで進めると fail-open するため fail closed。
-                if !traverse_is_complete(all.len(), total_count) {
+                if !pagination_is_complete(all.len(), total_count) {
                     anyhow::bail!(
                         "traverse {edge_type} {direction} from {source_node_id} collected {} \
                          neighbor(s) but backend reported total_count={total_count}; pagination is \
@@ -568,11 +587,14 @@ fn page_is_last(returned: usize, page_size: usize) -> bool {
     returned < page_size
 }
 
-/// ページング traverse の完全性判定: 収集件数 `collected` が backend 申告の `total_count`
-/// （フィルタ後・ページング前の全件数）以上なら完全。`total_count` が負（backend が値を
+/// offset ページングの完全性判定: 収集件数 `collected` が backend 申告の `total_count`
+/// （post-filter・pre-pagination の全件数）以上なら完全。`total_count` が負（backend が値を
 /// 埋めない異常時）は検証をスキップして完全とみなす（`returned < page_size` の終端に委ねる）。
+/// `total_count == 0` も「未申告 or 実際に 0 件」の両義で、`collected >= 0` が常に真なので
+/// 完全扱い（従来の短ページ終端に委ねる）＝非正なら実質 no-op として degrade する。
+/// `traverse_neighbors_paged`（隣接辺）と `query_nodes_paged`（ノード）の双方が共有する。
 /// `i128` 経由で比較し `usize`/`i32` の境界で溢れさせない。
-fn traverse_is_complete(collected: usize, total_count: i32) -> bool {
+fn pagination_is_complete(collected: usize, total_count: i32) -> bool {
     total_count < 0 || collected as i128 >= total_count as i128
 }
 
@@ -603,7 +625,7 @@ fn to_proto_edge(edge: GraphEdge) -> Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_is_last, traverse_is_complete};
+    use super::{page_is_last, pagination_is_complete};
 
     #[test]
     fn page_is_last_is_true_only_when_returned_below_page_size() {
@@ -617,16 +639,17 @@ mod tests {
     }
 
     #[test]
-    fn traverse_is_complete_requires_reaching_total_count() {
+    fn pagination_is_complete_requires_reaching_total_count() {
         // 収集が申告全件に届いていれば完全（3000 辺の hot signal を 3 ページで取り切ったケース）。
-        assert!(traverse_is_complete(3000, 3000));
-        assert!(traverse_is_complete(3001, 3000));
-        // 届かないまま終端したら不完全（取りこぼし）。
-        assert!(!traverse_is_complete(2999, 3000));
+        assert!(pagination_is_complete(3000, 3000));
+        assert!(pagination_is_complete(3001, 3000));
+        // 届かないまま終端したら不完全（取りこぼし）。query_nodes_paged が backend の
+        // 「まだ残るのに短ページ」に対して fail closed する根拠でもある。
+        assert!(!pagination_is_complete(2999, 3000));
         // 空（total 0）は完全。
-        assert!(traverse_is_complete(0, 0));
-        // total_count が負（backend 未設定）なら検証スキップ＝完全扱い。
-        assert!(traverse_is_complete(0, -1));
-        assert!(traverse_is_complete(5, -1));
+        assert!(pagination_is_complete(0, 0));
+        // total_count が非正（backend 未申告）なら検証スキップ＝完全扱い（短ページ終端に委ねる）。
+        assert!(pagination_is_complete(0, -1));
+        assert!(pagination_is_complete(5, -1));
     }
 }

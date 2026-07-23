@@ -32,21 +32,21 @@ use url::Url;
 /// （Task 3 サンプルテストと同じ規約 "doc-manual"）。
 const DOC_KEY: &str = "doc-manual";
 
-/// 本文中の型番検出語彙は vegapunk の Product ノードが正本（Issue #6: KNOWN_MODELS 廃止）。
-/// ingest 開始時に Product ノード一覧を取得し、`model` 属性と `aliases` 属性
-/// （カンマ区切り）から表層形 → product_key の対応表を組み立てる
-/// （`build_product_lexicon` 参照）。製品の追加・変更は `ingest_products` CLI で
-/// products.json を投入するだけで反映され、本バイナリの再ビルドは不要になった。
-///
-/// "ADC-V724" は "ADC-V724X" の前方一致になるため、detect_product_models 側で英数字境界を
-/// 見て誤爆(V724X ページを V724 とも誤判定)を防ぐ（`contains_as_token`）。
-///
-/// data/urtect/signal-lexicon.json の model_adc_v724 / model_adc_v724x / model_adc_vc727p
-/// signal は今も型番をハードコードしている（Issue #7、本件のスコープ外）。あちらは
-/// MENTIONS_SIGNAL（表現ゆれ吸収・normalize_key 部分一致）用、こちらは DESCRIBES（型番の
-/// 厳密な同一性）用で判定基準が異なるため別管理になっている（lexicon の surface_forms は
-/// normalize_key で "-" ごと失われ、境界チェック付きの厳密一致には使えない）。Issue #7 で
-/// signal-lexicon 側も Product ノード起点に統一するまでは、二重管理のままである点に注意。
+// 本文中の型番検出語彙は vegapunk の Product ノードが正本（Issue #6: KNOWN_MODELS 廃止）。
+// ingest 開始時に Product ノード一覧を取得し、`model` 属性と `aliases` 属性
+// （カンマ区切り）から表層形 → product_key の対応表を組み立てる
+// （`build_product_lexicon` 参照）。製品の追加・変更は `ingest_products` CLI で
+// products.json を投入するだけで反映され、本バイナリの再ビルドは不要になった。
+//
+// "ADC-V724" は "ADC-V724X" の前方一致になるため、detect_product_models 側で英数字境界を
+// 見て誤爆(V724X ページを V724 とも誤判定)を防ぐ（`contains_as_token`）。
+//
+// data/urtect/signal-lexicon.json の model_adc_v724 / model_adc_v724x / model_adc_vc727p
+// signal は今も型番をハードコードしている（Issue #7、本件のスコープ外）。あちらは
+// MENTIONS_SIGNAL（表現ゆれ吸収・normalize_key 部分一致）用、こちらは DESCRIBES（型番の
+// 厳密な同一性）用で判定基準が異なるため別管理になっている（lexicon の surface_forms は
+// normalize_key で "-" ごと失われ、境界チェック付きの厳密一致には使えない）。Issue #7 で
+// signal-lexicon 側も Product ノード起点に統一するまでは、二重管理のままである点に注意。
 
 /// 定型の免責文（変更予告）。footer/header/nav などの意味タグに入っていなくても
 /// 本文中に平文で混ざるケースを想定し、文字列一致で除去する。
@@ -593,7 +593,6 @@ async fn main() -> Result<()> {
     // 共通 signal が節数ぶん重複しやすい。冪等 upsert なので正しさには影響しないが、
     // gRPC ペイロードと ingest 時間を無駄に膨らませる）。順序は保持する。
     let mut seen_node_ids = HashSet::new();
-    let mut nodes = nodes;
     nodes.retain(|n| seen_node_ids.insert(n.id.clone()));
 
     // 5. embedding: 今回 ingest された section を embed し、一括 upsert する。Product の
@@ -620,7 +619,7 @@ async fn main() -> Result<()> {
     let upserted_vectors = if vectors_skipped {
         0
     } else {
-        let mut entries: Vec<(String, Vec<f32>, Vec<(String, String)>)> =
+        let mut entries: Vec<cs_support_mcp::vegapunk::VectorUpsertEntry> =
             Vec::with_capacity(section_bodies.len());
 
         // section_bodies はここ以降使わないため move で消費する。body は section 本文の

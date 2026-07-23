@@ -623,11 +623,23 @@ impl Harness {
                     let manual_corpus = manual_corpus
                         .as_deref()
                         .ok_or_else(|| anyhow!("manual corpus missing for ManualV1 evaluate"))?;
+                    // 回答可能性（coverage / best_manual_score）は product で hard-scope しない。
+                    // product スコープは「当該 Product を DESCRIBES する節 or 機種非依存の節」だけを
+                    // 残し、他機種のみを DESCRIBES する節を除外する。ところがパスワードリセットのような
+                    // 機種横断 how-to は特定機種ページとして DESCRIBES 辺を持つことがあり、resolve 済み
+                    // product で絞ると本来 answerable なページが候補から消え、best_manual_score が低く
+                    // 出て false-escalate する（実測: スコープ有 0.561 < 閾値、スコープ無 0.917）。
+                    // そこで evaluate の内部検索は product_key=None で走らせ、best_manual_score と
+                    // best_manual_sections（＝ evidence lineage）を同一 hit 列から coherent に導出する
+                    // （score は横断ページ、evidence は別ページ、という不整合を作らない）。
+                    // product は「絞り込み」から「（任意の）加点」へ格下げする方針で、現状は加点も
+                    // 掛けない（最小差分・ゲート挙動優先）。search_manual ツールが明示 product_key を
+                    // 尊重する挙動は search_with_snapshot 側で不変（本変更は evaluate の呼び出しのみ）。
                     let hits = store.search_with_snapshot(
                         &ctx.schema,
                         question,
                         &accumulated,
-                        product_key,
+                        None,
                         EVALUATE_TOP_K,
                         manual_corpus,
                         &vector_hits,

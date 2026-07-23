@@ -161,13 +161,15 @@ pub fn match_known_resolution<'a>(
             // より小さい leftover（より具体的な部分一致）を記録する
             let smaller = best_blocked
                 .as_ref()
-                .map_or(true, |current| leftover.len() < current.len());
+                .is_none_or(|current| leftover.len() < current.len());
             if smaller {
                 best_blocked = Some(leftover);
             }
         }
     }
-    applicable.sort_by(|a, b| b.signal_specificity().cmp(&a.signal_specificity()));
+    // signal_specificity 降順（同値は挿入順を保つ stable sort）。sort_by の逆順比較を
+    // Reverse キーに置き換えても順序は不変（clippy::unnecessary_sort_by）。
+    applicable.sort_by_key(|kr| std::cmp::Reverse(kr.signal_specificity()));
     if let Some(kr) = applicable.first() {
         return KrMatch::Applicable(kr);
     }

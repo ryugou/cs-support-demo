@@ -208,7 +208,7 @@ async fn main() -> Result<()> {
         // 1 件でも embed 失敗したら fail closed（embed_all の契約。中途半端なベクトル
         // 状態を後続の upsert_nodes に渡さない）。
         let vectors = embed_all(&client, items, EMBED_CONCURRENCY).await?;
-        let mut entries: Vec<(String, Vec<f32>, Vec<(String, String)>)> =
+        let mut entries: Vec<cs_support_mcp::vegapunk::VectorUpsertEntry> =
             Vec::with_capacity(product_inputs.len());
         for ((input, text), vector) in product_inputs.iter().zip(texts.iter()).zip(vectors) {
             let id = manual_node_id(&args.schema, KIND_PRODUCT, &input.model);

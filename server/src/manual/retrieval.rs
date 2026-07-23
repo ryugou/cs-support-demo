@@ -535,6 +535,10 @@ impl ManualStore {
     /// テキストのみは "text"、vector のみは "vector"、どちらも 0 で signal 絞り込みだけで
     /// 候補に残った場合は "signal" を `ManualHit.score_source` に残す（テキスト一致した
     /// かのような偽りの "text" にしない）。
+    // schema/question/signals/product_key/top_k/snapshot/vector_hits を受ける検索本体で
+    // 8 引数になる。入力構造体への集約はゲート経路の全 caller・テストに波及する再設計で、
+    // 挙動不変・最小差分の範囲を超えるため、意図した引数数として許可する。
+    #[allow(clippy::too_many_arguments)]
     pub fn search_with_snapshot(
         &self,
         schema: &str,
@@ -1636,6 +1640,111 @@ mod tests {
         assert!(keys.contains("sec-a"));
         assert!(keys.contains("sec-b"));
         assert!(keys.contains("sec-c"));
+    }
+
+    /// 機種横断 how-to（例: パスワードリセット）が product スコープで沈み、answerable なのに
+    /// best_manual_score から消える false-escalate の回帰テスト。`evaluate`（ManualV1）が
+    /// coverage 判定を product_key=None で走らせるようにした変更（harness/mod.rs）が前提とする
+    /// 性質を search_with_snapshot 層で直接検証する。
+    /// 構成: 横断ページ sec-howto は product B のみを DESCRIBES（他機種専用扱い）だが本文は質問の
+    /// 完全部分文字列で fast path 1.0。product A 専用ページ sec-a は本文が質問と弱くしか一致しない。
+    #[tokio::test]
+    async fn cross_product_howto_reaches_best_score_only_when_unscoped() {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let product_a = "ADC-V724";
+        let product_b = "ADC-VC727P";
+        let question = "パスワードをリセットする方法";
+        let section_node = |key: &str, body: &str| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), key.to_string()),
+                ("title".to_string(), key.to_string()),
+                ("body".to_string(), body.to_string()),
+                ("source_url".to_string(), String::new()),
+                ("breadcrumb".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        let product_node = |key: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, "Product", key),
+                node_type: "Product".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: HashMap::new(),
+            }
+        };
+        let describes_edge = |section_key: &str, product_key: &str| -> PE {
+            PE {
+                edge_id: String::new(),
+                from_id: manual_node_id(schema, "ManualSection", section_key),
+                to_id: manual_node_id(schema, "Product", product_key),
+                edge_type: "DESCRIBES".to_string(),
+            }
+        };
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![
+                // 横断 how-to: 本文＝質問（fast path 1.0）。product B のみを DESCRIBES する。
+                section_node("sec-howto", question),
+                // product A 専用ページ: 「方法」だけ一致する弱いページ（best にならない）。
+                section_node("sec-a", "カメラの設置方法について説明します。"),
+                product_node(product_a),
+                product_node(product_b),
+            ],
+            edges: vec![
+                describes_edge("sec-howto", product_b),
+                describes_edge("sec-a", product_a),
+            ],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let store = dummy_store();
+
+        // product A で hard-scope すると横断ページ(sec-howto)は「他機種のみ DESCRIBES」で除外され、
+        // best は弱い sec-a に落ちる（＝ answerable なのに coverage が下がる false-escalate の芽）。
+        let scoped = store
+            .search_with_snapshot(
+                schema,
+                question,
+                &SignalSet::new(),
+                Some(product_a),
+                10,
+                &snap,
+                &[],
+            )
+            .expect("search_with_snapshot scoped");
+        assert!(
+            scoped.iter().all(|h| h.section_key != "sec-howto"),
+            "product scope must drop the cross-product how-to: {scoped:?}"
+        );
+        let scoped_best = scoped.first().map(|h| h.score).unwrap_or(0.0);
+        assert!(
+            scoped_best < 1.0,
+            "scoped best must be the weak product page, not the 1.0 how-to: {scoped_best}"
+        );
+
+        // product_key=None（evaluate の coverage 検索が使う経路）なら横断ページが候補に戻り、
+        // best_manual_score が 1.0 になる（＝沈まず反映される）。
+        let unscoped = store
+            .search_with_snapshot(schema, question, &SignalSet::new(), None, 10, &snap, &[])
+            .expect("search_with_snapshot unscoped");
+        let best = unscoped.first().expect("at least one hit");
+        assert_eq!(best.section_key, "sec-howto");
+        assert_eq!(
+            best.score, 1.0,
+            "cross-product how-to must drive best_manual_score when unscoped"
+        );
     }
 
     #[test]

@@ -1446,9 +1446,9 @@ impl UsedJtis {
             self.prunes += 1;
             // 次の刈り取りは生存件数の 2 倍で。生存件数が少なければ最低閾値に戻る。
             // **上限で頭打ちにする**（超えると満杯後に刈り取りが走らなくなる）。
-            self.prune_at = (self.entries.len() * 2)
-                .max(PRUNE_THRESHOLD)
-                .min(MAX_USED_JTIS);
+            // PRUNE_THRESHOLD(=下限) <= MAX_USED_JTIS(=上限) は定数で常に成立するため
+            // clamp は panic せず、max().min() と挙動が一致する（clippy::manual_clamp）。
+            self.prune_at = (self.entries.len() * 2).clamp(PRUNE_THRESHOLD, MAX_USED_JTIS);
         }
         if self.entries.len() >= MAX_USED_JTIS {
             // **fail closed。** 上限に達した状態で新しいブロブを通すと、その 1 件は

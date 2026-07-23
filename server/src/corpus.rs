@@ -19,11 +19,11 @@
 //!
 //! corpus を 2 種に分ける:
 //!
-//! - [`CorpusLoader::manual_corpus`]: ingest（別プロセス）だけが書く材料
+//! - [`CorpusLoader::manual_corpus`] — ingest（別プロセス）だけが書く材料
 //!   （ManualSection / Product / Signal ノード、MENTIONS_SIGNAL / DESCRIBES 辺）。
 //!   **schema 単位 TTL キャッシュ（既定 60s）**。ingest からの invalidation 通知は無いため
 //!   TTL ベースで、最大 TTL 秒の staleness を許容する。
-//! - [`CorpusLoader::live_corpus`]: サーバが会話中に書く材料
+//! - [`CorpusLoader::live_corpus`] — サーバが会話中に書く材料
 //!   （support_case / Signal ノード、HAS_SIGNAL 辺）。**キャッシュしない**。
 //!   会話層の累積 signal（`case_signals_from_snapshot`）を毎ターン最新で読めないと、
 //!   前ターンで積んだ signal を取りこぼしてエスカレーション条件が成立せず fail-open するため、
