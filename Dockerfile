@@ -15,7 +15,8 @@ RUN cargo build --release --locked \
     --bin ingest_rules \
     --bin ingest_urtect \
     --bin ingest_products \
-    --bin ingest_alarmcom
+    --bin ingest_alarmcom \
+    --bin verify_alarmcom
 
 FROM debian:bookworm-slim
 
@@ -27,6 +28,7 @@ COPY --from=builder /app/server/target/release/ingest_rules /usr/local/bin/inges
 COPY --from=builder /app/server/target/release/ingest_urtect /usr/local/bin/ingest_urtect
 COPY --from=builder /app/server/target/release/ingest_products /usr/local/bin/ingest_products
 COPY --from=builder /app/server/target/release/ingest_alarmcom /usr/local/bin/ingest_alarmcom
+COPY --from=builder /app/server/target/release/verify_alarmcom /usr/local/bin/verify_alarmcom
 COPY server/config.gce.toml ./config.gce.toml
 COPY server/config.cloudrun.toml ./config.cloudrun.toml
 COPY server/data ./data

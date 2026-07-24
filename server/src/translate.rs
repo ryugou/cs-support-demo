@@ -265,6 +265,43 @@ impl GeminiClient {
             Err(GeminiCallError::Permanent(err))
         }
     }
+
+    /// caller が組み立てた `generateContent` リクエストを投げ、`responseSchema` に従う
+    /// JSON テキスト本体（`candidates[0].content.parts[0].text`）を返す。
+    ///
+    /// transient 失敗（429 / 5xx・接続断）は指数バックオフで最大 `MAX_ATTEMPTS` 回まで
+    /// リトライし、permanent 失敗（4xx・レスポンス JSON 不正）は即 `Err`。翻訳
+    /// （`translate_and_extract`）と、`responseSchema` を使う他 caller（例: `verify_alarmcom`
+    /// の質問生成）がこのリトライ規律を 1 箇所で共有するための公開窓口。JSON テキストの
+    /// 意味解釈（どのフィールドを読むか）は caller に委ねる。
+    pub async fn generate_json(&self, payload: &Value) -> Result<String> {
+        let mut last_retryable_err: Option<anyhow::Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                let backoff = Duration::from_millis(BASE_BACKOFF_MS * 2u64.pow(attempt - 1));
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max_attempts = MAX_ATTEMPTS,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "retrying gemini generateContent after a transient failure"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            match self.call(payload).await {
+                Ok(response_body) => {
+                    return extract_gemini_text(&response_body)
+                        .context("extract text from gemini generateContent response");
+                }
+                Err(GeminiCallError::Permanent(err)) => return Err(err),
+                Err(GeminiCallError::Retryable(err)) => {
+                    last_retryable_err = Some(err);
+                }
+            }
+        }
+        Err(last_retryable_err
+            .unwrap_or_else(|| anyhow!("gemini generateContent failed with no captured error")))
+        .with_context(|| format!("gemini generateContent exhausted {MAX_ATTEMPTS} attempts"))
+    }
 }
 
 enum GeminiCallError {
@@ -448,36 +485,8 @@ pub async fn translate_and_extract(
     glossary: &Glossary,
 ) -> Result<TranslationOutput> {
     let payload = build_gemini_request(title_en, en_body, context, glossary);
-    let mut last_retryable_err: Option<anyhow::Error> = None;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        if attempt > 0 {
-            let backoff = Duration::from_millis(BASE_BACKOFF_MS * 2u64.pow(attempt - 1));
-            tracing::warn!(
-                attempt = attempt + 1,
-                max_attempts = MAX_ATTEMPTS,
-                backoff_ms = backoff.as_millis() as u64,
-                "retrying gemini generateContent after a transient failure"
-            );
-            tokio::time::sleep(backoff).await;
-        }
-        match client.call(&payload).await {
-            Ok(response_body) => {
-                let text = extract_gemini_text(&response_body)
-                    .context("extract text from gemini generateContent response")?;
-                return parse_translation_response(&text)
-                    .context("parse gemini generateContent output json");
-            }
-            Err(GeminiCallError::Permanent(err)) => return Err(err),
-            Err(GeminiCallError::Retryable(err)) => {
-                last_retryable_err = Some(err);
-            }
-        }
-    }
-
-    Err(last_retryable_err
-        .unwrap_or_else(|| anyhow!("gemini generateContent failed with no captured error")))
-    .with_context(|| format!("gemini generateContent exhausted {MAX_ATTEMPTS} attempts"))
+    let text = client.generate_json(&payload).await?;
+    parse_translation_response(&text).context("parse gemini generateContent output json")
 }
 
 #[cfg(test)]
