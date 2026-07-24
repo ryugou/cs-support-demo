@@ -59,9 +59,9 @@ const DOC_KEY: &str = "doc-alarmcom";
 const MIN_CRAWL_DELAY_SECS: u64 = 5;
 
 /// site-structure 由来 skip（fetch 失敗・本文空・breadcrumb 欠落・翻訳失敗）の割合上限。これを
-/// 超えたら bail する（サイト構造・抽出セレクタ変化の疑い）。**parent-not-ingested の cascade
-/// skip はこの比率に含めない**（Warning 2: 空ハブ配下 subtree の巻き添え skip で誤発火するため。
-/// 判定は `site_skip_bail` を参照）。
+/// 超えたら bail する（サイト構造・抽出セレクタ変化の疑い）。**親ハブ未 ingest による子記事の
+/// root 降格は skip ではなく ingest なので、この比率には寄与しない**（判定は `site_skip_bail`
+/// を参照）。
 const MAX_SKIP_RATIO: f64 = 0.2;
 
 /// MAX_SKIP_RATIO の判定を開始する最小処理件数。記事単位インクリメンタル upsert に伴い、
@@ -312,13 +312,14 @@ fn depth_first_order(targets: &[CrawlTarget]) -> Vec<&CrawlTarget> {
     ordered
 }
 
-/// 子記事（`parent_slug = Some(parent)`）の親が「過去の ingest 実行で既に upsert 済み
-/// （`existing_hash` に slug が存在）」または「今回の実行で既に ingest 済み
-/// （`ingested_this_run` に slug が存在）」のいずれかであるかを判定する純関数。親なしは常に true。
+/// 子記事の親ハブが「過去の ingest 実行で既に upsert 済み（`existing_hash` に slug が存在）」
+/// または「今回の実行で既に ingest 済み（`ingested_this_run` に slug が存在）」のいずれかで
+/// あるかを判定する純関数。親なし（`None`）は常に true。
 ///
 /// どちらの集合にも無い場合、そのハブは今回も過去にも一度も upsert されていない ＝ 実在しない
-/// 親ノードを指す孤児 PARENT_OF 辺を生成しうる状態なので false を返す（呼び出し側で子記事を
-/// fetch 前に skip する）。
+/// 親ノードを指す孤児 PARENT_OF 辺を生成しうる状態なので false を返す。呼び出し側
+/// （`resolve_parent_edge_slug`）はこのとき PARENT_OF を張らず、子を document 直下 root として
+/// 投入する（子記事はスキップしない）。
 fn parent_is_known(
     parent_slug: Option<&str>,
     existing_hash: &HashMap<String, String>,
@@ -327,6 +328,27 @@ fn parent_is_known(
     match parent_slug {
         None => true,
         Some(parent) => existing_hash.contains_key(parent) || ingested_this_run.contains(parent),
+    }
+}
+
+/// 子記事に PARENT_OF を張ってよい親 slug を解決する純関数。
+///
+/// 親 URL が導出できない記事（`derived_parent = None`）は当然 root（`None`）。親が導出できても
+/// その親ハブが過去も今回も一度も upsert されていない（`parent_is_known` が false）場合は、
+/// **孤児 PARENT_OF 辺を避けるため `None` を返し、子を document 直下 root として投入させる**
+/// （子記事はスキップしない）。親が ingest 済みなら `Some(parent)` を返し従来どおり PARENT_OF を
+/// 張る。`build_section_graph` は `parent_slug` が `None` でも HAS_SECTION（document→section）を
+/// 必ず張るため、root 降格した子も reachable に保たれる。
+fn resolve_parent_edge_slug(
+    derived_parent: Option<String>,
+    existing_hash: &HashMap<String, String>,
+    ingested_this_run: &HashSet<String>,
+) -> Option<String> {
+    match derived_parent {
+        Some(parent) if parent_is_known(Some(&parent), existing_hash, ingested_this_run) => {
+            Some(parent)
+        }
+        _ => None,
     }
 }
 
@@ -422,10 +444,10 @@ async fn commit_article(
 /// site-structure 由来の skip（fetch 失敗 / 本文空 / breadcrumb 欠落 / 翻訳失敗 など「サイトが
 /// 変わった」ことを示す skip）だけで早期 bail 比率を判定する純関数。
 ///
-/// **parent-not-ingested による cascade skip は分子にも分母にも入れない**（Warning 2）。
-/// 空ハブが 1 件でもあると健全なサイトでも配下の subtree が丸ごと「親未 ingest」で skip され、
-/// これを比率に混ぜると 4.8h の full run を途中 bail させ、しかも「selector が変わった」と
-/// 誤誘導するため。呼び出し側は site-structure skip 件数だけを `site_skips` として渡す。
+/// **親ハブ未 ingest による root 降格は skip ではなく ingest なので、分子（`site_skips`）には
+/// 入れない**（子記事は投入され、分母側の `ingested` に計上される）。空ハブ 1 件で配下 subtree が
+/// 丸ごと巻き添え skip される旧挙動は廃止したが、翻訳失敗した巨大ハブ「自体」は依然 site-structure
+/// skip になる。呼び出し側は site-structure skip 件数だけを `site_skips` として渡す。
 ///
 /// 返り値 `Some(ratio)` は「site 異常比率が閾値超過 = bail すべき」の意。サンプルが少ないうちの
 /// 誤検知を避けるため `min_sample` 未満では常に `None`。
@@ -677,9 +699,9 @@ async fn main() -> Result<()> {
     // site-structure 由来の skip（fetch 失敗 / 本文空 / breadcrumb 欠落 / 翻訳失敗）。早期 bail
     // 比率の分子はこれだけ（Warning 2）。
     let mut skip_records: Vec<(String, String)> = Vec::new();
-    // parent-not-ingested による cascade skip。空ハブ配下の subtree が丸ごと入りうるため
-    // site-structure skip とは別勘定にし、bail 比率には一切含めない（記録は残す）。
-    let mut parent_skip_records: Vec<(String, String)> = Vec::new();
+    // 親ハブ未 ingest により document 直下 root へ降格した子記事の記録（スキップではなく投入）。
+    // どの記事が root 化したかを operator が追えるよう残す（bail 比率には一切含めない）。
+    let mut root_promoted_records: Vec<(String, String)> = Vec::new();
     let mut zero_signal_sections: Vec<String> = Vec::new();
     let mut ingested_this_run: HashSet<String> = HashSet::new();
     let mut total_nodes_upserted = upserted_doc_nodes;
@@ -692,25 +714,29 @@ async fn main() -> Result<()> {
     for target in depth_first_order(&targets) {
         let slug = target.slug.clone();
 
-        let parent_slug = parent_path_of(&target.path).and_then(|p| path_slug_map.get(&p).cloned());
+        let derived_parent =
+            parent_path_of(&target.path).and_then(|p| path_slug_map.get(&p).cloned());
 
-        // 親がこれまでも今回も一度も ingest されていない子記事は孤児 PARENT_OF 辺を生む
-        // ため、fetch する前に skip する。
-        if !parent_is_known(parent_slug.as_deref(), &existing_hash, &ingested_this_run) {
-            let parent = parent_slug.as_deref().unwrap_or("");
-            tracing::warn!(
+        // 親ハブが今回も過去にも一度も ingest されていない場合（巨大ナビゲーションページの翻訳
+        // 失敗・本文空・sitemap 欠落など）、PARENT_OF を張ると存在しない親を指す孤児辺になる。
+        // 実コンテンツを持つ子記事はスキップせず、document 直下の root section として投入する
+        // （HAS_SECTION は build_section_graph が必ず張るため reachable は保たれる）。連鎖スキップ
+        // （子の巻き添え）だけをやめ、本文の無い失敗ハブ「自体」は後段の site-structure skip で落ちる。
+        let parent_slug =
+            resolve_parent_edge_slug(derived_parent.clone(), &existing_hash, &ingested_this_run);
+        if derived_parent.is_some() && parent_slug.is_none() {
+            let parent = derived_parent.as_deref().unwrap_or("");
+            tracing::info!(
                 url = %target.url,
                 parent_slug = %parent,
-                "parent article was never ingested (fetch/extraction/translation failed or not yet \
-                 upserted); skipping child article to avoid a PARENT_OF edge pointing at a \
-                 non-existent node"
+                "parent hub was never ingested (fetch/extraction/translation failed or absent); \
+                 ingesting child as a document-root section without a PARENT_OF edge instead of \
+                 skipping it"
             );
-            // site-structure skip とは別勘定（Warning 2: bail 比率に混ぜない）。
-            parent_skip_records.push((
+            root_promoted_records.push((
                 target.url.clone(),
-                format!("parent {parent} not ingested (skipped to avoid orphan PARENT_OF edge)"),
+                format!("parent {parent} not ingested; promoted to document-root section"),
             ));
-            continue;
         }
 
         let en_html = match throttled_fetch(&http, &target.url, crawl_delay, &mut last_request)
@@ -914,21 +940,22 @@ async fn main() -> Result<()> {
                 "site-structure skips {}/{processed_so_far} articles fetched so far ({:.1}%), \
                  exceeding the {:.0}% safety threshold; the site structure or extraction selector \
                  (#elm-main-content / .mt-breadcrumbs) may have changed — aborting before \
-                 crawling further (this ratio excludes {} parent-not-ingested cascade skips; \
+                 crawling further ({} child article(s) were promoted to document-root sections \
+                 because their parent hub was not ingested — those are committed, not skipped; \
                  articles already upserted this run remain committed; inspect the skipped URLs)",
                 skip_records.len(),
                 running_ratio * 100.0,
                 MAX_SKIP_RATIO * 100.0,
-                parent_skip_records.len()
+                root_promoted_records.len()
             );
         }
     }
 
     let skipped_fetch_or_empty = skip_records.len();
-    let parent_skipped = parent_skip_records.len();
-    // skip_ratio は「fetch を試みた記事に対する site-structure skip の割合」。分母から
-    // parent-not-ingested の cascade skip（fetch 未試行）を除く（Warning 2 と一貫させる）。
-    let fetch_attempted = target_count.saturating_sub(parent_skipped);
+    let root_promoted = root_promoted_records.len();
+    // 親ハブ未 ingest でも子は必ず fetch するため、fetch 試行数は全 crawl 対象数に等しい。
+    // skip_ratio は「fetch を試みた記事に対する site-structure skip の割合」。
+    let fetch_attempted = target_count;
     let skip_ratio = if fetch_attempted == 0 {
         0.0
     } else {
@@ -939,7 +966,7 @@ async fn main() -> Result<()> {
         .iter()
         .map(|(url, reason)| json!({ "url": url, "reason": reason }))
         .collect();
-    let parent_skipped_urls: Vec<serde_json::Value> = parent_skip_records
+    let root_promoted_urls: Vec<serde_json::Value> = root_promoted_records
         .iter()
         .map(|(url, reason)| json!({ "url": url, "reason": reason }))
         .collect();
@@ -956,7 +983,7 @@ async fn main() -> Result<()> {
             "ingested_manual_sections": ingested,
             "skipped_unchanged": skipped_unchanged,
             "skipped_fetch_or_empty": skipped_fetch_or_empty,
-            "skipped_parent_not_ingested": parent_skipped,
+            "root_promoted_no_parent_hub": root_promoted,
             "fetch_attempted": fetch_attempted,
             "skip_ratio": skip_ratio,
             "upserted_nodes": total_nodes_upserted,
@@ -967,7 +994,7 @@ async fn main() -> Result<()> {
             "concept_mentions": concept_mentions_total,
             "sections_with_zero_signal_matches": zero_signal_sections,
             "fetch_or_empty_skipped_urls": fetch_or_empty_skipped_urls,
-            "parent_skipped_urls": parent_skipped_urls,
+            "root_promoted_urls": root_promoted_urls,
         }))?
     );
     Ok(())
@@ -1010,9 +1037,9 @@ mod tests {
     #[test]
     fn site_skip_bail_ignores_parent_skips_and_respects_min_sample() {
         // 分子・分母は site-structure skip / (ingested + unchanged + site skips) のみ。
-        // parent-not-ingested の cascade skip は引数に現れない ＝ 構造的に比率へ寄与しない
-        // （Warning 2 の核心）。健全なサイトの例: 空ハブ 1 件配下で 100 件が親未 ingest で
-        // skip されても、実 fetch した 30 件中 site skip が 2 件なら bail しない。
+        // 親ハブ未 ingest による root 降格は「投入された記事」なので引数には現れず、降格した子は
+        // 分母側の ingested に含まれる ＝ 比率を不当に押し上げない。健全なサイトの例: 実 fetch した
+        // 30 件（root 降格分を含む）のうち site skip が 2 件なら bail しない。
         assert_eq!(
             site_skip_bail(2, 25, 3, 20, 0.2),
             None,
@@ -1205,6 +1232,109 @@ mod tests {
             &existing_hash,
             &ingested_this_run
         ));
+    }
+
+    /// PARENT_OF/HAS_SECTION の本数を数える test ヘルパ。
+    fn edge_count(edges: &[GraphEdge], edge_type: &str) -> usize {
+        edges.iter().filter(|e| e.edge_type == edge_type).count()
+    }
+
+    /// 親 slug を差し替えた最小の子記事入力（body_original 有り = alarm.com 相当）。
+    fn child_input(parent_slug: Option<String>) -> ManualSectionInput {
+        ManualSectionInput {
+            slug: "alarmcom-sec-child".into(),
+            title: "子記事".into(),
+            body: "本文".into(),
+            source_url: "https://answers.alarm.com/Partner/Hub/Child".into(),
+            breadcrumb: "Partner > Hub > Child".into(),
+            section_no: None,
+            order: 3,
+            parent_slug,
+            product_models: Vec::new(),
+            signal_values: Vec::new(),
+            body_original: Some("body".into()),
+            original_hash: Some("h".into()),
+        }
+    }
+
+    #[test]
+    fn resolve_parent_edge_slug_keeps_known_parent() {
+        // (a) 親が過去/今回 ingest 済みなら Some(parent) を返し PARENT_OF を張らせる。
+        let mut existing_hash = HashMap::new();
+        existing_hash.insert("alarmcom-sec-hub".to_string(), "h".to_string());
+        assert_eq!(
+            resolve_parent_edge_slug(
+                Some("alarmcom-sec-hub".to_string()),
+                &existing_hash,
+                &HashSet::new()
+            ),
+            Some("alarmcom-sec-hub".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_parent_edge_slug_promotes_to_root_when_parent_unknown() {
+        // (b) 親ハブが今回も過去にも未 ingest なら None（root 化）を返す。子はスキップしない。
+        assert_eq!(
+            resolve_parent_edge_slug(
+                Some("alarmcom-sec-missing-hub".to_string()),
+                &HashMap::new(),
+                &HashSet::new()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_parent_edge_slug_none_when_no_derived_parent() {
+        // 親 URL がそもそも導出できない記事は当然 root。
+        assert_eq!(
+            resolve_parent_edge_slug(None, &HashMap::new(), &HashSet::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn child_with_known_parent_gets_parent_of_and_has_section() {
+        // (a) 構造検証: 親が既知 → PARENT_OF 1 本 + HAS_SECTION 1 本。
+        let mut existing_hash = HashMap::new();
+        existing_hash.insert("alarmcom-sec-hub".to_string(), "h".to_string());
+        let parent_slug = resolve_parent_edge_slug(
+            Some("alarmcom-sec-hub".to_string()),
+            &existing_hash,
+            &HashSet::new(),
+        );
+        let build = build_section_graph("urtect", DOC_KEY, &child_input(parent_slug), "hash");
+        assert_eq!(edge_count(&build.edges, "PARENT_OF"), 1);
+        assert_eq!(edge_count(&build.edges, "HAS_SECTION"), 1);
+    }
+
+    #[test]
+    fn child_promoted_to_root_has_has_section_but_no_parent_of() {
+        // (b) 構造検証: 親ハブ未 ingest → 子は投入され HAS_SECTION 1 本・PARENT_OF 0 本。
+        // スキップされず root section として reachable（孤児 PARENT_OF 辺を生まない）。
+        let parent_slug = resolve_parent_edge_slug(
+            Some("alarmcom-sec-missing-hub".to_string()),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(parent_slug, None, "unknown parent must resolve to root");
+        let build = build_section_graph("urtect", DOC_KEY, &child_input(parent_slug), "hash");
+        assert_eq!(
+            edge_count(&build.edges, "PARENT_OF"),
+            0,
+            "no orphan PARENT_OF edge for a promoted root child"
+        );
+        assert_eq!(
+            edge_count(&build.edges, "HAS_SECTION"),
+            1,
+            "promoted root child stays reachable via HAS_SECTION(document->section)"
+        );
+        // 子の ManualSection ノード自体は生成される（＝ スキップされていない）。
+        assert!(
+            build.nodes.iter().any(|n| n.node_type == KIND_SECTION),
+            "child ManualSection node must be produced, not skipped"
+        );
     }
 
     #[test]
