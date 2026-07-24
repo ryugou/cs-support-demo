@@ -1,9 +1,22 @@
 //! 再 ingest（差分 ingest）で「除去が必要になった辺」を検出する fail-closed ヘルパ。
 //!
 //! backend に delete API が無く、`upsert` は追加しかできない。再 ingest で本文・構造が変わり、
-//! 旧 DESCRIBES / MENTIONS_SIGNAL / MENTIONS_CONCEPT / PARENT_OF 辺が新しい派生集合・新しい親に
-//! 含まれなくなった場合、その stale 辺は検索側に誤って信頼され誤回答を生む。よって「除去が必要」を
-//! 検出したら **fail closed**（テナント schema 作り直しへ誘導）する。
+//! 旧 DESCRIBES / MENTIONS_SIGNAL / PARENT_OF 辺が新しい派生集合・新しい親に含まれなくなった
+//! 場合、その stale 辺は検索側に誤って信頼され誤回答を生む。よって「除去が必要」を検出したら
+//! **fail closed**（テナント schema 作り直しへ誘導）する。
+//!
+//! ただし **MENTIONS_CONCEPT だけは fail-closed 対象から除外する**（`DRIFT_TOLERANT_EDGE_TYPES`）。
+//! concept 辺は Gemini(LLM) の concept 抽出由来で、同一英語本文でも実行ごとに抽出結果がドリフト
+//! しうる。backend に delete が無いこの環境で strict 扱いすると、1 section の concept が 1 語
+//! 揺れただけで crawl 全体が「schema 作り直せ」で bail し、incremental 再 ingest が事実上不可能に
+//! なる（実測: `section …access-control requires removing derived edges (["…:Concept:requesttoexit"])`）。
+//! 旧 concept 辺が残っても実害が限定的なため許容する:
+//!   - search/corpus loader は MENTIONS_CONCEPT を読まない（`corpus.rs`）＝検索結果に無影響。
+//!   - 残存辺が影響するのは community クラスタリングのみで、そこへ軽微なノイズを足すだけ。
+//!   - vegapunk に delete が無く LLM ドリフトが不可避なので、strict にしても是正手段が無い。
+//!
+//! DESCRIBES / MENTIONS_SIGNAL / PARENT_OF は correctness-critical かつ変化が稀なので従来どおり
+//! strict な fail-closed を維持する。
 //!
 //! `ingest_urtect` と `ingest_alarmcom` はいずれも同じ検出を必要とするため、両者で共有する
 //! （旧 `ingest_urtect` は `graph_snapshot(5000)` の全件ロードに依存していたが、これは backend の
@@ -16,6 +29,30 @@ use anyhow::{Context, Result};
 
 use crate::manual::schema_ids::{manual_node_id, KIND_SECTION};
 use crate::vegapunk::VegapunkClient;
+
+/// stale fail-closed 対象から除外する（＝旧辺が残っても bail しない）派生 edge type。
+/// ここに載る edge type は「LLM 由来などでドリフトが不可避、かつ残存しても検索の正しさを
+/// 壊さない」辺に限る。現状は MENTIONS_CONCEPT のみ（理由はモジュール doc を参照）。
+/// DESCRIBES / MENTIONS_SIGNAL / PARENT_OF はここに入れない＝ strict な fail-closed 対象。
+const DRIFT_TOLERANT_EDGE_TYPES: &[&str] = &["MENTIONS_CONCEPT"];
+
+/// この edge type を strict な stale fail-closed 対象として扱うか。
+/// `DRIFT_TOLERANT_EDGE_TYPES` に載っていなければ strict（消えたら bail）。
+fn is_strict_edge_type(edge_type: &str) -> bool {
+    !DRIFT_TOLERANT_EDGE_TYPES.contains(&edge_type)
+}
+
+/// 呼び出し側が渡した派生 edge type のうち、strict な（stale 消失で bail する）ものだけを返す
+/// 純関数。drift-tolerant な edge type（MENTIONS_CONCEPT）はここで落ちるため、その旧辺は
+/// traverse すらされず stale 判定に一切入らない。「どの edge type を strict にするか」の唯一の
+/// 判断点であり、I/O 無しでテストできる。
+fn strict_edge_types<'a>(derived_edge_types: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    derived_edge_types
+        .iter()
+        .copied()
+        .filter(|(_, edge_type)| is_strict_edge_type(edge_type))
+        .collect()
+}
 
 /// 1-hop traverse のページサイズ上限。`traverse_neighbors_paged` は backend 申告の
 /// `total_count` を権威に完全性を fail-closed で保証する（不足ページで打ち切らない）ため、
@@ -34,7 +71,8 @@ fn stale_targets<'a>(old: &'a HashSet<String>, new: &HashSet<String>) -> Vec<&'a
 ///
 /// - `derived_edge_types`: outgoing で辿る `(neighbor_node_type, edge_type)` の並び。
 ///   urtect は `[(Product, DESCRIBES), (Signal, MENTIONS_SIGNAL)]`、alarmcom はこれに
-///   `(Concept, MENTIONS_CONCEPT)` を加える。
+///   `(Concept, MENTIONS_CONCEPT)` を加える。このうち `DRIFT_TOLERANT_EDGE_TYPES` に載る
+///   edge type（MENTIONS_CONCEPT）は strict 判定から除外され、traverse も stale 判定もしない。
 /// - `new_derived_targets`: 今回の本文から導出した派生辺の宛先 node_id 集合。
 /// - `parent_slug`: 今回の親 section slug（root なら `None`）。旧 PARENT_OF の from（親）が
 ///   これと一致しなければ「親が変わった/root 化した」＝ PARENT_OF 除去が必要とみなす。
@@ -51,9 +89,11 @@ pub async fn assert_no_stale_section_edges(
 ) -> Result<()> {
     let sec_id = manual_node_id(schema, KIND_SECTION, slug);
 
-    // 派生辺（DESCRIBES / MENTIONS_SIGNAL / MENTIONS_CONCEPT …）: section → 対象の outgoing。
+    // 派生辺（DESCRIBES / MENTIONS_SIGNAL …）: section → 対象の outgoing。
+    // strict な edge type だけを traverse する。drift-tolerant（MENTIONS_CONCEPT）は
+    // `strict_edge_types` で除外され、旧辺が残っても bail 対象にしない（＝ traverse もしない）。
     let mut old_derived: HashSet<String> = HashSet::new();
-    for (neighbor_type, edge_type) in derived_edge_types {
+    for (neighbor_type, edge_type) in strict_edge_types(derived_edge_types) {
         let neighbors = client
             .traverse_neighbor_ids(
                 schema,
@@ -134,5 +174,78 @@ mod tests {
         let old = set(&[]);
         let new = set(&["a", "b"]);
         assert!(stale_targets(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn correctness_critical_edge_types_are_strict() {
+        // DESCRIBES / MENTIONS_SIGNAL / PARENT_OF は strict（消えたら bail）。
+        assert!(is_strict_edge_type("DESCRIBES"));
+        assert!(is_strict_edge_type("MENTIONS_SIGNAL"));
+        assert!(is_strict_edge_type("PARENT_OF"));
+    }
+
+    #[test]
+    fn mentions_concept_is_drift_tolerant() {
+        // MENTIONS_CONCEPT は LLM ドリフト由来なので strict 対象から外す（消えても bail しない）。
+        assert!(!is_strict_edge_type("MENTIONS_CONCEPT"));
+    }
+
+    #[test]
+    fn strict_edge_types_drops_only_mentions_concept() {
+        // alarmcom が渡す 3 種のうち、strict traverse 対象に残るのは DESCRIBES と
+        // MENTIONS_SIGNAL のみ。MENTIONS_CONCEPT は落ちる（＝旧 concept 辺が消えても bail しない）。
+        let requested = [
+            ("Product", "DESCRIBES"),
+            ("Signal", "MENTIONS_SIGNAL"),
+            ("Concept", "MENTIONS_CONCEPT"),
+        ];
+        let strict = strict_edge_types(&requested);
+        assert_eq!(
+            strict,
+            vec![("Product", "DESCRIBES"), ("Signal", "MENTIONS_SIGNAL")]
+        );
+    }
+
+    #[test]
+    fn strict_edge_types_preserves_order_and_passes_through_all_strict() {
+        // urtect が渡す 2 種はどちらも strict なので、順序そのまま全通過する。
+        let requested = [("Product", "DESCRIBES"), ("Signal", "MENTIONS_SIGNAL")];
+        assert_eq!(strict_edge_types(&requested), requested.to_vec());
+    }
+
+    #[test]
+    fn concept_drift_does_not_produce_stale_but_signal_removal_does() {
+        // 派生辺の stale 判定を、edge type ごとに strict フィルタ経由で組み立てて確認する
+        // （`assert_no_stale_section_edges` の traverse ループと同じ手順を I/O 無しで再現）。
+        // 旧辺: Signal:a（新集合にあり残る）, Concept:x（新集合から消える）。
+        let old_by_type = [
+            ("Signal", "MENTIONS_SIGNAL", set(&["Signal:a"])),
+            ("Concept", "MENTIONS_CONCEPT", set(&["Concept:x"])),
+        ];
+        let derived_edge_types: Vec<(&str, &str)> =
+            old_by_type.iter().map(|(nt, et, _)| (*nt, *et)).collect();
+        let new_targets = set(&["Signal:a"]); // concept x は今回消えた
+
+        // strict な edge type の旧辺だけを集約して stale を取る。
+        let mut old_strict: HashSet<String> = HashSet::new();
+        for (_, edge_type) in strict_edge_types(&derived_edge_types) {
+            if let Some((_, _, old)) = old_by_type.iter().find(|(_, et, _)| *et == edge_type) {
+                old_strict.extend(old.iter().cloned());
+            }
+        }
+        // Concept:x は strict フィルタで除外され、消えても stale にならない。
+        assert!(
+            stale_targets(&old_strict, &new_targets).is_empty(),
+            "concept drift must not be treated as stale"
+        );
+
+        // 逆に Signal 辺が消えたケースは従来どおり stale として検出される。
+        let new_targets_signal_gone = set(&[]);
+        let stale = stale_targets(&old_strict, &new_targets_signal_gone);
+        assert_eq!(
+            stale.into_iter().cloned().collect::<Vec<_>>(),
+            vec!["Signal:a".to_string()],
+            "removal of a strict (MENTIONS_SIGNAL) edge must still be detected as stale"
+        );
     }
 }
