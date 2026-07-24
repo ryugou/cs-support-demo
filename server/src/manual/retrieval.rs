@@ -1512,6 +1512,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn degrades_gracefully_when_snapshot_has_no_mentions_signal_edges() {
+        // corpus loader は hot Signal の traverse timeout を避けるため MENTIONS_SIGNAL 辺を
+        // 載せなくなった。その結果 snapshot は Signal ノードを持つが section->Signal 辺を持たない。
+        // このとき、質問が signal を運んでいても:
+        //   (a) text/vector スコアが立つ節は従来どおり候補として返る（検索は生き続ける）、
+        //   (b) signal 絞り込みだけで残っていた節（text/vector=0）は候補から落ちる（縮退）。
+        // を search_with_snapshot 層で直接固定する。
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphNode as PN};
+        let schema = "urtect";
+        let question = "SDカードが認識されない場合の対処";
+        let signal_node = PN {
+            node_id: "urtect:gen1:Signal:sd_not_recognized".to_string(),
+            node_type: "Signal".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [("value".to_string(), "sd_not_recognized".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let mk_section = |key: &str, body: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: [
+                    ("section_key".to_string(), key.to_string()),
+                    ("title".to_string(), "見出し".to_string()),
+                    ("body".to_string(), body.to_string()),
+                    ("source_url".to_string(), String::new()),
+                    ("breadcrumb".to_string(), String::new()),
+                ]
+                .into_iter()
+                .collect(),
+            }
+        };
+        // text_match: 本文が質問を含む（text score が立つ）。signal_only: 本文が無関係で、
+        // 従来なら MENTIONS_SIGNAL 辺だけで候補に残っていた節。辺が無いので今回は落ちる。
+        let text_match = mk_section("sec-text-match", question);
+        let signal_only = mk_section("sec-signal-only", "全く関係のない本文です。");
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![signal_node, text_match, signal_only],
+            edges: Vec::new(), // ← MENTIONS_SIGNAL 辺を一切持たない（corpus loader の新挙動）
+            truncated: false,
+            total_node_count: 0,
+        };
+        let signals: SignalSet = [Signal::new("sd_not_recognized")].into_iter().collect();
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(schema, question, &signals, None, 10, &snap, &[])
+            .expect("search_with_snapshot");
+        assert!(
+            hits.iter().any(|h| h.section_key == "sec-text-match"),
+            "text-matching section must still be returned without signal edges: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| h.section_key != "sec-signal-only"),
+            "signal-only section must drop when MENTIONS_SIGNAL edges are absent: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn vector_id_absent_from_snapshot_is_ignored() {
         let schema = "urtect";
         let section_key = "sec-real";

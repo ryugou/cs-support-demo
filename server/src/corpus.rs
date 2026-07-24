@@ -12,15 +12,18 @@
 //!
 //! - ノード: `query_nodes_paged`（offset ページングで全件、上限なし）
 //! - 辺: **低カーディナリティ端点からのページング traverse**。数万ある ManualSection / support_case
-//!   側からではなく、語彙で上限が決まる Signal や小規模な Product 側から incoming で辿る。
-//!   これにより辺の走査回数が `|Signal| + |Product|` に比例し、グラフ全体規模に依存しない。
+//!   側からではなく、小規模な Product 側から incoming で辿る。これにより辺の走査回数が
+//!   `|Product|` に比例し、グラフ全体規模に依存しない。
+//!   なお `manual_corpus` の MENTIONS_SIGNAL（section->Signal）だけは、hot Signal の incoming 辺が
+//!   本番規模で激増し traverse が call timeout を超過して corpus load を丸ごと失敗させたため、
+//!   **意図的に載せない**（詳細と縮退挙動は [`CorpusLoader::load_manual_corpus`] のコメント参照）。
 //!
 //! ## キャッシュ境界（安全性の要）
 //!
 //! corpus を 2 種に分ける:
 //!
 //! - [`CorpusLoader::manual_corpus`] — ingest（別プロセス）だけが書く材料
-//!   （ManualSection / Product / Signal ノード、MENTIONS_SIGNAL / DESCRIBES 辺）。
+//!   （ManualSection / Product / Signal ノード、DESCRIBES 辺。MENTIONS_SIGNAL 辺は上記の理由で載せない）。
 //!   **schema 単位 TTL キャッシュ（既定 60s）**。ingest からの invalidation 通知は無いため
 //!   TTL ベースで、最大 TTL 秒の staleness を許容する。
 //! - [`CorpusLoader::live_corpus`] — サーバが会話中に書く材料
@@ -48,7 +51,6 @@ const NODE_PRODUCT: &str = "Product";
 const NODE_SIGNAL: &str = "Signal";
 const NODE_SUPPORT_CASE: &str = "support_case";
 const NODE_KNOWN_RESOLUTION: &str = "KnownResolution";
-const EDGE_MENTIONS_SIGNAL: &str = "MENTIONS_SIGNAL";
 const EDGE_DESCRIBES: &str = "DESCRIBES";
 const EDGE_HAS_SIGNAL: &str = "HAS_SIGNAL";
 
@@ -116,23 +118,34 @@ impl CorpusLoader {
     }
 
     async fn load_manual_corpus(&self, schema: &str) -> Result<GetGraphSnapshotResponse> {
-        // ノード全件（ページング・上限なし）。
+        // ノード全件（ページング・上限なし）。Signal ノードは語彙で上限が決まり cold なので
+        // 載せ続ける（辺は載せないが、per-query narrowing 復活時にノードだけ先にある方が差分が小さい）。
         let sections = self.load_nodes(schema, NODE_MANUAL_SECTION).await?;
         let products = self.load_nodes(schema, NODE_PRODUCT).await?;
         let signals = self.load_nodes(schema, NODE_SIGNAL).await?;
 
-        // 辺: 低カーディナリティ端点（Signal / Product）から incoming traverse で復元する。
+        // 辺: 低カーディナリティ端点（Product）から incoming traverse で復元する。
+        //
+        // MENTIONS_SIGNAL（ManualSection -> Signal）は **意図的に載せない**。
+        // これは hot Signal（例 camera_installation / app_install）1 件の incoming 辺が
+        // alarm.com 全件 ingest 後に激増し、Signal からの incoming traverse が offset 0
+        // （最初の 1 ページ）ですら vegapunk の call timeout(120s)を超過して Cancelled になり、
+        // corpus load が丸ごと失敗 → search_manual / evaluate / verify が全滅していたため
+        // （実測: `traverse MENTIONS_SIGNAL incoming from …:Signal:camera_installation (offset 0)
+        //  → Cancelled "Timeout expired"`）。
+        //
+        // 影響（graceful degradation）: `sections_for_signals` が空集合を返すため signal
+        // 絞り込みだけで候補に残っていた節（score_source="signal"）は落ちる。ただし
+        // `search_with_snapshot` は `in_signal || score > 0.0` で候補を残す設計なので、
+        // text/vector スコア > 0 の候補は従来どおり返る。signal boost が効かない分、検索品質は
+        // 一時的に低下する（これは grep 全滅より遥かにマシな縮退）。
+        //
+        // 将来: 「クエリに含まれる signal だけを per-query に短 timeout・fail-open で
+        // traverse して narrowing する」か、vegapunk 側の incoming index 改善で復活させる想定
+        // （別 Issue 相当）。Signal ノード自体は上で載せてあるので、辺復元だけ足せばよい。
         let mut edges: Vec<GraphEdge> = Vec::new();
-        // MENTIONS_SIGNAL: ManualSection -> Signal。Signal から incoming で from(=section) を集める。
-        self.collect_incoming_edges(
-            schema,
-            &signals,
-            NODE_MANUAL_SECTION,
-            EDGE_MENTIONS_SIGNAL,
-            &mut edges,
-        )
-        .await?;
         // DESCRIBES: ManualSection -> Product。Product から incoming で from(=section) を集める。
+        // Product は数が少なく cold なので、こちらの incoming traverse はタイムアウトしない。
         self.collect_incoming_edges(
             schema,
             &products,
@@ -301,19 +314,21 @@ mod tests {
 
     #[test]
     fn incoming_edges_point_from_neighbor_to_endpoint() {
-        // Signal を端点に MENTIONS_SIGNAL を incoming で辿った結果は section -> signal の辺になる。
+        // Product を端点に DESCRIBES を incoming で辿った結果は section -> product の辺になる。
+        // （corpus は hot な MENTIONS_SIGNAL を載せなくなったため、cold な DESCRIBES で検証する。
+        //  incoming_edges 自体は edge_type 非依存の汎用ヘルパで、この向き付けが本質。）
         let edges = incoming_edges(
-            "urtect:gen1:Signal:sd_not_recognized",
+            "urtect:gen1:Product:ADC-V724",
             vec![
                 "urtect:gen1:ManualSection:sec-a".to_string(),
                 "urtect:gen1:ManualSection:sec-b".to_string(),
             ],
-            EDGE_MENTIONS_SIGNAL,
+            EDGE_DESCRIBES,
         );
         assert_eq!(edges.len(), 2);
         for e in &edges {
-            assert_eq!(e.edge_type, "MENTIONS_SIGNAL");
-            assert_eq!(e.to_id, "urtect:gen1:Signal:sd_not_recognized");
+            assert_eq!(e.edge_type, "DESCRIBES");
+            assert_eq!(e.to_id, "urtect:gen1:Product:ADC-V724");
             assert!(e.from_id.contains("ManualSection"));
         }
         assert_eq!(edges[0].from_id, "urtect:gen1:ManualSection:sec-a");

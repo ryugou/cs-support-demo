@@ -58,7 +58,10 @@ impl VegapunkClient {
         limits: GrpcLimits,
     ) -> Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())?
-            .connect_timeout(Duration::from_secs(10))
+            // connect_timeout は 30s。本番規模で TCP+TLS+h2 の確立が 10s では間に合わず
+            // 常駐サーバのコールドな最初の 1 発が connect timeout に化ける事象への余裕。
+            // 呼び出し自体の上限は別途 `timeout(limits.timeout_secs)` が握る。
+            .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(limits.timeout_secs))
             // 長寿命チャネルがアイドル後に死んだ接続を掴んだまま 120s ハングする事象への対策
             // （実測: 新規接続の grpcurl は常に高速なのに、常駐サーバの呼び出しだけ停滞する）。
@@ -87,7 +90,10 @@ impl VegapunkClient {
         limits: GrpcLimits,
     ) -> Result<Self> {
         let channel = Endpoint::from_shared(endpoint.to_string())?
-            .connect_timeout(Duration::from_secs(10))
+            // connect_timeout は 30s。本番規模で TCP+TLS+h2 の確立が 10s では間に合わず
+            // 常駐サーバのコールドな最初の 1 発が connect timeout に化ける事象への余裕。
+            // 呼び出し自体の上限は別途 `timeout(limits.timeout_secs)` が握る。
+            .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(limits.timeout_secs))
             // 長寿命チャネルがアイドル後に死んだ接続を掴んだまま 120s ハングする事象への対策
             // （実測: 新規接続の grpcurl は常に高速なのに、常駐サーバの呼び出しだけ停滞する）。
