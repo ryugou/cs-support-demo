@@ -19,6 +19,7 @@ use cs_support_mcp::{
         retrieval::kind_marker,
         schema_ids::{KIND_CONCEPT, KIND_SECTION},
     },
+    proto::graphrag::{ComponentReadiness, ReadinessState, SearchReadiness},
     vegapunk::{GrpcLimits, VegapunkClient},
 };
 use serde_json::{json, Value};
@@ -109,6 +110,239 @@ impl ProbeCounts {
         }
         counts
     }
+
+    /// 1 実行分（全クエリ × 全 mode）の合算。
+    fn add(&mut self, other: Self) {
+        self.manual_section += other.manual_section;
+        self.concept += other.concept;
+        self.other += other.other;
+    }
+
+    fn to_json(self) -> Value {
+        json!({
+            "manual_section": self.manual_section,
+            "concept": self.concept,
+            "other": self.other,
+        })
+    }
+}
+
+/// probe 内訳の before→after 差分。`manual_section` が減って `other` が増えるなら
+/// community 由来の item に top_k を食われている、という B2 の判断材料になる。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProbeCountsDelta {
+    manual_section: i64,
+    concept: i64,
+    other: i64,
+}
+
+impl ProbeCountsDelta {
+    fn to_json(self) -> Value {
+        json!({
+            "manual_section": self.manual_section,
+            "concept": self.concept,
+            "other": self.other,
+        })
+    }
+}
+
+/// probe のヒット件数を符号付き差分にする。件数は
+/// `top_k × PROBE_QUERIES × PROBE_MODES`（既定で最大 120 件）で `i64` に収まるが、
+/// 万一の桁溢れでも黙って符号が反転しないよう飽和変換する。
+fn count_delta(before: usize, after: usize) -> i64 {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let after = i64::try_from(after).unwrap_or(i64::MAX);
+    after.saturating_sub(before)
+}
+
+/// `--probe-only` で after 側が無いときは「差分 0」ではなく「比較不能（null）」を返す。
+fn probe_counts_delta(before: ProbeCounts, after: Option<ProbeCounts>) -> Option<ProbeCountsDelta> {
+    let after = after?;
+    Some(ProbeCountsDelta {
+        manual_section: count_delta(before.manual_section, after.manual_section),
+        concept: count_delta(before.concept, after.concept),
+        other: count_delta(before.other, after.other),
+    })
+}
+
+/// `GetStats.community_count` の観測結果。**`Skipped`（`--probe-only` による意図した省略）と
+/// `Error`（取得できなかった）を型で区別する**。両者を同じ「値なし」に潰すと、
+/// 意図した省略まで異常として fail させるか、逆に取得失敗を見逃すかのどちらかになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatsObservation {
+    Value(i64),
+    Error,
+    Skipped,
+}
+
+impl StatsObservation {
+    fn value(self) -> Option<i64> {
+        match self {
+            Self::Value(count) => Some(count),
+            Self::Error | Self::Skipped => None,
+        }
+    }
+
+    fn is_error(self) -> bool {
+        matches!(self, Self::Error)
+    }
+}
+
+/// 両側とも観測できたときだけ増分を返す。`--probe-only` や stats 取得失敗では `None`。
+/// 桁溢れは飽和させる（`community_count` が i64 域を跨ぐ現実解は無いが、
+/// 万一のとき符号が反転した数値を運用者に見せない）。
+fn community_count_delta(before: StatsObservation, after: StatsObservation) -> Option<i64> {
+    Some(after.value()?.saturating_sub(before.value()?))
+}
+
+/// exit code 判定の入力。ネットワーク I/O の結果をここへ畳んでから純関数で判定する
+/// （判定ロジックを vegapunk 到達性から切り離してテストするため）。
+#[derive(Debug, Clone, Copy)]
+struct RunObservation {
+    community_before: StatsObservation,
+    community_after: StatsObservation,
+    probe_succeeded: usize,
+    probe_attempted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunVerdict {
+    Ok,
+    /// exit 0 のまま warn する（想定内だが読み手に伝えるべき状態）。
+    Warn(RunWarning),
+    /// 非 0 終了する（この実行の目的が達成できていない）。
+    Fatal(RunFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunWarning {
+    CommunityCountUnchanged,
+    StatsPartiallyUnavailable,
+}
+
+impl RunWarning {
+    fn code(self) -> &'static str {
+        match self {
+            Self::CommunityCountUnchanged => "community_count_unchanged",
+            Self::StatsPartiallyUnavailable => "stats_partially_unavailable",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::CommunityCountUnchanged => {
+                "community_count が Merge の前後で変化していない。前回 Merge 以降グラフが\
+                 変わっていなければ正常。ingest 直後にこれが出た場合は投入内容を確認する"
+            }
+            Self::StatsPartiallyUnavailable => {
+                "GetStats が片側だけ取得できず、community_count の前後比較が成立していない。\
+                 出力 JSON の stats_before / stats_after の error を確認する"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunFailure {
+    ProbeAllFailed,
+    StatsUnavailable,
+    NoCommunities,
+}
+
+impl RunFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ProbeAllFailed => "probe_all_failed",
+            Self::StatsUnavailable => "stats_unavailable",
+            Self::NoCommunities => "no_communities",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::ProbeAllFailed => {
+                "probe が 1 件も成功しなかった。この実行からは B2 の判断材料が何も得られていない。\
+                 出力 JSON の probe_* の error（接続 / 権限 / schema 名）を確認する"
+            }
+            Self::StatsUnavailable => {
+                "GetStats が before / after の両方で失敗し、Merge が効いたかを確認できていない。\
+                 出力 JSON の stats_before / stats_after の error を確認する"
+            }
+            Self::NoCommunities => {
+                "Merge 後も community_count が 0。Leiden コミュニティ検出が 1 件も作れていない\
+                 （グラフが空、または embedding / LLM 設定の前提未達）。vegapunk 側のログを確認する"
+            }
+        }
+    }
+}
+
+/// 実行の成否を判定する。**優先順位は上から順で、先に一致したものが勝つ**
+/// （観測ゼロ > 成否不明 > 空振り > 増分ゼロ の順。順序を入れ替えると、
+/// 例えば probe 全滅を「増分あり＝正常」で覆い隠してしまう）。
+fn evaluate_run(observation: RunObservation) -> RunVerdict {
+    // 1. 観測ゼロ。before/after の状態によらず、この実行は目的を果たしていない。
+    if observation.probe_attempted > 0 && observation.probe_succeeded == 0 {
+        return RunVerdict::Fatal(RunFailure::ProbeAllFailed);
+    }
+    // 2. stats が両側とも取れず、Merge の成否を一切確認できない。
+    if observation.community_before.is_error() && observation.community_after.is_error() {
+        return RunVerdict::Fatal(RunFailure::StatsUnavailable);
+    }
+    // 3. 真の空振り: Merge 後の community が 0 件。before の観測状態は問わない。
+    if observation.community_after.value() == Some(0) {
+        return RunVerdict::Fatal(RunFailure::NoCommunities);
+    }
+    // 4-5. 両側そろったので増分で判断する。0 は「グラフ不変の schema への再 Merge」で
+    //      起こりうるため warn 止まり。
+    if let Some(delta) =
+        community_count_delta(observation.community_before, observation.community_after)
+    {
+        return if delta == 0 {
+            RunVerdict::Warn(RunWarning::CommunityCountUnchanged)
+        } else {
+            RunVerdict::Ok
+        };
+    }
+    // 6. 残りは致命ではない。ただし片側だけ「エラー」なら比較が不完全なので伝える
+    //    （`--probe-only` による Skipped は意図した省略なので黙って通す）。
+    if observation.community_before.is_error() || observation.community_after.is_error() {
+        RunVerdict::Warn(RunWarning::StatsPartiallyUnavailable)
+    } else {
+        RunVerdict::Ok
+    }
+}
+
+/// `SearchReadiness` を JSON にする。B1 の目的は「global が使える状態か」の実測なので、
+/// readiness は degradations と並ぶ一次証跡。**サーバが送ってこなかった場合は `null`** にして、
+/// 「readiness が来ていない」と「全コンポーネントが READY」を読み手が区別できるようにする。
+fn readiness_json(readiness: Option<&SearchReadiness>) -> Value {
+    let Some(readiness) = readiness else {
+        return Value::Null;
+    };
+    json!({
+        "local": component_readiness_json(readiness.local.as_ref()),
+        "global": component_readiness_json(readiness.global.as_ref()),
+        "community_summary": component_readiness_json(readiness.community_summary.as_ref()),
+        "structural_vectors": component_readiness_json(readiness.structural_vectors.as_ref()),
+        "similar_patterns": component_readiness_json(readiness.similar_patterns.as_ref()),
+    })
+}
+
+/// `ComponentReadiness` 1 件分。`state` は prost の i32 なので、既知値は名前、
+/// 未知値は `UNKNOWN({n})`（`degradation_summary` と同じ流儀）で数値を残す。
+fn component_readiness_json(component: Option<&ComponentReadiness>) -> Value {
+    let Some(component) = component else {
+        return Value::Null;
+    };
+    let state = ReadinessState::try_from(component.state)
+        .map(|state| state.as_str_name().to_string())
+        .unwrap_or_else(|_| format!("UNKNOWN({})", component.state));
+    json!({
+        "state": state,
+        "reason": component.reason,
+        "revision": component.revision,
+        "ready_at_ms": component.ready_at_ms,
+    })
 }
 
 /// token 解決: 既定は --token-file、ファイルが無い/読めない場合のみ --token-env。
@@ -121,6 +355,12 @@ fn read_token(args: &Args) -> Result<String> {
                 if !trimmed.is_empty() {
                     return Ok(trimmed.to_string());
                 }
+                // 読めたが空。Secret Manager のマウント漏れ等で起きるので、
+                // 黙って env に落ちず「なぜ主経路を使わなかったか」を残す。
+                tracing::warn!(
+                    path = %path.display(),
+                    "token file is empty; falling back to --token-env"
+                );
             }
             Err(err) => {
                 tracing::warn!(
@@ -144,9 +384,15 @@ fn read_token(args: &Args) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-/// stats を取って JSON にする。**取得失敗は致命ではない**（Merge 本体の成否とは別軸）ので
-/// エラーを JSON に残して続行する。握りつぶさず理由を出す。
-async fn stats_json(client: &VegapunkClient, schema: &str, label: &str) -> Value {
+/// stats の観測結果: そのまま出力に載せる JSON と、成否判定に使う `community_count`。
+struct StatsSnapshot {
+    json: Value,
+    community_count: StatsObservation,
+}
+
+/// stats を取って JSON にする。**1 回の取得失敗だけでは即座に落とさない**
+/// （前後どちらかが取れていれば判断材料になるため）。最終的な成否は `evaluate_run` が決める。
+async fn stats_json(client: &VegapunkClient, schema: &str, label: &str) -> StatsSnapshot {
     match client.stats(schema).await {
         Ok(stats) => {
             tracing::info!(
@@ -157,38 +403,59 @@ async fn stats_json(client: &VegapunkClient, schema: &str, label: &str) -> Value
                 community_count = stats.community_count,
                 "vegapunk stats"
             );
-            json!({
-                "node_count": stats.node_count,
-                "edge_count": stats.edge_count,
-                "vector_count": stats.vector_count,
-                "community_count": stats.community_count,
-            })
+            StatsSnapshot {
+                json: json!({
+                    "node_count": stats.node_count,
+                    "edge_count": stats.edge_count,
+                    "vector_count": stats.vector_count,
+                    "community_count": stats.community_count,
+                }),
+                community_count: StatsObservation::Value(stats.community_count),
+            }
         }
         Err(err) => {
             tracing::error!(label, error = %format!("{err:#}"), "stats unavailable");
-            json!({ "error": format!("{err:#}") })
+            StatsSnapshot {
+                json: json!({ "error": format!("{err:#}") }),
+                community_count: StatsObservation::Error,
+            }
         }
     }
+}
+
+/// probe 1 周分の結果: 出力 JSON と、差分・成否判定に使う集計値。
+struct ProbeOutcome {
+    json: Value,
+    totals: ProbeCounts,
+    /// 成功したクエリ × mode の件数。0 なら「この実行から観測が何も得られていない」。
+    succeeded: usize,
+    attempted: usize,
 }
 
 /// 全 PROBE_QUERIES × PROBE_MODES を叩き、ヒットの種別内訳・上位サンプル・SearchExecution を
 /// JSON に残す。**エラー（Merge 前の global = FAILED_PRECONDITION 等）は記録して次へ進む**
 /// （前後差を取るのが目的で、片方のエラーで観測全体を落とさない）。
-async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> Value {
+async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcome {
     let mut entries = Vec::new();
+    let mut totals = ProbeCounts::default();
+    let mut succeeded = 0usize;
+    let mut attempted = 0usize;
     for query in PROBE_QUERIES {
         for mode in PROBE_MODES {
+            attempted += 1;
             let entry = match client
                 .search_with_mode(&args.schema, query, args.top_k, mode)
                 .await
             {
                 Ok(outcome) => {
+                    succeeded += 1;
                     let kinds: Vec<HitKind> = outcome
                         .results
                         .iter()
                         .map(|item| classify_hit(item.id.as_deref()))
                         .collect();
                     let counts = ProbeCounts::from_kinds(&kinds);
+                    totals.add(counts);
                     let samples: Vec<Value> = outcome
                         .results
                         .iter()
@@ -216,17 +483,14 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> Value {
                                 .iter()
                                 .map(cs_support_mcp::vegapunk::degradation_summary)
                                 .collect::<Vec<_>>(),
+                            "readiness": readiness_json(execution.readiness.as_ref()),
                         })
                     });
                     json!({
                         "query": query,
                         "mode": mode,
                         "hit_count": outcome.results.len(),
-                        "counts": {
-                            "manual_section": counts.manual_section,
-                            "concept": counts.concept,
-                            "other": counts.other,
-                        },
+                        "counts": counts.to_json(),
                         "samples": samples,
                         "execution": execution,
                     })
@@ -240,7 +504,27 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> Value {
             entries.push(entry);
         }
     }
-    json!({ "label": label, "entries": entries })
+    tracing::info!(
+        label,
+        succeeded,
+        attempted,
+        manual_section = totals.manual_section,
+        concept = totals.concept,
+        other = totals.other,
+        "probe finished"
+    );
+    ProbeOutcome {
+        json: json!({
+            "label": label,
+            "succeeded": succeeded,
+            "attempted": attempted,
+            "totals": totals.to_json(),
+            "entries": entries,
+        }),
+        totals,
+        succeeded,
+        attempted,
+    }
 }
 
 #[tokio::main]
@@ -259,50 +543,100 @@ async fn main() -> Result<()> {
     let stats_before = stats_json(&client, &args.schema, "before").await;
     let probe_before = probe(&client, &args, "before").await;
 
-    let (merge_result, elapsed_secs) = if args.probe_only {
-        tracing::info!("--probe-only: skipping Merge");
-        (json!({ "skipped": true }), 0.0)
+    // after 側（stats + probe）を取るかどうかは Merge を実行したかどうかと一体。
+    // 判断を 1 箇所に閉じ、`--probe-only` なのに after を観測してしまう分岐漏れを防ぐ。
+    let (merge_result, elapsed_secs, stats_after, probe_after) = if args.probe_only {
+        // Merge だけでなく after 側の観測もまとめてスキップする。同一条件の probe を
+        // 2 周させても本番 vegapunk に無駄な負荷をかけるだけで、JSON の読み手には
+        // 「before/after に差がある」と誤読させる材料にしかならない。
+        tracing::info!("--probe-only: skipping Merge and the after-side observation");
+        (json!({ "skipped": true }), 0.0, None, None)
     } else {
         tracing::info!(schema = %args.schema, "starting Merge (synchronous, whole-schema recompute)");
         let started = Instant::now();
         let outcome = client.merge(&args.schema).await;
         let elapsed = started.elapsed().as_secs_f64();
-        match outcome {
-            Ok(()) => {
-                tracing::info!(elapsed_secs = elapsed, "Merge completed");
-                (json!({ "ok": true }), elapsed)
-            }
-            Err(err) => {
-                // fail closed: サマリを出してから非 0 終了する（観測結果は捨てない）。
-                tracing::error!(error = %format!("{err:#}"), elapsed_secs = elapsed, "Merge failed");
-                let summary = json!({
-                    "schema": args.schema,
-                    "stats_before": stats_before,
-                    "probe_before": probe_before,
-                    "merge": { "ok": false, "error": format!("{err:#}") },
-                    "merge_elapsed_secs": elapsed,
-                });
-                println!("{}", serde_json::to_string_pretty(&summary)?);
-                return Err(err);
-            }
+        if let Err(err) = outcome {
+            // fail closed: サマリを出してから非 0 終了する（観測結果は捨てない）。
+            tracing::error!(error = %format!("{err:#}"), elapsed_secs = elapsed, "Merge failed");
+            let summary = json!({
+                "schema": args.schema,
+                "stats_before": stats_before.json,
+                "probe_before": probe_before.json,
+                "merge": { "ok": false, "error": format!("{err:#}") },
+                "merge_elapsed_secs": elapsed,
+            });
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            return Err(err);
         }
+        tracing::info!(elapsed_secs = elapsed, "Merge completed");
+        let stats_after = stats_json(&client, &args.schema, "after").await;
+        let probe_after = probe(&client, &args, "after").await;
+        (
+            json!({ "ok": true }),
+            elapsed,
+            Some(stats_after),
+            Some(probe_after),
+        )
     };
 
-    let stats_after = stats_json(&client, &args.schema, "after").await;
-    let probe_after = probe(&client, &args, "after").await;
+    let observation = RunObservation {
+        community_before: stats_before.community_count,
+        community_after: stats_after
+            .as_ref()
+            .map_or(StatsObservation::Skipped, |stats| stats.community_count),
+        probe_succeeded: probe_before.succeeded
+            + probe_after.as_ref().map_or(0, |probe| probe.succeeded),
+        probe_attempted: probe_before.attempted
+            + probe_after.as_ref().map_or(0, |probe| probe.attempted),
+    };
+    let verdict = evaluate_run(observation);
+    let (verdict_label, verdict_code, verdict_message) = match verdict {
+        RunVerdict::Ok => ("ok", None, None),
+        RunVerdict::Warn(warning) => ("warn", Some(warning.code()), Some(warning.message())),
+        RunVerdict::Fatal(failure) => ("fatal", Some(failure.code()), Some(failure.message())),
+    };
 
     let summary = json!({
         "schema": args.schema,
         "probe_only": args.probe_only,
-        "stats_before": stats_before,
-        "stats_after": stats_after,
+        "stats_before": stats_before.json,
+        "stats_after": stats_after.as_ref().map(|stats| stats.json.clone()),
         "merge": merge_result,
         "merge_elapsed_secs": elapsed_secs,
-        "probe_before": probe_before,
-        "probe_after": probe_after,
+        "probe_before": probe_before.json,
+        "probe_after": probe_after.as_ref().map(|probe| probe.json.clone()),
+        "summary": {
+            "community_count_delta": community_count_delta(
+                observation.community_before,
+                observation.community_after,
+            ),
+            "probe_counts_delta": probe_counts_delta(
+                probe_before.totals,
+                probe_after.as_ref().map(|probe| probe.totals),
+            )
+            .map(ProbeCountsDelta::to_json),
+            "probe_succeeded": observation.probe_succeeded,
+            "probe_attempted": observation.probe_attempted,
+            "verdict": verdict_label,
+            "verdict_code": verdict_code,
+            "verdict_message": verdict_message,
+        },
     });
+    // fail closed でも観測結果は捨てない。判定より先に JSON を出す。
     println!("{}", serde_json::to_string_pretty(&summary)?);
-    Ok(())
+
+    match verdict {
+        RunVerdict::Ok => Ok(()),
+        RunVerdict::Warn(warning) => {
+            tracing::warn!(verdict = warning.code(), "{}", warning.message());
+            Ok(())
+        }
+        RunVerdict::Fatal(failure) => {
+            tracing::error!(verdict = failure.code(), "{}", failure.message());
+            Err(anyhow::anyhow!("{}", failure.message()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -346,5 +680,199 @@ mod tests {
         assert_eq!(counts.manual_section, 2);
         assert_eq!(counts.concept, 1);
         assert_eq!(counts.other, 1);
+    }
+
+    /// probe が全件成功した通常実行（Merge あり）の観測を組み立てるヘルパ。
+    /// 各テストは「何を変えた結果その判定になるか」だけを書きたいので、
+    /// 変えない軸をここに固定する。
+    fn observation(before: StatsObservation, after: StatsObservation) -> RunObservation {
+        RunObservation {
+            community_before: before,
+            community_after: after,
+            probe_succeeded: PROBE_QUERIES.len() * PROBE_MODES.len() * 2,
+            probe_attempted: PROBE_QUERIES.len() * PROBE_MODES.len() * 2,
+        }
+    }
+
+    #[test]
+    fn community_count_delta_needs_both_sides_observed() {
+        assert_eq!(
+            community_count_delta(StatsObservation::Value(0), StatsObservation::Value(42)),
+            Some(42)
+        );
+        // 片側でも観測できていなければ「差分 0」ではなく「比較不能」。
+        assert_eq!(
+            community_count_delta(StatsObservation::Error, StatsObservation::Value(42)),
+            None
+        );
+        assert_eq!(
+            community_count_delta(StatsObservation::Value(42), StatsObservation::Skipped),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_counts_delta_is_none_without_after_side() {
+        let before = ProbeCounts {
+            manual_section: 10,
+            concept: 2,
+            other: 0,
+        };
+        let after = ProbeCounts {
+            manual_section: 7,
+            concept: 2,
+            other: 5,
+        };
+        let delta = probe_counts_delta(before, Some(after)).expect("両側そろえば差分が出る");
+        // community 由来のヒットに top_k を食われて ManualSection が減る、が読み取れること。
+        assert_eq!(delta.manual_section, -3);
+        assert_eq!(delta.concept, 0);
+        assert_eq!(delta.other, 5);
+        assert_eq!(probe_counts_delta(before, None), None);
+    }
+
+    #[test]
+    fn evaluate_run_accepts_community_growth() {
+        let verdict = evaluate_run(observation(
+            StatsObservation::Value(0),
+            StatsObservation::Value(37),
+        ));
+        assert_eq!(verdict, RunVerdict::Ok);
+    }
+
+    #[test]
+    fn evaluate_run_warns_when_community_count_did_not_move() {
+        // グラフ不変の schema への再 Merge では増分 0 が正常。fail にはしない。
+        let verdict = evaluate_run(observation(
+            StatsObservation::Value(37),
+            StatsObservation::Value(37),
+        ));
+        assert_eq!(
+            verdict,
+            RunVerdict::Warn(RunWarning::CommunityCountUnchanged)
+        );
+    }
+
+    #[test]
+    fn evaluate_run_fails_when_no_community_exists_after_merge() {
+        // Merge を実行したのに 0 件＝真の空振り。before の観測状態によらず fail。
+        assert_eq!(
+            evaluate_run(observation(
+                StatsObservation::Value(0),
+                StatsObservation::Value(0)
+            )),
+            RunVerdict::Fatal(RunFailure::NoCommunities)
+        );
+        assert_eq!(
+            evaluate_run(observation(
+                StatsObservation::Error,
+                StatsObservation::Value(0)
+            )),
+            RunVerdict::Fatal(RunFailure::NoCommunities)
+        );
+    }
+
+    #[test]
+    fn evaluate_run_fails_when_stats_unavailable_on_both_sides() {
+        // Merge の成否を一切確認できていない状態を成功として返さない。
+        assert_eq!(
+            evaluate_run(observation(
+                StatsObservation::Error,
+                StatsObservation::Error
+            )),
+            RunVerdict::Fatal(RunFailure::StatsUnavailable)
+        );
+    }
+
+    #[test]
+    fn evaluate_run_warns_when_only_one_side_of_stats_failed() {
+        assert_eq!(
+            evaluate_run(observation(
+                StatsObservation::Error,
+                StatsObservation::Value(37)
+            )),
+            RunVerdict::Warn(RunWarning::StatsPartiallyUnavailable)
+        );
+        assert_eq!(
+            evaluate_run(observation(
+                StatsObservation::Value(37),
+                StatsObservation::Error
+            )),
+            RunVerdict::Warn(RunWarning::StatsPartiallyUnavailable)
+        );
+    }
+
+    #[test]
+    fn evaluate_run_fails_when_every_probe_query_failed() {
+        // stats が正常でも「観測ゼロ」は最優先で fail（B1 の目的は実測 JSON を得ること）。
+        let verdict = evaluate_run(RunObservation {
+            community_before: StatsObservation::Value(0),
+            community_after: StatsObservation::Value(37),
+            probe_succeeded: 0,
+            probe_attempted: PROBE_QUERIES.len() * PROBE_MODES.len() * 2,
+        });
+        assert_eq!(verdict, RunVerdict::Fatal(RunFailure::ProbeAllFailed));
+    }
+
+    #[test]
+    fn evaluate_run_accepts_probe_only_run_without_after_side() {
+        // --probe-only は after を「意図して省略」しただけで、エラーではない。
+        let verdict = evaluate_run(RunObservation {
+            community_before: StatsObservation::Value(37),
+            community_after: StatsObservation::Skipped,
+            probe_succeeded: PROBE_QUERIES.len() * PROBE_MODES.len(),
+            probe_attempted: PROBE_QUERIES.len() * PROBE_MODES.len(),
+        });
+        assert_eq!(verdict, RunVerdict::Ok);
+    }
+
+    #[test]
+    fn evaluate_run_fails_probe_only_run_when_all_probes_failed() {
+        // after のスキップより「観測ゼロ」の方が優先される。
+        let verdict = evaluate_run(RunObservation {
+            community_before: StatsObservation::Value(37),
+            community_after: StatsObservation::Skipped,
+            probe_succeeded: 0,
+            probe_attempted: PROBE_QUERIES.len() * PROBE_MODES.len(),
+        });
+        assert_eq!(verdict, RunVerdict::Fatal(RunFailure::ProbeAllFailed));
+    }
+
+    #[test]
+    fn readiness_json_is_null_when_server_sent_none() {
+        // 「readiness が来ていない」と「全 READY」を読み手が区別できるようにする。
+        assert_eq!(readiness_json(None), Value::Null);
+        assert_eq!(component_readiness_json(None), Value::Null);
+    }
+
+    #[test]
+    fn readiness_json_names_known_states_and_keeps_unknown_numeric() {
+        let readiness = SearchReadiness {
+            local: Some(ComponentReadiness {
+                state: ReadinessState::Ready as i32,
+                reason: String::new(),
+                revision: 7,
+                ready_at_ms: 1_753_000_000_000,
+            }),
+            global: Some(ComponentReadiness {
+                // proto に state が増えても数値を残して握りつぶさない。
+                state: 9999,
+                reason: "unknown to this build".to_string(),
+                revision: 0,
+                ready_at_ms: 0,
+            }),
+            community_summary: None,
+            structural_vectors: None,
+            similar_patterns: None,
+        };
+        let rendered = readiness_json(Some(&readiness));
+        assert_eq!(rendered["local"]["state"], "READINESS_STATE_READY");
+        assert_eq!(rendered["local"]["revision"], 7);
+        assert_eq!(rendered["global"]["state"], "UNKNOWN(9999)");
+        assert_eq!(
+            rendered["global"]["reason"],
+            Value::from("unknown to this build")
+        );
+        assert_eq!(rendered["community_summary"], Value::Null);
     }
 }
