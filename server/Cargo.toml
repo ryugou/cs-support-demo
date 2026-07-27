@@ -82,3 +82,7 @@ path = "src/bin/ingest_products.rs"
 [[bin]]
 name = "ingest_alarmcom"
 path = "src/bin/ingest_alarmcom.rs"
+
+[[bin]]
+name = "merge_schema"
+path = "src/bin/merge_schema.rs"

@@ -3,7 +3,7 @@ use crate::manual::schema_ids::{manual_node_id, KIND_DOC, KIND_PRODUCT, KIND_SEC
 
 /// node_id 内で kind を挟む marker（`{schema}:gen1:{kind}:{key}` の `:{kind}:` 部分）。
 /// Search 結果 id をノード種別で絞る際のリテラル散在を避ける。
-fn kind_marker(kind: &str) -> String {
+pub fn kind_marker(kind: &str) -> String {
     format!(":{kind}:")
 }
 use crate::model::{ManualHit, ManualProductCandidate, ManualSectionView, ProductView};
