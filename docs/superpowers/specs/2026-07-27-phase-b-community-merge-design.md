@@ -104,6 +104,28 @@ Merge の実行と、**その前後の観測**を担う。
 
 `community_count = 198` になった時点でも `global` はまだ `FAILED_PRECONDITION: No community summaries found` を返し、`readiness.global` / `community_summary` は `NOT_READY` のままだった。**`community_count > 0` は「global が使える」ことを意味しない。** global の可否は `readiness` で判断する。
 
+### Merge が完了しない真因: node2vec ジョブが vegapunk 側のジョブタイムアウトを超える
+
+`ListJobs` 診断（`merge-schema-rhnxw`）で取得した `JobInfo.error`:
+
+| job_type | error | status |
+|---|---|---|
+| **node2vec** ×2 | **`job timed out (exceeded job_timeout_secs)`** | failed（`retry_count = 3`） |
+| community_summary | `unavailable: Gemini API request failed: error sending request` | completed（retry 後に成功） |
+| search_evaluation | `storage error: CozoDB script error: database is locked (code 5)` / Gemini エラー | failed / completed |
+
+node2vec ジョブは `created_at` 1785141057698 → `completed_at` 1785142826363 ＝ **約 29.5 分**走ってからタイムアウト判定されている。vegapunk の `worker.job_timeout_secs` の既定は **300 秒**（integration-guide §11）。3 回リトライして同じ理由で失敗し、**Merge 全体が abort** → CommunitySummary 未生成 → `global` 使用不可、という連鎖。
+
+**cs-support 側には打つ手が無い。** Merge の構成要素（Leiden / CommunitySummary / Node2Vec）は選択できず、ジョブのタイムアウトはサーバ設定である。解消には vegapunk 側で次が要る:
+
+- `worker.job_timeout_secs` を実測（約 30 分）より十分大きく上げる。**env 上書きのホワイトリストに含まれる**（integration-guide §11）ので `config.yml` の編集なしで変えられるが、config はホットリロードされないため**プロセス再起動が必要**
+- `worker.job_ttl_secs`（既定 3600 = 1 時間、「ジョブ終端の主条件」）も併せて確認する。node2vec が 1 回 30 分 × リトライで TTL を超えると、timeout を上げても TTL 側で終端する。**こちらは env ホワイトリストに無く `config.yml` 直接編集が必要**
+
+副次的に判明した 2 点（Merge の blocker ではないが記録する）:
+
+- vegapunk の LLM バックエンド（Gemini）が断続的に `error sending request` を返している。community_summary / search_evaluation がリトライで吸収しているが、Merge の所要時間を押し上げる
+- `search_evaluation` が `CozoDB: database is locked` で失敗している。Search の副作用として非同期 enqueue される検索品質採点ジョブ（integration-guide §5.4）で、書き込み競合が起きている
+
 ### Merge 実行中は本番検索のレイテンシが悪化する
 
 probe 1 件あたりの所要が Merge 前 約 5 秒 → Merge 走行中 30〜60 秒に伸びた。`search_manual` は Merge 中も落ちないが遅くなる。**Merge を定期実行する運用にするなら、業務時間外に回すか、遅延を許容できるかを先に決める。**
