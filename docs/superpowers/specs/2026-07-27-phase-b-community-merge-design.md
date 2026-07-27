@@ -88,6 +88,26 @@ Merge の実行と、**その前後の観測**を担う。
 - VPC connector / service account / Secret Manager injection は既存 `ingest-alarmcom` job と同設定
 - `CLAUDE.md` の Cloud Run 節に job 追加と再デプロイ時の tag 揃えを追記する
 
+## B1 実行で判明した事実（2026-07-27 実測。以後の運用判断はこれを前提にする）
+
+### h2 keepalive が正常な Merge を 40 秒で殺す
+
+初回の実 Merge（`merge-schema-k2pc4`）は **40 秒**で `status: Unavailable, message: "http2 error" ... keep-alive timed out` で落ちた。40 秒 = `http2_keep_alive_interval(30s)` + `keep_alive_timeout(10s)`。**Merge の失敗ではなくクライアント側の切断**で、Merge は同期実行のためサーバが h2 PING に応答できないことが原因。
+
+対処: `GrpcLimits` に keepalive の調整口を足し、`merge_schema` CLI だけ h2 keepalive を無効化した。常駐サーバの keepalive（アイドル後の死んだ接続を掴む事象への対策）は変えない。トレードオフとして、接続が本当に死んだ場合の検知は TCP keepalive（Linux 既定で約 12 分）と per-request timeout（6h）だけになる。
+
+### クライアントが切れてもサーバ側 Merge は継続する
+
+切断の 18 分後に `--probe-only` で観測したところ、`community_count` は **0 → 198**、`node_count` 5971 → 6280、`edge_count` 18549 → 24638 に増えていた。**Merge の再実行は不要**で、走行中の再実行は `FAILED_PRECONDITION`（同時 1 本）になる。接続断を見たら必ず `--probe-only` で `community_count` を確認してから判断する。
+
+### Leiden クラスタリングと CommunitySummary は別タイミングで揃う
+
+`community_count = 198` になった時点でも `global` はまだ `FAILED_PRECONDITION: No community summaries found` を返し、`readiness.global` / `community_summary` は `NOT_READY` のままだった。**`community_count > 0` は「global が使える」ことを意味しない。** global の可否は `readiness` で判断する。
+
+### Merge 実行中は本番検索のレイテンシが悪化する
+
+probe 1 件あたりの所要が Merge 前 約 5 秒 → Merge 走行中 30〜60 秒に伸びた。`search_manual` は Merge 中も落ちないが遅くなる。**Merge を定期実行する運用にするなら、業務時間外に回すか、遅延を許容できるかを先に決める。**
+
 ## B1 実測 JSON の判読手順（この順で読む。順序を守らないと誤読する）
 
 1. `summary.verdict` と `verdict_code` を見る。`fatal` なら以降の数値は信用しない
