@@ -71,7 +71,8 @@ Merge の実行と、**その前後の観測**を担う。
   6. before / after を並べたサマリを 1 箇所に出す（community_count の増分、probe の分類件数の差）
 - **probe の定義**（B2 の分岐を決める実測）:
   - 固定の日本語クエリを数件（マニュアル横断で答えが散っていそうな問い合わせ文。ソースにコメントで選定理由を残す）
-  - 各クエリを `mode=hybrid` と `mode=global` の両方で叩く
+  - 各クエリを `mode=local` / `mode=hybrid` / `mode=global` の 3 つで叩く（`local` は Merge の影響を受けない**基準線**。hybrid の変化が Merge 由来か probe の揺らぎかを切り分けるために要る）
+  - **前後の差分は `(query, mode)` ペア単位で取り、mode 別に出す**。Merge 前の `global` は正常に失敗するため、mode を横断合算すると「Merge の効果」ではなく「probe が何本通ったか」を映した値になる。比較可能ペアが無い mode は `null`、各 mode の delta には母数 `compared_pairs` を併記する。probe の合算値は母数が読み取れるキー名（`totals_of_succeeded_probes`）で出す
   - 返った `SearchResultItem` を **`type` / node_id の kind marker / score** で分類して JSON 出力する。少なくとも「ManualSection の node_id を持つ件数」「それ以外（community summary 等）の件数と、その `type` と id の形」が読み取れること
   - `SearchExecution`（requested / effective / degraded / degradations / readiness）も併せて出す
   - `mode=global` は Merge 前に `FAILED_PRECONDITION` を返すのが正常。**probe はこれで落ちず、記録して次のクエリへ進む**（Merge 前後の差分を取るのが目的のため）
@@ -86,6 +87,20 @@ Merge の実行と、**その前後の観測**を担う。
 - `--task-timeout` を Merge の想定所要時間より十分長く取る
 - VPC connector / service account / Secret Manager injection は既存 `ingest-alarmcom` job と同設定
 - `CLAUDE.md` の Cloud Run 節に job 追加と再デプロイ時の tag 揃えを追記する
+
+## B1 実測 JSON の判読手順（この順で読む。順序を守らないと誤読する）
+
+1. `summary.verdict` と `verdict_code` を見る。`fatal` なら以降の数値は信用しない
+2. `stats_before.community_count` → `stats_after.community_count` と `summary.community_count_delta` を見る。Merge が実際に何を作ったかの一次証跡
+3. **`probe_after.entries[].execution` の `degraded` / `effective_mode` / `readiness.global` / `readiness.community_summary` を先に確認する**。`hybrid` は Merge 未実行でも local へ degrade して「成功」扱いになるため、after 側 hybrid が degrade したままだと `probe_counts_delta.hybrid` はほぼ 0 になる。これを「community item に top_k を食われない ＝ hybrid 切替は安全」と読むのが**最も危険な誤読**（真相は「hybrid が一度も本来の形で動いていない」）
+4. そのうえで `summary.probe_counts_delta` を mode 別に読む。`local` は基準線（Merge 非感受）、`hybrid` が本命、`global` は初回実行では `null`（Merge 前に比較可能ペアが無いため）
+5. B2 の分岐は `probe_after.entries[].samples[].id` を見て決める。ManualSection の node_id が返っているなら hybrid 切替で別記事 join が成立し、返っていないなら `MENTIONS_CONCEPT` の自前 concept-expansion が要る
+
+### B2 で merge_schema を触るときに片付ける（B1 の実行結果には影響しない）
+
+- 各 mode の delta に `degraded_pairs`（片側でも degraded だったペア数）を併記し、上記 3 の確認を summary だけで完結できるようにする
+- `probe_grid_and_mode_list_stay_aligned` テストが恒真式（`(a*b) % b == 0`）で、probe ループの順序変更を検出できない。グリッド生成を純関数に切り出して index → mode の写像を assert する
+- 比較可能ペアが全 mode で 0 のとき `probe_counts_delta` 全体が `null` になり mode キーが消える。「測っていない」と「キー名を間違えた」を区別させる方針と逆なので、`{"local":null,...}` を返す形に揃える
 
 ## B2（実測後に本 spec へ追記して着手する）
 
