@@ -3,9 +3,9 @@ use crate::{
     proto::graphrag::{
         create_schema_request, graph_rag_engine_client::GraphRagEngineClient, AttributeFilter,
         CreateSchemaRequest, Edge, EdgeTraversal, EmbedRequest, GetGraphSnapshotRequest,
-        GetSchemaRequest, Node, NodeAttribute, QueryNodesRequest, SearchRequest,
-        UpdateSchemaRequest, UpsertEdgesRequest, UpsertNodesRequest, UpsertVectorsRequest,
-        VectorEntry,
+        GetSchemaRequest, GetStatsRequest, GetStatsResponse, MergeRequest, Node, NodeAttribute,
+        QueryNodesRequest, SearchRequest, UpdateSchemaRequest, UpsertEdgesRequest,
+        UpsertNodesRequest, UpsertVectorsRequest, VectorEntry,
     },
 };
 use anyhow::{Context, Result};
@@ -573,6 +573,47 @@ impl VegapunkClient {
         .context("search")
     }
 
+    /// Leiden コミュニティ検出 + CommunitySummary 生成 + Node2Vec を schema 全体に対して
+    /// 実行する（vegapunk `Merge` RPC）。**admin ロール必須・同期実行・同一 schema で同時 1 本のみ。**
+    /// 応答は空（`MergeResponse {}`）で進捗もジョブ ID も返らないため、成否の確認は
+    /// `stats()` の `community_count` で行う。10 万ノード規模では長時間化するので、
+    /// 呼び出し側は `GrpcLimits.timeout_secs` を十分長く張り替えてから使うこと。
+    pub async fn merge(&self, schema: &str) -> Result<()> {
+        let req = MergeRequest {
+            schema: schema.to_string(),
+        };
+        self.call(
+            |mut client, request| async move {
+                client.merge(request).await.map(|resp| resp.into_inner())
+            },
+            req,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| annotate_grpc_error(err, &format!("merge schema {schema}")))
+    }
+
+    /// schema のノード / エッジ / ベクトル / コミュニティ件数。`community_count` は
+    /// Merge を実行したかどうかの一次証跡になる（Merge 前は 0 のはず）。
+    pub async fn stats(&self, schema: &str) -> Result<GetStatsResponse> {
+        let req = GetStatsRequest {
+            schema: Some(schema.to_string()),
+            node_type: None,
+            filters: Vec::new(),
+        };
+        self.call(
+            |mut client, request| async move {
+                client
+                    .get_stats(request)
+                    .await
+                    .map(|resp| resp.into_inner())
+            },
+            req,
+        )
+        .await
+        .map_err(|err| annotate_grpc_error(err, &format!("get stats for schema {schema}")))
+    }
+
     async fn call<T, F, Fut, R>(&self, f: F, body: T) -> Result<R>
     where
         F: FnOnce(GraphRagEngineClient<Channel>, Request<T>) -> Fut,
@@ -591,6 +632,38 @@ impl VegapunkClient {
 /// 存在しうるため継続する。境界を誤ると早期終了（取りこぼし）か無限ループを招く。
 fn page_is_last(returned: usize, page_size: usize) -> bool {
     returned < page_size
+}
+
+/// gRPC の status code を、運用者が次のアクションを判断できる文言に写像する。
+/// 分類できない code は `None` を返し、元の `Status` の message をそのまま見せる
+/// （当てずっぽうの説明を足して原因を誤誘導しない）。
+pub fn merge_error_hint(code: Code) -> Option<&'static str> {
+    match code {
+        Code::FailedPrecondition => Some(
+            "同一 schema で Merge が同時実行中か、サーバ側の前提未達（embedding / LLM 設定等）。\
+             実行中なら完了を待つ。リトライでは解決しない",
+        ),
+        Code::PermissionDenied => {
+            Some("Merge は admin ロール必須。使用中の bearer token の権限を確認する")
+        }
+        Code::DeadlineExceeded => Some(
+            "クライアント側 timeout。--timeout-secs を引き上げる。\
+             サーバ側では Merge が継続している可能性があるため、再実行前に stats の community_count を確認する",
+        ),
+        _ => None,
+    }
+}
+
+/// `call` が返す anyhow エラーに、gRPC code 由来の運用ヒントを付ける。
+/// `call` は `tonic::Status` を `Into` で anyhow 化しているので downcast で code を取り出す。
+fn annotate_grpc_error(err: anyhow::Error, context: &str) -> anyhow::Error {
+    let hint = err
+        .downcast_ref::<tonic::Status>()
+        .and_then(|status| merge_error_hint(status.code()));
+    match hint {
+        Some(hint) => err.context(format!("{context}: {hint}")),
+        None => err.context(context.to_string()),
+    }
 }
 
 /// offset ページングの完全性判定: 収集件数 `collected` が backend 申告の `total_count`
@@ -631,7 +704,21 @@ fn to_proto_edge(edge: GraphEdge) -> Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_is_last, pagination_is_complete};
+    use super::{merge_error_hint, page_is_last, pagination_is_complete};
+    use tonic::Code;
+
+    #[test]
+    fn merge_error_hint_maps_operational_codes() {
+        // 運用者が「次に何をすればよいか」を判断できる文言であること。
+        let precondition = merge_error_hint(Code::FailedPrecondition).expect("hint");
+        assert!(precondition.contains("同時実行"));
+        let denied = merge_error_hint(Code::PermissionDenied).expect("hint");
+        assert!(denied.contains("admin"));
+        let deadline = merge_error_hint(Code::DeadlineExceeded).expect("hint");
+        assert!(deadline.contains("--timeout-secs"));
+        // 未分類の code はヒント無し（元の Status をそのまま見せる）
+        assert!(merge_error_hint(Code::Internal).is_none());
+    }
 
     #[test]
     fn page_is_last_is_true_only_when_returned_below_page_size() {
