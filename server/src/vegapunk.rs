@@ -698,8 +698,13 @@ impl VegapunkClient {
     /// 同期 RPC」が失敗したとき、失敗の具体的な理由（サーバ側でどのジョブがどう落ちたか）を
     /// 得る唯一の経路として使う。
     ///
-    /// `status` は proto コメントが `"pending" | "running" | "completed" | "dead_letter"` を
-    /// 挙げているが、vegapunk 側の有効値をここで断定しない（`None` = フィルタ無し、全件）。
+    /// `status` の有効値は `"pending" | "running" | "completed" | "failed"`（vegapunk 側に
+    /// 2026-07-27 に確認済み。proto / 統合仕様書 / 実装の 3 つで一貫している）。かつて
+    /// vendor 済み proto のコメントだけが `"dead_letter"` を挙げていたが、それは**こちらの
+    /// コピーが古かった**もので、vegapunk 側の不整合ではない。
+    ///
+    /// それでも既定は `None`（フィルタ無し、全件）にしている。診断用途では「失敗ジョブが
+    /// 1 件も無い」ことと「フィルタ値を間違えて 0 件だった」ことを取り違えたくないため。
     /// `until_ms` / `offset` / `job_type` は現状の呼び出し元（`merge_schema` CLI）が
     /// 使わないため引数を増やさない。必要になったら追加する。
     ///

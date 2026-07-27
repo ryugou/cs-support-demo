@@ -186,7 +186,9 @@ Cloud Run job から `Merge(schema="urtect")` を 2 回実行しました。時�
 
 `Merge` の失敗メッセージに、失敗ジョブの `error` 文字列（今回なら `job timed out (exceeded job_timeout_secs)`）を含めていただけると、運用者が一次情報だけで次のアクションを判断できるようになります。
 
-あわせて 1 点、`ListJobs` の `status` フィルタの有効値について確認させてください。proto のコメントは `"pending" | "running" | "completed" | "dead_letter"` を挙げていますが、統合仕様書 §4.4 は `ListJobs(status="failed")` と書いており、実際に返ってきた `JobInfo.status` は `"failed"` でした。**どれが正なのか**が分からなかったため、こちらは status フィルタ無し（全件取得）で実装しています。
+> **【取り下げ済み・2026-07-27】** 当初この節で「`ListJobs` の `status` の有効値が proto コメント（`dead_letter`）と統合仕様書（`failed`）で食い違っている」と質問しましたが、**これはこちらの誤解でした**。ご指摘のとおり proto（`proto/graphrag.proto:658`）・統合仕様書（`:263`）・実装（`src/worker/queue.rs:17-30`）の 3 つはいずれも `"pending" | "running" | "completed" | "failed"` で一貫しています。`dead_letter` が残っていたのは**当方がリポジトリに vendor している proto のコピー**（`server/proto/graphrag.proto`）だけで、そちらに不整合はありません。混乱させてしまい失礼しました。当方のコピーは修正済みです。
+>
+> あわせて、**vendor 済み proto が古かったこと自体**を当方の課題として持ち帰ります（この proto から gRPC クライアントを生成しているため、他のメッセージにも drift がある可能性があります）。最新の proto との突き合わせを別途行います。
 
 ### E. 【共有のみ】副次的に観測された 2 件
 

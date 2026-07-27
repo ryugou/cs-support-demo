@@ -651,7 +651,7 @@ message MaintenanceModeResponse {
 // ── ListJobs ─────────────────────────────────────────────────────────────
 
 message ListJobsRequest {
-  optional string status = 1;      // "pending" | "running" | "completed" | "dead_letter". empty = all
+  optional string status = 1;      // "pending" | "running" | "completed" | "failed". empty = all
   optional int64 since_ms = 2;     // epoch ms. unset = no lower bound
   optional int64 until_ms = 3;     // epoch ms. unset = no upper bound
   optional int32 offset = 4;       // default 0
