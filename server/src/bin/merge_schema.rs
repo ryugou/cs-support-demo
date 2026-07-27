@@ -19,11 +19,17 @@ use cs_support_mcp::{
         retrieval::kind_marker,
         schema_ids::{KIND_CONCEPT, KIND_SECTION},
     },
-    proto::graphrag::{ComponentReadiness, ReadinessState, SearchReadiness},
+    proto::graphrag::{
+        ComponentReadiness, JobInfo, ListJobsResponse, ReadinessState, SearchReadiness,
+    },
     vegapunk::{GrpcLimits, VegapunkClient},
 };
 use serde_json::{json, Map, Value};
-use std::{env, fs, path::PathBuf, time::Instant};
+use std::{
+    env, fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 /// probe に使う日本語クエリ。**複数記事にまたがって答えが散る問い合わせ**を選ぶ
 /// （single article で閉じるクエリだと、community 由来のヒットが出ても差が見えない）。
@@ -67,6 +73,24 @@ struct Args {
     /// probe の top-k。
     #[arg(long, default_value_t = 10)]
     top_k: i32,
+    /// Merge 失敗時・`--probe-only` 時に `ListJobs` で取得する直近ジョブの件数上限。
+    /// vegapunk 側の上限（proto コメント: max 500）に合わせて検証する。
+    #[arg(long, default_value_t = 50)]
+    jobs_limit: i32,
+    /// `ListJobs` を絞る時間窓（時間単位、既定 24）。`ListJobs` は schema を絞る手段が
+    /// proto に無く cross-schema・job_type 無フィルタで返るため、窓を切って「見た期間」を
+    /// 明示できるようにする。
+    ///
+    /// **窓を狭めても `--jobs-limit` の打ち切りは減らない。** `ListJobs` は `created_at DESC`
+    /// でソートしてから `limit` を適用するので、目的のジョブを押し出せるのは**それより新しい
+    /// ジョブだけ**であり、下限（`since_ms`）を上げても新しい側の競合は 1 件も減らない。
+    /// 打ち切りが起きたかどうかは `recent_jobs` の `total_count` と `jobs` の長さの比較で見る。
+    ///
+    /// `0` を指定すると窓なし（全期間）。**インシデントから既定の 24 時間以上が経っている
+    /// 場合は `0` か経過時間より大きい値を指定すること**（既定のままだと目的のジョブが窓外に
+    /// 落ち、`jobs` が空なのを「失敗ジョブは無い」と誤読する）。
+    #[arg(long, default_value_t = 24)]
+    jobs_since_hours: u64,
 }
 
 /// probe で返ったヒットの種別。B2 の分岐はこの内訳だけで決まる。
@@ -811,6 +835,214 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcom
     ProbeOutcome { json, per_probe }
 }
 
+/// 診断優先度の 2 段キー。第 1 キー: `error` が非空か（非空が最優先）。第 2 キー:
+/// `status` が `completed` 以外か（`completed` 以外が次点）。タプルは辞書式に比較されるため、
+/// このタプルの昇順ソートがそのまま 2 段階の優先順位になる（`false < true`）。
+///
+/// 1 段キー（「error 非空 OR status != completed」を 1 bit に潰す）だと、他 schema で
+/// ingest が並走しているときの running/pending ジョブ（error 無し）が、より古い
+/// dead_letter（error あり）と同じ優先度タイルに入る。安定ソートはタイル内で
+/// `created_at DESC` を保つため、新しい running ジョブが古い dead_letter より先頭に来て
+/// しまい、本当に見るべき失敗ジョブが埋もれる。error の有無を独立した第 1 キーにすることで
+/// この事故を防ぐ。
+fn diagnostic_priority(job: &JobInfo) -> (bool, bool) {
+    let has_error = job.error.as_deref().is_some_and(|error| !error.is_empty());
+    (!has_error, job.status == "completed")
+}
+
+/// `ListJobs` が返した順（vegapunk 申告: `created_at` DESC）を保ったまま、診断で先に
+/// 見るべきジョブを先頭に寄せる。[`diagnostic_priority`] の 2 段キーでグループを作り、
+/// `Vec::sort_by_key` の安定性でグループ内の順序（= created_at DESC）を保つ。
+fn sort_jobs_diagnostic_first(mut jobs: Vec<JobInfo>) -> Vec<JobInfo> {
+    jobs.sort_by_key(diagnostic_priority);
+    jobs
+}
+
+/// 出力 JSON に載せる `JobInfo` の射影。`msg_id` は運用者が Merge 失敗の原因特定に使う
+/// 情報（job_id / job_type / status / error / created_at / completed_at / retry_count）に
+/// 含まれないため意図して落とす。
+fn job_info_json(job: &JobInfo) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "job_type": job.job_type,
+        "status": job.status,
+        "error": job.error,
+        "created_at": job.created_at,
+        "completed_at": job.completed_at,
+        "retry_count": job.retry_count,
+    })
+}
+
+/// ログに個別出力する失敗ジョブの上限。`--probe-only` は日常的な観測コマンドなので、
+/// 実行のたびに過去の dead_letter ジョブ（最大 `--jobs-limit` 件、既定 50・上限 500）が
+/// 丸ごと ERROR ログへ出ると Cloud Run のエラー集計を汚し、「今回の失敗」と
+/// 「以前から残っている失敗」の区別が付かなくなる。先頭 5 件だけ個別に出し、
+/// 残りは件数のサマリ行にする。
+const FAILED_JOB_LOG_LIMIT: usize = 5;
+
+/// `jobs` から「error が非空」なものだけを抜き出し、ログに個別出力する先頭
+/// [`FAILED_JOB_LOG_LIMIT`] 件と、そこから溢れた残数に分ける。ログ出力そのもの
+/// （`tracing::warn!` / `tracing::error!`）と分離することで、5 件キャップと残数計算を
+/// トレーシング基盤なしに単体テストできる。
+fn split_failed_jobs_for_logging(jobs: &[JobInfo]) -> (Vec<&JobInfo>, usize) {
+    let failed: Vec<&JobInfo> = jobs
+        .iter()
+        .filter(|job| job.error.as_deref().is_some_and(|error| !error.is_empty()))
+        .collect();
+    let remaining = failed.len().saturating_sub(FAILED_JOB_LOG_LIMIT);
+    let head = failed.into_iter().take(FAILED_JOB_LOG_LIMIT).collect();
+    (head, remaining)
+}
+
+/// 失敗ジョブ（`error` が非空）をログに出す。`routine` が `true`（`--probe-only`、日常観測）
+/// なら `warn!`、`false`（Merge 失敗直後の診断）なら従来どおり `error!` にする。
+/// 先頭 [`FAILED_JOB_LOG_LIMIT`] 件だけ個別に出し、残りは件数だけのサマリ行にする。
+fn log_failed_jobs(jobs: &[JobInfo], routine: bool) {
+    let (head, remaining) = split_failed_jobs_for_logging(jobs);
+    for job in &head {
+        let error = job.error.as_deref().unwrap_or_default();
+        if routine {
+            tracing::warn!(job_id = %job.job_id, error = %error, "vegapunk job reported an error");
+        } else {
+            tracing::error!(job_id = %job.job_id, error = %error, "vegapunk job reported an error");
+        }
+    }
+    if remaining > 0 {
+        if routine {
+            tracing::warn!(
+                remaining,
+                "... and {remaining} more failed jobs; see recent_jobs in the summary JSON"
+            );
+        } else {
+            tracing::error!(
+                remaining,
+                "... and {remaining} more failed jobs; see recent_jobs in the summary JSON"
+            );
+        }
+    }
+}
+
+/// `list_jobs` の `Result` から `recent_jobs` フィールドの中身（JSON オブジェクト）を組み立てる。
+/// 経路（成功 / RPC 失敗 / タイムアウト）によらず**同じキー集合**を返す — この CLI の規約
+/// （`merge_report_json_keeps_the_same_shape_on_every_path` と同じ）に、この関数追加時点では
+/// `recent_jobs` だけが違反していた（成功時は配列、失敗時はオブジェクト）ため揃える:
+///
+/// - 成功時: `{"jobs": [...], "error": null, "total_count": N, "since_ms": <適用した窓 or null>}`
+/// - 失敗時（RPC エラー・タイムアウトとも同じ形）:
+///   `{"jobs": [], "error": "...", "total_count": null, "since_ms": <適用した窓 or null>}`
+///
+/// `total_count`（post-filter・pre-pagination の全件数）を残すのは、「`jobs`（`limit` 件で
+/// 打ち切り）に収まりきらなかった件数がどれだけあるか」を見るため。**ただし `ListJobs` は
+/// schema を絞る手段が proto に無く cross-schema・job_type 無フィルタのままなので、
+/// `total_count` は「その時間窓に入った全 schema のジョブ数」であり、「目的のジョブが
+/// 窓外に落ちたか」までは分からない**（それを見分けるには対象 schema 専用の絞り込みが要る
+/// が proto に無い）。`since_ms` を時間窓として渡すことで、少なくとも「どの期間を見て
+/// どの期間を見ていないか」は summary JSON だけで分かるようにする（呼び出し元の
+/// `--jobs-since-hours`、既定 24h・`0` で窓なし）。
+///
+/// `routine` は呼び出し文脈（`true` = `--probe-only` の日常観測、`false` = Merge 失敗直後の
+/// 診断）。成功時は失敗ジョブのログレベル（[`log_failed_jobs`] 参照）、失敗時は
+/// `list_jobs` 自体の失敗ログのレベルを、どちらもこのフラグで切り替える。`--probe-only` は
+/// 毎回の日常観測なので `list_jobs` の失敗（権限不足・タイムアウト等）を `warn!` に留め、
+/// Merge 失敗直後の診断では引き続き `error!` にする。
+fn recent_jobs_value(
+    result: Result<ListJobsResponse>,
+    since_ms: Option<i64>,
+    routine: bool,
+) -> Value {
+    match result {
+        Ok(resp) => {
+            let jobs = sort_jobs_diagnostic_first(resp.jobs);
+            log_failed_jobs(&jobs, routine);
+            json!({
+                "jobs": Value::Array(jobs.iter().map(job_info_json).collect()),
+                "error": null,
+                "total_count": resp.total_count,
+                "since_ms": since_ms,
+            })
+        }
+        Err(err) => {
+            let error = format!("{err:#}");
+            if routine {
+                tracing::warn!(
+                    error = %error,
+                    "list_jobs failed; recent_jobs diagnostics unavailable"
+                );
+            } else {
+                tracing::error!(
+                    error = %error,
+                    "list_jobs failed; recent_jobs diagnostics unavailable"
+                );
+            }
+            json!({
+                "jobs": [],
+                "error": error,
+                "total_count": null,
+                "since_ms": since_ms,
+            })
+        }
+    }
+}
+
+/// `--jobs-since-hours` を `ListJobs.since_ms` の下限（epoch ms）に変換する純関数。
+/// `jobs_since_hours == 0` は「窓なし」（`None` = 全期間、旧来の挙動）。
+/// `now_ms` を引数として受け取ることで、`SystemTime::now()` をこの判定ロジックに
+/// 埋め込まずに済み、決定論的にテストできる（呼び出し元は [`now_epoch_ms`] を渡す）。
+fn since_ms_from_hours(jobs_since_hours: u64, now_ms: i64) -> Option<i64> {
+    if jobs_since_hours == 0 {
+        return None;
+    }
+    const MS_PER_HOUR: i64 = 3_600_000;
+    let window_ms = i64::try_from(jobs_since_hours)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(MS_PER_HOUR);
+    Some(now_ms.saturating_sub(window_ms))
+}
+
+/// 現在時刻を epoch ms で返す薄いラッパ。`SystemTime::now()` の評価をここ 1 箇所に閉じ、
+/// 判定ロジック（[`since_ms_from_hours`]）を純関数のまま保つ。
+fn now_epoch_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// `recent_jobs` フィールドの中身を組み立てる。Merge 失敗時・`--probe-only` 時にだけ呼ぶ
+/// （呼び出し側の判断）。`list_jobs` 自体が失敗しても Merge の判定・exit code は変えない
+/// ため、ここでは `Result` を返さず [`recent_jobs_value`] の失敗形に畳んで続行する
+/// （診断が取れないことを黙って隠さない）。
+///
+/// `list_jobs` 呼び出しには `merge_cli_limits` の per-request timeout（既定 6h）とは独立に
+/// 60 秒の上限を設ける。`list_jobs` は本来ミリ秒級の read で、6h を継承すると
+/// 「診断呼び出しがサーバ無応答で最長 6 時間ブロックし、summary JSON も verdict も
+/// exit code も出ないまま job の task-timeout に食われる」事故になる
+/// （Merge が既に失敗している経路で、取得済みの stats_before / probe_before ごと
+/// 全観測を失う）。
+async fn recent_jobs_json(
+    client: &VegapunkClient,
+    limit: i32,
+    since_ms: Option<i64>,
+    routine: bool,
+) -> Value {
+    const LIST_JOBS_TIMEOUT: Duration = Duration::from_secs(60);
+    let result = match tokio::time::timeout(
+        LIST_JOBS_TIMEOUT,
+        client.list_jobs(None, since_ms, limit),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "list_jobs timed out after {}s (this diagnostic call is bounded independently of \
+             --timeout-secs / merge_cli_limits' long Merge timeout; vegapunk did not respond in time)",
+            LIST_JOBS_TIMEOUT.as_secs()
+        )),
+    };
+    recent_jobs_value(result, since_ms, routine)
+}
+
 /// この CLI 専用の gRPC 上限。**h2 PING keepalive を無効にする**のがここの本質。
 ///
 /// なぜ無効にするか: Merge は schema 全体の同期再計算（Leiden + LLM 要約 + Node2Vec）で、
@@ -843,6 +1075,11 @@ fn merge_cli_limits(timeout_secs: u64) -> GrpcLimits {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    anyhow::ensure!(
+        (1..=500).contains(&args.jobs_limit),
+        "--jobs-limit must be in 1..=500 (vegapunk ListJobs upper bound), got {}",
+        args.jobs_limit
+    );
     let token = read_token(&args)?;
     let limits = merge_cli_limits(args.timeout_secs);
     let client = VegapunkClient::connect_with_limits(&args.endpoint, &token, limits)
@@ -852,17 +1089,27 @@ async fn main() -> Result<()> {
     let stats_before = stats_json(&client, &args.schema, "before").await;
     let probe_before = probe(&client, &args, "before").await;
 
+    // `ListJobs` に適用する時間窓。呼び出し直前ではなく実行開始時点の 1 回だけ評価する
+    // （Merge 自体が長時間かかるため、診断時に「now」を取り直すと窓の意味がぶれる）。
+    let jobs_since_ms = since_ms_from_hours(args.jobs_since_hours, now_epoch_ms());
+
     // after 側（stats + probe）を取るかどうかは Merge の結果と一体。判断を 1 箇所に閉じ、
     // `--probe-only` や Merge 失敗時に after を観測してしまう分岐漏れを防ぐ。
     // **出力 JSON の形はどのパスでも同じにする**（後段ツールが `.summary.verdict` を読むときに
     // パスによってスキーマが変わらないようにする。以前は Merge 失敗の早期 return が
     // 別スキーマの JSON を出しており、`stats_after` 等が丸ごと欠落していた）。
-    let (merge_report, stats_after, probe_after) = if args.probe_only {
+    // recent_jobs は Merge 失敗時・--probe-only 時にだけ取得する（診断が要る場面に限る）。
+    // Merge が成功した通常実行では取得せず null にする（`stats_after` 等と同じ
+    // 「経路で JSON の形は揃えるが、値は意図して null にする」規約）。
+    let (merge_report, stats_after, probe_after, recent_jobs) = if args.probe_only {
         // Merge だけでなく after 側の観測もまとめてスキップする。同一条件の probe を
         // 2 周させても本番 vegapunk に無駄な負荷をかけるだけで、JSON の読み手には
         // 「before/after に差がある」と誤読させる材料にしかならない。
         tracing::info!("--probe-only: skipping Merge and the after-side observation");
-        (MergeReport::skipped(), None, None)
+        // routine = true: --probe-only は日常的な観測コマンドなので、失敗ジョブは warn に
+        // 留める（recent_jobs_json 参照）。
+        let recent_jobs = recent_jobs_json(&client, args.jobs_limit, jobs_since_ms, true).await;
+        (MergeReport::skipped(), None, None, Some(recent_jobs))
     } else {
         tracing::info!(schema = %args.schema, "starting Merge (synchronous, whole-schema recompute)");
         let started = Instant::now();
@@ -877,15 +1124,24 @@ async fn main() -> Result<()> {
                     MergeReport::ok(elapsed),
                     Some(stats_after),
                     Some(probe_after),
+                    None,
                 )
             }
             Err(err) => {
-                // after 側は意図して観測しない。FAILED_PRECONDITION は「同一 schema で
-                // Merge が同時実行中」の可能性があり、失敗直後に追い打ちで stats/probe を
-                // 叩くのはノイズにしかならない。JSON のスキーマは成功パスと揃え、
-                // after 側は null（意図した省略）で表す。
+                // after 側の stats/probe は意図して観測しない（FAILED_PRECONDITION は
+                // 「同一 schema で Merge が同時実行中」の可能性があり、失敗直後に追い打ちで
+                // 叩くのはノイズにしかならない）。一方 recent_jobs は「なぜ落ちたか」を知る
+                // 唯一の経路なので、こちらは取得する。
                 tracing::error!(error = %format!("{err:#}"), elapsed_secs = elapsed, "Merge failed");
-                (MergeReport::failed(err, elapsed), None, None)
+                // routine = false: Merge 失敗直後の診断なので、失敗ジョブは error のままにする。
+                let recent_jobs =
+                    recent_jobs_json(&client, args.jobs_limit, jobs_since_ms, false).await;
+                (
+                    MergeReport::failed(err, elapsed),
+                    None,
+                    None,
+                    Some(recent_jobs),
+                )
             }
         }
     };
@@ -924,6 +1180,9 @@ async fn main() -> Result<()> {
         "merge_elapsed_secs": merge_report.elapsed_secs,
         "probe_before": probe_before.json,
         "probe_after": probe_after.as_ref().map(|probe| probe.json.clone()),
+        // Merge 失敗時・--probe-only 時にだけ取得する診断情報（vegapunk ListJobs）。
+        // 通常の Merge 成功パスでは null（意図した省略。取得失敗ではない）。
+        "recent_jobs": recent_jobs,
         "summary": {
             "community_count_delta": community_count_delta(
                 observation.community_before,
@@ -1598,5 +1857,309 @@ mod tests {
             Value::from("unknown to this build")
         );
         assert_eq!(rendered["community_summary"], Value::Null);
+    }
+
+    /// テスト用の `JobInfo` 組み立てヘルパ。`msg_id` は診断出力（`job_info_json`）に
+    /// 使わない固定値で埋め、テストの意図（status / error / 並び順）を読みやすくする。
+    fn job_info(
+        job_id: &str,
+        status: &str,
+        error: Option<&str>,
+        created_at: i64,
+        completed_at: Option<i64>,
+        retry_count: i32,
+    ) -> JobInfo {
+        JobInfo {
+            job_id: job_id.to_string(),
+            job_type: "merge".to_string(),
+            status: status.to_string(),
+            error: error.map(str::to_string),
+            created_at,
+            completed_at,
+            msg_id: Some("msg-1".to_string()),
+            retry_count,
+        }
+    }
+
+    #[test]
+    fn diagnostic_priority_ranks_error_above_non_completed_above_completed() {
+        let has_error =
+            diagnostic_priority(&job_info("j1", "completed", Some("boom"), 1, Some(2), 0));
+        let non_completed_no_error =
+            diagnostic_priority(&job_info("j2", "running", None, 1, None, 0));
+        let dead_letter_no_error =
+            diagnostic_priority(&job_info("j3", "dead_letter", None, 1, None, 3));
+        let completed_no_error =
+            diagnostic_priority(&job_info("j4", "completed", None, 1, Some(2), 0));
+        let empty_error_completed =
+            diagnostic_priority(&job_info("j5", "completed", Some(""), 1, Some(2), 0));
+
+        assert!(
+            has_error < non_completed_no_error,
+            "error 非空が最優先（第 1 キー）: {has_error:?} vs {non_completed_no_error:?}"
+        );
+        assert!(
+            non_completed_no_error < completed_no_error,
+            "status != completed が次点（第 2 キー）: {non_completed_no_error:?} vs {completed_no_error:?}"
+        );
+        assert_eq!(
+            non_completed_no_error, dead_letter_no_error,
+            "completed 以外はどの status でも同じ優先度: {non_completed_no_error:?} vs {dead_letter_no_error:?}"
+        );
+        assert_eq!(
+            empty_error_completed, completed_no_error,
+            "error が空文字は非空ではないので error 無し扱い"
+        );
+    }
+
+    #[test]
+    fn sort_jobs_diagnostic_first_moves_flagged_jobs_to_front_preserving_relative_order() {
+        // vegapunk 申告順（created_at DESC）を模した並び:
+        // completed, dead_letter(error あり), completed, running(error 無し)。
+        let jobs = vec![
+            job_info("ok-1", "completed", None, 400, Some(410), 0),
+            job_info(
+                "dead-1",
+                "dead_letter",
+                Some("node2vec failed"),
+                300,
+                Some(305),
+                5,
+            ),
+            job_info("ok-2", "completed", None, 200, Some(210), 0),
+            job_info("running-1", "running", None, 100, None, 0),
+        ];
+
+        let sorted = sort_jobs_diagnostic_first(jobs);
+        let ids: Vec<&str> = sorted.iter().map(|j| j.job_id.as_str()).collect();
+
+        // 診断対象（dead-1, running-1）が先頭に来て、かつ各グループ内では元の並び
+        // （created_at DESC）が保たれる（安定ソートであることの回帰テスト）。
+        assert_eq!(ids, vec!["dead-1", "running-1", "ok-1", "ok-2"]);
+    }
+
+    #[test]
+    fn sort_jobs_diagnostic_first_keeps_error_jobs_ahead_of_newer_error_free_jobs_from_other_schemas(
+    ) {
+        // 他 schema の ingest/merge が並走していると、error 無しの running ジョブが
+        // dead_letter よりずっと新しい created_at で並ぶ。1 段キー（error 非空 OR
+        // status != completed を 1 bit に潰す）だと両者が同じ優先度タイルに入り、安定ソート
+        // が created_at DESC を保つ結果、running が dead_letter より先頭に来ていた
+        // （この回帰テストが無い状態だと検出できないバグ）。2 段キーでは error の有無を
+        // 独立した第 1 キーにするため、dead_letter が常に先に来る。
+        let jobs = vec![
+            job_info("running-other-schema", "running", None, 500, None, 0),
+            job_info(
+                "dead-1",
+                "dead_letter",
+                Some("node2vec failed"),
+                300,
+                Some(305),
+                5,
+            ),
+            job_info("ok-1", "completed", None, 200, Some(210), 0),
+        ];
+
+        let sorted = sort_jobs_diagnostic_first(jobs);
+        let ids: Vec<&str> = sorted.iter().map(|j| j.job_id.as_str()).collect();
+
+        assert_eq!(ids, vec!["dead-1", "running-other-schema", "ok-1"]);
+    }
+
+    #[test]
+    fn since_ms_from_hours_zero_means_no_window() {
+        assert_eq!(since_ms_from_hours(0, 1_753_000_000_000), None);
+    }
+
+    #[test]
+    fn since_ms_from_hours_subtracts_the_window_from_now() {
+        let now_ms = 1_753_000_000_000;
+        // 24h = 86_400_000ms
+        assert_eq!(since_ms_from_hours(24, now_ms), Some(now_ms - 86_400_000));
+        // 1h = 3_600_000ms
+        assert_eq!(since_ms_from_hours(1, now_ms), Some(now_ms - 3_600_000));
+    }
+
+    #[test]
+    fn since_ms_from_hours_saturates_instead_of_overflowing_on_huge_windows() {
+        // u64::MAX 時間を渡しても panic せず飽和する
+        // （`--jobs-since-hours` はユーザ入力なので、桁あふれで CLI が落ちないことを保証する）。
+        // jobs_since_hours -> i64::MAX（try_from 失敗時の unwrap_or）-> *3_600_000 は
+        // saturating_mul で i64::MAX に飽和し、`0 - i64::MAX` は i64 の範囲内（i64::MIN より
+        // 1 大きい）なのでこちらは飽和しない。
+        let result = since_ms_from_hours(u64::MAX, 0);
+        assert_eq!(result, Some(-i64::MAX));
+    }
+
+    #[test]
+    fn job_info_json_includes_diagnostic_fields_and_excludes_msg_id() {
+        let job = job_info(
+            "j1",
+            "dead_letter",
+            Some("node2vec failed"),
+            1_753_000_000_000,
+            Some(1_753_000_060_000),
+            5,
+        );
+        let rendered = job_info_json(&job);
+
+        assert_eq!(rendered["job_id"], "j1");
+        assert_eq!(rendered["job_type"], "merge");
+        assert_eq!(rendered["status"], "dead_letter");
+        assert_eq!(rendered["error"], "node2vec failed");
+        assert_eq!(rendered["created_at"], 1_753_000_000_000i64);
+        assert_eq!(rendered["completed_at"], 1_753_000_060_000i64);
+        assert_eq!(rendered["retry_count"], 5);
+        assert!(
+            rendered.get("msg_id").is_none(),
+            "msg_id は完了条件のフィールド一覧に無いので出力しない: {rendered}"
+        );
+    }
+
+    /// `recent_jobs_value` の成功 / 失敗パスが同じキー集合を返すことの回帰テスト。
+    /// `merge_report_json_keeps_the_same_shape_on_every_path` と同じ趣旨: キーの有無で
+    /// 後段ツールが分岐する事態を防ぐ。
+    #[test]
+    fn recent_jobs_value_ok_and_err_share_the_same_key_set() {
+        let keys = |value: &Value| {
+            value
+                .as_object()
+                .expect("recent_jobs は object")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let ok = recent_jobs_value(
+            Ok(ListJobsResponse {
+                jobs: Vec::new(),
+                total_count: 0,
+            }),
+            Some(1_753_000_000_000),
+            false,
+        );
+        let err = recent_jobs_value(
+            Err(anyhow::anyhow!("list jobs: boom")),
+            Some(1_753_000_000_000),
+            false,
+        );
+
+        assert_eq!(keys(&ok), keys(&err));
+        assert_eq!(
+            keys(&ok),
+            ["jobs", "error", "total_count", "since_ms"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn recent_jobs_value_ok_carries_sorted_jobs_total_count_and_applied_window() {
+        // total_count は ListJobs がフィルタ後・ページング前に申告する全件数。jobs（limit で
+        // 打ち切られる）と切り離して残さないと、フィルタ後の全件が見えているかどうかが
+        // 分からなくなる。since_ms は「どの時間窓を見たか」を summary JSON だけで判別できる
+        // ようにするために残す（ListJobs は schema を絞れず cross-schema のままなので、
+        // total_count だけでは対象 schema のジョブが漏れたかまでは分からない）。
+        let resp = ListJobsResponse {
+            jobs: vec![
+                job_info("ok-1", "completed", None, 200, Some(210), 0),
+                job_info(
+                    "dead-1",
+                    "dead_letter",
+                    Some("node2vec failed"),
+                    100,
+                    Some(110),
+                    3,
+                ),
+            ],
+            total_count: 9_999,
+        };
+        let rendered = recent_jobs_value(Ok(resp), Some(1_753_000_000_000), false);
+
+        assert_eq!(rendered["error"], Value::Null);
+        assert_eq!(rendered["total_count"], 9_999);
+        assert_eq!(rendered["since_ms"], 1_753_000_000_000i64);
+        let jobs = rendered["jobs"].as_array().expect("jobs は array");
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs[0]["job_id"], "dead-1",
+            "診断対象（error あり）が先頭に来る: {jobs:?}"
+        );
+    }
+
+    #[test]
+    fn recent_jobs_value_ok_reports_null_since_ms_when_window_is_disabled() {
+        // `--jobs-since-hours 0` で窓なしにした場合、since_ms は None のまま JSON の null に
+        // 落ちる（「窓を掛けていない」ことを summary JSON だけで判別できるようにする）。
+        let rendered = recent_jobs_value(
+            Ok(ListJobsResponse {
+                jobs: Vec::new(),
+                total_count: 0,
+            }),
+            None,
+            false,
+        );
+
+        assert_eq!(rendered["since_ms"], Value::Null);
+    }
+
+    #[test]
+    fn recent_jobs_value_err_reports_error_with_empty_jobs_null_total_count_and_the_applied_window()
+    {
+        let rendered = recent_jobs_value(
+            Err(anyhow::anyhow!("permission denied")),
+            Some(1_753_000_000_000),
+            false,
+        );
+
+        assert_eq!(rendered["jobs"], Value::Array(Vec::new()));
+        assert_eq!(rendered["total_count"], Value::Null);
+        assert_eq!(rendered["error"], "permission denied");
+        assert_eq!(rendered["since_ms"], 1_753_000_000_000i64);
+    }
+
+    #[test]
+    fn split_failed_jobs_for_logging_caps_at_five_and_reports_remaining() {
+        // 7 件の失敗ジョブ + 完了ジョブ 1 件。先頭 5 件だけ個別ログ対象になり、
+        // 残り 2 件は件数だけのサマリに回ることを保証する
+        // （--probe-only の日常観測で過去の dead_letter が ERROR ログを埋め尽くす事故対策）。
+        let mut jobs: Vec<JobInfo> = (0..7)
+            .map(|i| {
+                job_info(
+                    &format!("failed-{i}"),
+                    "dead_letter",
+                    Some("node2vec failed"),
+                    100 + i,
+                    None,
+                    1,
+                )
+            })
+            .collect();
+        jobs.push(job_info("ok-1", "completed", None, 1, Some(2), 0));
+
+        let (head, remaining) = split_failed_jobs_for_logging(&jobs);
+
+        assert_eq!(head.len(), 5, "先頭 5 件だけ個別ログ対象: {head:?}");
+        assert!(
+            head.iter().all(|job| job.job_id.starts_with("failed-")),
+            "完了ジョブ（error 無し）は個別ログ対象に混ざらない: {head:?}"
+        );
+        assert_eq!(remaining, 2, "5 件を超えた分は残数として報告する");
+    }
+
+    #[test]
+    fn split_failed_jobs_for_logging_ignores_jobs_without_error() {
+        let jobs = vec![
+            job_info("ok-1", "completed", None, 1, Some(2), 0),
+            job_info("running-1", "running", None, 2, None, 0),
+        ];
+
+        let (head, remaining) = split_failed_jobs_for_logging(&jobs);
+
+        assert!(
+            head.is_empty(),
+            "error が無いジョブ（completed も running も）はログ対象にしない: {head:?}"
+        );
+        assert_eq!(remaining, 0);
     }
 }

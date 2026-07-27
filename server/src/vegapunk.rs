@@ -3,10 +3,10 @@ use crate::{
     proto::graphrag::{
         create_schema_request, graph_rag_engine_client::GraphRagEngineClient, AttributeFilter,
         CreateSchemaRequest, Edge, EdgeTraversal, EmbedRequest, GetGraphSnapshotRequest,
-        GetSchemaRequest, GetStatsRequest, GetStatsResponse, MergeRequest, Node, NodeAttribute,
-        QueryNodesRequest, SearchDegradation, SearchExecution, SearchRequest, SearchResultItem,
-        UpdateSchemaRequest, UpsertEdgesRequest, UpsertNodesRequest, UpsertVectorsRequest,
-        VectorEntry,
+        GetSchemaRequest, GetStatsRequest, GetStatsResponse, ListJobsRequest, ListJobsResponse,
+        MergeRequest, Node, NodeAttribute, QueryNodesRequest, SearchDegradation, SearchExecution,
+        SearchRequest, SearchResultItem, UpdateSchemaRequest, UpsertEdgesRequest,
+        UpsertNodesRequest, UpsertVectorsRequest, VectorEntry,
     },
 };
 use anyhow::{Context, Result};
@@ -693,6 +693,52 @@ impl VegapunkClient {
         .with_context(|| format!("get stats for schema {schema}"))
     }
 
+    /// vegapunk の Admin API `ListJobs`（read ロール）。ジョブキューを問い合わせて
+    /// job_id / status / error 等を取得する。Merge のような「進捗もジョブ ID も返らない
+    /// 同期 RPC」が失敗したとき、失敗の具体的な理由（サーバ側でどのジョブがどう落ちたか）を
+    /// 得る唯一の経路として使う。
+    ///
+    /// `status` は proto コメントが `"pending" | "running" | "completed" | "dead_letter"` を
+    /// 挙げているが、vegapunk 側の有効値をここで断定しない（`None` = フィルタ無し、全件）。
+    /// `until_ms` / `offset` / `job_type` は現状の呼び出し元（`merge_schema` CLI）が
+    /// 使わないため引数を増やさない。必要になったら追加する。
+    ///
+    /// `since_ms` は cross-schema・`job_type` 無フィルタで返ることの緩和策。`ListJobs` は
+    /// schema を絞る手段が proto に無いため、他 schema の大量の `entity_extraction` ジョブに
+    /// 目的のジョブが `created_at DESC` の先頭 `limit` 件から押し出されうる。`since_ms` で
+    /// 時間窓を絞ることで、少なくとも「窓の外」を明示的に切り離せる（呼び出し元は
+    /// `merge_schema` CLI の `--jobs-since-hours` 参照）。
+    pub async fn list_jobs(
+        &self,
+        status: Option<&str>,
+        since_ms: Option<i64>,
+        limit: i32,
+    ) -> Result<ListJobsResponse> {
+        let req = ListJobsRequest {
+            status: status.map(str::to_string),
+            since_ms,
+            until_ms: None,
+            offset: None,
+            limit: Some(limit),
+            job_type: None,
+        };
+        self.call(
+            |mut client, request| async move {
+                client
+                    .list_jobs(request)
+                    .await
+                    .map(|resp| resp.into_inner())
+            },
+            req,
+        )
+        .await
+        // Merge 専用のヒント（annotate_grpc_error / merge_error_hint）は流用しない。
+        // ListJobs 自体の失敗は診断取得の失敗であって、Merge の同時実行やタイムアウトとは
+        // 無関係。ListJobs 固有のヒント（cross-schema observability RPC の権限境界）は
+        // annotate_list_jobs_error が別途付ける。
+        .map_err(|err| annotate_list_jobs_error(err, "list jobs"))
+    }
+
     async fn call<T, F, Fut, R>(&self, f: F, body: T) -> Result<R>
     where
         F: FnOnce(GraphRagEngineClient<Channel>, Request<T>) -> Fut,
@@ -757,6 +803,36 @@ pub fn merge_error_hint(code: Code) -> Option<&'static str> {
              そのまま再実行してよい。走行中に再実行すると FAILED_PRECONDITION（同時実行不可）になる",
         ),
         _ => None,
+    }
+}
+
+/// `list_jobs` 専用のヒント関数。**`merge_error_hint` を流用しない** — 意味が異なるため。
+/// `merge_error_hint(Code::PermissionDenied)` は「Merge は admin ロール必須」だが、
+/// `ListJobs` は vegapunk 統合仕様書 §2.3 の cross-schema observability RPC であり、
+/// 権限境界が別物: **サービストークン（`vgp_`）からは常に拒否され、無制限資格情報
+/// （ルート Bearer / JWT admin）でのみ許可される**。本番トークンがサービストークンの
+/// 場合、この診断は毎回 PermissionDenied で終わるため、その理由をヒントで明示する。
+pub fn list_jobs_error_hint(code: Code) -> Option<&'static str> {
+    match code {
+        Code::PermissionDenied => Some(
+            "ListJobs は cross-schema observability RPC。サービストークン（vgp_）では常に \
+             拒否される。ルート Bearer / JWT admin で実行する",
+        ),
+        _ => None,
+    }
+}
+
+/// `list_jobs` が返す anyhow エラーに、[`list_jobs_error_hint`] 由来の運用ヒントを付ける。
+/// `annotate_grpc_error` と同じ downcast の型だが、**`list_jobs` 専用**。
+/// `annotate_grpc_error`（Merge 専用）と統合すると、Merge のヒント文言（同時実行中 等）が
+/// ListJobs の失敗に紛れ込み、原因を誤誘導する。
+fn annotate_list_jobs_error(err: anyhow::Error, context: &str) -> anyhow::Error {
+    let hint = err
+        .downcast_ref::<tonic::Status>()
+        .and_then(|status| list_jobs_error_hint(status.code()));
+    match hint {
+        Some(hint) => err.context(format!("{context}: {hint}")),
+        None => err.context(context.to_string()),
     }
 }
 
@@ -828,8 +904,8 @@ fn to_proto_edge(edge: GraphEdge) -> Edge {
 #[cfg(test)]
 mod tests {
     use super::{
-        annotate_grpc_error, degradation_summary, merge_error_hint, page_is_last,
-        pagination_is_complete, GrpcLimits,
+        annotate_grpc_error, annotate_list_jobs_error, degradation_summary, list_jobs_error_hint,
+        merge_error_hint, page_is_last, pagination_is_complete, GrpcLimits,
     };
     use std::time::Duration;
     use tonic::Code;
@@ -992,6 +1068,59 @@ mod tests {
         assert!(rendered.contains("channel closed"), "{rendered}");
         assert!(
             !rendered.contains("同時実行"),
+            "分類できないエラーにヒントを付けない: {rendered}"
+        );
+    }
+
+    #[test]
+    fn list_jobs_error_hint_explains_service_token_cannot_call_cross_schema_rpc() {
+        // merge_error_hint(PermissionDenied) と混同すると「Merge は admin ロール必須」という
+        // 誤った理由が出る。ListJobs は別の権限境界（サービストークンは常に拒否）なので、
+        // 専用のヒントであることを保証する。
+        let denied = list_jobs_error_hint(Code::PermissionDenied).expect("hint");
+        assert!(
+            denied.contains("vgp_"),
+            "サービストークンが常に拒否されることを示す: {denied}"
+        );
+        assert!(
+            denied.contains("cross-schema"),
+            "cross-schema observability RPC であることを示す: {denied}"
+        );
+        assert!(
+            !denied.contains("admin ロール必須"),
+            "merge_error_hint の文言（Merge 専用）を混同していない: {denied}"
+        );
+        // 未分類の code はヒント無し（merge_error_hint と同じ規約）。
+        assert!(list_jobs_error_hint(Code::Internal).is_none());
+    }
+
+    #[test]
+    fn annotate_list_jobs_error_attaches_hint_by_downcasting_tonic_status() {
+        let err = anyhow::Error::from(tonic::Status::permission_denied("rbac: read denied"));
+        let annotated = annotate_list_jobs_error(err, "list jobs");
+        let rendered = format!("{annotated:#}");
+        assert!(
+            rendered.contains("list jobs"),
+            "呼び出し文脈を残す: {rendered}"
+        );
+        assert!(
+            rendered.contains("vgp_"),
+            "PermissionDenied のヒントが付く: {rendered}"
+        );
+        assert!(
+            rendered.contains("rbac: read denied"),
+            "サーバの message を落とさない: {rendered}"
+        );
+    }
+
+    #[test]
+    fn annotate_list_jobs_error_keeps_context_only_for_unclassified_errors() {
+        let err = anyhow::anyhow!("channel closed");
+        let rendered = format!("{:#}", annotate_list_jobs_error(err, "list jobs"));
+        assert!(rendered.contains("list jobs"), "{rendered}");
+        assert!(rendered.contains("channel closed"), "{rendered}");
+        assert!(
+            !rendered.contains("vgp_"),
             "分類できないエラーにヒントを付けない: {rendered}"
         );
     }

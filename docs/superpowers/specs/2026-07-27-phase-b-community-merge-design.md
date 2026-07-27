@@ -110,6 +110,10 @@ probe 1 件あたりの所要が Merge 前 約 5 秒 → Merge 走行中 30〜60
 
 ## B1 実測 JSON の判読手順（この順で読む。順序を守らないと誤読する）
 
+0. **`merge.status` が `failed` なら、まず `recent_jobs.jobs[].error` を読む**。Merge の abort 理由（例: `node2vec ジョブが terminal failure state`）だけでは何が起きたか分からず、具体的な失敗内容は `ListJobs` の `JobInfo.error` にしか入らない。`recent_jobs` は 3 形を取る: 診断を取らなかった（Merge 成功パス）＝ `null` / 取得失敗＝ `{"jobs": [], "error": "...", "total_count": null, "since_ms": N}` / 成功＝ `{"jobs": [...], "error": null, "total_count": N, "since_ms": N}`
+   - `--jobs-limit`（既定 50、上限 500）で打ち切られたかは `total_count` と `jobs` の長さを比べる。**時間窓 `--jobs-since-hours` を狭めても打ち切りは減らない**（`ListJobs` は `created_at DESC` でソートしてから `limit` を適用するため、押し出すのは新しいジョブだけ）
+   - **インシデントから 24 時間以上経っている場合は `--jobs-since-hours 0`** を付ける。既定のままだと目的のジョブが窓外に落ち、`jobs` が空なのを「失敗ジョブは無い」と誤読する
+   - `ListJobs` は **cross-schema**（proto に schema 絞り込みが無い）。他 schema のジョブの `error` 文字列がこの JSON と Cloud Run ログに混ざる。意図的に受容している副作用なので、**summary JSON をそのまま外部へ共有しない**
 1. `summary.verdict` と `verdict_code` を見る。`fatal` なら以降の数値は信用しない
 2. `stats_before.community_count` → `stats_after.community_count` と `summary.community_count_delta` を見る。Merge が実際に何を作ったかの一次証跡
 3. **`probe_after.entries[].execution` の `degraded` / `effective_mode` / `readiness.global` / `readiness.community_summary` を先に確認する**。`hybrid` は Merge 未実行でも local へ degrade して「成功」扱いになるため、after 側 hybrid が degrade したままだと `probe_counts_delta.hybrid` はほぼ 0 になる。これを「community item に top_k を食われない ＝ hybrid 切替は安全」と読むのが**最も危険な誤読**（真相は「hybrid が一度も本来の形で動いていない」）
