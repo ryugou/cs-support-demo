@@ -388,10 +388,10 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
   - 製品を追加する手順: `products.json` に `{ "model", "name", "aliases" }` を追記 → `ingest_products` を実行する。**サービスの再ビルド・再デプロイは不要**（Product ノードは vegapunk 側にしか存在しないため）。
   - 全体リセット後の ingest 実行順序は **`ingest_products` → `ingest_urtect` / `ingest_alarmcom`** の順を必ず守ること。`ingest_urtect` / `ingest_alarmcom` はどちらも起動時に vegapunk の Product ノード一覧を取得し、0 件なら「製品マスタが空。先に `ingest_products` を実行せよ」という fail closed で止まる。`ingest_urtect`（Google Sites）と `ingest_alarmcom`（answers.alarm.com）の間に順序依存は無い（両方 products.json 投入後ならどちらを先に走らせてもよい）。
   - **第 2 のマニュアルソース `ingest_alarmcom`（Issue #8）**: answers.alarm.com（MindTouch KB）を `?mt-language=JA` の機械翻訳で ingest する。クロール対象は sitemap.xml と製品マスタ（Product ノード）駆動で絞る。各製品の型番/別名が「ファミリーハブ URL」に現れる記事ファミリーだけを取り込み、1 製品でもハブ未マッチなら fail closed で止まる（`products.json` の aliases に URL 上の表記を足して再投入する）。robots.txt の Crawl-delay=5 秒を守るため全リクエストを 5 秒以上空けて逐次実行し、**実行時間は対象ファミリー数（≒英日 2 リクエスト × 記事数 × 5 秒）に比例する**。Cloud Run job は本件スコープ外（未新設）。
-  - **`merge-schema`（Issue #8 Phase B1）**: vegapunk の `Merge` RPC（Leiden コミュニティ検出 + CommunitySummary + Node2Vec）を schema `urtect` に対して実行し、**前後の `GetStats` と global/hybrid 検索の返却物を JSON で出す**。
-  - Merge は **schema 全体の同期再計算で、同一 schema では同時 1 本しか走らない**。実行中に再実行すると `FAILED_PRECONDITION` で弾かれる。
-  - job の `--task-timeout` は CLI の `--timeout-secs`（既定 6h）以上に取ること。短いと Merge の途中で task が殺され、サーバ側だけ処理が続く状態になる。
-  - ingest とは独立した job にしてある。`ingest_alarmcom` は実測約 6 時間かかるため、その末尾に Merge を積むと Merge だけの再実行ができない。
+- **`merge-schema`（Issue #8 Phase B1）**: vegapunk の `Merge` RPC（Leiden コミュニティ検出 + CommunitySummary + Node2Vec）を schema `urtect` に対して実行し、**前後の `GetStats` と global/hybrid 検索の返却物を JSON で出す**。
+- Merge は **schema 全体の同期再計算で、同一 schema では同時 1 本しか走らない**。実行中に再実行すると `FAILED_PRECONDITION` で弾かれる。
+- job の `--task-timeout` は CLI の `--timeout-secs`（既定 6h）以上に取ること。短いと Merge の途中で task が殺され、サーバ側だけ処理が続く状態になる。
+- ingest とは独立した job にしてある。`ingest_alarmcom` は実測約 6 時間かかるため、その末尾に Merge を積むと Merge だけの再実行ができない。
 - env（fail-closed 境界で2群に分けて扱うこと）:
   - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs:54` で起動時 fail closed）
   - **未設定でも起動する**: `VEGAPUNK_ENDPOINT`（`config.cloudrun.toml:13` の値にフォールバック。env があれば `config.rs:218` が上書き）、`VEGAPUNK_BEARER_TOKEN`
@@ -417,7 +417,7 @@ gcloud run jobs update ingest-urtect --project sivira-cs-support --region asia-n
 gcloud run jobs update merge-schema --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
 ```
 
-`<tag>` は service と両 job で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。
+`<tag>` は service と全 job（`ingest-rules` / `ingest-urtect` / `merge-schema`）で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。
 
 ### 認証（OAuth 2.1 フェデレーション、実測済み）
 
