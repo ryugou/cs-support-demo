@@ -729,13 +729,32 @@ pub fn merge_error_hint(code: Code) -> Option<&'static str> {
             "クライアント側 timeout。--timeout-secs を引き上げる。\
              サーバ側では Merge が継続している可能性があるため、再実行前に stats の community_count を確認する",
         ),
+        // tonic 0.12.3 実測（tonic-0.12.3/src/status.rs の find_status_in_source_chain）:
+        // `Endpoint::timeout`（--timeout-secs）の満了は `TimeoutExpired` → `Status::cancelled`
+        // に写像され、Code::DeadlineExceeded にはならない。h2 keepalive を無効化した
+        // merge_cli_limits() の下では、接続が本当に死んだときの唯一の出口がこの
+        // per-request timeout（既定 6h）なので、ここにヒントが無いと「6 時間待った末に
+        // "Timeout expired" だけが出る」ことになる。DeadlineExceeded と同趣旨のヒントを返す
+        // （どちらの code に転んでも運用者に届くよう両方を扱う）。
+        Code::Cancelled => Some(
+            "クライアント側 timeout（tonic 0.12 では Endpoint::timeout の満了が \
+             Code::Cancelled に写像される。DeadlineExceeded にはならない）。\
+             --timeout-secs を引き上げる。再実行の前に --probe-only で community_count を確認し、\
+             サーバ側の Merge が継続しているかを見る",
+        ),
         // 実測（本番 Cloud Run job）: h2 keepalive が Merge 実行中の接続を 40 秒で切り、
-        // Unavailable("http2 error: keep-alive timed out") になった。Merge は同期実行で
-        // その間サーバが h2 PING に応答しないため、切ったのはクライアント側である。
+        // Unavailable("http2 error: keep-alive timed out") になった。keepalive を無効化した
+        // 後に残る Unavailable の主因は、それとは別に (a) 長時間 RPC 中の何らかの切断
+        // （その場合サーバ側の Merge は継続している）、(b) vegapunk の再起動・LB ドレイン・
+        // 到達不能（その場合 Merge も中断している）のいずれかであり、どちらかは実行前には
+        // 分からない。運用者が取るべき行動は同じ（--probe-only で確認）なので、断定せず
+        // 両分岐と、確認後にどう動くかまで書く。
         Code::Unavailable => Some(
-            "接続断（h2 / transport エラー）。サーバ側の Merge は継続している可能性が高い。\
-             再実行の前に必ず --probe-only で community_count を確認する。\
-             走行中に再実行すると FAILED_PRECONDITION（同時実行不可）になる",
+            "接続断（h2 / transport エラー）。原因は (a) 長時間 RPC 中の切断でサーバ側の \
+             Merge は継続している、(b) vegapunk の再起動・LB ドレイン・到達不能で Merge も \
+             中断している、のいずれか。再実行の前に --probe-only で community_count を確認する: \
+             前回観測より増えていれば (a) と判断して完了を待ち、変化が無ければ (b) と判断して \
+             そのまま再実行してよい。走行中に再実行すると FAILED_PRECONDITION（同時実行不可）になる",
         ),
         _ => None,
     }
@@ -898,10 +917,10 @@ mod tests {
     #[test]
     fn merge_error_hint_explains_transport_disconnect() {
         // 本番 Cloud Run job 実測: h2 keepalive が Merge 実行中の接続を 40 秒で切り、
-        // Unavailable("http2 error: keep-alive timed out") になった。このとき運用者が
-        // 即座に知る必要があるのは「サーバ側の Merge は続いている可能性が高いので、
-        // 再実行の前に --probe-only で community_count を確認しろ」であること。
-        // 走行中に再実行すると FAILED_PRECONDITION（同時実行不可）になる。
+        // Unavailable("http2 error: keep-alive timed out") になった。keepalive を無効化した
+        // 今、残る Unavailable の主因は「サーバ側 Merge は継続中」と「vegapunk 再起動・到達不能で
+        // Merge も中断」のいずれかで、実行前にはどちらか分からない。断定せず両分岐を示し、
+        // --probe-only の結果でどう動くか（増えていれば待つ、変化が無ければ再実行）まで伝えること。
         let unavailable = merge_error_hint(Code::Unavailable).expect("hint");
         assert!(
             unavailable.contains("--probe-only"),
@@ -912,8 +931,34 @@ mod tests {
             "何を見れば継続中か分かるかを示す: {unavailable}"
         );
         assert!(
-            unavailable.contains("継続している可能性"),
-            "サーバ側処理が生きている前提を伝える: {unavailable}"
+            unavailable.contains("継続している"),
+            "分岐 (a): 長時間 RPC 中の切断でサーバ側 Merge は継続、を伝える: {unavailable}"
+        );
+        assert!(
+            unavailable.contains("再起動") && unavailable.contains("中断している"),
+            "分岐 (b): vegapunk 再起動・到達不能で Merge も中断、を伝える: {unavailable}"
+        );
+        assert!(
+            unavailable.contains("増えていれば") && unavailable.contains("再実行してよい"),
+            "probe 後にどう動くか（待つ / そのまま再実行）まで伝える: {unavailable}"
+        );
+    }
+
+    #[test]
+    fn merge_error_hint_explains_client_side_cancellation() {
+        // tonic 0.12.3 実測（status.rs の find_status_in_source_chain）: Endpoint::timeout の
+        // 満了は Status::cancelled（Code::Cancelled）に写像され、Code::DeadlineExceeded には
+        // ならない。h2 keepalive を無効化した merge_schema CLI では、接続が本当に死んだときの
+        // 唯一の出口が per-request timeout なので、Cancelled にヒントが無いと「6 時間待った末に
+        // "Timeout expired" だけが出る」ことになる。DeadlineExceeded と同趣旨のヒントが要る。
+        let cancelled = merge_error_hint(Code::Cancelled).expect("hint");
+        assert!(
+            cancelled.contains("--timeout-secs"),
+            "timeout 値を引き上げる手段を示す: {cancelled}"
+        );
+        assert!(
+            cancelled.contains("--probe-only") && cancelled.contains("community_count"),
+            "再実行前の確認手段を DeadlineExceeded と同趣旨で示す: {cancelled}"
         );
     }
 

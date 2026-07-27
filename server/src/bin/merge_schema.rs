@@ -825,6 +825,12 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcom
 /// （`--timeout-secs`、既定 6h）まで気づけない。Cloud Run job の `--task-timeout` を 7h
 /// （= `--timeout-secs` より長く）に取ってある前提で、ハングは job 側で検出できる。
 /// TCP keepalive（60s）は `build_endpoint` 側で有効なままなので、OS 層の検知は残る。
+/// ただし検知までの遅延は keepalive の設定値（60s）そのものではない。h2 PING keepalive
+/// （無効化前）なら約 40s で死活に気づけていたのに対し、TCP keepalive は Linux では
+/// `tcp_keepalive(60s)` が `TCP_KEEPIDLE=60` を設定するだけで、既定の
+/// `tcp_keepalive_probes=9` / `tcp_keepalive_intvl=75s` と合わせると
+/// 死判定は `60 + 9 * 75 = 735s`（約 12 分）後になる。「60 秒で気づける」という
+/// 読みは誤りで、実際は h2 なら 40 秒、TCP keepalive では約 12 分。
 fn merge_cli_limits(timeout_secs: u64) -> GrpcLimits {
     GrpcLimits {
         timeout_secs,

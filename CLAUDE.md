@@ -390,7 +390,7 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
   - **第 2 のマニュアルソース `ingest_alarmcom`（Issue #8）**: answers.alarm.com（MindTouch KB）を `?mt-language=JA` の機械翻訳で ingest する。クロール対象は sitemap.xml と製品マスタ（Product ノード）駆動で絞る。各製品の型番/別名が「ファミリーハブ URL」に現れる記事ファミリーだけを取り込み、1 製品でもハブ未マッチなら fail closed で止まる（`products.json` の aliases に URL 上の表記を足して再投入する）。robots.txt の Crawl-delay=5 秒を守るため全リクエストを 5 秒以上空けて逐次実行し、**実行時間は対象ファミリー数（≒英日 2 リクエスト × 記事数 × 5 秒）に比例する**。Cloud Run job は本件スコープ外（未新設）。
 - **`merge-schema`（Issue #8 Phase B1）**: vegapunk の `Merge` RPC（Leiden コミュニティ検出 + CommunitySummary + Node2Vec）を schema `urtect` に対して実行し、**前後の `GetStats` と global/hybrid 検索の返却物を JSON で出す**。
 - Merge は **schema 全体の同期再計算で、同一 schema では同時 1 本しか走らない**。実行中に再実行すると `FAILED_PRECONDITION` で弾かれる。
-- job の `--task-timeout` は CLI の `--timeout-secs`（既定 6h）以上に取ること。短いと Merge の途中で task が殺され、サーバ側だけ処理が続く状態になる。
+- job の `--task-timeout` は CLI の `--timeout-secs`（既定 6h = 21600 秒）より長く取ること。**ちょうど同じ値にすると、CLI の per-request timeout と task-timeout が同着し、JSON summary が出力される前に task が kill される。** 実際の job は 7h（25200 秒）で作成済み。短いと Merge の途中で task が殺され、サーバ側だけ処理が続く状態になる。
 - ingest とは独立した job にしてある。`ingest_alarmcom` は実測約 6 時間かかるため、その末尾に Merge を積むと Merge だけの再実行ができない。
 - env（fail-closed 境界で2群に分けて扱うこと）:
   - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs:54` で起動時 fail closed）
