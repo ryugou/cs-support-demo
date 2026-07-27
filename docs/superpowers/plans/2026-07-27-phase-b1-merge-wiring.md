@@ -334,6 +334,7 @@ git commit -m "feat(vegapunk): expose SearchExecution and warn on degraded searc
 - Create: `server/src/bin/merge_schema.rs`
 - Modify: `server/Cargo.toml`（`[[bin]]` 追加）
 - Modify: `server/src/manual/retrieval.rs:6`（`fn kind_marker` を `pub fn kind_marker` にする。bin から node_id 分類に使うため）
+- Modify: `Dockerfile`（`cargo build --release` の `--bin` 列挙と `COPY --from=builder` 列挙の両方に `merge_schema` を追加する。両方に入れないと Cloud Run job `merge-schema` のイメージにバイナリが存在せず、job 実行時に初めて失敗する）
 
 **Interfaces:**
 - Consumes: Task 1 の `merge` / `stats`、Task 2 の `search_with_mode` / `SearchOutcome`、既存 `GrpcLimits` / `VegapunkClient::connect_with_limits`、`cs_support_mcp::manual::schema_ids::{KIND_SECTION, KIND_CONCEPT, KIND_DOC, KIND_PRODUCT}`、`cs_support_mcp::manual::retrieval::kind_marker`
