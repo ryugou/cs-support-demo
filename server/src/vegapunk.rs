@@ -4,8 +4,9 @@ use crate::{
         create_schema_request, graph_rag_engine_client::GraphRagEngineClient, AttributeFilter,
         CreateSchemaRequest, Edge, EdgeTraversal, EmbedRequest, GetGraphSnapshotRequest,
         GetSchemaRequest, GetStatsRequest, GetStatsResponse, MergeRequest, Node, NodeAttribute,
-        QueryNodesRequest, SearchRequest, UpdateSchemaRequest, UpsertEdgesRequest,
-        UpsertNodesRequest, UpsertVectorsRequest, VectorEntry,
+        QueryNodesRequest, SearchDegradation, SearchExecution, SearchRequest, SearchResultItem,
+        UpdateSchemaRequest, UpsertEdgesRequest, UpsertNodesRequest, UpsertVectorsRequest,
+        VectorEntry,
     },
 };
 use anyhow::{Context, Result};
@@ -21,6 +22,13 @@ use tonic::{
 /// `vector_entry` ヘルパの戻り値・各 ingest CLI の組み立てバッファと型を共有し、
 /// 同じ 3 段ネストのタプルが複数箇所に散らばる（clippy::type_complexity）のを避ける。
 pub type VectorUpsertEntry = (String, Vec<f32>, Vec<(String, String)>);
+
+/// `Search` の応答から、プロダクトが使う 2 つを取り出したもの。
+/// `execution` は degrade（Merge 未実行で global が落ちた等）の可視化に使う。
+pub struct SearchOutcome {
+    pub results: Vec<SearchResultItem>,
+    pub execution: Option<SearchExecution>,
+}
 
 #[derive(Clone)]
 pub struct VegapunkClient {
@@ -542,35 +550,70 @@ impl VegapunkClient {
         .context("get graph snapshot")
     }
 
+    /// 既存呼び出し元互換の local 検索。retrieval / verify CLI はこちらを使う。
     pub async fn search(
         &self,
         schema: &str,
         query: &str,
         top_k: i32,
-    ) -> Result<Vec<crate::proto::graphrag::SearchResultItem>> {
+    ) -> Result<Vec<SearchResultItem>> {
+        Ok(self
+            .search_with_mode(schema, query, top_k, "local")
+            .await?
+            .results)
+    }
+
+    /// mode を明示する検索。`global` は Merge 未実行だと FAILED_PRECONDITION、
+    /// `hybrid` は global 部分だけ local へ degrade する（落ちない）。
+    /// degrade したときは warn で理由を出す（黙って degrade させない）。
+    pub async fn search_with_mode(
+        &self,
+        schema: &str,
+        query: &str,
+        top_k: i32,
+        mode: &str,
+    ) -> Result<SearchOutcome> {
         let req = SearchRequest {
             text: query.to_string(),
             filter: None,
             depth: Some(1),
             top_k: Some(top_k),
             format: None,
-            mode: Some("local".to_string()),
+            mode: Some(mode.to_string()),
             schema: schema.to_string(),
             offset: Some(0),
             limit: Some(top_k),
             structural_weight: Some(0.0),
         };
-        self.call(
-            |mut client, request| async move {
-                client
-                    .search(request)
-                    .await
-                    .map(|resp| resp.into_inner().results)
-            },
-            req,
-        )
-        .await
-        .context("search")
+        let resp = self
+            .call(
+                |mut client, request| async move {
+                    client.search(request).await.map(|resp| resp.into_inner())
+                },
+                req,
+            )
+            .await
+            .map_err(|err| annotate_grpc_error(err, &format!("search schema {schema}")))?;
+        if let Some(execution) = resp.execution.as_ref() {
+            if execution.degraded {
+                tracing::warn!(
+                    schema,
+                    requested_mode = %execution.requested_mode,
+                    effective_mode = %execution.effective_mode,
+                    degradations = %execution
+                        .degradations
+                        .iter()
+                        .map(degradation_summary)
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    "vegapunk search degraded"
+                );
+            }
+        }
+        Ok(SearchOutcome {
+            results: resp.results,
+            execution: resp.execution,
+        })
     }
 
     /// Leiden コミュニティ検出 + CommunitySummary 生成 + Node2Vec を schema 全体に対して
@@ -654,6 +697,19 @@ pub fn merge_error_hint(code: Code) -> Option<&'static str> {
     }
 }
 
+/// `SearchDegradation` を 1 行のログ文字列にする。prost の enum は i32 なので、
+/// 既知値は名前、未知値は数値のまま残す（proto にフィールドが増えても情報を落とさない）。
+pub fn degradation_summary(degradation: &SearchDegradation) -> String {
+    use crate::proto::graphrag::{SearchComponent, SearchDegradedReason};
+    let component = SearchComponent::try_from(degradation.component)
+        .map(|c| c.as_str_name().to_string())
+        .unwrap_or_else(|_| format!("UNKNOWN({})", degradation.component));
+    let reason = SearchDegradedReason::try_from(degradation.reason)
+        .map(|r| r.as_str_name().to_string())
+        .unwrap_or_else(|_| format!("UNKNOWN({})", degradation.reason));
+    format!("{component}/{reason}: {}", degradation.message)
+}
+
 /// `call` が返す anyhow エラーに、gRPC code 由来の運用ヒントを付ける。
 /// `call` は `tonic::Status` を `Into` で anyhow 化しているので downcast で code を取り出す。
 fn annotate_grpc_error(err: anyhow::Error, context: &str) -> anyhow::Error {
@@ -704,8 +760,51 @@ fn to_proto_edge(edge: GraphEdge) -> Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_error_hint, page_is_last, pagination_is_complete};
+    use super::{degradation_summary, merge_error_hint, page_is_last, pagination_is_complete};
     use tonic::Code;
+
+    #[test]
+    fn degradation_summary_renders_component_and_reason() {
+        use crate::proto::graphrag::{SearchComponent, SearchDegradation, SearchDegradedReason};
+        let degradation = SearchDegradation {
+            component: SearchComponent::Global as i32,
+            reason: SearchDegradedReason::NotReady as i32,
+            message: "No community summaries found".to_string(),
+        };
+        let rendered = degradation_summary(&degradation);
+        assert!(
+            rendered.contains("GLOBAL"),
+            "component が読める: {rendered}"
+        );
+        assert!(
+            rendered.contains("NOT_READY"),
+            "reason が読める: {rendered}"
+        );
+        assert!(
+            rendered.contains("No community summaries found"),
+            "サーバの message を落とさない: {rendered}"
+        );
+    }
+
+    #[test]
+    fn degradation_summary_keeps_unknown_enum_values_visible() {
+        use crate::proto::graphrag::SearchDegradation;
+        // 未知の enum 値（proto 追加時）でも数値を残し、握りつぶさない。
+        let degradation = SearchDegradation {
+            component: 9999,
+            reason: 8888,
+            message: String::new(),
+        };
+        let rendered = degradation_summary(&degradation);
+        assert!(
+            rendered.contains("9999"),
+            "未知 component を数値で残す: {rendered}"
+        );
+        assert!(
+            rendered.contains("8888"),
+            "未知 reason を数値で残す: {rendered}"
+        );
+    }
 
     #[test]
     fn merge_error_hint_maps_operational_codes() {
