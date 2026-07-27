@@ -129,11 +129,13 @@ impl ProbeCounts {
 
 /// probe 内訳の before→after 差分。`manual_section` が減って `other` が増えるなら
 /// community 由来の item に top_k を食われている、という B2 の判断材料になる。
+/// `compared_pairs` は差分の母数（両側そろった `(query, mode)` の数）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ProbeCountsDelta {
     manual_section: i64,
     concept: i64,
     other: i64,
+    compared_pairs: usize,
 }
 
 impl ProbeCountsDelta {
@@ -142,6 +144,9 @@ impl ProbeCountsDelta {
             "manual_section": self.manual_section,
             "concept": self.concept,
             "other": self.other,
+            // 母数を出さないと、読み手は「12 probe 分の差」なのか「2 probe 分の差」なのかを
+            // 検証できない。delta 単体では意味が決まらないので必ず併記する。
+            "compared_pairs": self.compared_pairs,
         })
     }
 }
@@ -155,14 +160,48 @@ fn count_delta(before: usize, after: usize) -> i64 {
     after.saturating_sub(before)
 }
 
-/// `--probe-only` で after 側が無いときは「差分 0」ではなく「比較不能（null）」を返す。
-fn probe_counts_delta(before: ProbeCounts, after: Option<ProbeCounts>) -> Option<ProbeCountsDelta> {
+/// probe 内訳の before→after 差分を、**同じ `(query, mode)` で両側とも成功したペアだけ**から取る。
+///
+/// `(query, mode)` のグリッドは `PROBE_QUERIES × PROBE_MODES` で固定なので、`per_probe` の
+/// index はそのまま probe の同一性を意味する。ここで index を捨てて合算どうしを引くと
+/// **母数の異なる集計の引き算**になる。これは例外ケースではなく、B1 で最初に回す Merge 実行で
+/// 確実に起きる: Merge 前の `global` は FAILED_PRECONDITION が正常なので before は 8 probe 分、
+/// after は 12 probe 分の合算になり、差は「Merge の効果」ではなく「probe が 4 本増えた」を映す。
+///
+/// `--probe-only`（after 側が無い）と、両側そろったペアが 1 つも無い場合は「差分 0」ではなく
+/// 「比較不能（`None` → JSON では `null`）」を返す。測れていないものを 0 として見せない。
+fn probe_counts_delta(
+    before: &[Option<ProbeCounts>],
+    after: Option<&[Option<ProbeCounts>]>,
+) -> Option<ProbeCountsDelta> {
     let after = after?;
-    Some(ProbeCountsDelta {
-        manual_section: count_delta(before.manual_section, after.manual_section),
-        concept: count_delta(before.concept, after.concept),
-        other: count_delta(before.other, after.other),
-    })
+    if before.len() != after.len() {
+        // 同じ固定グリッドから作る以上ここは起きない。起きたなら index 対応が崩れており、
+        // 前方一致で辻褄を合わせると別の probe どうしを引き算することになる。比較不能で返す。
+        tracing::error!(
+            before_len = before.len(),
+            after_len = after.len(),
+            "probe grid size mismatch; refusing to compute a delta from misaligned probes"
+        );
+        return None;
+    }
+    let mut delta = ProbeCountsDelta::default();
+    for (before, after) in before.iter().zip(after.iter()) {
+        let (Some(before), Some(after)) = (before, after) else {
+            continue;
+        };
+        delta.manual_section = delta
+            .manual_section
+            .saturating_add(count_delta(before.manual_section, after.manual_section));
+        delta.concept = delta
+            .concept
+            .saturating_add(count_delta(before.concept, after.concept));
+        delta.other = delta
+            .other
+            .saturating_add(count_delta(before.other, after.other));
+        delta.compared_pairs += 1;
+    }
+    (delta.compared_pairs > 0).then_some(delta)
 }
 
 /// `GetStats.community_count` の観測結果。**`Skipped`（`--probe-only` による意図した省略）と
@@ -195,14 +234,63 @@ fn community_count_delta(before: StatsObservation, after: StatsObservation) -> O
     Some(after.value()?.saturating_sub(before.value()?))
 }
 
+/// Merge 呼び出し自体の結果。`Skipped` は `--probe-only` による意図した省略、
+/// `Failed` は Merge RPC がエラーを返した（after 側は意図して観測していない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeStatus {
+    Skipped,
+    Ok,
+    Failed,
+}
+
+/// after 側 probe の観測結果。`StatsObservation::{Value, Error, Skipped}` と同じ
+/// 「意図した省略」と「実行したが失敗した」の型分離を probe 側にも適用する。
+/// before 側は `--probe-only` でも常に実行するため区別が要らず、素の usize で持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeSideObservation {
+    /// Merge を実行し、after 側 probe も実行した（`attempted` 件中 `succeeded` 件成功）。
+    Attempted { attempted: usize, succeeded: usize },
+    /// `--probe-only`、または Merge 失敗により after 側 probe を実行しなかった。
+    Skipped,
+}
+
+impl ProbeSideObservation {
+    /// 実行はしたが 1 件も成功しなかった（= この実行から after 側の情報が何も得られていない）。
+    fn all_failed(self) -> bool {
+        matches!(
+            self,
+            Self::Attempted {
+                attempted,
+                succeeded: 0
+            } if attempted > 0
+        )
+    }
+
+    fn attempted_count(self) -> Option<usize> {
+        match self {
+            Self::Attempted { attempted, .. } => Some(attempted),
+            Self::Skipped => None,
+        }
+    }
+
+    fn succeeded_count(self) -> Option<usize> {
+        match self {
+            Self::Attempted { succeeded, .. } => Some(succeeded),
+            Self::Skipped => None,
+        }
+    }
+}
+
 /// exit code 判定の入力。ネットワーク I/O の結果をここへ畳んでから純関数で判定する
 /// （判定ロジックを vegapunk 到達性から切り離してテストするため）。
 #[derive(Debug, Clone, Copy)]
 struct RunObservation {
     community_before: StatsObservation,
     community_after: StatsObservation,
-    probe_succeeded: usize,
-    probe_attempted: usize,
+    merge: MergeStatus,
+    probe_before_attempted: usize,
+    probe_before_succeeded: usize,
+    probe_after: ProbeSideObservation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +333,8 @@ impl RunWarning {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunFailure {
     ProbeAllFailed,
+    MergeFailed,
+    ProbeAfterAllFailed,
     StatsUnavailable,
     NoCommunities,
 }
@@ -253,6 +343,8 @@ impl RunFailure {
     fn code(self) -> &'static str {
         match self {
             Self::ProbeAllFailed => "probe_all_failed",
+            Self::MergeFailed => "merge_failed",
+            Self::ProbeAfterAllFailed => "probe_after_all_failed",
             Self::StatsUnavailable => "stats_unavailable",
             Self::NoCommunities => "no_communities",
         }
@@ -261,8 +353,21 @@ impl RunFailure {
     fn message(self) -> &'static str {
         match self {
             Self::ProbeAllFailed => {
-                "probe が 1 件も成功しなかった。この実行からは B2 の判断材料が何も得られていない。\
-                 出力 JSON の probe_* の error（接続 / 権限 / schema 名）を確認する"
+                "before 側の probe が 1 件も成功しなかった。この実行からは B2 の判断材料が\
+                 何も得られていない。出力 JSON の probe_before の error（接続 / 権限 / schema 名）\
+                 を確認する"
+            }
+            Self::MergeFailed => {
+                "Merge の実行自体が失敗した。after 側の stats / probe は意図して取得していない\
+                 （Merge 失敗直後の再呼び出しは避けている）。出力 JSON の merge.error（gRPC code\
+                 由来のヒント込み）を確認する。stats_before / probe_before は取得済みなので\
+                 Merge 前の状態把握には使える"
+            }
+            Self::ProbeAfterAllFailed => {
+                "Merge は成功したのに after 側 probe が 1 件も成功しなかった。global/hybrid の\
+                 実測 JSON が空で、B2 の分岐判断（mode=hybrid 切替か自前 concept-expansion か）に\
+                 使える情報が無い。出力 JSON の probe_after の error を確認する。stats_after の\
+                 community_count で Merge 自体の効果は別途確認できる"
             }
             Self::StatsUnavailable => {
                 "GetStats が before / after の両方で失敗し、Merge が効いたかを確認できていない。\
@@ -277,22 +382,31 @@ impl RunFailure {
 }
 
 /// 実行の成否を判定する。**優先順位は上から順で、先に一致したものが勝つ**
-/// （観測ゼロ > 成否不明 > 空振り > 増分ゼロ の順。順序を入れ替えると、
-/// 例えば probe 全滅を「増分あり＝正常」で覆い隠してしまう）。
+/// （before 観測ゼロ > Merge 失敗 > after 観測ゼロ > 成否不明 > 空振り > 増分ゼロ の順。
+/// 順序を入れ替えると、例えば after 側の probe 全滅を「community_count 増分あり＝正常」で
+/// 覆い隠してしまう）。
 fn evaluate_run(observation: RunObservation) -> RunVerdict {
-    // 1. 観測ゼロ。before/after の状態によらず、この実行は目的を果たしていない。
-    if observation.probe_attempted > 0 && observation.probe_succeeded == 0 {
+    // 1. before 側の観測がゼロ。Merge の成否によらず、この実行は目的を果たしていない。
+    if observation.probe_before_attempted > 0 && observation.probe_before_succeeded == 0 {
         return RunVerdict::Fatal(RunFailure::ProbeAllFailed);
     }
-    // 2. stats が両側とも取れず、Merge の成否を一切確認できない。
+    // 2. Merge 自体が失敗。after 側は意図して観測していないため、これ以降は判断材料が無い。
+    if observation.merge == MergeStatus::Failed {
+        return RunVerdict::Fatal(RunFailure::MergeFailed);
+    }
+    // 3. Merge は成功したのに after 側 probe が全滅。B2 の実測 JSON が空になる致命的な欠落。
+    if observation.probe_after.all_failed() {
+        return RunVerdict::Fatal(RunFailure::ProbeAfterAllFailed);
+    }
+    // 4. stats が両側とも取れず、Merge の成否を一切確認できない。
     if observation.community_before.is_error() && observation.community_after.is_error() {
         return RunVerdict::Fatal(RunFailure::StatsUnavailable);
     }
-    // 3. 真の空振り: Merge 後の community が 0 件。before の観測状態は問わない。
+    // 5. 真の空振り: Merge 後の community が 0 件。before の観測状態は問わない。
     if observation.community_after.value() == Some(0) {
         return RunVerdict::Fatal(RunFailure::NoCommunities);
     }
-    // 4-5. 両側そろったので増分で判断する。0 は「グラフ不変の schema への再 Merge」で
+    // 6-7. 両側そろったので増分で判断する。0 は「グラフ不変の schema への再 Merge」で
     //      起こりうるため warn 止まり。
     if let Some(delta) =
         community_count_delta(observation.community_before, observation.community_after)
@@ -303,7 +417,7 @@ fn evaluate_run(observation: RunObservation) -> RunVerdict {
             RunVerdict::Ok
         };
     }
-    // 6. 残りは致命ではない。ただし片側だけ「エラー」なら比較が不完全なので伝える
+    // 8. 残りは致命ではない。ただし片側だけ「エラー」なら比較が不完全なので伝える
     //    （`--probe-only` による Skipped は意図した省略なので黙って通す）。
     if observation.community_before.is_error() || observation.community_after.is_error() {
         RunVerdict::Warn(RunWarning::StatsPartiallyUnavailable)
@@ -423,13 +537,39 @@ async fn stats_json(client: &VegapunkClient, schema: &str, label: &str) -> Stats
     }
 }
 
-/// probe 1 周分の結果: 出力 JSON と、差分・成否判定に使う集計値。
+/// probe 1 周分の結果: 出力 JSON と、差分・成否判定に使う per-probe 集計。
 struct ProbeOutcome {
     json: Value,
-    totals: ProbeCounts,
-    /// 成功したクエリ × mode の件数。0 なら「この実行から観測が何も得られていない」。
-    succeeded: usize,
-    attempted: usize,
+    /// `PROBE_QUERIES × PROBE_MODES` のグリッドと **index 対応が取れた** 集計。
+    /// 失敗した probe は `None` にする（`ProbeCounts::default()` で埋めると
+    /// 「ヒット 0 件だった」と「そもそも測れていない」が区別できなくなる）。
+    /// before/after の差分はこの index 対応でのみ取る（`probe_counts_delta`）。
+    per_probe: Vec<Option<ProbeCounts>>,
+}
+
+impl ProbeOutcome {
+    fn attempted(&self) -> usize {
+        self.per_probe.len()
+    }
+
+    fn succeeded(&self) -> usize {
+        probe_succeeded(&self.per_probe)
+    }
+}
+
+/// 成功した `(query, mode)` の件数。0 なら「この実行から観測が何も得られていない」。
+fn probe_succeeded(per_probe: &[Option<ProbeCounts>]) -> usize {
+    per_probe.iter().filter(|counts| counts.is_some()).count()
+}
+
+/// 成功した probe だけを合算した内訳。母数が違えば比較できないので、読むときは必ず
+/// `succeeded` と併せて見ること（before/after 差分は必ず `probe_counts_delta` を通す）。
+fn probe_totals(per_probe: &[Option<ProbeCounts>]) -> ProbeCounts {
+    let mut totals = ProbeCounts::default();
+    for counts in per_probe.iter().flatten() {
+        totals.add(*counts);
+    }
+    totals
 }
 
 /// 全 PROBE_QUERIES × PROBE_MODES を叩き、ヒットの種別内訳・上位サンプル・SearchExecution を
@@ -437,25 +577,22 @@ struct ProbeOutcome {
 /// （前後差を取るのが目的で、片方のエラーで観測全体を落とさない）。
 async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcome {
     let mut entries = Vec::new();
-    let mut totals = ProbeCounts::default();
-    let mut succeeded = 0usize;
-    let mut attempted = 0usize;
+    // グリッドの 1 マスにつき必ず 1 要素 push する（成功は Some、失敗は None）。
+    // index が (query, mode) の同一性を担保するので、途中で push を飛ばさないこと。
+    let mut per_probe: Vec<Option<ProbeCounts>> = Vec::new();
     for query in PROBE_QUERIES {
         for mode in PROBE_MODES {
-            attempted += 1;
-            let entry = match client
+            let (entry, counts) = match client
                 .search_with_mode(&args.schema, query, args.top_k, mode)
                 .await
             {
                 Ok(outcome) => {
-                    succeeded += 1;
                     let kinds: Vec<HitKind> = outcome
                         .results
                         .iter()
                         .map(|item| classify_hit(item.id.as_deref()))
                         .collect();
                     let counts = ProbeCounts::from_kinds(&kinds);
-                    totals.add(counts);
                     let samples: Vec<Value> = outcome
                         .results
                         .iter()
@@ -486,24 +623,34 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcom
                             "readiness": readiness_json(execution.readiness.as_ref()),
                         })
                     });
-                    json!({
-                        "query": query,
-                        "mode": mode,
-                        "hit_count": outcome.results.len(),
-                        "counts": counts.to_json(),
-                        "samples": samples,
-                        "execution": execution,
-                    })
+                    (
+                        json!({
+                            "query": query,
+                            "mode": mode,
+                            "hit_count": outcome.results.len(),
+                            "counts": counts.to_json(),
+                            "samples": samples,
+                            "execution": execution,
+                        }),
+                        Some(counts),
+                    )
                 }
                 Err(err) => {
                     // Merge 前の global は FAILED_PRECONDITION が正常。異常ではないので error にしない。
                     tracing::warn!(query, mode, error = %format!("{err:#}"), "probe query failed");
-                    json!({ "query": query, "mode": mode, "error": format!("{err:#}") })
+                    (
+                        json!({ "query": query, "mode": mode, "error": format!("{err:#}") }),
+                        None,
+                    )
                 }
             };
             entries.push(entry);
+            per_probe.push(counts);
         }
     }
+    let totals = probe_totals(&per_probe);
+    let attempted = per_probe.len();
+    let succeeded = probe_succeeded(&per_probe);
     tracing::info!(
         label,
         succeeded,
@@ -518,12 +665,12 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcom
             "label": label,
             "succeeded": succeeded,
             "attempted": attempted,
+            // 成功した probe だけの合算。before/after で母数が違いうるので、
+            // 単独で引き算しないこと（差分は summary.probe_counts_delta を見る）。
             "totals": totals.to_json(),
             "entries": entries,
         }),
-        totals,
-        succeeded,
-        attempted,
+        per_probe,
     }
 }
 
@@ -543,41 +690,64 @@ async fn main() -> Result<()> {
     let stats_before = stats_json(&client, &args.schema, "before").await;
     let probe_before = probe(&client, &args, "before").await;
 
-    // after 側（stats + probe）を取るかどうかは Merge を実行したかどうかと一体。
-    // 判断を 1 箇所に閉じ、`--probe-only` なのに after を観測してしまう分岐漏れを防ぐ。
-    let (merge_result, elapsed_secs, stats_after, probe_after) = if args.probe_only {
+    // after 側（stats + probe）を取るかどうかは Merge の結果と一体。判断を 1 箇所に閉じ、
+    // `--probe-only` や Merge 失敗時に after を観測してしまう分岐漏れを防ぐ。
+    // **出力 JSON の形はどのパスでも同じにする**（後段ツールが `.summary.verdict` を読むときに
+    // パスによってスキーマが変わらないようにする。以前は Merge 失敗の早期 return が
+    // 別スキーマの JSON を出しており、`stats_after` 等が丸ごと欠落していた）。
+    let (merge_status, merge_json, elapsed_secs, stats_after, probe_after) = if args.probe_only {
         // Merge だけでなく after 側の観測もまとめてスキップする。同一条件の probe を
         // 2 周させても本番 vegapunk に無駄な負荷をかけるだけで、JSON の読み手には
         // 「before/after に差がある」と誤読させる材料にしかならない。
         tracing::info!("--probe-only: skipping Merge and the after-side observation");
-        (json!({ "skipped": true }), 0.0, None, None)
+        (
+            MergeStatus::Skipped,
+            json!({ "skipped": true }),
+            None,
+            None,
+            None,
+        )
     } else {
         tracing::info!(schema = %args.schema, "starting Merge (synchronous, whole-schema recompute)");
         let started = Instant::now();
         let outcome = client.merge(&args.schema).await;
         let elapsed = started.elapsed().as_secs_f64();
-        if let Err(err) = outcome {
-            // fail closed: サマリを出してから非 0 終了する（観測結果は捨てない）。
-            tracing::error!(error = %format!("{err:#}"), elapsed_secs = elapsed, "Merge failed");
-            let summary = json!({
-                "schema": args.schema,
-                "stats_before": stats_before.json,
-                "probe_before": probe_before.json,
-                "merge": { "ok": false, "error": format!("{err:#}") },
-                "merge_elapsed_secs": elapsed,
-            });
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            return Err(err);
+        match outcome {
+            Ok(()) => {
+                tracing::info!(elapsed_secs = elapsed, "Merge completed");
+                let stats_after = stats_json(&client, &args.schema, "after").await;
+                let probe_after = probe(&client, &args, "after").await;
+                (
+                    MergeStatus::Ok,
+                    json!({ "ok": true }),
+                    Some(elapsed),
+                    Some(stats_after),
+                    Some(probe_after),
+                )
+            }
+            Err(err) => {
+                // after 側は意図して観測しない。FAILED_PRECONDITION は「同一 schema で
+                // Merge が同時実行中」の可能性があり、失敗直後に追い打ちで stats/probe を
+                // 叩くのはノイズにしかならない。JSON のスキーマは成功パスと揃え、
+                // after 側は null（意図した省略）で表す。
+                tracing::error!(error = %format!("{err:#}"), elapsed_secs = elapsed, "Merge failed");
+                (
+                    MergeStatus::Failed,
+                    json!({ "ok": false, "error": format!("{err:#}") }),
+                    Some(elapsed),
+                    None,
+                    None,
+                )
+            }
         }
-        tracing::info!(elapsed_secs = elapsed, "Merge completed");
-        let stats_after = stats_json(&client, &args.schema, "after").await;
-        let probe_after = probe(&client, &args, "after").await;
-        (
-            json!({ "ok": true }),
-            elapsed,
-            Some(stats_after),
-            Some(probe_after),
-        )
+    };
+
+    let probe_after_observation = match &probe_after {
+        Some(outcome) => ProbeSideObservation::Attempted {
+            attempted: outcome.attempted(),
+            succeeded: outcome.succeeded(),
+        },
+        None => ProbeSideObservation::Skipped,
     };
 
     let observation = RunObservation {
@@ -585,10 +755,10 @@ async fn main() -> Result<()> {
         community_after: stats_after
             .as_ref()
             .map_or(StatsObservation::Skipped, |stats| stats.community_count),
-        probe_succeeded: probe_before.succeeded
-            + probe_after.as_ref().map_or(0, |probe| probe.succeeded),
-        probe_attempted: probe_before.attempted
-            + probe_after.as_ref().map_or(0, |probe| probe.attempted),
+        merge: merge_status,
+        probe_before_attempted: probe_before.attempted(),
+        probe_before_succeeded: probe_before.succeeded(),
+        probe_after: probe_after_observation,
     };
     let verdict = evaluate_run(observation);
     let (verdict_label, verdict_code, verdict_message) = match verdict {
@@ -602,7 +772,7 @@ async fn main() -> Result<()> {
         "probe_only": args.probe_only,
         "stats_before": stats_before.json,
         "stats_after": stats_after.as_ref().map(|stats| stats.json.clone()),
-        "merge": merge_result,
+        "merge": merge_json,
         "merge_elapsed_secs": elapsed_secs,
         "probe_before": probe_before.json,
         "probe_after": probe_after.as_ref().map(|probe| probe.json.clone()),
@@ -611,19 +781,24 @@ async fn main() -> Result<()> {
                 observation.community_before,
                 observation.community_after,
             ),
+            // 同じ (query, mode) で両側とも成功したペアだけの差分。母数は
+            // compared_pairs として同じオブジェクトに入る。
             "probe_counts_delta": probe_counts_delta(
-                probe_before.totals,
-                probe_after.as_ref().map(|probe| probe.totals),
+                &probe_before.per_probe,
+                probe_after.as_ref().map(|probe| probe.per_probe.as_slice()),
             )
             .map(ProbeCountsDelta::to_json),
-            "probe_succeeded": observation.probe_succeeded,
-            "probe_attempted": observation.probe_attempted,
+            "probe_before_attempted": observation.probe_before_attempted,
+            "probe_before_succeeded": observation.probe_before_succeeded,
+            "probe_after_attempted": observation.probe_after.attempted_count(),
+            "probe_after_succeeded": observation.probe_after.succeeded_count(),
             "verdict": verdict_label,
             "verdict_code": verdict_code,
             "verdict_message": verdict_message,
         },
     });
-    // fail closed でも観測結果は捨てない。判定より先に JSON を出す。
+    // fail closed でも観測結果は捨てない。判定・exit code に関わらず同じ 1 箇所で出す
+    // （Merge 失敗の早期 return を廃止し、出力経路を 1 本に統一した）。
     println!("{}", serde_json::to_string_pretty(&summary)?);
 
     match verdict {
@@ -684,13 +859,19 @@ mod tests {
 
     /// probe が全件成功した通常実行（Merge あり）の観測を組み立てるヘルパ。
     /// 各テストは「何を変えた結果その判定になるか」だけを書きたいので、
-    /// 変えない軸をここに固定する。
+    /// 変えない軸（Merge 成功・probe 前後とも全件成功）をここに固定する。
     fn observation(before: StatsObservation, after: StatsObservation) -> RunObservation {
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
         RunObservation {
             community_before: before,
             community_after: after,
-            probe_succeeded: PROBE_QUERIES.len() * PROBE_MODES.len() * 2,
-            probe_attempted: PROBE_QUERIES.len() * PROBE_MODES.len() * 2,
+            merge: MergeStatus::Ok,
+            probe_before_attempted: full,
+            probe_before_succeeded: full,
+            probe_after: ProbeSideObservation::Attempted {
+                attempted: full,
+                succeeded: full,
+            },
         }
     }
 
@@ -711,24 +892,97 @@ mod tests {
         );
     }
 
+    /// per-probe 集計の 1 マス。テストの意図（どのマスが欠測か）を読みやすくするヘルパ。
+    fn hit(manual_section: usize, concept: usize, other: usize) -> Option<ProbeCounts> {
+        Some(ProbeCounts {
+            manual_section,
+            concept,
+            other,
+        })
+    }
+
+    #[test]
+    fn probe_totals_sums_only_successful_probes() {
+        // 欠測（None）は 0 として足さない。母数は succeeded 側で別に出す。
+        let totals = probe_totals(&[hit(3, 1, 0), None, hit(2, 0, 4)]);
+        assert_eq!(totals.manual_section, 5);
+        assert_eq!(totals.concept, 1);
+        assert_eq!(totals.other, 4);
+    }
+
+    #[test]
+    fn probe_counts_delta_compares_only_pairs_succeeded_on_both_sides() {
+        // B1 初回実行の形: Merge 前の global（index 2）は FAILED_PRECONDITION で欠測し、
+        // Merge 後は成功する。合算どうしを引くと「probe が 1 本増えた」分まで delta に
+        // 混ざる（この例では manual_section が naive 集計だと +2 になり、符号すら反転する）。
+        let before = vec![hit(5, 0, 0), hit(4, 1, 0), None];
+        let after = vec![hit(3, 0, 2), hit(2, 1, 3), hit(6, 0, 1)];
+
+        let delta =
+            probe_counts_delta(&before, Some(&after)).expect("成功ペアがあるので比較できる");
+
+        assert_eq!(
+            delta.compared_pairs, 2,
+            "before 側が欠測の global は母数に入れない"
+        );
+        assert_eq!(delta.manual_section, -4, "(3-5) + (2-4)");
+        assert_eq!(delta.concept, 0);
+        assert_eq!(delta.other, 5, "(2-0) + (3-0)");
+        assert_eq!(
+            delta.to_json()["compared_pairs"],
+            2,
+            "読み手が母数を検証できるよう JSON にも出す"
+        );
+    }
+
     #[test]
     fn probe_counts_delta_is_none_without_after_side() {
-        let before = ProbeCounts {
-            manual_section: 10,
-            concept: 2,
-            other: 0,
-        };
-        let after = ProbeCounts {
-            manual_section: 7,
-            concept: 2,
-            other: 5,
-        };
-        let delta = probe_counts_delta(before, Some(after)).expect("両側そろえば差分が出る");
-        // community 由来のヒットに top_k を食われて ManualSection が減る、が読み取れること。
-        assert_eq!(delta.manual_section, -3);
-        assert_eq!(delta.concept, 0);
-        assert_eq!(delta.other, 5);
-        assert_eq!(probe_counts_delta(before, None), None);
+        assert_eq!(probe_counts_delta(&[hit(10, 2, 0)], None), None);
+    }
+
+    #[test]
+    fn probe_counts_delta_is_none_when_no_pair_succeeded_on_both_sides() {
+        // 欠測が互い違いで、同じ (query, mode) で両側そろったマスが 1 つも無い。
+        // 合算どうしなら数字が出てしまうが、比較可能なペアが無い以上「差分 0」ではなく比較不能。
+        let before = vec![hit(10, 2, 0), None];
+        let after = vec![None, hit(1, 1, 8)];
+        assert_eq!(probe_counts_delta(&before, Some(&after)), None);
+        // 片側が全滅した場合も同じ（旧実装が succeeded == 0 で弾いていたケース）。
+        assert_eq!(
+            probe_counts_delta(&before, Some(&[None, None])),
+            None,
+            "after 側が全滅なら delta は null"
+        );
+    }
+
+    #[test]
+    fn probe_counts_delta_is_none_when_grids_are_misaligned() {
+        // グリッドは固定なので長さは常に一致するはずだが、一致しないなら index 対応が
+        // 崩れている。前方一致で辻褄を合わせず比較不能にする。
+        let before = vec![hit(5, 0, 0), hit(4, 1, 0), hit(1, 0, 0)];
+        let after = vec![hit(3, 0, 2), hit(2, 1, 3)];
+        assert_eq!(probe_counts_delta(&before, Some(&after)), None);
+    }
+
+    #[test]
+    fn probe_side_observation_all_failed_only_when_attempted_and_zero_succeeded() {
+        assert!(ProbeSideObservation::Attempted {
+            attempted: 5,
+            succeeded: 0,
+        }
+        .all_failed());
+        assert!(!ProbeSideObservation::Attempted {
+            attempted: 5,
+            succeeded: 1,
+        }
+        .all_failed());
+        // attempted 0 は「そもそも回していない」であって「全滅」ではない。
+        assert!(!ProbeSideObservation::Attempted {
+            attempted: 0,
+            succeeded: 0,
+        }
+        .all_failed());
+        assert!(!ProbeSideObservation::Skipped.all_failed());
     }
 
     #[test]
@@ -803,13 +1057,76 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_run_fails_when_every_probe_query_failed() {
-        // stats が正常でも「観測ゼロ」は最優先で fail（B1 の目的は実測 JSON を得ること）。
+    fn evaluate_run_fails_when_before_side_probe_all_failed() {
+        // stats が正常でも「before 側の観測ゼロ」は最優先で fail
+        // （B1 の目的は実測 JSON を得ること。何も観測できていない実行を ok にしない）。
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
         let verdict = evaluate_run(RunObservation {
             community_before: StatsObservation::Value(0),
             community_after: StatsObservation::Value(37),
-            probe_succeeded: 0,
-            probe_attempted: PROBE_QUERIES.len() * PROBE_MODES.len() * 2,
+            merge: MergeStatus::Ok,
+            probe_before_attempted: full,
+            probe_before_succeeded: 0,
+            probe_after: ProbeSideObservation::Attempted {
+                attempted: full,
+                succeeded: full,
+            },
+        });
+        assert_eq!(verdict, RunVerdict::Fatal(RunFailure::ProbeAllFailed));
+    }
+
+    #[test]
+    fn evaluate_run_fails_when_after_side_probe_all_failed_despite_merge_success() {
+        // レビュー指摘の核心: Merge は成功し community_count も増えているのに、
+        // after 側 probe が全滅している。これを before/after 合算で「succeeded > 0」と
+        // 読んで ok にすると、B2 の分岐判断に使う実測 JSON が空のまま見逃される。
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
+        let verdict = evaluate_run(RunObservation {
+            community_before: StatsObservation::Value(0),
+            community_after: StatsObservation::Value(37),
+            merge: MergeStatus::Ok,
+            probe_before_attempted: full,
+            probe_before_succeeded: full,
+            probe_after: ProbeSideObservation::Attempted {
+                attempted: full,
+                succeeded: 0,
+            },
+        });
+        assert_eq!(verdict, RunVerdict::Fatal(RunFailure::ProbeAfterAllFailed));
+    }
+
+    #[test]
+    fn evaluate_run_fails_when_merge_itself_failed() {
+        // Merge RPC 自体がエラーを返した実行は、stats/probe の値によらず Fatal。
+        // after 側は意図して観測していない（Skipped）。
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
+        let verdict = evaluate_run(RunObservation {
+            community_before: StatsObservation::Value(37),
+            community_after: StatsObservation::Skipped,
+            merge: MergeStatus::Failed,
+            probe_before_attempted: full,
+            probe_before_succeeded: full,
+            probe_after: ProbeSideObservation::Skipped,
+        });
+        assert_eq!(verdict, RunVerdict::Fatal(RunFailure::MergeFailed));
+    }
+
+    #[test]
+    fn evaluate_run_prefers_probe_all_failed_over_stats_unavailable_when_both_apply() {
+        // before 側 probe が全滅、かつ stats が両側ともエラーという 2 条件が同時に成立する
+        // ケース。判定順を入れ替えると StatsUnavailable が返り、「そもそも何も観測できて
+        // いない」という一次原因が隠れてしまう。優先順位を固定するための回帰テスト。
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
+        let verdict = evaluate_run(RunObservation {
+            community_before: StatsObservation::Error,
+            community_after: StatsObservation::Error,
+            merge: MergeStatus::Ok,
+            probe_before_attempted: full,
+            probe_before_succeeded: 0,
+            probe_after: ProbeSideObservation::Attempted {
+                attempted: full,
+                succeeded: full,
+            },
         });
         assert_eq!(verdict, RunVerdict::Fatal(RunFailure::ProbeAllFailed));
     }
@@ -817,23 +1134,29 @@ mod tests {
     #[test]
     fn evaluate_run_accepts_probe_only_run_without_after_side() {
         // --probe-only は after を「意図して省略」しただけで、エラーではない。
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
         let verdict = evaluate_run(RunObservation {
             community_before: StatsObservation::Value(37),
             community_after: StatsObservation::Skipped,
-            probe_succeeded: PROBE_QUERIES.len() * PROBE_MODES.len(),
-            probe_attempted: PROBE_QUERIES.len() * PROBE_MODES.len(),
+            merge: MergeStatus::Skipped,
+            probe_before_attempted: full,
+            probe_before_succeeded: full,
+            probe_after: ProbeSideObservation::Skipped,
         });
         assert_eq!(verdict, RunVerdict::Ok);
     }
 
     #[test]
     fn evaluate_run_fails_probe_only_run_when_all_probes_failed() {
-        // after のスキップより「観測ゼロ」の方が優先される。
+        // after のスキップより「before 観測ゼロ」の方が優先される。
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
         let verdict = evaluate_run(RunObservation {
             community_before: StatsObservation::Value(37),
             community_after: StatsObservation::Skipped,
-            probe_succeeded: 0,
-            probe_attempted: PROBE_QUERIES.len() * PROBE_MODES.len(),
+            merge: MergeStatus::Skipped,
+            probe_before_attempted: full,
+            probe_before_succeeded: 0,
+            probe_after: ProbeSideObservation::Skipped,
         });
         assert_eq!(verdict, RunVerdict::Fatal(RunFailure::ProbeAllFailed));
     }
