@@ -811,15 +811,34 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcom
     ProbeOutcome { json, per_probe }
 }
 
+/// この CLI 専用の gRPC 上限。**h2 PING keepalive を無効にする**のがここの本質。
+///
+/// なぜ無効にするか: Merge は schema 全体の同期再計算（Leiden + LLM 要約 + Node2Vec）で、
+/// その間サーバは h2 PING に応答できない。常駐サーバ向けの既定
+/// （interval 30s + timeout 10s）のままだと、**正常に走っている Merge を 40 秒で切断する**。
+/// 本番 Cloud Run job での実測:
+/// `Unavailable, message: "http2 error", ... keep-alive timed out` / `elapsed_secs=40.0`。
+/// このとき Merge が失敗したのではなく、こちら側が接続を切っていた。
+/// 一発の長時間 RPC を投げるだけの CLI に、常駐サーバ向けの死活検知は要らない。
+///
+/// トレードオフ: 接続が本当に死んだ場合、この CLI は per-request timeout
+/// （`--timeout-secs`、既定 6h）まで気づけない。Cloud Run job の `--task-timeout` を 7h
+/// （= `--timeout-secs` より長く）に取ってある前提で、ハングは job 側で検出できる。
+/// TCP keepalive（60s）は `build_endpoint` 側で有効なままなので、OS 層の検知は残る。
+fn merge_cli_limits(timeout_secs: u64) -> GrpcLimits {
+    GrpcLimits {
+        timeout_secs,
+        keep_alive: None,
+        ..GrpcLimits::default()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let token = read_token(&args)?;
-    let limits = GrpcLimits {
-        timeout_secs: args.timeout_secs,
-        ..GrpcLimits::default()
-    };
+    let limits = merge_cli_limits(args.timeout_secs);
     let client = VegapunkClient::connect_with_limits(&args.endpoint, &token, limits)
         .await
         .context("connect vegapunk")?;
@@ -942,6 +961,27 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_cli_limits_disable_h2_keepalive_and_honor_timeout_arg() {
+        // Merge は schema 全体の同期再計算で、その間サーバは h2 PING に応答できない。
+        // 既定の keepalive（interval 30s + timeout 10s）のままだと、正常に走っている
+        // Merge を 40 秒で切断する（本番実測）。この CLI では必ず無効であること。
+        let limits = merge_cli_limits(21_600);
+        assert!(
+            limits.keep_alive.is_none(),
+            "merge_schema CLI は h2 PING keepalive を張らない"
+        );
+        assert_eq!(
+            limits.timeout_secs, 21_600,
+            "--timeout-secs がそのまま per-request timeout になる"
+        );
+        assert_eq!(
+            limits.max_decode_bytes,
+            GrpcLimits::default().max_decode_bytes,
+            "decode 上限は既定のまま（keepalive 以外を触らない）"
+        );
+    }
 
     #[test]
     fn classify_hit_recognizes_manual_section() {

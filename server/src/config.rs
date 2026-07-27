@@ -86,6 +86,9 @@ impl AppConfig {
                 .vegapunk_max_decode_mb
                 .max(1)
                 .saturating_mul(1024 * 1024),
+            // keepalive は既定のまま。常駐サーバは長寿命チャネルを使い回すため、
+            // アイドル後の死んだ接続を h2 PING で検知する必要がある（config で切らせない）。
+            ..crate::vegapunk::GrpcLimits::default()
         }
     }
 }

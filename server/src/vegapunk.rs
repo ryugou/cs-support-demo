@@ -36,14 +36,45 @@ pub struct VegapunkClient {
     auth_header: MetadataValue<tonic::metadata::Ascii>,
 }
 
+/// h2 PING keepalive の設定。**この既定は常駐サーバ向け**で、
+/// 「長寿命チャネルがアイドル後に死んだ接続を掴んだまま 120s ハングする」事象への対策
+/// として入っている（詳細は `connect_lazy_with_limits` のコメント）。
+///
+/// 一方、サーバが応答を返さないまま長時間走る同期 RPC（`Merge`）では、この死活検知が
+/// **正常な処理を誤検知で切断する**。そのため `GrpcLimits.keep_alive = None` で
+/// 無効化できるようにしてある。無効化の判断は呼び出し側（現状 merge_schema CLI のみ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepAlive {
+    /// h2 PING を送る間隔。
+    pub interval: Duration,
+    /// PING 応答の待ち時間。超えると接続を切って再接続させる。
+    pub timeout: Duration,
+    /// 進行中のリクエストが無いときも PING を送るか。
+    pub while_idle: bool,
+}
+
+impl Default for KeepAlive {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(10),
+            while_idle: true,
+        }
+    }
+}
+
 /// gRPC channel の運用上限。マニュアル本文込みの graph snapshot が tonic 既定の
 /// 4MiB decode 上限・短い timeout を超えるため、既定を引き上げている
 /// （URTECT 実測 ~6MB / snapshot 読みで 30s 超）。環境ごとに締められるよう
 /// config（vegapunk_timeout_secs / vegapunk_max_decode_mb）から上書き可能。
-#[derive(Debug, Clone, Copy)]
+///
+/// `keep_alive` は `None` で h2 PING keepalive を一切設定しない（TCP keepalive は残る）。
+/// `Default` は常駐サーバの現行挙動そのままなので、既定を変えないこと。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrpcLimits {
     pub timeout_secs: u64,
     pub max_decode_bytes: usize,
+    pub keep_alive: Option<KeepAlive>,
 }
 
 impl Default for GrpcLimits {
@@ -51,8 +82,35 @@ impl Default for GrpcLimits {
         Self {
             timeout_secs: 120,
             max_decode_bytes: 64 * 1024 * 1024,
+            keep_alive: Some(KeepAlive::default()),
         }
     }
+}
+
+/// `connect_lazy_with_limits` / `connect_with_limits` が共有する Endpoint 組み立て。
+/// 片方だけ設定が漏れると「lazy 接続だけ挙動が違う」という追いにくい差になるため、
+/// 1 箇所に閉じている。
+fn build_endpoint(endpoint: &str, limits: GrpcLimits) -> Result<Endpoint> {
+    let mut builder = Endpoint::from_shared(endpoint.to_string())?
+        // connect_timeout は 30s。本番規模で TCP+TLS+h2 の確立が 10s では間に合わず
+        // 常駐サーバのコールドな最初の 1 発が connect timeout に化ける事象への余裕。
+        // 呼び出し自体の上限は別途 `timeout(limits.timeout_secs)` が握る。
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(limits.timeout_secs))
+        // TCP keepalive は h2 keepalive の有無に関わらず常に張る。h2 を切った呼び出し側でも
+        // OS 層の死活検知だけは残しておく。
+        .tcp_keepalive(Some(Duration::from_secs(60)));
+    // 長寿命チャネルがアイドル後に死んだ接続を掴んだまま 120s ハングする事象への対策
+    // （実測: 新規接続の grpcurl は常に高速なのに、常駐サーバの呼び出しだけ停滞する）。
+    // h2 PING keepalive で死活を検知し、切断時は再接続させる。
+    // `None` の呼び出し側は、応答を返さない長時間 RPC を誤検知で切られるのを避けている。
+    if let Some(keep_alive) = limits.keep_alive {
+        builder = builder
+            .http2_keep_alive_interval(keep_alive.interval)
+            .keep_alive_timeout(keep_alive.timeout)
+            .keep_alive_while_idle(keep_alive.while_idle);
+    }
+    Ok(builder)
 }
 
 impl VegapunkClient {
@@ -65,20 +123,7 @@ impl VegapunkClient {
         bearer_token: &str,
         limits: GrpcLimits,
     ) -> Result<Self> {
-        let channel = Endpoint::from_shared(endpoint.to_string())?
-            // connect_timeout は 30s。本番規模で TCP+TLS+h2 の確立が 10s では間に合わず
-            // 常駐サーバのコールドな最初の 1 発が connect timeout に化ける事象への余裕。
-            // 呼び出し自体の上限は別途 `timeout(limits.timeout_secs)` が握る。
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(limits.timeout_secs))
-            // 長寿命チャネルがアイドル後に死んだ接続を掴んだまま 120s ハングする事象への対策
-            // （実測: 新規接続の grpcurl は常に高速なのに、常駐サーバの呼び出しだけ停滞する）。
-            // h2 PING keepalive で死活を検知し、切断時は再接続させる。
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .connect_lazy();
+        let channel = build_endpoint(endpoint, limits)?.connect_lazy();
         let auth_header = MetadataValue::try_from(format!("Bearer {bearer_token}"))
             .context("invalid bearer token metadata")?;
         Ok(Self {
@@ -97,19 +142,7 @@ impl VegapunkClient {
         bearer_token: &str,
         limits: GrpcLimits,
     ) -> Result<Self> {
-        let channel = Endpoint::from_shared(endpoint.to_string())?
-            // connect_timeout は 30s。本番規模で TCP+TLS+h2 の確立が 10s では間に合わず
-            // 常駐サーバのコールドな最初の 1 発が connect timeout に化ける事象への余裕。
-            // 呼び出し自体の上限は別途 `timeout(limits.timeout_secs)` が握る。
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(limits.timeout_secs))
-            // 長寿命チャネルがアイドル後に死んだ接続を掴んだまま 120s ハングする事象への対策
-            // （実測: 新規接続の grpcurl は常に高速なのに、常駐サーバの呼び出しだけ停滞する）。
-            // h2 PING keepalive で死活を検知し、切断時は再接続させる。
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            .tcp_keepalive(Some(Duration::from_secs(60)))
+        let channel = build_endpoint(endpoint, limits)?
             .connect()
             .await
             .with_context(|| format!("connect vegapunk endpoint {endpoint}"))?;
@@ -696,6 +729,14 @@ pub fn merge_error_hint(code: Code) -> Option<&'static str> {
             "クライアント側 timeout。--timeout-secs を引き上げる。\
              サーバ側では Merge が継続している可能性があるため、再実行前に stats の community_count を確認する",
         ),
+        // 実測（本番 Cloud Run job）: h2 keepalive が Merge 実行中の接続を 40 秒で切り、
+        // Unavailable("http2 error: keep-alive timed out") になった。Merge は同期実行で
+        // その間サーバが h2 PING に応答しないため、切ったのはクライアント側である。
+        Code::Unavailable => Some(
+            "接続断（h2 / transport エラー）。サーバ側の Merge は継続している可能性が高い。\
+             再実行の前に必ず --probe-only で community_count を確認する。\
+             走行中に再実行すると FAILED_PRECONDITION（同時実行不可）になる",
+        ),
         _ => None,
     }
 }
@@ -769,9 +810,34 @@ fn to_proto_edge(edge: GraphEdge) -> Edge {
 mod tests {
     use super::{
         annotate_grpc_error, degradation_summary, merge_error_hint, page_is_last,
-        pagination_is_complete,
+        pagination_is_complete, GrpcLimits,
     };
+    use std::time::Duration;
     use tonic::Code;
+
+    #[test]
+    fn grpc_limits_default_keeps_resident_server_keepalive() {
+        // 常駐サーバ（main.rs）と merge_schema 以外の CLI は、この既定のまま動いている。
+        // h2 keepalive を既定から外すと「長寿命チャネルがアイドル後に死んだ接続を掴んだまま
+        // 120s ハングする」事象（対策コメントは connect_lazy_with_limits 参照）が再発する。
+        // keepalive を切ってよいのは、一発の長時間 RPC しか投げない merge_schema CLI だけ。
+        let limits = GrpcLimits::default();
+        assert_eq!(limits.timeout_secs, 120, "既定の per-request timeout");
+        assert_eq!(
+            limits.max_decode_bytes,
+            64 * 1024 * 1024,
+            "既定の decode 上限"
+        );
+        let keep_alive = limits
+            .keep_alive
+            .expect("既定では h2 PING keepalive が有効であること");
+        assert_eq!(keep_alive.interval, Duration::from_secs(30));
+        assert_eq!(keep_alive.timeout, Duration::from_secs(10));
+        assert!(
+            keep_alive.while_idle,
+            "アイドル中の死活検知が既定の目的なので while_idle は true"
+        );
+    }
 
     #[test]
     fn degradation_summary_renders_component_and_reason() {
@@ -827,6 +893,28 @@ mod tests {
         assert!(deadline.contains("--timeout-secs"));
         // 未分類の code はヒント無し（元の Status をそのまま見せる）
         assert!(merge_error_hint(Code::Internal).is_none());
+    }
+
+    #[test]
+    fn merge_error_hint_explains_transport_disconnect() {
+        // 本番 Cloud Run job 実測: h2 keepalive が Merge 実行中の接続を 40 秒で切り、
+        // Unavailable("http2 error: keep-alive timed out") になった。このとき運用者が
+        // 即座に知る必要があるのは「サーバ側の Merge は続いている可能性が高いので、
+        // 再実行の前に --probe-only で community_count を確認しろ」であること。
+        // 走行中に再実行すると FAILED_PRECONDITION（同時実行不可）になる。
+        let unavailable = merge_error_hint(Code::Unavailable).expect("hint");
+        assert!(
+            unavailable.contains("--probe-only"),
+            "再実行前の確認手段を示す: {unavailable}"
+        );
+        assert!(
+            unavailable.contains("community_count"),
+            "何を見れば継続中か分かるかを示す: {unavailable}"
+        );
+        assert!(
+            unavailable.contains("継続している可能性"),
+            "サーバ側処理が生きている前提を伝える: {unavailable}"
+        );
     }
 
     #[test]
