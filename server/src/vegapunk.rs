@@ -593,7 +593,9 @@ impl VegapunkClient {
                 req,
             )
             .await
-            .map_err(|err| annotate_grpc_error(err, &format!("search schema {schema}")))?;
+            // Merge 固有のヒントは付けない。`mode=global` は Merge 前に FAILED_PRECONDITION を
+            // 返すのが正常であり、そこへ「Merge が同時実行中」と書くと原因を誤誘導する。
+            .with_context(|| format!("search schema {schema}"))?;
         if let Some(execution) = resp.execution.as_ref() {
             if execution.degraded {
                 tracing::warn!(
@@ -654,7 +656,8 @@ impl VegapunkClient {
             req,
         )
         .await
-        .map_err(|err| annotate_grpc_error(err, &format!("get stats for schema {schema}")))
+        // Merge 固有のヒントは付けない（GetStats の失敗は Merge の同時実行とは無関係）。
+        .with_context(|| format!("get stats for schema {schema}"))
     }
 
     async fn call<T, F, Fut, R>(&self, f: F, body: T) -> Result<R>
@@ -712,6 +715,10 @@ pub fn degradation_summary(degradation: &SearchDegradation) -> String {
 
 /// `call` が返す anyhow エラーに、gRPC code 由来の運用ヒントを付ける。
 /// `call` は `tonic::Status` を `Into` で anyhow 化しているので downcast で code を取り出す。
+///
+/// **`merge` 専用**。ヒント文言は Merge の失敗を前提に書かれているため、他の RPC に付けると
+/// 誤った原因説明になる（例: `mode=global` が Merge 前に返す FAILED_PRECONDITION は正常応答で、
+/// 「Merge が同時実行中」は嘘になる）。他の RPC は素の `Context` を使うこと。
 fn annotate_grpc_error(err: anyhow::Error, context: &str) -> anyhow::Error {
     let hint = err
         .downcast_ref::<tonic::Status>()
@@ -760,7 +767,10 @@ fn to_proto_edge(edge: GraphEdge) -> Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::{degradation_summary, merge_error_hint, page_is_last, pagination_is_complete};
+    use super::{
+        annotate_grpc_error, degradation_summary, merge_error_hint, page_is_last,
+        pagination_is_complete,
+    };
     use tonic::Code;
 
     #[test]
@@ -817,6 +827,40 @@ mod tests {
         assert!(deadline.contains("--timeout-secs"));
         // 未分類の code はヒント無し（元の Status をそのまま見せる）
         assert!(merge_error_hint(Code::Internal).is_none());
+    }
+
+    #[test]
+    fn annotate_grpc_error_attaches_hint_by_downcasting_tonic_status() {
+        // `call` は tonic::Status を Into で anyhow 化する。その downcast 経路が生きていないと
+        // ヒントが黙って消え、Merge 失敗時に運用者へ次のアクションが伝わらない。
+        let err = anyhow::Error::from(tonic::Status::failed_precondition("merge already running"));
+        let annotated = annotate_grpc_error(err, "merge schema test");
+        let rendered = format!("{annotated:#}");
+        assert!(
+            rendered.contains("merge schema test"),
+            "呼び出し文脈を残す: {rendered}"
+        );
+        assert!(
+            rendered.contains("同時実行"),
+            "FAILED_PRECONDITION のヒントが付く: {rendered}"
+        );
+        assert!(
+            rendered.contains("merge already running"),
+            "サーバの message を落とさない: {rendered}"
+        );
+    }
+
+    #[test]
+    fn annotate_grpc_error_keeps_context_only_for_unclassified_errors() {
+        // tonic::Status でない（= downcast できない）エラーに、当てずっぽうの Merge 説明を足さない。
+        let err = anyhow::anyhow!("channel closed");
+        let rendered = format!("{:#}", annotate_grpc_error(err, "merge schema test"));
+        assert!(rendered.contains("merge schema test"), "{rendered}");
+        assert!(rendered.contains("channel closed"), "{rendered}");
+        assert!(
+            !rendered.contains("同時実行"),
+            "分類できないエラーにヒントを付けない: {rendered}"
+        );
     }
 
     #[test]
