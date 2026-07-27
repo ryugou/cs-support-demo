@@ -117,7 +117,9 @@ Upsert を使う理由（確認済み）: 高レベル `Ingest` RPC は生テキ
 
 ## community 配線（Phase B）
 
-- Upsert 完了後、`ingest_alarmcom` の末尾で **`Merge` RPC を明示呼び**（`VegapunkClient` に `merge(schema)` を追加）
+> **2026-07-27 更新**: Phase B の確定 spec は [`2026-07-27-phase-b-community-merge-design.md`](./2026-07-27-phase-b-community-merge-design.md) に移した。下記「`ingest_alarmcom` の末尾で Merge を呼ぶ」は**専用 CLI + 専用 Cloud Run job `merge-schema` に分離する**方針へ変更済み（`ingest_alarmcom` の実測所要が約 6 時間で、その末尾に同期 Merge を積むと Merge だけの再実行ができないため）。Phase B は B1（Merge 配線 + 実行 + global 返却物の実測）と B2（実測に基づく結合実装）に分割した。
+
+- Upsert 完了後、**`Merge` RPC を明示呼び**（`VegapunkClient` に `merge(schema)` を追加）。呼び出し経路は上記のとおり専用 CLI へ変更
 - **vegapunk 側前提（対応済み・2026-07-22）**: `community.target_node_types` に `ManualSection` + `Concept` を追加済み（既定 8 型 + 2 型 = 10 型）。手順は [`docs/runbooks/vegapunk-community-target-node-types.md`](../../runbooks/vegapunk-community-target-node-types.md)。この設定はグローバル（schema 別上書き不可）だが、該当型を持たない schema には無害な加算
 - 代替経路（community を使わない場合）: query 時に `MENTIONS_CONCEPT` を辿る concept-expansion（get_section 展開の延長）。vegapunk 変更不要だが LLM 合成サマリは得られない
 
