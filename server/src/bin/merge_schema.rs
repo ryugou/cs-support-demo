@@ -402,8 +402,9 @@ fn evaluate_run(observation: RunObservation) -> RunVerdict {
     if observation.community_before.is_error() && observation.community_after.is_error() {
         return RunVerdict::Fatal(RunFailure::StatsUnavailable);
     }
-    // 5. 真の空振り: Merge 後の community が 0 件。before の観測状態は問わない。
-    if observation.community_after.value() == Some(0) {
+    // 5. 真の空振り: **Merge を実行した**のに community が 0 件。before の観測状態は問わない。
+    //    Merge を回していない実行（--probe-only）に当てると、観測専用実行が非 0 終了に化ける。
+    if observation.merge == MergeStatus::Ok && observation.community_after.value() == Some(0) {
         return RunVerdict::Fatal(RunFailure::NoCommunities);
     }
     // 6-7. 両側そろったので増分で判断する。0 は「グラフ不変の schema への再 Merge」で
@@ -986,6 +987,20 @@ mod tests {
     }
 
     #[test]
+    fn probe_side_observation_counts_are_none_when_skipped() {
+        // Skipped は `Some(0)` ではなく `None`。0 に潰すと --probe-only 実行の JSON が
+        // 「after 側 probe を回して 1 件も成功しなかった」と読める（実際には回していない）。
+        assert_eq!(ProbeSideObservation::Skipped.attempted_count(), None);
+        assert_eq!(ProbeSideObservation::Skipped.succeeded_count(), None);
+        let attempted = ProbeSideObservation::Attempted {
+            attempted: 12,
+            succeeded: 8,
+        };
+        assert_eq!(attempted.attempted_count(), Some(12));
+        assert_eq!(attempted.succeeded_count(), Some(8));
+    }
+
+    #[test]
     fn evaluate_run_accepts_community_growth() {
         let verdict = evaluate_run(observation(
             StatsObservation::Value(0),
@@ -1024,6 +1039,49 @@ mod tests {
             )),
             RunVerdict::Fatal(RunFailure::NoCommunities)
         );
+    }
+
+    #[test]
+    fn evaluate_run_does_not_blame_merge_for_zero_communities_when_merge_did_not_run() {
+        // 「Merge を実行したのに 0 件」が空振りの定義なので、Merge を回していない実行に
+        // この判定を当てない。RunObservation は merge: Skipped と community_after: Value(0) を
+        // 同時に持てる値であり（--probe-only でも after stats を取る変更を入れれば実際に成立する）、
+        // merge を条件に含めないと観測専用実行が非 0 終了に化ける。
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
+        let verdict = evaluate_run(RunObservation {
+            community_before: StatsObservation::Value(0),
+            community_after: StatsObservation::Value(0),
+            merge: MergeStatus::Skipped,
+            probe_before_attempted: full,
+            probe_before_succeeded: full,
+            probe_after: ProbeSideObservation::Skipped,
+        });
+        assert_eq!(
+            verdict,
+            RunVerdict::Warn(RunWarning::CommunityCountUnchanged)
+        );
+    }
+
+    #[test]
+    fn evaluate_run_prefers_probe_after_all_failed_over_no_communities() {
+        // Merge 成功 / community 0 件 / after probe 全滅が同時成立するケース。
+        // 先に出すのは「after 側の観測が何も取れていない」方。観測経路そのもの（接続・権限）が
+        // 死んでいる可能性がある状態で「コミュニティが作れていない」と読ませると、
+        // vegapunk 側のログを追う誤った調査に運用者を送り込む。どちらも非 0 終了だが、
+        // 先頭に出るメッセージが調査の入口を決めるので優先順位を固定する。
+        let full = PROBE_QUERIES.len() * PROBE_MODES.len();
+        let verdict = evaluate_run(RunObservation {
+            community_before: StatsObservation::Value(0),
+            community_after: StatsObservation::Value(0),
+            merge: MergeStatus::Ok,
+            probe_before_attempted: full,
+            probe_before_succeeded: full,
+            probe_after: ProbeSideObservation::Attempted {
+                attempted: full,
+                succeeded: 0,
+            },
+        });
+        assert_eq!(verdict, RunVerdict::Fatal(RunFailure::ProbeAfterAllFailed));
     }
 
     #[test]
