@@ -243,6 +243,73 @@ enum MergeStatus {
     Failed,
 }
 
+impl MergeStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Merge 実行パスの結果。**判定・出力 JSON・exit 時のエラーをすべてここから作る**。
+/// 経路ごとに JSON を手書きすると、キー構成が経路依存になり（`{"ok":true}` /
+/// `{"ok":false,"error":..}` / `{"skipped":true}`）、後段ツールがキーの有無で分岐する羽目になる。
+/// verdict と JSON がずれる余地も残る。
+struct MergeReport {
+    status: MergeStatus,
+    /// Merge RPC が返した原エラー。`Failed` のときだけ `Some`。
+    /// gRPC code 由来のヒントを exit 時のエラー行にも残すため、文字列化せず保持する。
+    error: Option<anyhow::Error>,
+    /// Merge を実際に呼んだときの所要秒。`Skipped` では `None`（0.0 と区別する）。
+    elapsed_secs: Option<f64>,
+}
+
+impl MergeReport {
+    fn skipped() -> Self {
+        Self {
+            status: MergeStatus::Skipped,
+            error: None,
+            elapsed_secs: None,
+        }
+    }
+
+    fn ok(elapsed_secs: f64) -> Self {
+        Self {
+            status: MergeStatus::Ok,
+            error: None,
+            elapsed_secs: Some(elapsed_secs),
+        }
+    }
+
+    fn failed(error: anyhow::Error, elapsed_secs: f64) -> Self {
+        Self {
+            status: MergeStatus::Failed,
+            error: Some(error),
+            elapsed_secs: Some(elapsed_secs),
+        }
+    }
+
+    /// どの経路でも同じキー構成（`status` / `error`）にする。
+    fn to_json(&self) -> Value {
+        json!({
+            "status": self.status.as_str(),
+            "error": self.error.as_ref().map(|err| format!("{err:#}")),
+        })
+    }
+}
+
+/// Fatal 時に `main` が返すエラー。Merge 由来の原エラーがあるなら、**それを保持したまま**
+/// verdict の説明を context として被せる。定型文へ置き換えると、Cloud Run job の失敗
+/// サマリ（最終エラー行しか見えないことがある）に gRPC code 由来のヒントが届かない。
+fn fatal_error(failure: RunFailure, merge_error: Option<anyhow::Error>) -> anyhow::Error {
+    match merge_error {
+        Some(err) => err.context(failure.message()),
+        None => anyhow::anyhow!("{}", failure.message()),
+    }
+}
+
 /// after 側 probe の観測結果。`StatsObservation::{Value, Error, Skipped}` と同じ
 /// 「意図した省略」と「実行したが失敗した」の型分離を probe 側にも適用する。
 /// before 側は `--probe-only` でも常に実行するため区別が要らず、素の usize で持つ。
@@ -696,18 +763,12 @@ async fn main() -> Result<()> {
     // **出力 JSON の形はどのパスでも同じにする**（後段ツールが `.summary.verdict` を読むときに
     // パスによってスキーマが変わらないようにする。以前は Merge 失敗の早期 return が
     // 別スキーマの JSON を出しており、`stats_after` 等が丸ごと欠落していた）。
-    let (merge_status, merge_json, elapsed_secs, stats_after, probe_after) = if args.probe_only {
+    let (merge_report, stats_after, probe_after) = if args.probe_only {
         // Merge だけでなく after 側の観測もまとめてスキップする。同一条件の probe を
         // 2 周させても本番 vegapunk に無駄な負荷をかけるだけで、JSON の読み手には
         // 「before/after に差がある」と誤読させる材料にしかならない。
         tracing::info!("--probe-only: skipping Merge and the after-side observation");
-        (
-            MergeStatus::Skipped,
-            json!({ "skipped": true }),
-            None,
-            None,
-            None,
-        )
+        (MergeReport::skipped(), None, None)
     } else {
         tracing::info!(schema = %args.schema, "starting Merge (synchronous, whole-schema recompute)");
         let started = Instant::now();
@@ -719,9 +780,7 @@ async fn main() -> Result<()> {
                 let stats_after = stats_json(&client, &args.schema, "after").await;
                 let probe_after = probe(&client, &args, "after").await;
                 (
-                    MergeStatus::Ok,
-                    json!({ "ok": true }),
-                    Some(elapsed),
+                    MergeReport::ok(elapsed),
                     Some(stats_after),
                     Some(probe_after),
                 )
@@ -732,13 +791,7 @@ async fn main() -> Result<()> {
                 // 叩くのはノイズにしかならない。JSON のスキーマは成功パスと揃え、
                 // after 側は null（意図した省略）で表す。
                 tracing::error!(error = %format!("{err:#}"), elapsed_secs = elapsed, "Merge failed");
-                (
-                    MergeStatus::Failed,
-                    json!({ "ok": false, "error": format!("{err:#}") }),
-                    Some(elapsed),
-                    None,
-                    None,
-                )
+                (MergeReport::failed(err, elapsed), None, None)
             }
         }
     };
@@ -756,7 +809,7 @@ async fn main() -> Result<()> {
         community_after: stats_after
             .as_ref()
             .map_or(StatsObservation::Skipped, |stats| stats.community_count),
-        merge: merge_status,
+        merge: merge_report.status,
         probe_before_attempted: probe_before.attempted(),
         probe_before_succeeded: probe_before.succeeded(),
         probe_after: probe_after_observation,
@@ -773,8 +826,8 @@ async fn main() -> Result<()> {
         "probe_only": args.probe_only,
         "stats_before": stats_before.json,
         "stats_after": stats_after.as_ref().map(|stats| stats.json.clone()),
-        "merge": merge_json,
-        "merge_elapsed_secs": elapsed_secs,
+        "merge": merge_report.to_json(),
+        "merge_elapsed_secs": merge_report.elapsed_secs,
         "probe_before": probe_before.json,
         "probe_after": probe_after.as_ref().map(|probe| probe.json.clone()),
         "summary": {
@@ -810,7 +863,7 @@ async fn main() -> Result<()> {
         }
         RunVerdict::Fatal(failure) => {
             tracing::error!(verdict = failure.code(), "{}", failure.message());
-            Err(anyhow::anyhow!("{}", failure.message()))
+            Err(fatal_error(failure, merge_report.error))
         }
     }
 }
@@ -1038,6 +1091,69 @@ mod tests {
                 StatsObservation::Value(0)
             )),
             RunVerdict::Fatal(RunFailure::NoCommunities)
+        );
+    }
+
+    #[test]
+    fn merge_report_json_keeps_the_same_shape_on_every_path() {
+        // 経路ごとにキーが変わる（skipped / ok / error）と、後段ツールは
+        // 「キーの有無」で分岐せざるを得ず、新しい経路が増えるたびに壊れる。
+        let keys = |value: &Value| {
+            value
+                .as_object()
+                .expect("merge は object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let skipped = MergeReport::skipped().to_json();
+        let ok = MergeReport::ok(12.5).to_json();
+        let failed = MergeReport::failed(
+            anyhow::anyhow!("permission denied").context("merge schema urtect"),
+            3.0,
+        )
+        .to_json();
+
+        assert_eq!(keys(&skipped), keys(&ok));
+        assert_eq!(keys(&skipped), keys(&failed));
+        assert_eq!(skipped["status"], "skipped");
+        assert_eq!(skipped["error"], Value::Null);
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["error"], Value::Null);
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(
+            failed["error"],
+            Value::from("merge schema urtect: permission denied"),
+            "gRPC code 由来のヒントを含む context 連鎖を落とさない"
+        );
+    }
+
+    #[test]
+    fn fatal_error_keeps_the_original_merge_error_in_the_chain() {
+        // Cloud Run job の失敗サマリでは最終エラー行しか見ないことがある。定型文で
+        // 置き換えると、Merge が返した gRPC 由来のヒントが運用者へ届かなくなる。
+        let err = fatal_error(
+            RunFailure::MergeFailed,
+            Some(anyhow::anyhow!("Merge は admin ロール必須").context("merge schema urtect")),
+        );
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(RunFailure::MergeFailed.message()),
+            "verdict の説明が先頭に出る: {rendered}"
+        );
+        assert!(
+            rendered.contains("admin ロール必須"),
+            "原エラーが連鎖に残る: {rendered}"
+        );
+    }
+
+    #[test]
+    fn fatal_error_falls_back_to_the_verdict_message_without_a_merge_error() {
+        // Merge 以外の Fatal（probe 全滅など）では原エラーが無い。verdict の説明だけを返す。
+        let err = fatal_error(RunFailure::ProbeAllFailed, None);
+        assert_eq!(
+            format!("{err:#}"),
+            RunFailure::ProbeAllFailed.message().to_string()
         );
     }
 
