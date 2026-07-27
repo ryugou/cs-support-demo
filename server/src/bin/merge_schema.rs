@@ -22,7 +22,7 @@ use cs_support_mcp::{
     proto::graphrag::{ComponentReadiness, ReadinessState, SearchReadiness},
     vegapunk::{GrpcLimits, VegapunkClient},
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::{env, fs, path::PathBuf, time::Instant};
 
 /// probe に使う日本語クエリ。**複数記事にまたがって答えが散る問い合わせ**を選ぶ
@@ -127,9 +127,9 @@ impl ProbeCounts {
     }
 }
 
-/// probe 内訳の before→after 差分。`manual_section` が減って `other` が増えるなら
-/// community 由来の item に top_k を食われている、という B2 の判断材料になる。
-/// `compared_pairs` は差分の母数（両側そろった `(query, mode)` の数）。
+/// probe 内訳の before→after 差分（**1 つの mode 内**）。`manual_section` が減って
+/// `other` が増えるなら community 由来の item に top_k を食われている、という B2 の判断材料。
+/// `compared_pairs` は差分の母数（その mode で両側そろった `(query, mode)` の数）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ProbeCountsDelta {
     manual_section: i64,
@@ -160,21 +160,60 @@ fn count_delta(before: usize, after: usize) -> i64 {
     after.saturating_sub(before)
 }
 
-/// probe 内訳の before→after 差分を、**同じ `(query, mode)` で両側とも成功したペアだけ**から取る。
+/// mode 別の before→after 差分。キーは `PROBE_MODES` の値で、その mode に比較可能ペアが
+/// 1 つも無ければ `None`（JSON では `null`）。
 ///
-/// `(query, mode)` のグリッドは `PROBE_QUERIES × PROBE_MODES` で固定なので、`per_probe` の
-/// index はそのまま probe の同一性を意味する。ここで index を捨てて合算どうしを引くと
+/// **mode を横断して合算しない。** 3 つの mode は性質が違う: `local` は Merge の影響を
+/// 受けない基準線、`global` は Merge 前が FAILED_PRECONDITION で全欠測（B1 初回実行では必ず
+/// こうなる）、B2 の一次シグナルは `hybrid` の `manual_section` 減少（community 由来の item に
+/// top_k を食われた）である。合算すると、基準線 `local` の偶然の増減が `hybrid` のシグナルを
+/// 打ち消して隠しうる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeCountsDeltaByMode {
+    /// `PROBE_MODES` と同じ並びの `(mode, その mode の差分)`。
+    per_mode: Vec<(&'static str, Option<ProbeCountsDelta>)>,
+}
+
+impl ProbeCountsDeltaByMode {
+    fn to_json(&self) -> Value {
+        let mut map = Map::with_capacity(self.per_mode.len());
+        for (mode, delta) in &self.per_mode {
+            // 比較不能な mode もキーごと消さない。キーが無いと読み手は
+            // 「その mode を測っていない」のか「キー名を間違えた」のか区別できない。
+            map.insert(
+                (*mode).to_string(),
+                delta.map_or(Value::Null, ProbeCountsDelta::to_json),
+            );
+        }
+        Value::Object(map)
+    }
+}
+
+/// probe 内訳の before→after 差分を、**同じ `(query, mode)` で両側とも成功したペアだけ**から
+/// 取り、**mode ごとに分けて**返す。
+///
+/// `(query, mode)` のグリッドは `PROBE_QUERIES × PROBE_MODES` で固定（query-major /
+/// mode-minor）なので、`per_probe` の index はそのまま probe の同一性を意味し、
+/// `index % modes.len()` がその probe の mode になる。ここで index を捨てて合算どうしを引くと
 /// **母数の異なる集計の引き算**になる。これは例外ケースではなく、B1 で最初に回す Merge 実行で
 /// 確実に起きる: Merge 前の `global` は FAILED_PRECONDITION が正常なので before は 8 probe 分、
 /// after は 12 probe 分の合算になり、差は「Merge の効果」ではなく「probe が 4 本増えた」を映す。
 ///
-/// `--probe-only`（after 側が無い）と、両側そろったペアが 1 つも無い場合は「差分 0」ではなく
-/// 「比較不能（`None` → JSON では `null`）」を返す。測れていないものを 0 として見せない。
+/// `--probe-only`（after 側が無い）、index 対応が崩れている場合、どの mode にも両側そろった
+/// ペアが無い場合は「差分 0」ではなく「比較不能（`None` → JSON では `null`）」を返す。
+/// 測れていないものを 0 として見せない。
 fn probe_counts_delta(
+    modes: &[&'static str],
     before: &[Option<ProbeCounts>],
     after: Option<&[Option<ProbeCounts>]>,
-) -> Option<ProbeCountsDelta> {
+) -> Option<ProbeCountsDeltaByMode> {
     let after = after?;
+    if modes.is_empty() {
+        // 定数 PROBE_MODES が空になることは無いが、剰余演算が成立しない入力で
+        // panic させない（判定は純関数として他所からも呼べる形にしてある）。
+        tracing::error!("probe mode list is empty; cannot map a probe index to its mode");
+        return None;
+    }
     if before.len() != after.len() {
         // 同じ固定グリッドから作る以上ここは起きない。起きたなら index 対応が崩れており、
         // 前方一致で辻褄を合わせると別の probe どうしを引き算することになる。比較不能で返す。
@@ -185,11 +224,27 @@ fn probe_counts_delta(
         );
         return None;
     }
-    let mut delta = ProbeCountsDelta::default();
-    for (before, after) in before.iter().zip(after.iter()) {
+    if before.len() % modes.len() != 0 {
+        // グリッドが mode 数の倍数でないなら index → mode の写像が決まらない。
+        // 適当に割り当てると「hybrid の差分」と称して別 mode の値を見せることになる。
+        tracing::error!(
+            grid_len = before.len(),
+            mode_count = modes.len(),
+            "probe grid is not a whole number of mode rows; refusing to attribute probes to modes"
+        );
+        return None;
+    }
+    let mut per_mode: Vec<(&'static str, Option<ProbeCountsDelta>)> =
+        modes.iter().map(|mode| (*mode, None)).collect();
+    for (index, (before, after)) in before.iter().zip(after.iter()).enumerate() {
         let (Some(before), Some(after)) = (before, after) else {
             continue;
         };
+        // 最初の比較可能ペアが出た時点で None → Some に切り替える。ペアが 1 つも無い mode を
+        // 差分 0 と区別するため、既定値で先に埋めておかない。
+        let delta = per_mode[index % modes.len()]
+            .1
+            .get_or_insert_with(ProbeCountsDelta::default);
         delta.manual_section = delta
             .manual_section
             .saturating_add(count_delta(before.manual_section, after.manual_section));
@@ -201,7 +256,10 @@ fn probe_counts_delta(
             .saturating_add(count_delta(before.other, after.other));
         delta.compared_pairs += 1;
     }
-    (delta.compared_pairs > 0).then_some(delta)
+    per_mode
+        .iter()
+        .any(|(_, delta)| delta.is_some())
+        .then_some(ProbeCountsDeltaByMode { per_mode })
 }
 
 /// `GetStats.community_count` の観測結果。**`Skipped`（`--probe-only` による意図した省略）と
@@ -630,6 +688,27 @@ fn probe_succeeded(per_probe: &[Option<ProbeCounts>]) -> usize {
     per_probe.iter().filter(|counts| counts.is_some()).count()
 }
 
+/// probe 1 周分の出力 JSON。合算のキー名は `totals_of_succeeded_probes` で、母数
+/// （`succeeded` / `attempted`）を同じオブジェクトに並べる。**単に `totals` とすると
+/// JSON の読み手に母数が見えず**、before/after で母数が違うこと（初回実行では
+/// before 8 probe 分・after 12 probe 分）に気づかないまま
+/// `.probe_after.totals - .probe_before.totals` を計算できてしまう。
+/// ソースコメントの注意書きは JSON の読み手には届かない。mode 別の正しい差分は
+/// `summary.probe_counts_delta` にある。
+fn probe_summary_json(
+    label: &str,
+    entries: Vec<Value>,
+    per_probe: &[Option<ProbeCounts>],
+) -> Value {
+    json!({
+        "label": label,
+        "succeeded": probe_succeeded(per_probe),
+        "attempted": per_probe.len(),
+        "totals_of_succeeded_probes": probe_totals(per_probe).to_json(),
+        "entries": entries,
+    })
+}
+
 /// 成功した probe だけを合算した内訳。母数が違えば比較できないので、読むときは必ず
 /// `succeeded` と併せて見ること（before/after 差分は必ず `probe_counts_delta` を通す）。
 fn probe_totals(per_probe: &[Option<ProbeCounts>]) -> ProbeCounts {
@@ -728,18 +807,8 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcom
         other = totals.other,
         "probe finished"
     );
-    ProbeOutcome {
-        json: json!({
-            "label": label,
-            "succeeded": succeeded,
-            "attempted": attempted,
-            // 成功した probe だけの合算。before/after で母数が違いうるので、
-            // 単独で引き算しないこと（差分は summary.probe_counts_delta を見る）。
-            "totals": totals.to_json(),
-            "entries": entries,
-        }),
-        per_probe,
-    }
+    let json = probe_summary_json(label, entries, &per_probe);
+    ProbeOutcome { json, per_probe }
 }
 
 #[tokio::main]
@@ -835,13 +904,15 @@ async fn main() -> Result<()> {
                 observation.community_before,
                 observation.community_after,
             ),
-            // 同じ (query, mode) で両側とも成功したペアだけの差分。母数は
-            // compared_pairs として同じオブジェクトに入る。
+            // 同じ (query, mode) で両側とも成功したペアだけの差分を、mode ごとに分けて出す。
+            // 母数は各 mode の compared_pairs として同じオブジェクトに入る。
+            // mode 横断で合算すると、Merge 非感受の local の増減が hybrid のシグナルを隠す。
             "probe_counts_delta": probe_counts_delta(
+                PROBE_MODES,
                 &probe_before.per_probe,
                 probe_after.as_ref().map(|probe| probe.per_probe.as_slice()),
             )
-            .map(ProbeCountsDelta::to_json),
+            .map(|by_mode| by_mode.to_json()),
             "probe_before_attempted": observation.probe_before_attempted,
             "probe_before_succeeded": observation.probe_before_succeeded,
             "probe_after_attempted": observation.probe_after.attempted_count(),
@@ -956,6 +1027,27 @@ mod tests {
     }
 
     #[test]
+    fn probe_summary_json_labels_totals_with_their_denominator() {
+        // 合算は「成功した probe だけ」の値で、母数は実行ごとに変わる（初回実行では
+        // before 8 / after 12）。キー名に母数を書いておかないと、読み手が
+        // `.probe_after.totals - .probe_before.totals` のワンライナーで母数の違う
+        // 集計どうしを引き算し、Merge の効果と称した捏造値を作れてしまう。
+        let per_probe = vec![hit(3, 1, 0), None, hit(2, 0, 4)];
+        let rendered = probe_summary_json("before", Vec::new(), &per_probe);
+
+        assert_eq!(rendered["succeeded"], 2);
+        assert_eq!(rendered["attempted"], 3);
+        assert_eq!(rendered["totals_of_succeeded_probes"]["manual_section"], 5);
+        assert_eq!(rendered["totals_of_succeeded_probes"]["concept"], 1);
+        assert_eq!(rendered["totals_of_succeeded_probes"]["other"], 4);
+        assert_eq!(
+            rendered["totals"],
+            Value::Null,
+            "母数の読めない旧キーを残さない（両方あると読み手が古い方を使える）"
+        );
+    }
+
+    #[test]
     fn probe_totals_sums_only_successful_probes() {
         // 欠測（None）は 0 として足さない。母数は succeeded 側で別に出す。
         let totals = probe_totals(&[hit(3, 1, 0), None, hit(2, 0, 4)]);
@@ -964,46 +1056,108 @@ mod tests {
         assert_eq!(totals.other, 4);
     }
 
+    /// テスト用の mode グリッド。実際の `PROBE_MODES` と同じ並び（probe が
+    /// query-major / mode-minor で回すので、index % modes.len() が mode を決める）。
+    const TEST_MODES: &[&str] = &["local", "hybrid", "global"];
+
+    /// mode 別 delta を名前で引くヘルパ。「そのキーが存在すること」も同時に確かめる
+    /// （キーが落ちていれば `expect` で落ちる）。
+    fn delta_of(by_mode: &ProbeCountsDeltaByMode, mode: &str) -> Option<ProbeCountsDelta> {
+        by_mode
+            .per_mode
+            .iter()
+            .find(|(name, _)| *name == mode)
+            .map(|(_, delta)| *delta)
+            .unwrap_or_else(|| panic!("mode {mode} のキーが無い: {by_mode:?}"))
+    }
+
     #[test]
-    fn probe_counts_delta_compares_only_pairs_succeeded_on_both_sides() {
-        // B1 初回実行の形: Merge 前の global（index 2）は FAILED_PRECONDITION で欠測し、
-        // Merge 後は成功する。合算どうしを引くと「probe が 1 本増えた」分まで delta に
-        // 混ざる（この例では manual_section が naive 集計だと +2 になり、符号すら反転する）。
-        let before = vec![hit(5, 0, 0), hit(4, 1, 0), None];
-        let after = vec![hit(3, 0, 2), hit(2, 1, 3), hit(6, 0, 1)];
+    fn probe_counts_delta_keys_each_mode_separately() {
+        // B1 初回実行の形（2 クエリ × 3 mode）: Merge 前の global は FAILED_PRECONDITION で
+        // 欠測し、Merge 後だけ成功する。mode を横断合算すると、Merge 非感受の local の
+        // 増減が hybrid の manual_section 減少（B2 の一次シグナル）を打ち消しうる。
+        let before = vec![
+            // query 1: local, hybrid, global
+            hit(5, 0, 0),
+            hit(5, 0, 0),
+            None,
+            // query 2: local, hybrid, global
+            hit(4, 1, 0),
+            hit(4, 1, 0),
+            None,
+        ];
+        let after = vec![
+            hit(5, 0, 0),
+            hit(3, 0, 2),
+            hit(6, 0, 1),
+            hit(4, 1, 0),
+            hit(2, 1, 3),
+            hit(6, 0, 1),
+        ];
 
-        let delta =
-            probe_counts_delta(&before, Some(&after)).expect("成功ペアがあるので比較できる");
+        let by_mode = probe_counts_delta(TEST_MODES, &before, Some(&after))
+            .expect("成功ペアがあるので比較できる");
 
+        let local = delta_of(&by_mode, "local").expect("local は両側そろっている");
+        assert_eq!(local.compared_pairs, 2);
         assert_eq!(
-            delta.compared_pairs, 2,
-            "before 側が欠測の global は母数に入れない"
+            local.manual_section, 0,
+            "local は Merge の影響を受けない基準線"
         );
-        assert_eq!(delta.manual_section, -4, "(3-5) + (2-4)");
-        assert_eq!(delta.concept, 0);
-        assert_eq!(delta.other, 5, "(2-0) + (3-0)");
+        assert_eq!(local.other, 0);
+
+        let hybrid = delta_of(&by_mode, "hybrid").expect("hybrid は両側そろっている");
+        assert_eq!(hybrid.compared_pairs, 2);
+        assert_eq!(hybrid.manual_section, -4, "(3-5) + (2-4)");
+        assert_eq!(hybrid.concept, 0);
+        assert_eq!(hybrid.other, 5, "(2-0) + (3-0)");
+
         assert_eq!(
-            delta.to_json()["compared_pairs"],
-            2,
-            "読み手が母数を検証できるよう JSON にも出す"
+            delta_of(&by_mode, "global"),
+            None,
+            "before 側が全欠測の global は比較不能（0 として見せない）"
+        );
+    }
+
+    #[test]
+    fn probe_counts_delta_json_lists_every_mode_with_null_for_incomparable_ones() {
+        // 読み手が「どの mode の話か」と「その mode の母数」を JSON だけで確認できること。
+        let before = vec![hit(5, 0, 0), hit(5, 0, 0), None];
+        let after = vec![hit(5, 0, 0), hit(3, 0, 2), hit(6, 0, 1)];
+        let rendered = probe_counts_delta(TEST_MODES, &before, Some(&after))
+            .expect("成功ペアがある")
+            .to_json();
+
+        assert_eq!(rendered["local"]["manual_section"], 0);
+        assert_eq!(rendered["local"]["compared_pairs"], 1);
+        assert_eq!(rendered["hybrid"]["manual_section"], -2);
+        assert_eq!(rendered["hybrid"]["other"], 2);
+        assert_eq!(rendered["hybrid"]["compared_pairs"], 1);
+        assert_eq!(
+            rendered["global"],
+            Value::Null,
+            "比較不能な mode はキーごと消さず null で残す"
         );
     }
 
     #[test]
     fn probe_counts_delta_is_none_without_after_side() {
-        assert_eq!(probe_counts_delta(&[hit(10, 2, 0)], None), None);
+        assert_eq!(
+            probe_counts_delta(TEST_MODES, &[hit(10, 2, 0), None, None], None),
+            None
+        );
     }
 
     #[test]
-    fn probe_counts_delta_is_none_when_no_pair_succeeded_on_both_sides() {
+    fn probe_counts_delta_is_none_when_no_mode_has_a_comparable_pair() {
         // 欠測が互い違いで、同じ (query, mode) で両側そろったマスが 1 つも無い。
         // 合算どうしなら数字が出てしまうが、比較可能なペアが無い以上「差分 0」ではなく比較不能。
-        let before = vec![hit(10, 2, 0), None];
-        let after = vec![None, hit(1, 1, 8)];
-        assert_eq!(probe_counts_delta(&before, Some(&after)), None);
+        let before = vec![hit(10, 2, 0), None, hit(1, 0, 0)];
+        let after = vec![None, hit(1, 1, 8), None];
+        assert_eq!(probe_counts_delta(TEST_MODES, &before, Some(&after)), None);
         // 片側が全滅した場合も同じ（旧実装が succeeded == 0 で弾いていたケース）。
         assert_eq!(
-            probe_counts_delta(&before, Some(&[None, None])),
+            probe_counts_delta(TEST_MODES, &before, Some(&[None, None, None])),
             None,
             "after 側が全滅なら delta は null"
         );
@@ -1015,7 +1169,34 @@ mod tests {
         // 崩れている。前方一致で辻褄を合わせず比較不能にする。
         let before = vec![hit(5, 0, 0), hit(4, 1, 0), hit(1, 0, 0)];
         let after = vec![hit(3, 0, 2), hit(2, 1, 3)];
-        assert_eq!(probe_counts_delta(&before, Some(&after)), None);
+        assert_eq!(probe_counts_delta(TEST_MODES, &before, Some(&after)), None);
+    }
+
+    #[test]
+    fn probe_counts_delta_is_none_when_grid_is_not_a_whole_number_of_mode_rows() {
+        // 長さが mode 数の倍数でないなら index → mode の対応が決まらない。
+        // 適当に割り当てると「local の差分」と称して別 mode の値を見せることになる。
+        let before = vec![hit(5, 0, 0), hit(4, 1, 0)];
+        let after = vec![hit(3, 0, 2), hit(2, 1, 3)];
+        assert_eq!(probe_counts_delta(TEST_MODES, &before, Some(&after)), None);
+    }
+
+    #[test]
+    fn probe_counts_delta_is_none_when_mode_list_is_empty() {
+        // mode が 0 件だと index → mode の写像が定義できない（剰余演算も成立しない）。
+        assert_eq!(probe_counts_delta(&[], &[], Some(&[])), None);
+    }
+
+    #[test]
+    fn probe_grid_and_mode_list_stay_aligned() {
+        // 本番グリッドが「mode 数の倍数」であることを固定する。probe() が
+        // query-major / mode-minor で push する限り成り立つ不変条件で、これが崩れると
+        // 上の mode 別集計が丸ごと比較不能（null）に落ちる。
+        assert_eq!(
+            (PROBE_QUERIES.len() * PROBE_MODES.len()) % PROBE_MODES.len(),
+            0
+        );
+        assert!(!PROBE_MODES.is_empty());
     }
 
     #[test]
