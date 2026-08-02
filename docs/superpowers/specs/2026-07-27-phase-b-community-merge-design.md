@@ -76,7 +76,7 @@ Merge の実行と、**その前後の観測**を担う。
 - **probe の定義**（hybrid 切替の可否を決める実測）:
   - 固定の日本語クエリを数件（マニュアル横断で答えが散っていそうな問い合わせ文。ソースにコメントで選定理由を残す）
   - 各クエリを `mode=local` / `mode=hybrid` / `mode=global` の 3 つで叩く（`local` は Merge の影響を受けない**基準線**。hybrid の変化が Merge 由来か probe の揺らぎかを切り分けるために要る）
-  - **前後の差分は `(query, mode)` ペア単位で取り、mode 別に出す**。Merge 前の `global` は正常に失敗するため、mode を横断合算すると「Merge の効果」ではなく「probe が何本通ったか」を映した値になる。比較可能ペアが無い mode は `null`、各 mode の delta には母数 `compared_pairs` を併記する。probe の合算値は母数が読み取れるキー名（`totals_of_succeeded_probes`）で出す
+  - **前後の差分は `(query, mode)` ペア単位で取り、mode 別に出す**。Merge 前の `global` は正常に失敗するため、mode を横断合算すると「Merge の効果」ではなく「probe が何本通ったか」を映した値になる。比較可能ペアが無い mode は値を `null` にする（**mode キー自体は必ず出す**。キーごと消えると「測っていない」と「キー名を間違えた」が区別できない）。各 mode の delta には母数 `compared_pairs` と、上記「degraded の 3 バケット」の 2 キーを併記する。probe の合算値は母数が読み取れるキー名（`totals_of_succeeded_probes`）で出す
   - 返った `SearchResultItem` を **`type` / node_id の kind marker / score** で分類して JSON 出力する。少なくとも「ManualSection の node_id を持つ件数」「それ以外（community summary 等）の件数と、その `type` と id の形」が読み取れること
   - `SearchExecution`（requested / effective / degraded / degradations / readiness）も併せて出す
   - `mode=global` は Merge 前に `FAILED_PRECONDITION` を返すのが正常。**probe はこれで落ちず、記録して次のクエリへ進む**（Merge 前後の差分を取るのが目的のため）
@@ -142,15 +142,23 @@ probe 1 件あたりの所要が Merge 前 約 5 秒 → Merge 走行中 30〜60
    - `ListJobs` は **cross-schema**（proto に schema 絞り込みが無い）。他 schema のジョブの `error` 文字列がこの JSON と Cloud Run ログに混ざる。意図的に受容している副作用なので、**summary JSON をそのまま外部へ共有しない**
 1. `summary.verdict` と `verdict_code` を見る。`fatal` なら以降の数値は信用しない
 2. `stats_before.community_count` → `stats_after.community_count` と `summary.community_count_delta` を見る。Merge が実際に何を作ったかの一次証跡
-3. **`probe_after.entries[].execution` の `degraded` / `effective_mode` / `readiness.global` / `readiness.community_summary` を先に確認する**。`hybrid` は Merge 未実行でも local へ degrade して「成功」扱いになるため、after 側 hybrid が degrade したままだと `probe_counts_delta.hybrid` はほぼ 0 になる。これを「community item に top_k を食われない ＝ hybrid 切替は安全」と読むのが**最も危険な誤読**（真相は「hybrid が一度も本来の形で動いていない」）
-4. そのうえで `summary.probe_counts_delta` を mode 別に読む。`local` は基準線（Merge 非感受）、`hybrid` が本命、`global` は初回実行では `null`（Merge 前に比較可能ペアが無いため）
+3. **`summary.probe_counts_delta.<mode>` の `degraded_pairs` と `degraded_unknown_pairs` を先に見る**。`hybrid` は Merge 未実行でも local へ degrade して「成功」扱いになるため、after 側 hybrid が degrade したままだと `probe_counts_delta.hybrid` の件数差はほぼ 0 になる。これを「community item に top_k を食われない ＝ hybrid 切替は安全」と読むのが**最も危険な誤読**（真相は「hybrid が一度も本来の形で動いていない」）。この 2 キーが両方 0 で `compared_pairs` が正のときだけ「degrade 無しと判明した」と言える（上記「degraded の 3 バケット」）。個別の `degradations` の中身が要るときだけ `probe_after.entries[].execution` を開く
+4. そのうえで `summary.probe_counts_delta` の件数差を mode 別に読む。`local` は基準線（Merge 非感受）、`hybrid` が本命、`global` は初回実行では `null`（Merge 前に比較可能ペアが無いため）
 5. hybrid 切替の可否は `probe_after.entries[].samples[].id` を見て決める。ManualSection の node_id が返っているなら hybrid 切替だけで別記事 join が成立する（Phase C で扱う）。**B1 では `readiness.global` が READY にならず、この判定自体が未実施**
 
-### merge_schema の未実装事項（Merge の再実行前に入れる。B1 の実行結果には影響しない）
+### degraded の 3 バケット（`probe_counts_delta` の各 mode）
 
-- 各 mode の delta に `degraded_pairs`（片側でも degraded だったペア数）を併記し、上記 3 の確認を summary だけで完結できるようにする
-- `probe_grid_and_mode_list_stay_aligned` テストが恒真式（`(a*b) % b == 0`）で、probe ループの順序変更を検出できない。グリッド生成を純関数に切り出して index → mode の写像を assert する
-- 比較可能ペアが全 mode で 0 のとき `probe_counts_delta` 全体が `null` になり mode キーが消える。「測っていない」と「キー名を間違えた」を区別させる方針と逆なので、`{"local":null,...}` を返す形に揃える
+各 mode の delta は比較可能ペアを次の 3 つに排他かつ網羅に分類する。**二重計上も取りこぼしも構造上起きない。**
+
+| バケット | 定義 | JSON |
+|---|---|---|
+| 既知 degraded | 少なくとも片側が `degraded == Some(true)` | `degraded_pairs` |
+| 判定不能 | 上に該当せず、少なくとも片側が `None`（`execution` 未取得） | `degraded_unknown_pairs` |
+| 判明して安全 | 上のいずれでもない（＝両側とも `Some(false)`） | 専用キー無し。`compared_pairs - degraded_pairs - degraded_unknown_pairs` で復元する |
+
+**`degraded_pairs == 0` を「degraded は無かった」と読んではならない。** `degraded_unknown_pairs` が非ゼロなら、その分は「観測できていない」のであって「安全だと分かった」のではない。
+
+分類は `Some(true)` を優先する。`(Some(true), None)` の混合ペアは既知 degraded に入る。片側で観測した degrade を、他方が不明であることは打ち消さない。この順序を逆にすると実測された degrade を見落とす。
 
 ## B2: concept-expansion
 
@@ -180,7 +188,8 @@ B2 は計測 → データ → 検索 + eval の 3 段階に分割する。fan-i
 ネットワーク非依存の純関数に単体テストを置く:
 
 - node_id → kind 分類（probe の集計ロジック）
-- probe 出力の整形（JSON 構造）
+- probe 出力の整形（JSON 構造）。`degraded_pairs` / `degraded_unknown_pairs` は**非ゼロ値を JSON 経由で**検証する（キー名の typo と隣接フィールドの取り違えを同時に押さえるため）
+- probe グリッド生成（`probe_grid`）の index → (query, mode) 写像。純関数に切り出し、**実行順を変えたらテストが落ちる**ことを確認できる形にする
 - gRPC `Code` → 運用者向けメッセージの写像
 - CLI 引数のパース（既存 CLI と同じ流儀の範囲で）
 

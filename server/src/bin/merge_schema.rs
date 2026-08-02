@@ -4,11 +4,13 @@
 //! 応答は空（進捗もジョブ ID も返らない）。したがって「実行したか / 効いたか」は
 //! `GetStats.community_count` の前後差で確認する。
 //!
-//! さらに Phase B2 の分岐（`mode=hybrid` への切替だけで別記事 join が成立するか、
-//! `MENTIONS_CONCEPT` を辿る自前 concept-expansion が必要か）を決めるため、Merge の前後で
-//! **global / hybrid の返却物を実測**して JSON で出す。統合仕様書は global を
-//! 「コミュニティ要約を検索し代表メンバーを返す」と書いているが、proto の `SearchResultItem` に
-//! メンバー一覧フィールドは無く、ManualSection の node_id が返るかは実測しないと確定しない。
+//! さらに **Phase C で `mode=hybrid` への切替（別記事 join）の可否を判断するための実測**を
+//! Merge の前後で取る（`MENTIONS_CONCEPT` を辿る自前 concept-expansion は B2 として既に
+//! 実装対象が確定しており、この実測の結果を待たない）。global / hybrid の返却物を JSON で出す。
+//! 統合仕様書は global を「コミュニティ要約を検索し代表メンバーを返す」と書いているが、
+//! proto の `SearchResultItem` にメンバー一覧フィールドは無く、ManualSection の node_id が
+//! 返るかは実測しないと確定しない。B1 では `readiness.global` が READY にならず
+//! （node2vec の job timeout で Merge が abort）、この判定自体が未実施のまま残っている。
 //!
 //! VPC 内 Cloud Run job として実行する前提（本番 vegapunk は VPC 内部限定）。
 //! ネットワーク非依存の分類・集計は純関数として単体テストがある。
@@ -41,7 +43,8 @@ const PROBE_QUERIES: &[&str] = &[
 ];
 
 /// probe で叩く検索 mode。`local` は基準線（Merge の影響を受けない）、
-/// `global` は Merge 前だと FAILED_PRECONDITION が正常、`hybrid` が B2 の本命。
+/// `global` は Merge 前だと FAILED_PRECONDITION が正常、`hybrid` が Phase C の hybrid
+/// 切替可否判断の本命。
 const PROBE_MODES: &[&str] = &["local", "hybrid", "global"];
 
 #[derive(Debug, Parser)]
@@ -67,7 +70,7 @@ struct Args {
     /// LLM 要約で、既定の 120s ではまず足りない。
     #[arg(long, default_value_t = 21_600)]
     timeout_secs: u64,
-    /// Merge を実行せず観測だけ行う（実行前の状態確認、B2 検討時の再観測)。
+    /// Merge を実行せず観測だけ行う（実行前の状態確認、Phase C 検討時の再観測)。
     #[arg(long)]
     probe_only: bool,
     /// probe の top-k。
@@ -93,7 +96,7 @@ struct Args {
     jobs_since_hours: u64,
 }
 
-/// probe で返ったヒットの種別。B2 の分岐はこの内訳だけで決まる。
+/// probe で返ったヒットの種別。Phase C の hybrid 切替可否判断はこの内訳だけで決まる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HitKind {
     ManualSection,
@@ -120,6 +123,11 @@ struct ProbeCounts {
     manual_section: usize,
     concept: usize,
     other: usize,
+    /// この probe の `SearchExecution.degraded`。`execution` が返らなかった probe（サーバが
+    /// 送ってこなかった場合）は `None`（「degraded ではない」と断定できないため、既定値
+    /// `false` で埋めない）。`probe_counts_delta` の `degraded_pairs` はここが `Some(true)`
+    /// の probe だけを数える。
+    degraded: Option<bool>,
 }
 
 impl ProbeCounts {
@@ -135,7 +143,10 @@ impl ProbeCounts {
         counts
     }
 
-    /// 1 実行分（全クエリ × 全 mode）の合算。
+    /// 1 実行分（全クエリ × 全 mode）の合算。`degraded` はここでは合算しない
+    /// （observation flag であって計数ではないため、複数 probe 分を足し合わせる意味を持たない）。
+    /// 合算後の `self.degraded` は不定値として扱うこと。`to_json` がこのフィールドを
+    /// 出力しない限りは無害だが、将来 `to_json` に足すときは合算不能である点に注意する。
     fn add(&mut self, other: Self) {
         self.manual_section += other.manual_section;
         self.concept += other.concept;
@@ -152,7 +163,8 @@ impl ProbeCounts {
 }
 
 /// probe 内訳の before→after 差分（**1 つの mode 内**）。`manual_section` が減って
-/// `other` が増えるなら community 由来の item に top_k を食われている、という B2 の判断材料。
+/// `other` が増えるなら community 由来の item に top_k を食われている、という
+/// Phase C（hybrid 切替可否判断）の判断材料。
 /// `compared_pairs` は差分の母数（その mode で両側そろった `(query, mode)` の数）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ProbeCountsDelta {
@@ -160,6 +172,32 @@ struct ProbeCountsDelta {
     concept: i64,
     other: i64,
     compared_pairs: usize,
+    /// `compared_pairs` のうち、before / after のどちらか片側でも
+    /// `SearchExecution.degraded == true` だった件数。分母は `compared_pairs`。
+    ///
+    /// `docs/superpowers/specs/2026-07-27-phase-b-community-merge-design.md` の
+    /// 「B1 実測 JSON の判読手順」節（`probe_after.entries[].execution` の `degraded` を
+    /// 先に確認せず `probe_counts_delta.hybrid` の数値だけで判断すると生じる、と同節が
+    /// 名指しする「最も危険な誤読」）が指すのは、`hybrid` が一度も本来の形（degrade せず）で
+    /// 動いていないのに `probe_counts_delta.hybrid` の数値だけを見て「安全」と読むことだった。
+    /// 以前はこれを確認するのに `probe_after.entries[].execution` を個別に開く必要があったが、
+    /// この値を summary に併記することで、mode 別 delta を読むだけでその確認を完結できる。
+    degraded_pairs: usize,
+    /// `compared_pairs` のうち、`degraded_pairs` に数えなかった（＝ before/after のどちらも
+    /// `Some(true)` ではなかった）ペアのうち、片側以上が `None`（execution 情報が無い）
+    /// だったもの。
+    ///
+    /// **`degraded_pairs == 0` だけを見ると「degraded は無かった」と断定できてしまう。**
+    /// vegapunk が `execution` を返さない実行では全 probe が `degraded: None` になり、
+    /// `degraded_pairs` は必ず 0 になる。この 0 は「degraded ではないと確認できた」のではなく
+    /// 「degraded かどうか一度も分からなかった」であり、`Option<bool>`（`ProbeCounts::degraded`）
+    /// を導入した意図（「不明を false で埋めない」）が `to_json` の出力段で `0` という断定に
+    /// 潰れてしまう。summary だけを読む運用者がこれを「hybrid は degrade せず動いた」と誤読する
+    /// のは、spec の「B1 実測 JSON の判読手順」（3 番目の項目）が名指しする最も危険な誤読と
+    /// 同じ構図である。`degraded_unknown_pairs` を併記することで、
+    /// `compared_pairs = degraded_pairs + degraded_unknown_pairs + (判明していて degraded で
+    /// はない残り)` の内訳が summary JSON だけで閉じるようにする。
+    degraded_unknown_pairs: usize,
 }
 
 impl ProbeCountsDelta {
@@ -171,6 +209,8 @@ impl ProbeCountsDelta {
             // 母数を出さないと、読み手は「12 probe 分の差」なのか「2 probe 分の差」なのかを
             // 検証できない。delta 単体では意味が決まらないので必ず併記する。
             "compared_pairs": self.compared_pairs,
+            "degraded_pairs": self.degraded_pairs,
+            "degraded_unknown_pairs": self.degraded_unknown_pairs,
         })
     }
 }
@@ -189,9 +229,9 @@ fn count_delta(before: usize, after: usize) -> i64 {
 ///
 /// **mode を横断して合算しない。** 3 つの mode は性質が違う: `local` は Merge の影響を
 /// 受けない基準線、`global` は Merge 前が FAILED_PRECONDITION で全欠測（B1 初回実行では必ず
-/// こうなる）、B2 の一次シグナルは `hybrid` の `manual_section` 減少（community 由来の item に
-/// top_k を食われた）である。合算すると、基準線 `local` の偶然の増減が `hybrid` のシグナルを
-/// 打ち消して隠しうる。
+/// こうなる）、Phase C（hybrid 切替可否判断）の一次シグナルは `hybrid` の `manual_section`
+/// 減少（community 由来の item に top_k を食われた）である。合算すると、基準線 `local` の
+/// 偶然の増減が `hybrid` のシグナルを打ち消して隠しうる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProbeCountsDeltaByMode {
     /// `PROBE_MODES` と同じ並びの `(mode, その mode の差分)`。
@@ -223,9 +263,16 @@ impl ProbeCountsDeltaByMode {
 /// 確実に起きる: Merge 前の `global` は FAILED_PRECONDITION が正常なので before は 8 probe 分、
 /// after は 12 probe 分の合算になり、差は「Merge の効果」ではなく「probe が 4 本増えた」を映す。
 ///
-/// `--probe-only`（after 側が無い）、index 対応が崩れている場合、どの mode にも両側そろった
-/// ペアが無い場合は「差分 0」ではなく「比較不能（`None` → JSON では `null`）」を返す。
-/// 測れていないものを 0 として見せない。
+/// `--probe-only`（after 側が無い）、または index 対応が崩れている場合は、関数全体で
+/// `None`（JSON では `probe_counts_delta` キー自体が `null`）を返す。
+///
+/// 一方、**mode 一覧・グリッドの形そのものは正常だが、どの mode にも両側そろったペアが
+/// 1 つも無い**場合は、関数レベルの `None` にはしない。`Some(ProbeCountsDeltaByMode)` を
+/// 返し、各 mode の値だけ `null` にする（`ProbeCountsDeltaByMode::to_json` が担う）。
+/// 以前はここも関数レベルの `None` にしており、`summary.probe_counts_delta` 全体が
+/// `null` になって mode キーごと消えていた。読み手はそれを「測っていない」のか
+/// 「キー名を間違えた」のか JSON だけでは区別できない。mode キーを常に残すことで、
+/// 「mode 一覧は分かっているが、比較可能なペアが無かった」ことを明示する。
 fn probe_counts_delta(
     modes: &[&'static str],
     before: &[Option<ProbeCounts>],
@@ -279,11 +326,21 @@ fn probe_counts_delta(
             .other
             .saturating_add(count_delta(before.other, after.other));
         delta.compared_pairs += 1;
+        // どちらか片側でも degraded なら数える。execution 情報が無い（None）probe は
+        // 「degraded ではない」と断定できないため加算しない（過大にも過小にも倒さない）。
+        if before.degraded == Some(true) || after.degraded == Some(true) {
+            delta.degraded_pairs += 1;
+        } else if before.degraded.is_none() || after.degraded.is_none() {
+            // 「degraded ではないと判明した」のではなく「判定できなかった」。この件数を
+            // `degraded_pairs` に混ぜない・かつ黙って消さない（`ProbeCountsDelta::degraded_unknown_pairs`
+            // のコメント参照）。
+            delta.degraded_unknown_pairs += 1;
+        }
     }
-    per_mode
-        .iter()
-        .any(|(_, delta)| delta.is_some())
-        .then_some(ProbeCountsDeltaByMode { per_mode })
+    // 上の guard（modes 空 / グリッド長不一致 / grid が mode 数の倍数でない）をすべて
+    // 通過した以上、per_mode は常に意味のある形（mode ごとに 1 エントリ）になっている。
+    // 比較可能なペアが 1 つも無くても、mode キー一覧を持つ `Some` を返す。
+    Some(ProbeCountsDeltaByMode { per_mode })
 }
 
 /// `GetStats.community_count` の観測結果。**`Skipped`（`--probe-only` による意図した省略）と
@@ -502,9 +559,9 @@ impl RunFailure {
     fn message(self) -> &'static str {
         match self {
             Self::ProbeAllFailed => {
-                "before 側の probe が 1 件も成功しなかった。この実行からは B2 の判断材料が\
-                 何も得られていない。出力 JSON の probe_before の error（接続 / 権限 / schema 名）\
-                 を確認する"
+                "before 側の probe が 1 件も成功しなかった。この実行からは Phase C\
+                 （hybrid 切替可否判断）の材料が何も得られていない。出力 JSON の\
+                 probe_before の error（接続 / 権限 / schema 名）を確認する"
             }
             Self::MergeFailed => {
                 "Merge の実行自体が失敗した。after 側の stats / probe は意図して取得していない\
@@ -514,9 +571,9 @@ impl RunFailure {
             }
             Self::ProbeAfterAllFailed => {
                 "Merge は成功したのに after 側 probe が 1 件も成功しなかった。global/hybrid の\
-                 実測 JSON が空で、B2 の分岐判断（mode=hybrid 切替か自前 concept-expansion か）に\
-                 使える情報が無い。出力 JSON の probe_after の error を確認する。stats_after の\
-                 community_count で Merge 自体の効果は別途確認できる"
+                 実測 JSON が空で、Phase C の hybrid 切替可否判断（mode=hybrid だけで別記事 join が\
+                 成立するか）に使える情報が無い。出力 JSON の probe_after の error を確認する。\
+                 stats_after の community_count で Merge 自体の効果は別途確認できる"
             }
             Self::StatsUnavailable => {
                 "GetStats が before / after の両方で失敗し、Merge が効いたかを確認できていない。\
@@ -543,7 +600,7 @@ fn evaluate_run(observation: RunObservation) -> RunVerdict {
     if observation.merge == MergeStatus::Failed {
         return RunVerdict::Fatal(RunFailure::MergeFailed);
     }
-    // 3. Merge は成功したのに after 側 probe が全滅。B2 の実測 JSON が空になる致命的な欠落。
+    // 3. Merge は成功したのに after 側 probe が全滅。Phase C の実測 JSON が空になる致命的な欠落。
     if observation.probe_after.all_failed() {
         return RunVerdict::Fatal(RunFailure::ProbeAfterAllFailed);
     }
@@ -743,6 +800,22 @@ fn probe_totals(per_probe: &[Option<ProbeCounts>]) -> ProbeCounts {
     totals
 }
 
+/// `probe()` が叩く `(query, mode)` の実行グリッド。**query-major / mode-minor**
+/// （同じ query に対して `PROBE_MODES` を全部回してから次の query へ進む）順で並べる。
+///
+/// `probe_counts_delta` の index → mode 写像（`index % modes.len()`）はこの並びを
+/// 前提にしている。生成をここ 1 箇所に閉じることで、`probe()` 本体とテスト
+/// （`probe_grid_matches_query_major_mode_minor_order`）の両方が同じグリッドを見る。
+/// 以前は `probe()` 内の nested for loop が唯一の実装で、テストは
+/// `(a*b) % b == 0` という順序に依存しない恒真式しか検証しておらず、
+/// このループの入れ替え（mode-major への変更等）を検出できなかった。
+fn probe_grid() -> Vec<(&'static str, &'static str)> {
+    PROBE_QUERIES
+        .iter()
+        .flat_map(|query| PROBE_MODES.iter().map(move |mode| (*query, *mode)))
+        .collect()
+}
+
 /// 全 PROBE_QUERIES × PROBE_MODES を叩き、ヒットの種別内訳・上位サンプル・SearchExecution を
 /// JSON に残す。**エラー（Merge 前の global = FAILED_PRECONDITION 等）は記録して次へ進む**
 /// （前後差を取るのが目的で、片方のエラーで観測全体を落とさない）。
@@ -751,73 +824,77 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcom
     // グリッドの 1 マスにつき必ず 1 要素 push する（成功は Some、失敗は None）。
     // index が (query, mode) の同一性を担保するので、途中で push を飛ばさないこと。
     let mut per_probe: Vec<Option<ProbeCounts>> = Vec::new();
-    for query in PROBE_QUERIES {
-        for mode in PROBE_MODES {
-            let (entry, counts) = match client
-                .search_with_mode(&args.schema, query, args.top_k, mode)
-                .await
-            {
-                Ok(outcome) => {
-                    let kinds: Vec<HitKind> = outcome
-                        .results
-                        .iter()
-                        .map(|item| classify_hit(item.id.as_deref()))
-                        .collect();
-                    let counts = ProbeCounts::from_kinds(&kinds);
-                    let samples: Vec<Value> = outcome
-                        .results
-                        .iter()
-                        .take(5)
-                        .map(|item| {
-                            json!({
-                                "type": item.r#type,
-                                "id": item.id,
-                                "score": item.score,
-                                // text は先頭だけ（ログ肥大を避ける）。返却の「形」が分かればよい。
-                                "text_head": item
-                                    .text
-                                    .as_deref()
-                                    .map(|t| t.chars().take(120).collect::<String>()),
-                            })
-                        })
-                        .collect();
-                    let execution = outcome.execution.as_ref().map(|execution| {
+    for (query, mode) in probe_grid() {
+        let (entry, counts) = match client
+            .search_with_mode(&args.schema, query, args.top_k, mode)
+            .await
+        {
+            Ok(outcome) => {
+                let kinds: Vec<HitKind> = outcome
+                    .results
+                    .iter()
+                    .map(|item| classify_hit(item.id.as_deref()))
+                    .collect();
+                let mut counts = ProbeCounts::from_kinds(&kinds);
+                // execution が返らなかった probe は degraded を「不明」のままにする
+                // （`ProbeCounts::degraded` のコメント参照。既定値 false で埋めない）。
+                counts.degraded = outcome
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.degraded);
+                let samples: Vec<Value> = outcome
+                    .results
+                    .iter()
+                    .take(5)
+                    .map(|item| {
                         json!({
-                            "requested_mode": execution.requested_mode,
-                            "effective_mode": execution.effective_mode,
-                            "degraded": execution.degraded,
-                            "degradations": execution
-                                .degradations
-                                .iter()
-                                .map(cs_support_mcp::vegapunk::degradation_summary)
-                                .collect::<Vec<_>>(),
-                            "readiness": readiness_json(execution.readiness.as_ref()),
+                            "type": item.r#type,
+                            "id": item.id,
+                            "score": item.score,
+                            // text は先頭だけ（ログ肥大を避ける）。返却の「形」が分かればよい。
+                            "text_head": item
+                                .text
+                                .as_deref()
+                                .map(|t| t.chars().take(120).collect::<String>()),
                         })
-                    });
-                    (
-                        json!({
-                            "query": query,
-                            "mode": mode,
-                            "hit_count": outcome.results.len(),
-                            "counts": counts.to_json(),
-                            "samples": samples,
-                            "execution": execution,
-                        }),
-                        Some(counts),
-                    )
-                }
-                Err(err) => {
-                    // Merge 前の global は FAILED_PRECONDITION が正常。異常ではないので error にしない。
-                    tracing::warn!(query, mode, error = %format!("{err:#}"), "probe query failed");
-                    (
-                        json!({ "query": query, "mode": mode, "error": format!("{err:#}") }),
-                        None,
-                    )
-                }
-            };
-            entries.push(entry);
-            per_probe.push(counts);
-        }
+                    })
+                    .collect();
+                let execution = outcome.execution.as_ref().map(|execution| {
+                    json!({
+                        "requested_mode": execution.requested_mode,
+                        "effective_mode": execution.effective_mode,
+                        "degraded": execution.degraded,
+                        "degradations": execution
+                            .degradations
+                            .iter()
+                            .map(cs_support_mcp::vegapunk::degradation_summary)
+                            .collect::<Vec<_>>(),
+                        "readiness": readiness_json(execution.readiness.as_ref()),
+                    })
+                });
+                (
+                    json!({
+                        "query": query,
+                        "mode": mode,
+                        "hit_count": outcome.results.len(),
+                        "counts": counts.to_json(),
+                        "samples": samples,
+                        "execution": execution,
+                    }),
+                    Some(counts),
+                )
+            }
+            Err(err) => {
+                // Merge 前の global は FAILED_PRECONDITION が正常。異常ではないので error にしない。
+                tracing::warn!(query, mode, error = %format!("{err:#}"), "probe query failed");
+                (
+                    json!({ "query": query, "mode": mode, "error": format!("{err:#}") }),
+                    None,
+                )
+            }
+        };
+        entries.push(entry);
+        per_probe.push(counts);
     }
     let totals = probe_totals(&per_probe);
     let attempted = per_probe.len();
@@ -841,8 +918,8 @@ async fn probe(client: &VegapunkClient, args: &Args, label: &str) -> ProbeOutcom
 ///
 /// 1 段キー（「error 非空 OR status != completed」を 1 bit に潰す）だと、他 schema で
 /// ingest が並走しているときの running/pending ジョブ（error 無し）が、より古い
-/// dead_letter（error あり）と同じ優先度タイルに入る。安定ソートはタイル内で
-/// `created_at DESC` を保つため、新しい running ジョブが古い dead_letter より先頭に来て
+/// failed（error あり）と同じ優先度タイルに入る。安定ソートはタイル内で
+/// `created_at DESC` を保つため、新しい running ジョブが古い failed より先頭に来て
 /// しまい、本当に見るべき失敗ジョブが埋もれる。error の有無を独立した第 1 キーにすることで
 /// この事故を防ぐ。
 fn diagnostic_priority(job: &JobInfo) -> (bool, bool) {
@@ -874,7 +951,7 @@ fn job_info_json(job: &JobInfo) -> Value {
 }
 
 /// ログに個別出力する失敗ジョブの上限。`--probe-only` は日常的な観測コマンドなので、
-/// 実行のたびに過去の dead_letter ジョブ（最大 `--jobs-limit` 件、既定 50・上限 500）が
+/// 実行のたびに過去の failed ジョブ（最大 `--jobs-limit` 件、既定 50・上限 500）が
 /// 丸ごと ERROR ログへ出ると Cloud Run のエラー集計を汚し、「今回の失敗」と
 /// 「以前から残っている失敗」の区別が付かなくなる。先頭 5 件だけ個別に出し、
 /// 残りは件数のサマリ行にする。
@@ -1323,11 +1400,31 @@ mod tests {
     }
 
     /// per-probe 集計の 1 マス。テストの意図（どのマスが欠測か）を読みやすくするヘルパ。
+    /// `degraded` は「不明」（`None`）で埋める。degraded_pairs を検証したいテストは
+    /// [`hit_degraded`] を使う。
     fn hit(manual_section: usize, concept: usize, other: usize) -> Option<ProbeCounts> {
         Some(ProbeCounts {
             manual_section,
             concept,
             other,
+            ..Default::default()
+        })
+    }
+
+    /// [`hit`] に `SearchExecution.degraded` の観測値を足した版。
+    /// `degraded_pairs`（before/after のどちらか片側でも degraded だったペア数）の
+    /// テスト専用。
+    fn hit_degraded(
+        manual_section: usize,
+        concept: usize,
+        other: usize,
+        degraded: bool,
+    ) -> Option<ProbeCounts> {
+        Some(ProbeCounts {
+            manual_section,
+            concept,
+            other,
+            degraded: Some(degraded),
         })
     }
 
@@ -1380,7 +1477,7 @@ mod tests {
     fn probe_counts_delta_keys_each_mode_separately() {
         // B1 初回実行の形（2 クエリ × 3 mode）: Merge 前の global は FAILED_PRECONDITION で
         // 欠測し、Merge 後だけ成功する。mode を横断合算すると、Merge 非感受の local の
-        // 増減が hybrid の manual_section 減少（B2 の一次シグナル）を打ち消しうる。
+        // 増減が hybrid の manual_section 減少（Phase C の一次シグナル）を打ち消しうる。
         let before = vec![
             // query 1: local, hybrid, global
             hit(5, 0, 0),
@@ -1410,17 +1507,78 @@ mod tests {
             "local は Merge の影響を受けない基準線"
         );
         assert_eq!(local.other, 0);
+        assert_eq!(
+            local.degraded_pairs, 0,
+            "hit() は degraded を観測していない（None）ので加算されない"
+        );
+        assert_eq!(
+            local.degraded_unknown_pairs, 2,
+            "両側とも hit() = degraded 不明。「degraded ではない」と断定できないので不明分に計上する"
+        );
 
         let hybrid = delta_of(&by_mode, "hybrid").expect("hybrid は両側そろっている");
         assert_eq!(hybrid.compared_pairs, 2);
         assert_eq!(hybrid.manual_section, -4, "(3-5) + (2-4)");
         assert_eq!(hybrid.concept, 0);
         assert_eq!(hybrid.other, 5, "(2-0) + (3-0)");
+        assert_eq!(hybrid.degraded_pairs, 0);
+        assert_eq!(hybrid.degraded_unknown_pairs, 2);
 
         assert_eq!(
             delta_of(&by_mode, "global"),
             None,
             "before 側が全欠測の global は比較不能（0 として見せない）"
+        );
+    }
+
+    #[test]
+    fn probe_counts_delta_degraded_pairs_counts_either_side_degraded() {
+        // spec の「最も危険な誤読」対策: hybrid が degrade したまま動いていたことを
+        // summary だけで確認できるようにする。before/after のどちらか片側でも degraded なら
+        // 数え、両側とも degraded ではない（Some(false)）、または不明（None）なら数えない。
+        let before = vec![
+            hit_degraded(5, 0, 0, false), // local: 両側 not degraded（判明）
+            hit_degraded(5, 0, 0, true),  // hybrid: before だけ degraded
+            hit(1, 0, 0),                 // global: degraded 不明（None）のまま
+        ];
+        let after = vec![
+            hit_degraded(5, 0, 0, false),
+            hit_degraded(3, 0, 2, false), // hybrid: after は degraded 解消
+            hit(1, 0, 0),
+        ];
+
+        let by_mode = probe_counts_delta(TEST_MODES, &before, Some(&after))
+            .expect("全 mode で比較可能ペアがある");
+
+        let local = delta_of(&by_mode, "local").unwrap();
+        assert_eq!(
+            local.degraded_pairs, 0,
+            "両側とも degraded=false なら加算しない"
+        );
+        assert_eq!(
+            local.degraded_unknown_pairs, 0,
+            "両側とも degraded の値が判明している（Some(false)）ので不明分にも入らない"
+        );
+
+        let hybrid = delta_of(&by_mode, "hybrid").unwrap();
+        assert_eq!(
+            hybrid.degraded_pairs, 1,
+            "before 側だけでも degraded=true なら片側分として数える"
+        );
+        assert_eq!(
+            hybrid.degraded_unknown_pairs, 0,
+            "degraded=true と判明している以上、不明分ではない"
+        );
+
+        let global = delta_of(&by_mode, "global").unwrap();
+        assert_eq!(
+            global.degraded_pairs, 0,
+            "degraded が不明（None）は degraded=true と断定しないので加算しない"
+        );
+        assert_eq!(
+            global.degraded_unknown_pairs, 1,
+            "W1: degraded_pairs=0 だけでは「degraded 無し」と「一度も分からなかった」を\
+             summary JSON だけで区別できない。この不明分を可視化するのが degraded_unknown_pairs"
         );
     }
 
@@ -1435,13 +1593,64 @@ mod tests {
 
         assert_eq!(rendered["local"]["manual_section"], 0);
         assert_eq!(rendered["local"]["compared_pairs"], 1);
+        assert_eq!(rendered["local"]["degraded_pairs"], 0);
+        assert_eq!(rendered["local"]["degraded_unknown_pairs"], 1);
         assert_eq!(rendered["hybrid"]["manual_section"], -2);
         assert_eq!(rendered["hybrid"]["other"], 2);
         assert_eq!(rendered["hybrid"]["compared_pairs"], 1);
+        assert_eq!(rendered["hybrid"]["degraded_pairs"], 0);
+        assert_eq!(rendered["hybrid"]["degraded_unknown_pairs"], 1);
         assert_eq!(
             rendered["global"],
             Value::Null,
             "比較不能な mode はキーごと消さず null で残す"
+        );
+    }
+
+    #[test]
+    fn probe_counts_delta_json_renders_degraded_pairs_and_degraded_unknown_pairs_distinctly() {
+        // reviewer 指摘の再発防止: degraded_pairs と degraded_unknown_pairs はキー名が近く、
+        // struct レベルのテストだけだと JSON 化の際にキーの取り違え（お互いの値を入れ違える）
+        // や typo を見逃しうる。両方を非ゼロにして JSON 経由で個別に検証する。
+        //
+        // 1 mode に 3 ペアを集約させ、`compared_pairs = degraded_pairs + degraded_unknown_pairs
+        // + (判明していて degraded ではない残り)` の内訳が summary JSON だけで閉じることも
+        // 併せて確認する（W1: compared_pairs だけでは「判明」と「不明」の内訳が読めない）。
+        const ONE_MODE: &[&str] = &["only"];
+        let before = vec![
+            hit_degraded(1, 0, 0, true), // pair 1: before が degraded=true → 既知の degraded
+            hit(1, 0, 0),                // pair 2: 両側とも execution 情報が無い → 不明
+            hit_degraded(1, 0, 0, false), // pair 3: 両側とも degraded=false → 判明していて安全
+        ];
+        let after = vec![
+            hit_degraded(1, 0, 0, false),
+            hit(1, 0, 0),
+            hit_degraded(1, 0, 0, false),
+        ];
+
+        let rendered = probe_counts_delta(ONE_MODE, &before, Some(&after))
+            .expect("比較可能ペアがある")
+            .to_json();
+
+        assert_eq!(rendered["only"]["compared_pairs"], 3);
+        assert_eq!(
+            rendered["only"]["degraded_pairs"], 1,
+            "pair 1 だけが既知の degraded"
+        );
+        assert_eq!(
+            rendered["only"]["degraded_unknown_pairs"], 1,
+            "pair 2 は両側とも execution 情報が無く degraded かどうか不明"
+        );
+        // pair 3（判明していて degraded ではない残り 1 件）は compared_pairs から
+        // degraded_pairs / degraded_unknown_pairs を引いた差分として summary JSON だけで
+        // 復元できる。専用フィールドを持たないのは意図的（W1 の対応範囲は「不明」の可視化）。
+        let compared = rendered["only"]["compared_pairs"].as_u64().unwrap();
+        let degraded = rendered["only"]["degraded_pairs"].as_u64().unwrap();
+        let unknown = rendered["only"]["degraded_unknown_pairs"].as_u64().unwrap();
+        assert_eq!(
+            compared - degraded - unknown,
+            1,
+            "残り 1 件（pair 3）は判明していて degraded ではない"
         );
     }
 
@@ -1454,18 +1663,42 @@ mod tests {
     }
 
     #[test]
-    fn probe_counts_delta_is_none_when_no_mode_has_a_comparable_pair() {
+    fn probe_counts_delta_lists_null_per_mode_when_no_pair_is_comparable() {
         // 欠測が互い違いで、同じ (query, mode) で両側そろったマスが 1 つも無い。
-        // 合算どうしなら数字が出てしまうが、比較可能なペアが無い以上「差分 0」ではなく比較不能。
+        // 「比較可能ペアが 0」であって「mode 一覧が分からない」わけではないので、関数レベルの
+        // `None`（JSON では probe_counts_delta 全体が null）ではなく、mode キーは残したまま
+        // 各値だけ null にする。以前は前者だった。読み手は「測っていない」のか
+        // 「キー名を間違えた」のか JSON だけでは区別できず、
+        // `docs/superpowers/specs/2026-07-27-phase-b-community-merge-design.md`
+        // （Phase B 全体 / B1 の正本、「merge_schema の未実装事項」節）が
+        // 禁じる読み違いの温床になる。
         let before = vec![hit(10, 2, 0), None, hit(1, 0, 0)];
         let after = vec![None, hit(1, 1, 8), None];
-        assert_eq!(probe_counts_delta(TEST_MODES, &before, Some(&after)), None);
+        let by_mode = probe_counts_delta(TEST_MODES, &before, Some(&after))
+            .expect("mode 一覧そのものは常に返る（グリッドの形は正常なため）");
+        for mode in TEST_MODES {
+            assert_eq!(
+                delta_of(&by_mode, mode),
+                None,
+                "mode {mode} は比較可能ペアが無いので値は null"
+            );
+        }
+        let rendered = by_mode.to_json();
+        for mode in TEST_MODES {
+            assert_eq!(
+                rendered[mode],
+                Value::Null,
+                "mode {mode} のキーは残り、値だけ null"
+            );
+        }
+
         // 片側が全滅した場合も同じ（旧実装が succeeded == 0 で弾いていたケース）。
-        assert_eq!(
-            probe_counts_delta(TEST_MODES, &before, Some(&[None, None, None])),
-            None,
-            "after 側が全滅なら delta は null"
-        );
+        let by_mode_after_all_failed =
+            probe_counts_delta(TEST_MODES, &before, Some(&[None, None, None]))
+                .expect("after 側が全滅でも mode 一覧は返る");
+        for mode in TEST_MODES {
+            assert_eq!(delta_of(&by_mode_after_all_failed, mode), None);
+        }
     }
 
     #[test]
@@ -1493,15 +1726,34 @@ mod tests {
     }
 
     #[test]
-    fn probe_grid_and_mode_list_stay_aligned() {
-        // 本番グリッドが「mode 数の倍数」であることを固定する。probe() が
-        // query-major / mode-minor で push する限り成り立つ不変条件で、これが崩れると
-        // 上の mode 別集計が丸ごと比較不能（null）に落ちる。
+    fn probe_grid_matches_query_major_mode_minor_order() {
+        // `probe_grid()` は probe() 本体が実際に使う唯一の生成元。ここでは index →
+        // (query, mode) の写像そのものを検証する。
+        //
+        // 以前のテスト（`(a*b) % b == 0`）は並び順に一切依存しない恒真式で、probe() の
+        // ループ順を mode-major に入れ替えても常に成功していた（実際に入れ替えて
+        // `cargo test` を実行し、旧テストが通ったまま新テストだけ落ちることを確認した）。
+        // この形なら、index % modes.len() が実際の mode と一致するという
+        // `probe_counts_delta` の前提が崩れた場合に検出できる。
+        let grid = probe_grid();
         assert_eq!(
-            (PROBE_QUERIES.len() * PROBE_MODES.len()) % PROBE_MODES.len(),
-            0
+            grid.len(),
+            PROBE_QUERIES.len() * PROBE_MODES.len(),
+            "1 query あたり PROBE_MODES 件、必ず全マスを埋める"
         );
         assert!(!PROBE_MODES.is_empty());
+        for (index, (query, mode)) in grid.iter().enumerate() {
+            assert_eq!(
+                *mode,
+                PROBE_MODES[index % PROBE_MODES.len()],
+                "index {index}: query-major/mode-minor なら mode は index % PROBE_MODES.len() の位置と一致するはず"
+            );
+            assert_eq!(
+                *query,
+                PROBE_QUERIES[index / PROBE_MODES.len()],
+                "index {index}: query-major/mode-minor なら query は index / PROBE_MODES.len() の位置と一致するはず"
+            );
+        }
     }
 
     #[test]
@@ -1739,7 +1991,7 @@ mod tests {
     fn evaluate_run_fails_when_after_side_probe_all_failed_despite_merge_success() {
         // レビュー指摘の核心: Merge は成功し community_count も増えているのに、
         // after 側 probe が全滅している。これを before/after 合算で「succeeded > 0」と
-        // 読んで ok にすると、B2 の分岐判断に使う実測 JSON が空のまま見逃される。
+        // 読んで ok にすると、Phase C の hybrid 切替可否判断に使う実測 JSON が空のまま見逃される。
         let full = PROBE_QUERIES.len() * PROBE_MODES.len();
         let verdict = evaluate_run(RunObservation {
             community_before: StatsObservation::Value(0),
@@ -1887,8 +2139,7 @@ mod tests {
             diagnostic_priority(&job_info("j1", "completed", Some("boom"), 1, Some(2), 0));
         let non_completed_no_error =
             diagnostic_priority(&job_info("j2", "running", None, 1, None, 0));
-        let dead_letter_no_error =
-            diagnostic_priority(&job_info("j3", "dead_letter", None, 1, None, 3));
+        let failed_no_error = diagnostic_priority(&job_info("j3", "failed", None, 1, None, 3));
         let completed_no_error =
             diagnostic_priority(&job_info("j4", "completed", None, 1, Some(2), 0));
         let empty_error_completed =
@@ -1903,8 +2154,8 @@ mod tests {
             "status != completed が次点（第 2 キー）: {non_completed_no_error:?} vs {completed_no_error:?}"
         );
         assert_eq!(
-            non_completed_no_error, dead_letter_no_error,
-            "completed 以外はどの status でも同じ優先度: {non_completed_no_error:?} vs {dead_letter_no_error:?}"
+            non_completed_no_error, failed_no_error,
+            "completed 以外はどの status でも同じ優先度: {non_completed_no_error:?} vs {failed_no_error:?}"
         );
         assert_eq!(
             empty_error_completed, completed_no_error,
@@ -1915,12 +2166,12 @@ mod tests {
     #[test]
     fn sort_jobs_diagnostic_first_moves_flagged_jobs_to_front_preserving_relative_order() {
         // vegapunk 申告順（created_at DESC）を模した並び:
-        // completed, dead_letter(error あり), completed, running(error 無し)。
+        // completed, failed(error あり), completed, running(error 無し)。
         let jobs = vec![
             job_info("ok-1", "completed", None, 400, Some(410), 0),
             job_info(
-                "dead-1",
-                "dead_letter",
+                "failed-1",
+                "failed",
                 Some("node2vec failed"),
                 300,
                 Some(305),
@@ -1933,25 +2184,25 @@ mod tests {
         let sorted = sort_jobs_diagnostic_first(jobs);
         let ids: Vec<&str> = sorted.iter().map(|j| j.job_id.as_str()).collect();
 
-        // 診断対象（dead-1, running-1）が先頭に来て、かつ各グループ内では元の並び
+        // 診断対象（failed-1, running-1）が先頭に来て、かつ各グループ内では元の並び
         // （created_at DESC）が保たれる（安定ソートであることの回帰テスト）。
-        assert_eq!(ids, vec!["dead-1", "running-1", "ok-1", "ok-2"]);
+        assert_eq!(ids, vec!["failed-1", "running-1", "ok-1", "ok-2"]);
     }
 
     #[test]
     fn sort_jobs_diagnostic_first_keeps_error_jobs_ahead_of_newer_error_free_jobs_from_other_schemas(
     ) {
         // 他 schema の ingest/merge が並走していると、error 無しの running ジョブが
-        // dead_letter よりずっと新しい created_at で並ぶ。1 段キー（error 非空 OR
+        // failed よりずっと新しい created_at で並ぶ。1 段キー（error 非空 OR
         // status != completed を 1 bit に潰す）だと両者が同じ優先度タイルに入り、安定ソート
-        // が created_at DESC を保つ結果、running が dead_letter より先頭に来ていた
+        // が created_at DESC を保つ結果、running が failed より先頭に来ていた
         // （この回帰テストが無い状態だと検出できないバグ）。2 段キーでは error の有無を
-        // 独立した第 1 キーにするため、dead_letter が常に先に来る。
+        // 独立した第 1 キーにするため、failed が常に先に来る。
         let jobs = vec![
             job_info("running-other-schema", "running", None, 500, None, 0),
             job_info(
-                "dead-1",
-                "dead_letter",
+                "failed-1",
+                "failed",
                 Some("node2vec failed"),
                 300,
                 Some(305),
@@ -1963,7 +2214,7 @@ mod tests {
         let sorted = sort_jobs_diagnostic_first(jobs);
         let ids: Vec<&str> = sorted.iter().map(|j| j.job_id.as_str()).collect();
 
-        assert_eq!(ids, vec!["dead-1", "running-other-schema", "ok-1"]);
+        assert_eq!(ids, vec!["failed-1", "running-other-schema", "ok-1"]);
     }
 
     #[test]
@@ -1995,7 +2246,7 @@ mod tests {
     fn job_info_json_includes_diagnostic_fields_and_excludes_msg_id() {
         let job = job_info(
             "j1",
-            "dead_letter",
+            "failed",
             Some("node2vec failed"),
             1_753_000_000_000,
             Some(1_753_000_060_000),
@@ -2005,7 +2256,7 @@ mod tests {
 
         assert_eq!(rendered["job_id"], "j1");
         assert_eq!(rendered["job_type"], "merge");
-        assert_eq!(rendered["status"], "dead_letter");
+        assert_eq!(rendered["status"], "failed");
         assert_eq!(rendered["error"], "node2vec failed");
         assert_eq!(rendered["created_at"], 1_753_000_000_000i64);
         assert_eq!(rendered["completed_at"], 1_753_000_060_000i64);
@@ -2064,8 +2315,8 @@ mod tests {
             jobs: vec![
                 job_info("ok-1", "completed", None, 200, Some(210), 0),
                 job_info(
-                    "dead-1",
-                    "dead_letter",
+                    "failed-1",
+                    "failed",
                     Some("node2vec failed"),
                     100,
                     Some(110),
@@ -2082,7 +2333,7 @@ mod tests {
         let jobs = rendered["jobs"].as_array().expect("jobs は array");
         assert_eq!(jobs.len(), 2);
         assert_eq!(
-            jobs[0]["job_id"], "dead-1",
+            jobs[0]["job_id"], "failed-1",
             "診断対象（error あり）が先頭に来る: {jobs:?}"
         );
     }
@@ -2122,12 +2373,12 @@ mod tests {
     fn split_failed_jobs_for_logging_caps_at_five_and_reports_remaining() {
         // 7 件の失敗ジョブ + 完了ジョブ 1 件。先頭 5 件だけ個別ログ対象になり、
         // 残り 2 件は件数だけのサマリに回ることを保証する
-        // （--probe-only の日常観測で過去の dead_letter が ERROR ログを埋め尽くす事故対策）。
+        // （--probe-only の日常観測で過去の failed ジョブが ERROR ログを埋め尽くす事故対策）。
         let mut jobs: Vec<JobInfo> = (0..7)
             .map(|i| {
                 job_info(
                     &format!("failed-{i}"),
-                    "dead_letter",
+                    "failed",
                     Some("node2vec failed"),
                     100 + i,
                     None,
