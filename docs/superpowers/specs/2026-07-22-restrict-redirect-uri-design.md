@@ -2,7 +2,7 @@
 
 ## 背景
 
-`server/src/oauth/authserver.rs` の `is_acceptable_redirect_uri`（`:755-767`）は、スキームが `https` であればホストを一切見ずに `true` を返す。
+`server/src/oauth/authserver.rs` の `is_acceptable_redirect_uri` は、スキームが `https` であればホストを一切見ずに `true` を返す。
 
 ```rust
 match parsed.scheme() {
@@ -26,7 +26,7 @@ GCP のみで完結させる。外部 IdP（Auth0 等）は導入しない。OAu
 
 ### 1. redirect_uri の許可リスト化
 
-`is_acceptable_redirect_uri`（`server/src/oauth/authserver.rs:755`）を、スキームだけでなく**ホストで判定**する形に変更する。
+`server/src/oauth/authserver.rs` の `is_acceptable_redirect_uri` を、スキームだけでなく**ホストで判定**する形に変更する。
 
 - 本番で許可するのは claude.ai のコールバックのみ
 - ローカル開発用に `http://localhost` / `http://127.0.0.1` は残す（ポートは任意で可）

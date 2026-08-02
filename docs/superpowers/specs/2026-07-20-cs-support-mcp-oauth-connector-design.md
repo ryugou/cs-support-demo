@@ -95,7 +95,7 @@ CS担当(ブラウザ/Claude)                claude.ai / Desktop
   - `allowed_schemas`
 - Google 経路で得た検証済み `email` を actor 表と突合して actor を確定。
 - **email が actor 表に無ければ拒否**（fail-closed）。＝**ホワイトリスト運用**（許可する Gmail を明示登録。sivira.co 内外を問わず 1 件ずつ role 付きで登録）。
-  > **[撤去済み, 2026-07-21]** この email ホワイトリストは commit `1809b8e` で撤去済み。現行実装（`server/src/harness/authn.rs:70-85`）は突合を行わず、検証済み email を無条件に supervisor へ解決する。詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
+  > **[撤去済み, 2026-07-21]** この email ホワイトリストは commit `1809b8e` で撤去済み。現行実装（`server/src/harness/authn.rs` の `Authenticator::lookup_by_identity`）は突合を行わず、検証済み email を無条件に supervisor へ解決する。詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
 - role→tool 認可（例: `add_known_resolution` は supervisor/admin）は現行ロジックのまま。
 - （将来オプション・本スコープ外）「`@sivira.co` ドメインは既定 role で自動許可＋外部は個別ホワイトリスト」も config で拡張可能。今回はホワイトリストのみ。
   > **[撤去済み, 2026-07-21]** ホワイトリスト自体が撤去済みのため、この拡張案も前提が成立しない。

@@ -4,10 +4,10 @@ GitHub Issue: #6
 
 ## 背景 / 問題
 
-`server/src/bin/ingest_urtect.rs:42` の `const KNOWN_MODELS: &[&str] = &["ADC-V724", "ADC-V724X", "ADC-VC727P"]` が2つの役割を兼ねている。
+`server/src/bin/ingest_urtect.rs` の `const KNOWN_MODELS: &[&str] = &["ADC-V724", "ADC-V724X", "ADC-VC727P"]`（Issue #6 で削除済み）が2つの役割を兼ねている。
 
 1. マニュアル本文からの型番検出（`detect_product_models`）の語彙
-2. Product ノード生成の**マスタそのもの**（`ingest_urtect.rs:702-711` で無条件に 3 件 upsert）
+2. Product ノード生成の**マスタそのもの**（`ingest_urtect.rs` で無条件に 3 件 upsert。当該コードは Issue #6 で削除済み）
 
 製品マスタがコードに埋まっているため、製品を 1 件追加するたびにコード修正 → ビルド → イメージ再ビルド → 再デプロイが必要になる。これを廃止し、**vegapunk の Product ノードを製品マスタの唯一の正本**にする。
 
@@ -17,7 +17,7 @@ GitHub Issue: #6
 
 製品マスタを vegapunk に投入する専用 CLI。全体リセット後の seed 投入と、製品追加の両方に使う。
 
-CLI 引数（`ingest_urtect.rs:261-294` の `Args` と同じ流儀。clap derive）:
+CLI 引数（`ingest_urtect.rs` の `struct Args` と同じ流儀。clap derive）:
 
 - `--endpoint`（env `VEGAPUNK_ENDPOINT`、既定 `http://vegapunk.local:6840`）
 - `--schema`（既定 `"urtect"`）
@@ -37,10 +37,10 @@ CLI 引数（`ingest_urtect.rs:261-294` の `Args` と同じ流儀。clap derive
    ```
    - `model` 空文字は即エラー。`model` の重複（大文字小文字無視）は即エラー
    - パース失敗・検証失敗は fail closed（何も upsert せず終了。エラーには対象ファイルパスと原因を含める）
-2. 各エントリを `ManualProductInput { model, name, aliases }` に写像し、`build_product_node`（`server/src/manual/ingest_model.rs:47`）で Product ノードを構築する。node id 規約（`{schema}:gen1:Product:{model}`）・attributes（`product_key` / `name` / `model` / `aliases` カンマ結合）は既存関数をそのまま使い、変更しない
+2. 各エントリを `ManualProductInput { model, name, aliases }` に写像し、`build_product_node`（`server/src/manual/ingest_model.rs`）で Product ノードを構築する。node id 規約（`{schema}:gen1:Product:{model}`）・attributes（`product_key` / `name` / `model` / `aliases` カンマ結合）は既存関数をそのまま使い、変更しない
 3. embed → `upsert_vectors` → `upsert_nodes` の順で投入する（`ingest_urtect` の「vector 先行」の順序に合わせる）。
    - embed テキストは現在 `ingest_urtect` が product embed で使っている組み立てと同一にする。共通化できるなら `server/src/manual/` 側に小さな helper として括り出してよい（`ingest_urtect` 側も同 helper を使う。ただし今回 `ingest_urtect` からは product embed 自体を削除するので、実際の利用者は `ingest_products` のみになる）
-   - vector metadata は既存契約に従う: 認識キーは `node_id` / `text` / `source_type` / `timestamp_ms` の 4 つのみ、`node_id` は entry `id`（graph node_id）と同一文字列（`ingest_urtect.rs:135-146` のコメント参照。`vector_metadata` helper を再利用してよい）
+   - vector metadata は既存契約に従う: 認識キーは `node_id` / `text` / `source_type` / `timestamp_ms` の 4 つのみ、`node_id` は entry `id`（graph node_id）と同一文字列（`server/src/manual/vectors.rs` の `vector_metadata` のコメント参照。同 helper を再利用してよい）
    - embed 同時実行は `EMBED_CONCURRENCY = 4` と同じ値。1 件でも embed 失敗したら fail closed（中途半端な状態を作らない）
 4. 完了時に投入件数・スキップ有無をログ出力する
 
@@ -52,16 +52,16 @@ CLI 引数（`ingest_urtect.rs:261-294` の `Args` と同じ流儀。clap derive
 
 ### 3. `server/src/bin/ingest_urtect.rs` の変更
 
-- `const KNOWN_MODELS`（`:42`）を削除
-- Product ノード生成ループ（`:702-711`）と product embed を削除（`ingest_products` の責務に移動）
+- `const KNOWN_MODELS`（Issue #6 で削除済み）を削除
+- Product ノード生成ループ（Issue #6 で削除済み）と product embed を削除（`ingest_products` の責務に移動）
 - ingest 開始時（クロール前）に vegapunk から製品一覧を取得する:
-  - `client.query_nodes(&args.schema, "Product", Vec::new(), 1000)`（`server/src/vegapunk.rs:293` の既存メソッド）
+  - `client.query_nodes(&args.schema, "Product", Vec::new(), 1000)`（`server/src/vegapunk.rs` の `query_nodes`、既存メソッド）
   - **0 件なら bail**: エラーメッセージに「製品マスタが空。先に `ingest_products` を実行せよ」という運用者向け次アクションを含める（fail closed）
   - **返却件数が limit と同数なら bail**: 取りこぼし（silent truncation）の可能性があるため。メッセージに limit 値を含める
 - 検出語彙の構築: 各 Product ノードの `model` 属性と `aliases` 属性（カンマ区切りを split・trim・空要素除去）を集め、`(表層形, product model)` の対応表を作る。表層形は大文字化して保持する
 - `detect_product_models(body)` を「ハードコード一覧と照合」から「上記対応表と照合」に変更する。**英数字境界チェック（`contains_as_token`）の意味論は一切変えない**（`ADC-V724` が `ADC-V724X` の内部一致で誤爆しない性質を維持）。ヒットした表層形は product model（`product_key`）に解決して返す。同一 product が model と alias の両方でヒットしても 1 回だけ返す
 - `DESCRIBES` 辺の構築ロジック自体は変更しない（検出結果の由来が変わるだけ）
-- `:34-41` の KNOWN_MODELS 説明コメントを現状に合わせて書き直す。lexicon（`model_adc_*` signal）との二重管理が残っている点は Issue #7 への参照として残す
+- KNOWN_MODELS（Issue #6 で削除済み）の説明コメントを現状に合わせて書き直す。lexicon（`model_adc_*` signal）との二重管理が残っている点は Issue #7 への参照として残す
 
 ### 4. `Dockerfile` の変更
 
