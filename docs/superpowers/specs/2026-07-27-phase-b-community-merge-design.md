@@ -11,19 +11,21 @@ Phase B を **B1 / B2 に分割する**。本 spec は両方の正本とする�
 - **B1（実施済み）**: `Merge` RPC を配線して本番 schema に対し実行し、**global 検索が何を返すかを実測する**
 - **B2（実装対象）**: `MENTIONS_CONCEPT` による Concept 跨ぎの結合（concept-expansion）を実装する
 
-分割した理由: R4（別記事 join）の実装形態が「`search` を `mode=hybrid` に切り替えるだけ」で済むのか「自前 concept-expansion が必要」なのかは、**global の返却物を見るまで決まらない**ため。統合仕様書 §5.1 は global を「コミュニティ要約を検索し**代表メンバーを返す**」と記述しているが、`server/proto/graphrag.proto` の `SearchResultItem`（160 行目）に**メンバー一覧フィールドは無い**。現行 retrieval は node_id に ManualSection の kind marker を含むヒットだけを残す（`server/src/manual/retrieval.rs` の `search_ids_with_scores`）ため、代表メンバーが ManualSection の node_id として返るかどうかが分岐点になる。この判定は Phase C で hybrid を再検討するときにも使う。
+分割した理由: R4（別記事 join）の実装形態が「`search` を `mode=hybrid` に切り替えるだけ」で済むのか「自前 concept-expansion が必要」なのかは、**global の返却物を見るまで決まらない**ため。統合仕様書 §5.1 は global を「コミュニティ要約を検索し**代表メンバーを返す**」と記述しているが、`server/proto/graphrag.proto` の `SearchResultItem` に**メンバー一覧フィールドは無い**。現行 retrieval は node_id に ManualSection の kind marker を含むヒットだけを残す（`server/src/manual/retrieval.rs` の `search_ids_with_scores`）ため、代表メンバーが ManualSection の node_id として返るかどうかが分岐点になる。この判定は Phase C で hybrid を再検討するときにも使う。
 
 **B1 の実測により B2 は自前 concept-expansion に確定した**（「B2: concept-expansion」節）。
 
 ## 調査で確定した事実（推測ではない）
 
-- `MergeRequest { string schema }` → `MergeResponse {}`（空）。`server/proto/graphrag.proto:357-360`。進捗・ジョブ ID を返す口は無い
+**参照はシンボル名で書く**（`message` 名・関数名）。行番号で書くと proto 同期のたびに腐る（`71d4785` の upstream 同期で実際に全引用が +4 / +5 ずれた）。
+
+- `MergeRequest { string schema }` → `MergeResponse {}`（空）。`server/proto/graphrag.proto` の `MergeRequest` / `MergeResponse`。進捗・ジョブ ID を返す口は無い
 - `Merge` は **admin ロール・同期実行・schema 全体の再計算**。Node2Vec も Merge 内で同期実行（integration-guide §6.2 / §6.4）。**同一 schema で Merge は同時 1 本のみ**（衝突は `FAILED_PRECONDITION`、非リトライ）
-- `SearchResponse.execution`（`SearchExecution`）に `requested_mode` / `effective_mode` / `degraded` / `degradations` / `readiness` が入る（proto 231-245 行）。**現行 `VegapunkClient::search` は `results` だけ取って `execution` を捨てている**（`server/src/vegapunk.rs:557` 付近、`mode: "local"` / `structural_weight: 0.0`）
+- `SearchResponse.execution`（`SearchExecution`）に `requested_mode` / `effective_mode` / `degraded` / `degradations` / `readiness` が入る。B1 で `VegapunkClient::search` / `search_with_mode` が `SearchOutcome` として保持するよう変更済み（変更前は `results` だけ取って `execution` を捨てていた）
 - `hybrid` は Merge 未実行なら global 部分を吸収して local へ degrade する（integration-guide §5.1）。**落ちない**
-- `structural_weight > 0` にすると score は「テキスト類似と構造類似の正規化ブレンド＝順序専用の相対値」になる（proto 164-166 行のコメント、integration-guide §5.2）
-- `GetStatsResponse` に `community_count`（proto 690 行）。Merge 成否の一次証跡に使える
-- `GetGraphSnapshotResponse` の `GraphNode` に `optional int32 community`（proto 830 行）。Merge 後は snapshot 経由でも community id が見える
+- `structural_weight > 0` にすると score は「テキスト類似と構造類似の正規化ブレンド＝順序専用の相対値」になる（`SearchResultItem.score` のコメント、integration-guide §5.2）
+- `GetStatsResponse.community_count`。Merge 成否の一次証跡に使える
+- `GetGraphSnapshotResponse` の `GraphNode.community`（`optional int32`）。Merge 後は snapshot 経由でも community id が見える
 - 本番 vegapunk（`10.10.0.2:6840`）は VPC 内部限定。`GetStats` の確認すら Cloud Run job 経由になる
 - 対象 schema は **`urtect`**（`server/config.cloudrun.toml` の `[[projects]] schema = "urtect"`。`manual_schema = "manual_v1"` は schema 名ではなく retrieval 経路の種別フラグ）
 
@@ -87,7 +89,7 @@ Merge の実行と、**その前後の観測**を担う。
 
 - service / 既存 job と**同一イメージ・同一 tag**
 - `--task-timeout` を Merge の想定所要時間より十分長く取る
-- VPC connector / service account / Secret Manager injection は既存 `ingest-alarmcom` job と同設定
+- VPC connector / service account / Secret Manager injection は既存 `ingest-urtect` job と同設定（`ingest_alarmcom` の Cloud Run job は新設していない）
 - `CLAUDE.md` の Cloud Run 節に job 追加と再デプロイ時の tag 揃えを追記する
 
 ## B1 実行で判明した事実（2026-07-27 実測。以後の運用判断はこれを前提にする）
@@ -152,73 +154,11 @@ probe 1 件あたりの所要が Merge 前 約 5 秒 → Merge 走行中 30〜60
 
 ## B2: concept-expansion
 
-### 採用する設計
+**正本は [`2026-08-02-concept-expansion-design.md`](./2026-08-02-concept-expansion-design.md) とする。** 設計・受理条件・未決事項はすべてそちらで管理する。
 
-Concept → section の引き当てを **ManualSection への非正規化**で行い、検索経路の RPC 増加をゼロにする。`MENTIONS_CONCEPT` 辺はグラフの正として残し、`ManualSection.concept_keys` はその読み取り最適化の射影とする。**両者が食い違った場合は辺を正とする。**
+要約: text / vector で上位ヒットした section が持つ Concept を seed に、同じ Concept を持つ別 section を `top_k` の**残枠へ詰める**（2-hop 拡張）。引き当ては `ManualSection.concept_keys` への非正規化で行い、検索経路の RPC 増加をゼロにする。拡張候補は既存 hit を押し出さないため、`best_manual_score` が変化せず**回答可否判定と 3 層判定は影響を受けない**。
 
-クエリ時に一致 Concept を incoming traverse する案は採らない。汎用的な Concept ほど fan-in が大きく、**利用者が投げがちなクエリで最も遅くなる**。hot Signal の incoming traverse が 1 ページ目で call timeout 120s を超え、corpus load を丸ごと落とした事象（`server/src/corpus.rs:129-145` で MENTIONS_SIGNAL を載せていない理由）と同じ失敗構造になる。加えて fan-in を知るには traverse するしかないため、識別力の無い Concept を候補から落とす判定が原理的にできない。
-
-### スキーマ変更（additive）
-
-`schema/cs-support.yml` の `ManualSection` に 1 属性を足す。
-
-```yaml
-      concept_keys: { type: string }   # JSON 配列文字列。既存 aliases_ja と同じ扱い
-```
-
-属性追加は世代据え置き・job 不要・既存ノード再投入不要（integration-guide §8.2）。全 ingest CLI が起動時に呼ぶ `ensure_schema` で伝播する。
-
-### 書き込み経路
-
-1. **`ingest_alarmcom.rs`**: セクションごとに集めた `concept_keys`（`:832` で重複排除済み）を JSON 配列文字列にして section ノード属性へ載せる。`MENTIONS_CONCEPT` 辺は従来どおり張る
-2. **`server/src/bin/backfill_concept_keys.rs`（新規）**: 既存データ用。ManualSection 全件を `query_nodes` で取得 → 各件について `MENTIONS_CONCEPT` を **outgoing** `traverse_neighbors_paged` → `concept_keys` を組み立てて `upsert_nodes`
-   - **読み出した全属性に `concept_keys` を足して再送する**。`UpsertNodes` が部分マージか全置換かは未確定（下記「未決事項」）で、全属性再送はどちらの意味論でも安全側に倒れる
-   - 既に同じ `concept_keys` を持つ section は skip する（冪等・RPC 削減）。`--dry-run` で upsert せず件数と差分だけ出す
-   - concept ごとの fan-in 分布を stdout に JSON で出す（下記 fan-in 閾値の決定材料）
-   - `ingest_alarmcom` の 6h クロールとは独立に単体で再実行できる。既存 bin と同じく `clap::Parser` と複製した `read_token` を使う
-
-outgoing 方向の fan-out は 1 section あたり数件で、incoming と違い timeout しない。
-
-### 読み取り経路（`server/src/manual/retrieval.rs`）
-
-1. `corpus.rs` の `load_manual_corpus` に `load_nodes(schema, KIND_CONCEPT)` を 1 回追加する（低カーディナリティ。既存 TTL 60s に乗る）。in-memory 表現への復元は既存の `concept::restore_registry_from_nodes` をそのまま使う
-2. 正規化したクエリに Concept の `name_ja` / `aliases_ja` / `name_en` が部分一致するかで、一致 Concept 集合を作る
-3. **fan-in フィルタ**: corpus 上の `concept_keys` から Concept ごとの出現 section 数を数え、**全 ManualSection の 5% を超える Concept を候補から除外**する
-4. 一致 Concept を `concept_keys` に含む section へ `CONCEPT_SCORE = 0.5` を与え、`score = text_score.max(vector_score).max(concept_score)` とする
-5. `score_source` に `"concept"` を追加する（concept が最終スコアを供給し、text も vector もそれに届かなかった場合）
-
-### 不変条件
-
-**`CONCEPT_SCORE`(0.5) < answerability の low 閾値**。concept 経路だけで拾った section は、単独では絶対に「回答可能」へ転ばない。既定値（`server/config.cloudrun.toml` の low = 0.6）に対して単体テストで固定する。
-
-閾値は config で変更できるため、起動時に `low 閾値 <= CONCEPT_SCORE` を検出したら `tracing::warn!` で「concept 経路単独で回答可能へ転ぶ設定である」と 1 回警告する（起動は止めない。閾値を下げるのは運用判断であり、起動不能にするのは過剰）。
-
-### 受理条件
-
-`verify_alarmcom` を before / after で実行し、**recall@5 ≥ 0.86 / recall@1 ≥ 0.48 / should-miss false-positive ≤ 0.15**（いずれも現状値）を満たすこと。false-positive 率が悪化していないことは、上記の不変条件が構造的に保証する部分と実測の両方で確認する。
-
-併せて `server/src/manual/concept.rs:3` のドックコメント（`translate::translate_and_extract` を「現時点は stub」と書いている）を実態に合わせて修正する。実際には Gemini 実装が `ingest_alarmcom.rs:788` から呼ばれている。
-
-### 未決事項
-
-| 未決 | 決定者 | 決定時期 | 影響範囲 |
-|---|---|---|---|
-| `UpsertNodes` の属性が部分マージか全置換か | 実機検証（backfill CLI の `--dry-run`） | backfill CLI 初回実行時 | **実装変更は不要**。全属性再送で両方に対応済みのため、判明しても upsert ペイロードが縮むだけ |
-| fan-in 閾値 5% の妥当性 | ryugo | backfill CLI が fan-in 分布を出力した時点 | 検索候補の広さのみ。閾値変更に再 ingest は不要（メモリ内フィルタのため） |
-
-本番 `urtect` の Concept ノード件数は未計測である。5% は暫定値で、根拠は分布を見るまで無い。
-
-### テスト
-
-ネットワーク非依存の純関数に単体テストを置く。
-
-- `concept_keys` の JSON シリアライズ / デシリアライズ（不正 JSON は空配列へフォールバックし warn する。`restore_registry_from_nodes` の `aliases_ja` と同じ規律）
-- クエリ → 一致 Concept 集合（正規化、部分一致、`aliases_ja` 経由の一致）
-- fan-in フィルタ（閾値の境界を含む）
-- スコア融合と `score_source` の写像（concept が最終スコアを供給するケース、text / vector が上回るケース）
-- `CONCEPT_SCORE < low 閾値` の不変条件
-
-実 backfill と実検索は本番 vegapunk への到達が必要なため CI・コンテナでは実行しない。backfill CLI の実行ログを evidence とし、未実行の検証はその旨を明記する。
+B2 は計測 → データ → 検索 + eval の 3 段階に分割する。fan-in 閾値と seed 上限を実測なしに確定させないためである。
 
 ## スコープ外
 
@@ -258,5 +198,5 @@ outgoing 方向の fan-out は 1 section あたり数件で、incoming と違い
 - 認証情報をハードコードしない。bearer token はファイル / env 経由
 - エラーを握りつぶさない。skip・degrade は必ず理由付きでログする
 - 既存の構成・命名・型に合わせ最小差分。新 bin は既存 `ingest_*` / `verify_*` CLI の引数・token 解決の流儀を踏襲する
-- B1 ではスキーマを変更せず、グラフも書き換えない（Merge はサーバ側の派生データを作るだけ）。B2 のスキーマ変更は `ManualSection.concept_keys` の追加 1 件のみとし、既存属性の型・必須性は変えない
+- B1 ではスキーマを変更せず、グラフも書き換えない（Merge はサーバ側の派生データを作るだけ）。B2 のスキーマ変更は B2 spec を正本とする
 - Conventional Commits。commit は可、push・PR 作成は指示があるまで禁止
