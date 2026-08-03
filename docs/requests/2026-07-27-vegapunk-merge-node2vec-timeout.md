@@ -235,4 +235,25 @@ vegapunk 側の問題と混同しないよう、こちらの不具合として�
 
 Merge を呼ぶ CLI に限り h2 keepalive を無効化し（常駐サーバ側の設定は変更していません）、2 回目は 31 分間切断せずに待ち切ってサーバ側の本当の理由を受け取れています。
 
+---
+
+## 9. 再テスト結果（2026-08-03、設定変更後の検証）
+
+vegapunk 側の設定変更後として Merge を再実行しましたが、**同一のエラーで再現しました。設定がプロセスに反映されていないと考えられます。**
+
+| 項目 | 値 |
+|---|---|
+| 実行 | Cloud Run job `merge-schema-g64rn`（2026-08-03 03:19 UTC 開始、31.5 分で abort） |
+| Merge の失敗理由 | `FailedPrecondition: merge aborted: 1 job(s) reached a terminal failure state: node2vec:urtect:gen1:mrev1:att31024da8-d761-4d70-9fac-d9dee5e79d04 (failed)` |
+| node2vec の `JobInfo.error` | **`job timed out (exceeded job_timeout_secs)`**（前回と同一） |
+| node2vec の所要 | `created_at` → `completed_at` 約 29.8 分、`retry_count = 3`（前回実測 約 29.5 分と同水準） |
+| `readiness.global` | `NOT_READY`（`No community summaries found`）のまま |
+| community_summary | 今回は retry 0 で多数完走（前回断続的だった Gemini 側は安定） |
+
+`job_timeout_secs` が 3600s に上がっていれば 1 試行に 60 分許容されるため、29.8 分でのタイムアウトは起こり得ません。確認をお願いしたい点（可能性の高い順）:
+
+1. **プロセス再起動を実施したか**（config はホットリロードされないため、変更だけでは反映されません）
+2. **`worker.job_ttl_secs`（既定 3600s）も引き上げたか**（env ホワイトリスト外のため `config.yml` 直接編集が必要。`job_timeout_secs` だけ上げても TTL 側で終端されると同種のエラーになります）
+3. **env で上書きした場合、起動プロセスにその env が届いているか**（systemd unit / シェル環境の差異）
+
 なお、**クライアントが切断してもサーバ側の Merge は継続していました**（切断後に `community_count` が 0 → 198 に増加）。これは想定どおりの挙動でしょうか。もしそうであれば、接続断のあとに再実行すると `FAILED_PRECONDITION`（同時実行不可）になるはずなので、こちらの運用手順に「再実行前に `GetStats` で確認する」を入れてあります。
