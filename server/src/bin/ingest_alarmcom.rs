@@ -890,6 +890,7 @@ async fn main() -> Result<()> {
             signal_values,
             body_original: Some(body_en),
             original_hash: Some(hash.clone()),
+            concept_keys: Vec::new(),
         };
         let build = build_section_graph(&args.schema, DOC_KEY, &input, &hash);
         let mut article_nodes = build.nodes;
@@ -1254,6 +1255,7 @@ mod tests {
             signal_values: Vec::new(),
             body_original: Some("body".into()),
             original_hash: Some("h".into()),
+            concept_keys: Vec::new(),
         }
     }
 

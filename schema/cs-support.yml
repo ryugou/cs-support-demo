@@ -141,6 +141,8 @@ nodes:
       # 多言語予約（純予約・空可・駆動コードは読まない）
       body_original: { type: string }
       original_hash: { type: string }
+      # Issue #8 B2: MENTIONS_CONCEPT 辺の読み取り最適化射影。JSON 配列文字列（型は string 固定のため）。
+      concept_keys: { type: string }
   # Issue #8 v2: answers.alarm.com の概念クエリ（型番なしの自然文）・記事横断 join の拠り所。
   Concept:
     attributes:

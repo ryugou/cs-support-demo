@@ -572,6 +572,9 @@ async fn main() -> Result<()> {
             // source_lang は build_section_graph 側で従来どおり "ja" になる。
             body_original: None,
             original_hash: None,
+            // urtect（Google Sites）は Concept 抽出の対象外（抽出は alarm.com 側の翻訳パスにのみ
+            // ある）。concept_expansion_design.md の「スコープ外」節に明記済み。
+            concept_keys: Vec::new(),
         };
         let build = build_section_graph(&args.schema, DOC_KEY, &input, &hash);
         nodes.extend(build.nodes);

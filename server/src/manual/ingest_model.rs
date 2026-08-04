@@ -19,6 +19,9 @@ pub struct ManualSectionInput {
     pub body_original: Option<String>,
     /// 英語原文本文の hash。`Some` のときだけ `original_hash` 属性を書く。
     pub original_hash: Option<String>,
+    /// この section が言及する concept_key の一覧（MENTIONS_CONCEPT 辺の読み取り最適化射影。
+    /// 辺がグラフの正で、この属性は射影。食い違ったら辺が正）。空なら属性自体を書かない。
+    pub concept_keys: Vec<String>,
 }
 
 pub struct ManualProductInput {
@@ -103,6 +106,12 @@ pub fn build_section_graph(
     if let Some(original_hash) = &s.original_hash {
         attributes.push(("original_hash".to_string(), original_hash.clone()));
     }
+    if !s.concept_keys.is_empty() {
+        attributes.push((
+            "concept_keys".to_string(),
+            serde_json::to_string(&s.concept_keys).unwrap_or_else(|_| "[]".to_string()),
+        ));
+    }
     let mut nodes = vec![GraphNode {
         id: sec_id.clone(),
         node_type: KIND_SECTION.to_string(),
@@ -165,7 +174,36 @@ mod tests {
             signal_values: vec!["sd_not_recognized".into()],
             body_original: None,
             original_hash: None,
+            concept_keys: Vec::new(),
         }
+    }
+
+    #[test]
+    fn build_section_graph_writes_concept_keys_json_when_non_empty() {
+        let mut s = sample();
+        s.concept_keys = vec!["firstpersonin".into(), "geofence".into()];
+        let build = build_section_graph("urtect", "doc-x", &s, "hash");
+        let attr = build.nodes[0]
+            .attributes
+            .iter()
+            .find(|(k, _)| k == "concept_keys")
+            .map(|(_, v)| v.clone())
+            .expect("concept_keys attribute must be written");
+        let parsed: Vec<String> = serde_json::from_str(&attr).unwrap();
+        assert_eq!(
+            parsed,
+            vec!["firstpersonin".to_string(), "geofence".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_section_graph_omits_concept_keys_when_empty() {
+        let s = sample();
+        let build = build_section_graph("urtect", "doc-x", &s, "hash");
+        assert!(build.nodes[0]
+            .attributes
+            .iter()
+            .all(|(k, _)| k != "concept_keys"));
     }
 
     #[test]
