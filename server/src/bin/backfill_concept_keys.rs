@@ -19,7 +19,11 @@ use cs_support_mcp::{
     vegapunk::VegapunkClient,
 };
 use serde_json::{json, Value};
-use std::{collections::HashMap, env, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    path::PathBuf,
+};
 
 /// `query_nodes_paged` / `traverse_neighbors_paged` の 1 ページあたり件数。backend 上限 1000。
 const PAGE_SIZE: i32 = 1000;
@@ -318,11 +322,50 @@ fn needs_update(attr_concept_keys: Option<&str>, computed_sorted: &[String]) -> 
         Ok(v) => v,
         Err(_) => return true,
     };
-    let existing_set: std::collections::HashSet<&str> =
-        existing.iter().map(|s| s.as_str()).collect();
-    let computed_set: std::collections::HashSet<&str> =
-        computed_sorted.iter().map(|s| s.as_str()).collect();
+    let existing_set: HashSet<&str> = existing.iter().map(|s| s.as_str()).collect();
+    let computed_set: HashSet<&str> = computed_sorted.iter().map(|s| s.as_str()).collect();
     existing_set != computed_set
+}
+
+/// `MENTIONS_CONCEPT` 辺（`row.concept_keys`、正）と `concept_keys` 属性（射影）の乖離を
+/// **集合比較**で検出する（`needs_update` と同じ理由: 出現順とソート順の差を乖離と誤判定しない
+/// ため）。一致する行は結果に含めない。属性が不正 JSON の場合は判定不能だが「一致」とは
+/// 絶対にみなさず、`attr: null` を付けて必ず乖離として報告する（fail closed）。
+fn divergences(rows: &[SectionConcepts]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for row in rows {
+        let attr_keys = match &row.attr_concept_keys {
+            None => Some(Vec::new()),
+            Some(raw) => serde_json::from_str::<Vec<String>>(raw).ok(),
+        };
+        match attr_keys {
+            Some(keys) => {
+                let edge_set: HashSet<&str> = row.concept_keys.iter().map(|s| s.as_str()).collect();
+                let attr_set: HashSet<&str> = keys.iter().map(|s| s.as_str()).collect();
+                if edge_set != attr_set {
+                    out.push(json!({
+                        "section_key": row.section_key,
+                        "edges": row.concept_keys,
+                        "attr": keys,
+                    }));
+                }
+            }
+            None => {
+                tracing::warn!(
+                    section_key = %row.section_key,
+                    "concept_keys attribute is not valid JSON; reporting as diverged \
+                     (cannot assume it matches the edges)"
+                );
+                out.push(json!({
+                    "section_key": row.section_key,
+                    "edges": row.concept_keys,
+                    "attr": Value::Null,
+                    "note": "concept_keys attribute is not valid JSON",
+                }));
+            }
+        }
+    }
+    out
 }
 
 /// 読み出した全属性 + 計算済み `concept_keys`（ソート済み JSON）で `GraphNode` を組み立てる。
@@ -561,10 +604,14 @@ async fn main() -> Result<()> {
     }
 
     if args.verify {
-        anyhow::bail!(
-            "--verify is not implemented in this build yet (Issue #8 Phase B2-1 Task 6); \
-             rerun after that commit lands"
-        );
+        let diverged = divergences(&rows);
+        let summary = json!({
+            "total_sections": rows.len(),
+            "diverged": diverged.len(),
+            "items": diverged,
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
     }
 
     if let Some(section_key) = &args.probe_one {
@@ -648,6 +695,37 @@ mod tests {
         assert_eq!(parsed, vec!["a".to_string(), "b".to_string()]);
         // 他の必須属性はそのまま残る
         assert!(node.attributes.iter().any(|(k, v)| k == "body" && v == "x"));
+    }
+
+    fn row_with_attr(
+        section_key: &str,
+        concept_keys: &[&str],
+        attr_concept_keys: Option<&str>,
+    ) -> SectionConcepts {
+        let mut r = row(section_key, concept_keys);
+        r.attr_concept_keys = attr_concept_keys.map(|s| s.to_string());
+        r
+    }
+
+    #[test]
+    fn divergences_reports_set_difference_only() {
+        let rows = vec![
+            row_with_attr("s1", &["a", "b"], Some(r#"["b","a"]"#)), // 順序差 = 一致
+            row_with_attr("s2", &["a"], Some(r#"["a","zzz"]"#)),    // 乖離
+            row_with_attr("s3", &[], None),                         // 両方空 = 一致
+        ];
+        let d = divergences(&rows);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["section_key"], "s2");
+    }
+
+    #[test]
+    fn divergences_flags_invalid_json_attr_as_diverged() {
+        let rows = vec![row_with_attr("s1", &["a"], Some("not json"))];
+        let d = divergences(&rows);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0]["section_key"], "s1");
+        assert!(d[0]["attr"].is_null());
     }
 
     #[test]
