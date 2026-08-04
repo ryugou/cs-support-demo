@@ -132,6 +132,8 @@ Cloud Run job から `Merge(schema="urtect")` を 2 回実行しました。時�
 
 ## 4. 分析（分かっていること / 分かっていないこと）
 
+> **[2026-08-04 更新]** 本節の「1 試行 7〜13 分」という推定は誤りでした。node2vec には組み込み既定 `max(job_timeout_secs, 1800)` があり、実測はこの 1,800 秒とほぼ一致します。最新の分析は **§9.2** を参照してください。
+
 **分かっていること**
 
 - node2vec ジョブが terminal failure になると **Merge 全体が abort** し、Leiden の結果（198 コミュニティ）が残っていても CommunitySummary は commit されず、global search は使えないままになる
@@ -149,6 +151,8 @@ Cloud Run job から `Merge(schema="urtect")` を 2 回実行しました。時�
 ## 5. 依頼事項
 
 優先度順に記載します。A だけでも実施いただければ、こちらで効果を検証できます。
+
+> **[2026-08-04 更新]** A の設定値・手順は再テストの実測を踏まえて **§9.3** で更新しました（`job_timeout_secs` ではなく `job_timeout_overrides.node2vec` を上げる形に変更）。現時点の依頼は §9.3 が正です。B〜E は変更ありません。
 
 ### A. 【最優先】`worker.job_timeout_secs` の確認と引き上げ（+ 再起動）
 
@@ -237,23 +241,63 @@ Merge を呼ぶ CLI に限り h2 keepalive を無効化し（常駐サーバ側�
 
 ---
 
-## 9. 再テスト結果（2026-08-03、設定変更後の検証）
+## 9. 再テスト結果と依頼内容の更新（2026-08-03 実測、2026-08-04 追記）
 
-vegapunk 側の設定変更後として Merge を再実行しましたが、**同一のエラーで再現しました。設定がプロセスに反映されていないと考えられます。**
+この節が現時点の最新の依頼です。§5-A の依頼内容は、本節の実測と統合仕様書の再確認を踏まえてここで更新しています。
 
-| 項目 | 値 |
+### 9.1 再テストの経緯と結果
+
+設定変更後との連絡を受けて、2026-08-03 03:19 UTC に Cloud Run job `merge-schema-g64rn` で Merge を再実行しました。結果は**前回と同一のエラーによる abort**でした。
+
+| 項目 | 実測値 |
 |---|---|
-| 実行 | Cloud Run job `merge-schema-g64rn`（2026-08-03 03:19 UTC 開始、31.5 分で abort） |
-| Merge の失敗理由 | `FailedPrecondition: merge aborted: 1 job(s) reached a terminal failure state: node2vec:urtect:gen1:mrev1:att31024da8-d761-4d70-9fac-d9dee5e79d04 (failed)` |
-| node2vec の `JobInfo.error` | **`job timed out (exceeded job_timeout_secs)`**（前回と同一） |
-| node2vec の所要 | `created_at` → `completed_at` 約 29.8 分、`retry_count = 3`（前回実測 約 29.5 分と同水準） |
+| Merge の失敗理由 | `FailedPrecondition: merge aborted: 1 job(s) reached a terminal failure state: node2vec:urtect:gen1:mrev1:att31024da8-... (failed)` |
+| node2vec の `JobInfo.error` | `job timed out (exceeded job_timeout_secs)`（前回と同一） |
+| node2vec の `created_at` → `completed_at` | **1,786 秒（約 29.8 分）**、`retry_count = 3` |
 | `readiness.global` | `NOT_READY`（`No community summaries found`）のまま |
-| community_summary | 今回は retry 0 で多数完走（前回断続的だった Gemini 側は安定） |
+| community_summary | 今回は retry 0 で全件完走（前回断続的だった Gemini 側は安定していました） |
 
-`job_timeout_secs` が 3600s に上がっていれば 1 試行に 60 分許容されるため、29.8 分でのタイムアウトは起こり得ません。確認をお願いしたい点（可能性の高い順）:
+### 9.2 実測が指している結論: node2vec の実効タイムアウトは今も 1,800 秒（組み込み既定）のまま
 
-1. **プロセス再起動を実施したか**（config はホットリロードされないため、変更だけでは反映されません）
-2. **`worker.job_ttl_secs`（既定 3600s）も引き上げたか**（env ホワイトリスト外のため `config.yml` 直接編集が必要。`job_timeout_secs` だけ上げても TTL 側で終端されると同種のエラーになります）
-3. **env で上書きした場合、起動プロセスにその env が届いているか**（systemd unit / シェル環境の差異）
+統合仕様書 §11 を読み直したところ、§4 で当方が行った推定（「1 試行 7〜13 分」）は誤りで、実測を正確に説明する仕組みが記載されていました。
+
+> `worker.job_timeout_overrides` — ジョブ種別ごとの timeout 上書き。**node2vec のみ組み込み既定 `max(job_timeout_secs, 1800)`**
+
+つまり node2vec の実効タイムアウトは、`job_timeout_secs` が既定 300 秒のままでも **1,800 秒（30 分）**です。今回の失敗は `created_at` から **1,786 秒**後に `job timed out` となっており、この組み込み既定 1,800 秒とほぼ一致します（前回の 29.5 分も同様です）。
+
+このことから、**現在走っているプロセスの実効タイムアウトは依然 1,800 秒である**と判断しています。もし `job_timeout_secs` が 3,600 秒に反映されていれば、実効値は `max(3600, 1800) = 3600` 秒となり、29.8 分でのタイムアウトは起こり得ないためです。
+
+反映されなかった原因として、次の 3 つのいずれかを疑っています。
+
+1. **変更後にプロセスを再起動していない。** config は起動時に一度読むだけでホットリロードされないため、`config.yml` や env を変えただけでは反映されません（統合仕様書 §11）。
+2. **`worker.job_timeout_overrides.node2vec` を環境変数で設定した。** このキーは map 型のため **env 上書きの対象外**で、`config.yml` に直接書く以外の変更手段がありません（統合仕様書 §11 に明記）。`VEGAPUNK_*` の env で設定した場合、エラーにならず黙って無視されます。
+3. **`job_timeout_secs` を 1,800 以下の値に設定した。** node2vec の実効値は `max(job_timeout_secs, 1800)` なので、1,800 以下への変更は node2vec には一切効きません（例: 300 → 1200 に上げても実効値は 1,800 のまま変わらない）。
+
+### 9.3 お願いしたい作業（具体的な設定値と手順）
+
+以下の 2 行を **`config.yml` に直接**書いていただき、その後**プロセスを再起動**してください。env での設定は、前者は不可能・後者も不可能（いずれもホワイトリスト外）のため、config.yml 一択です。
+
+```yaml
+worker:
+  job_timeout_overrides:
+    node2vec: 7200        # 実効タイムアウト。組み込み既定 1800 では足りないことが 3 回の実測で確定済み
+  job_ttl_secs: 14400     # ジョブ終端の主条件。timeout だけ上げても TTL(既定 3600)が先に発火すると同じ失敗になる
+```
+
+値の根拠です。node2vec は 1,800 秒では完走できないことが確定していますが、**完走に何秒必要かは分かっていません**（一度も完走していないため）。3,600 秒でも足りない可能性を考慮し、1 回の検証で決着させるために 7,200 秒（2 時間）を提案します。`job_ttl_secs` は「timeout × (試行回数 + 1) を上回る」が目安のため、7,200 × 2 = 14,400 秒としています。`job_timeout_secs`（グローバル値）は触らないでください — community_summary など他ジョブのタイムアウトまで一律に延び、別の問題の検知が遅れます。
+
+作業完了のご連絡の際に、次の 2 点を添えていただけると、こちらで反映確認まで一度に検証できます。
+
+1. **適用後の `config.yml` の該当行**（`worker:` ブロックの抜粋で構いません）
+2. **プロセスを再起動した時刻**
+
+### 9.4 こちらで行う再検証（ご負担はありません）
+
+再起動時刻の連絡を受けたら、こちらで `merge-schema` job を再実行し、次の順で判定します。
+
+1. node2vec の `JobInfo` を `ListJobs` で取得し、`created_at` → `completed_at` と `error` を確認します。**30 分（旧実効値）を超えて走っていれば反映成功**です。反映されていなければ、また 29〜30 分で `job timed out` になるので、その場で判別できます
+2. 完走した場合は `readiness.global` / `readiness.community_summary` が `READY` になることを確認し、`Search(mode="global")` の返却物（特に ManualSection の node_id が代表メンバーとして返るか）を記録します
+
+なお、上記の設定値にすると Merge RPC のサブジョブ待機上限（統合仕様書 §11: `job_ttl_secs + max(サブジョブ実効 timeout) + 60`）は最大 14,400 + 7,200 + 60 = **21,660 秒（約 6 時間 1 分）**になり、当方クライアントの既定タイムアウト（21,600 秒）をわずかに超えます。再実行時はこちらで `--timeout-secs 22200` を指定して呼びます（Cloud Run job の task-timeout は 25,200 秒のため収まります）。
 
 なお、**クライアントが切断してもサーバ側の Merge は継続していました**（切断後に `community_count` が 0 → 198 に増加）。これは想定どおりの挙動でしょうか。もしそうであれば、接続断のあとに再実行すると `FAILED_PRECONDITION`（同時実行不可）になるはずなので、こちらの運用手順に「再実行前に `GetStats` で確認する」を入れてあります。
