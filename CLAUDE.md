@@ -383,10 +383,11 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 - image: `asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>`（`<tag>` は git short SHA を使う運用）
 - public URL: `https://cs-support-mcp-235108918288.asia-northeast1.run.app`
 - MCP endpoint: `https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp`
-- Cloud Run jobs（service と同一イメージ）: `ingest-rules`, `ingest-urtect`, `merge-schema`
+- Cloud Run jobs（service と同一イメージ）: `ingest-rules`, `ingest-urtect`, `merge-schema`, `backfill-concept-keys`
 - **製品マスタの正本は vegapunk の Product ノード**（Issue #6: `KNOWN_MODELS` 定数は廃止済み）。`server/data/urtect/products.json` はコードではなく、`ingest_products` CLI に渡す seed 投入の入力記録である。
   - 製品を追加する手順: `products.json` に `{ "model", "name", "aliases" }` を追記 → `ingest_products` を実行する。**サービスの再ビルド・再デプロイは不要**（Product ノードは vegapunk 側にしか存在しないため）。
   - 全体リセット後の ingest 実行順序は **`ingest_products` → `ingest_urtect` / `ingest_alarmcom`** の順を必ず守ること。`ingest_urtect` / `ingest_alarmcom` はどちらも起動時に vegapunk の Product ノード一覧を取得し、0 件なら「製品マスタが空。先に `ingest_products` を実行せよ」という fail closed で止まる。`ingest_urtect`（Google Sites）と `ingest_alarmcom`（answers.alarm.com）の間に順序依存は無い（両方 products.json 投入後ならどちらを先に走らせてもよい）。
+  - **`backfill-concept-keys`（Issue #8 Phase B2-0/B2-1）は schema 更新後・2-hop 拡張の読み取り経路有効化前に必ず実行すること。** `ManualSection.concept_keys`（`MENTIONS_CONCEPT` 辺の読み取り最適化射影）を書く CLI で、`ingest_alarmcom` の差分 ingest は既存 section を再翻訳しないため単独では埋まらない（未変更記事は `existing_hash == hash` で skip される）。`--probe-only`（書き込みなし・B2-0 の fan-in 実測）/ `--verify`（辺と属性の乖離検出）/ `--probe-one <section_key>`（`UpsertNodes` の意味論を実測し即復旧）/ 既定（全件書き込み・冪等）の 4 モードは相互排他。詳細は `docs/superpowers/specs/2026-08-02-concept-expansion-design.md`。
   - **第 2 のマニュアルソース `ingest_alarmcom`（Issue #8）**: answers.alarm.com（MindTouch KB）を `?mt-language=JA` の機械翻訳で ingest する。クロール対象は sitemap.xml と製品マスタ（Product ノード）駆動で絞る。各製品の型番/別名が「ファミリーハブ URL」に現れる記事ファミリーだけを取り込み、1 製品でもハブ未マッチなら fail closed で止まる（`products.json` の aliases に URL 上の表記を足して再投入する）。robots.txt の Crawl-delay=5 秒を守るため全リクエストを 5 秒以上空けて逐次実行し、**実行時間は対象ファミリー数（≒英日 2 リクエスト × 記事数 × 5 秒）に比例する**。Cloud Run job は本件スコープ外（未新設）。
 - **`merge-schema`（Issue #8 Phase B1）**: vegapunk の `Merge` RPC（Leiden コミュニティ検出 + CommunitySummary + Node2Vec）を schema `urtect` に対して実行し、**前後の `GetStats` と global/hybrid 検索の返却物を JSON で出す**。
 - Merge は **schema 全体の同期再計算で、同一 schema では同時 1 本しか走らない**。実行中に再実行すると `FAILED_PRECONDITION` で弾かれる。
@@ -415,9 +416,11 @@ gcloud run jobs update ingest-rules --project sivira-cs-support --region asia-no
 gcloud run jobs update ingest-urtect --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
 
 gcloud run jobs update merge-schema --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
+
+gcloud run jobs update backfill-concept-keys --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
 ```
 
-`<tag>` は service と全 job（`ingest-rules` / `ingest-urtect` / `merge-schema`）で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。
+`<tag>` は service と全 job（`ingest-rules` / `ingest-urtect` / `merge-schema` / `backfill-concept-keys`）で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。`backfill-concept-keys` job は初回のみ `merge-schema` と同じ VPC connector / service account / Secret Manager injection で `gcloud run jobs create` が必要（未作成の場合、上記 `jobs update` は失敗する）。
 
 ### 認証（OAuth 2.1 フェデレーション、実測済み）
 
