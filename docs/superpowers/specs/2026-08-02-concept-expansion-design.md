@@ -87,7 +87,12 @@ B2-0 と B2-1 は同一の bin（`backfill_concept_keys`）を使う。B2-0 で�
 
 - **再送前に required 属性（`section_key` / `doc_key` / `title` / `body` / `source_url` / `breadcrumb` / `order` / `source_lang` / `content_hash`）が存在し、かつ空文字でないことを検査する。** 欠けた section は理由付き warn で skip し、欠落率が閾値を超えたら fail closed する（`site_skip_bail` と同じ規律）。`UpsertNodes` が全置換だった場合、読み出しで 1 属性でも欠けると本文や TOC 順が失われるうえ、`retrieval.rs` の `order` は `parse().unwrap_or(0)` なので**失敗が静かに進む**
   - `doc_key` を含めるのは、検索経路ではなく**差分 ingest と eval の母集団**がこれで絞られるため（`ingest_alarmcom` / `ingest_urtect` の既存 section 読み込みと `verify_alarmcom` が `doc_key eq` でフィルタする）。失うと当該 section が差分 ingest から見えなくなり、次回 new 扱いで再翻訳され（LLM 課金）、eval の分母からも黙って消える。`retrieval.rs` / `corpus.rs` は `doc_key` を読まないので検索自体は壊れず、**壊れたことに気づく経路が無い**
-  - **存在検査だけでなく非空検査もする**のは、backend が「schema 宣言済みだが未設定」の属性を読み出しで空文字として返す場合、キーの存在検査だけではガードが常に true になり無意味化するため。上記 9 属性はいずれも `build_section_graph` が正当に空文字で書くことがない（空本文・空 title の記事は ingest 側で skip される）ので、非空を要求しても正常な section を弾かない。`section_no` は空になりうるため required に含めない
+  - **存在検査だけでなく非空検査もする**のは、backend が「schema 宣言済みだが未設定」の属性を読み出しで空文字として返す場合、キーの存在検査だけではガードが常に true になり無意味化するため。`section_no` は `build_section_graph` が `unwrap_or_default()` で正当に空文字を書くため required に含めない
+  - 非空を要求しても正常な section を弾かない根拠は、**ソースごとに分けて理解すること**（同じ理由で成り立っているわけではない）:
+    - **alarm.com 由来（＝実際の書き込み対象）**: `ingest_alarmcom` が空 body / 空 title の記事を skip する（英語原文・翻訳後の両方を `trim()` 込みで検査）ため、非空が ingest 時に保証される。breadcrumb は title を最後の crumb とするので、title 非空なら breadcrumb も非空
+    - **urtect 由来**: `ingest_urtect` に **title の空ガードは無い**（`extract_title` は `<title>` 不在時に空文字を返し、親を持たない section は breadcrumb = title なので breadcrumb も空になりうる）。それでも実害が無いのは、urtect 由来 section が Concept を持たず `needs_update(None, &[]) == false` で**書き込み候補にならない**ため、ガードに到達しないから
+  - **この 2 つ目の根拠は「urtect に Concept を付けない」というスコープ制約に依存している。** 将来 urtect にも Concept 抽出を広げる（本 spec「スコープ外」から出す）場合、空 title / 空 breadcrumb の section が候補に昇格して skip され、skip 率が閾値を超えると backfill 全体が fail closed で停止する。データは壊れないが B2-1 が進まなくなるので、そのときは `ingest_urtect` 側に title の空ガードを入れること
+  - 同じ理由で、**backend が未設定属性を空文字で返す**ことが判明した場合も同じ経路が開く（`concept_keys` が全 section で `Some("")` → 不正 JSON 扱い → 全 urtect section が候補に昇格）。`--probe-one` の `empty_value_keys` でこれを先に確定させる
 - 最初に **`--probe-one <section_key>`** を通す。`concept_keys` だけを持つ最小ノードを 1 件 upsert して読み戻し、他属性が残っているかを見る。全置換なら消えるので、**その 1 件を全属性再送で即復旧する**。復旧可能な 1 件で意味論を確かめてから全件へ進む
 - `--start-after <section_key>` で再開できる。upsert は 50 件ごとにバッチし、100 件ごとに進捗をログする
 - Cloud Run job の `--task-timeout` は CLI の per-request timeout より長く取る（B1 で「同着させると summary 出力前に kill される」を踏んだため）

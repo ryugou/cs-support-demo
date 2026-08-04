@@ -396,8 +396,22 @@ fn apply_concept_names(mut summary: Value, name_ja: &HashMap<String, String>) ->
 /// **キーの存在だけでなく値の非空も要求する。** backend が「schema 宣言済みだが未設定」の
 /// 属性を読み出しで空文字として返す場合、`contains_key` だけではガードが常に true になり
 /// 完全に無意味化する（backend の実挙動は本番 vegapunk 到達が要るため未確定。どちらでも
-/// 安全側に倒れるようこの形にしてある）。`REQUIRED_ATTRS` の 9 属性は `build_section_graph`
-/// が正当に空文字で書くことがないため、非空を要求しても正常な section を弾かない。
+/// 安全側に倒れるようこの形にしてある）。
+///
+/// 非空を要求しても正常な section を弾かない根拠は**ソースごとに別**であり、混同しないこと:
+///
+/// - **alarm.com 由来（＝実際の書き込み対象）**: `ingest_alarmcom` が空 body / 空 title の記事を
+///   `trim()` 込みで skip するため、ingest 時点で非空が保証される
+/// - **urtect 由来**: `ingest_urtect` に **title の空ガードは無い**（`extract_title` は `<title>`
+///   不在時に空文字を返し、親を持たない section は breadcrumb = title なので breadcrumb も空に
+///   なりうる）。それでも実害が無いのは、urtect 由来 section が Concept を持たず
+///   `needs_update(None, &[]) == false` で**書き込み候補にならない**ため、ここに到達しないから
+///
+/// 後者は「urtect に Concept を付けない」というスコープ制約に依存している。将来それを外すか、
+/// backend が未設定属性を空文字で返すことが判明した場合（`concept_keys` が全 section で
+/// `Some("")` → 不正 JSON 扱い → 全 urtect section が候補に昇格）、空 title の section が skip
+/// されて skip 率が閾値を超え、backfill 全体が停止する。データは壊れないが B2-1 が進まなくなる
+/// ので、そのときは `ingest_urtect` 側に title の空ガードを入れること。
 fn missing_required_attrs(attrs: &HashMap<String, String>) -> Vec<&'static str> {
     REQUIRED_ATTRS
         .iter()
