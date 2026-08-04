@@ -28,11 +28,22 @@ use std::{
 /// `query_nodes_paged` / `traverse_neighbors_paged` の 1 ページあたり件数。backend 上限 1000。
 const PAGE_SIZE: i32 = 1000;
 
-/// 書き込み前に存在を検査する必須属性。1 つでも欠けた状態で「読み出した全属性 + concept_keys」
-/// を再送すると、本文や TOC 順が失われるうえ `retrieval.rs` の `order` は `parse().unwrap_or(0)`
-/// のため失敗が静かに進む（spec の安全規定）。
-const REQUIRED_ATTRS: [&str; 8] = [
+/// 書き込み前に存在と非空を検査する必須属性。1 つでも欠けた状態で「読み出した全属性 +
+/// concept_keys」を再送すると、本文や TOC 順が失われるうえ `retrieval.rs` の `order` は
+/// `parse().unwrap_or(0)` のため失敗が静かに進む（spec の安全規定）。
+///
+/// `doc_key` を含めるのは、**検索経路ではなく差分 ingest と eval の母集団**がこれで絞られる
+/// ため（`ingest_alarmcom.rs` / `ingest_urtect.rs` の既存 section 読み込みと
+/// `verify_alarmcom.rs` が `doc_key eq` でフィルタする）。失うと当該 section が差分 ingest から
+/// 見えなくなり次回 new 扱いで再翻訳され（LLM 課金）、eval の分母からも黙って消える。
+/// `retrieval.rs` / `corpus.rs` は `doc_key` を読まないので**検索は壊れず、壊れたことに気づく
+/// 経路が無い**。
+///
+/// `section_no` は含めない。`build_section_graph` が `unwrap_or_default()` で正当に空文字を
+/// 書くため、required に入れると全 section が skip され backfill が 1 件も進まない。
+const REQUIRED_ATTRS: [&str; 9] = [
     "section_key",
+    "doc_key",
     "title",
     "body",
     "source_url",
@@ -168,6 +179,10 @@ struct Collected {
 
 impl Collected {
     /// `--start-after` によって母集団が縮んでいるか。summary の `truncated` にそのまま出す。
+    ///
+    /// **`--probe-one` の絞り込み（1 件）でも true になる**が、probe-one の summary は
+    /// `truncated` を出さない（意図した 1 件指定であって「気づかぬ打ち切り」ではないため）。
+    /// この値を意味があるものとして読んでよいのは `only_section_key` が None の実行だけ。
     fn truncated(&self) -> bool {
         self.rows.len() != self.total_before_start_after
     }
@@ -225,6 +240,12 @@ fn probe_summary(rows: &[SectionConcepts], truncated: bool) -> Value {
 
 /// 全 ManualSection と、それぞれの MENTIONS_CONCEPT outgoing 隣接（Concept）を集約する。
 ///
+/// `only_section_key` を渡すと**その 1 件だけ**に絞る（`--probe-one` 用）。絞らないと probe 1 回の
+/// ために全 section 分（本番 alarm.com で約 3,490 件）の traverse を逐次発行することになり、
+/// 「全件 backfill の前に安全確認する」という `--probe-one` の役割に対して確認コストが高すぎる
+/// （重い確認は飛ばされる）。**絞り込みは traverse の前に効かせる**（ノード一覧の取得は
+/// `query_nodes_paged` 1 系統に保ち、経路を二重化しない）。
+///
 /// 戻り値は (行データ, concept_key → name_ja の観測済みマップ)。name_ja は traverse で得た
 /// Concept ノードの属性から拾えたときだけ埋める（未 ingest な Concept は無いはずだが、
 /// 属性欠落があっても fail closed にはしない。probe 出力の補助情報のため）。
@@ -235,6 +256,7 @@ async fn collect_section_concepts(
     client: &VegapunkClient,
     schema: &str,
     start_after: Option<&str>,
+    only_section_key: Option<&str>,
 ) -> Result<Collected> {
     let sections = client
         .query_nodes_paged(schema, KIND_SECTION, Vec::new(), PAGE_SIZE)
@@ -251,6 +273,10 @@ async fn collect_section_concepts(
         .into_iter()
         .filter(|n| {
             let section_key = n.attributes.get("section_key").map(|k| k.as_str());
+            // --probe-one は 1 件だけ見るので、traverse を発行する前にここで絞る。
+            if let Some(only) = only_section_key {
+                return section_key == Some(only);
+            }
             let keep = after_start(section_key, start_after);
             // section_key 欠落による除外は「読みが壊れている signal」なので必ず残す。
             // --start-after 無しなら後段の missing_required_attrs が warn + skip するが、
@@ -355,11 +381,17 @@ fn apply_concept_names(mut summary: Value, name_ja: &HashMap<String, String>) ->
 
 /// 書き込み前の必須属性チェック。欠けている `REQUIRED_ATTRS` を（宣言順で）列挙する。
 /// 空なら安全に全属性再送できる。
+///
+/// **キーの存在だけでなく値の非空も要求する。** backend が「schema 宣言済みだが未設定」の
+/// 属性を読み出しで空文字として返す場合、`contains_key` だけではガードが常に true になり
+/// 完全に無意味化する（backend の実挙動は本番 vegapunk 到達が要るため未確定。どちらでも
+/// 安全側に倒れるようこの形にしてある）。`REQUIRED_ATTRS` の 9 属性は `build_section_graph`
+/// が正当に空文字で書くことがないため、非空を要求しても正常な section を弾かない。
 fn missing_required_attrs(attrs: &HashMap<String, String>) -> Vec<&'static str> {
     REQUIRED_ATTRS
         .iter()
         .copied()
-        .filter(|key| !attrs.contains_key(*key))
+        .filter(|key| attrs.get(*key).is_none_or(|value| value.trim().is_empty()))
         .collect()
 }
 
@@ -781,8 +813,13 @@ async fn main() -> Result<()> {
         .await
         .context("register/update schema (adds concept_keys attribute)")?;
 
-    let collected =
-        collect_section_concepts(&client, &args.schema, args.start_after.as_deref()).await?;
+    let collected = collect_section_concepts(
+        &client,
+        &args.schema,
+        args.start_after.as_deref(),
+        args.probe_one.as_deref(),
+    )
+    .await?;
     let truncated = collected.truncated();
     let Collected {
         rows,
@@ -868,6 +905,38 @@ mod tests {
         attrs.remove("order");
         assert_eq!(missing_required_attrs(&attrs), vec!["body", "order"]);
         assert!(missing_required_attrs(&full_attrs()).is_empty());
+    }
+
+    #[test]
+    fn missing_required_attrs_guards_doc_key() {
+        // doc_key は検索経路では使われないが、差分 ingest（ingest_alarmcom /
+        // ingest_urtect）と eval（verify_alarmcom）の母集団が doc_key eq で絞られる。
+        // 失うと「検索は動くのに差分 ingest から消える」= 気づけない壊れ方をする。
+        let mut attrs = full_attrs();
+        attrs.remove("doc_key");
+        assert_eq!(missing_required_attrs(&attrs), vec!["doc_key"]);
+    }
+
+    #[test]
+    fn missing_required_attrs_rejects_empty_values_not_just_absent_keys() {
+        // backend が未設定属性を空文字で返す仕様だった場合、キーの存在検査だけでは
+        // ガードが常に true になり無意味化する。空文字も欠落として扱う。
+        let mut attrs = full_attrs();
+        attrs.insert("body".to_string(), String::new());
+        assert_eq!(missing_required_attrs(&attrs), vec!["body"]);
+        // 空白のみも実質空として弾く（本文が空白だけの section は正常な ingest では生じない）。
+        let mut attrs = full_attrs();
+        attrs.insert("breadcrumb".to_string(), "   ".to_string());
+        assert_eq!(missing_required_attrs(&attrs), vec!["breadcrumb"]);
+    }
+
+    #[test]
+    fn missing_required_attrs_does_not_require_section_no() {
+        // section_no は build_section_graph が正当に空文字で書く（`unwrap_or_default`）。
+        // required に含めると全 section が skip され backfill が 1 件も進まない。
+        let mut attrs = full_attrs();
+        attrs.insert("section_no".to_string(), String::new());
+        assert!(missing_required_attrs(&attrs).is_empty());
     }
 
     #[test]

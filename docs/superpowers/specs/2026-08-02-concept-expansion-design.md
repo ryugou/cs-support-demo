@@ -85,7 +85,9 @@ B2-0 と B2-1 は同一の bin（`backfill_concept_keys`）を使う。B2-0 で�
 
 安全規定:
 
-- **再送前に required 属性（`section_key` / `title` / `body` / `source_url` / `breadcrumb` / `order` / `source_lang` / `content_hash`）の存在を検査する。** 欠けた section は理由付き warn で skip し、欠落率が閾値を超えたら fail closed する（`site_skip_bail` と同じ規律）。`UpsertNodes` が全置換だった場合、読み出しで 1 属性でも欠けると本文や TOC 順が失われるうえ、`retrieval.rs` の `order` は `parse().unwrap_or(0)` なので**失敗が静かに進む**
+- **再送前に required 属性（`section_key` / `doc_key` / `title` / `body` / `source_url` / `breadcrumb` / `order` / `source_lang` / `content_hash`）が存在し、かつ空文字でないことを検査する。** 欠けた section は理由付き warn で skip し、欠落率が閾値を超えたら fail closed する（`site_skip_bail` と同じ規律）。`UpsertNodes` が全置換だった場合、読み出しで 1 属性でも欠けると本文や TOC 順が失われるうえ、`retrieval.rs` の `order` は `parse().unwrap_or(0)` なので**失敗が静かに進む**
+  - `doc_key` を含めるのは、検索経路ではなく**差分 ingest と eval の母集団**がこれで絞られるため（`ingest_alarmcom` / `ingest_urtect` の既存 section 読み込みと `verify_alarmcom` が `doc_key eq` でフィルタする）。失うと当該 section が差分 ingest から見えなくなり、次回 new 扱いで再翻訳され（LLM 課金）、eval の分母からも黙って消える。`retrieval.rs` / `corpus.rs` は `doc_key` を読まないので検索自体は壊れず、**壊れたことに気づく経路が無い**
+  - **存在検査だけでなく非空検査もする**のは、backend が「schema 宣言済みだが未設定」の属性を読み出しで空文字として返す場合、キーの存在検査だけではガードが常に true になり無意味化するため。上記 9 属性はいずれも `build_section_graph` が正当に空文字で書くことがない（空本文・空 title の記事は ingest 側で skip される）ので、非空を要求しても正常な section を弾かない。`section_no` は空になりうるため required に含めない
 - 最初に **`--probe-one <section_key>`** を通す。`concept_keys` だけを持つ最小ノードを 1 件 upsert して読み戻し、他属性が残っているかを見る。全置換なら消えるので、**その 1 件を全属性再送で即復旧する**。復旧可能な 1 件で意味論を確かめてから全件へ進む
 - `--start-after <section_key>` で再開できる。upsert は 50 件ごとにバッチし、100 件ごとに進捗をログする
 - Cloud Run job の `--task-timeout` は CLI の per-request timeout より長く取る（B1 で「同着させると summary 出力前に kill される」を踏んだため）
