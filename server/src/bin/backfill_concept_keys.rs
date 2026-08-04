@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cs_support_mcp::{
     manual::schema_ids::{with_schema_name, KIND_CONCEPT, KIND_SECTION},
+    model::GraphNode,
     vegapunk::VegapunkClient,
 };
 use serde_json::{json, Value};
@@ -22,6 +23,27 @@ use std::{collections::HashMap, env, fs, path::PathBuf};
 
 /// `query_nodes_paged` / `traverse_neighbors_paged` の 1 ページあたり件数。backend 上限 1000。
 const PAGE_SIZE: i32 = 1000;
+
+/// 書き込み前に存在を検査する必須属性。1 つでも欠けた状態で「読み出した全属性 + concept_keys」
+/// を再送すると、本文や TOC 順が失われるうえ `retrieval.rs` の `order` は `parse().unwrap_or(0)`
+/// のため失敗が静かに進む（spec の安全規定）。
+const REQUIRED_ATTRS: [&str; 8] = [
+    "section_key",
+    "title",
+    "body",
+    "source_url",
+    "breadcrumb",
+    "order",
+    "source_lang",
+    "content_hash",
+];
+
+/// missing_required_attrs による skip が対象件数（書き込み候補数）に占める許容比率。
+/// 超過したら fail closed する（`ingest_alarmcom.rs` の `site_skip_bail` と同じ規律）。
+const MAX_SKIP_RATIO: f64 = 0.10;
+
+/// `upsert_nodes` を発行するバッチサイズ。
+const UPSERT_BATCH_SIZE: usize = 50;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -104,6 +126,9 @@ struct SectionConcepts {
     concept_keys: Vec<String>,
     /// ManualSection.concept_keys 属性の生値（欠落なら None。射影の現在値）。
     attr_concept_keys: Option<String>,
+    /// ManualSection の生の全属性（読み出したそのまま）。書き込み時の全属性再送に使う
+    /// （`UpsertNodes` が部分マージか全置換か未確定なため、常に全属性を持たせて再送する）。
+    attrs: HashMap<String, String>,
 }
 
 /// `--probe-only` の出力（B2-0 の実測 JSON）を組み立てる純関数。
@@ -240,6 +265,7 @@ async fn collect_section_concepts(
             node_id: section.node_id.clone(),
             concept_keys: keys,
             attr_concept_keys: section.attributes.get("concept_keys").cloned(),
+            attrs: section.attributes.clone(),
         });
         if (idx + 1) % 100 == 0 {
             tracing::info!(processed = idx + 1, total, "collecting section concepts");
@@ -266,6 +292,137 @@ fn apply_concept_names(mut summary: Value, name_ja: &HashMap<String, String>) ->
         }
     }
     summary
+}
+
+/// 書き込み前の必須属性チェック。欠けている `REQUIRED_ATTRS` を（宣言順で）列挙する。
+/// 空なら安全に全属性再送できる。
+fn missing_required_attrs(attrs: &HashMap<String, String>) -> Vec<&'static str> {
+    REQUIRED_ATTRS
+        .iter()
+        .copied()
+        .filter(|key| !attrs.contains_key(*key))
+        .collect()
+}
+
+/// 既存の `concept_keys` 属性（JSON 配列文字列）と、計算済みの concept_key 集合を
+/// **集合として**比較し、書き込みが要るかを判定する。
+///
+/// ingest は抽出順（重複排除のみ）、backfill はソート順で書くため、文字列比較のままだと
+/// 順序差だけで永久に「乖離」と判定してしまう（`needs_update` / `divergences` 共通の理由）。
+/// 属性が不正 JSON の場合は内容を判定できないため、常に書き直して修復する。
+fn needs_update(attr_concept_keys: Option<&str>, computed_sorted: &[String]) -> bool {
+    let Some(raw) = attr_concept_keys else {
+        return !computed_sorted.is_empty();
+    };
+    let existing: Vec<String> = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    let existing_set: std::collections::HashSet<&str> =
+        existing.iter().map(|s| s.as_str()).collect();
+    let computed_set: std::collections::HashSet<&str> =
+        computed_sorted.iter().map(|s| s.as_str()).collect();
+    existing_set != computed_set
+}
+
+/// 読み出した全属性 + 計算済み `concept_keys`（ソート済み JSON）で `GraphNode` を組み立てる。
+/// `UpsertNodes` が部分マージか全置換か未確定なため、常に全属性を持たせて再送する
+/// （`--probe-one` の実測で確定しても、復旧可能性のためこの方針自体は変えない）。
+fn build_backfill_node(row: &SectionConcepts) -> GraphNode {
+    let mut attributes: Vec<(String, String)> = row
+        .attrs
+        .iter()
+        .filter(|(k, _)| k.as_str() != "concept_keys")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    attributes.push((
+        "concept_keys".to_string(),
+        serde_json::to_string(&row.concept_keys).unwrap_or_else(|_| "[]".to_string()),
+    ));
+    GraphNode {
+        id: row.node_id.clone(),
+        node_type: KIND_SECTION.to_string(),
+        attributes,
+    }
+}
+
+/// 既定モード（全件書き込み）本体。
+///
+/// 対象件数は「未確定で増え続ける」ingest_alarmcom のクロールと違い、`rows` の時点で全件
+/// 確定している。したがって missing-attrs skip 率の判定は **書き込みを始める前に** 行う
+/// （閾値超過なら 1 件も書かずに bail する方が、書きかけの状態を残すより安全）。
+async fn write_backfill(client: &VegapunkClient, rows: &[SectionConcepts]) -> Result<Value> {
+    let total_sections = rows.len();
+    let candidates: Vec<&SectionConcepts> = rows
+        .iter()
+        .filter(|r| needs_update(r.attr_concept_keys.as_deref(), &r.concept_keys))
+        .collect();
+    let total_candidates = candidates.len();
+    let skipped_up_to_date = total_sections - total_candidates;
+
+    let mut writable: Vec<&SectionConcepts> = Vec::with_capacity(total_candidates);
+    let mut skipped_missing_attrs = 0usize;
+    let mut missing_examples: Vec<String> = Vec::new();
+    for row in &candidates {
+        let missing = missing_required_attrs(&row.attrs);
+        if missing.is_empty() {
+            writable.push(row);
+            continue;
+        }
+        skipped_missing_attrs += 1;
+        if missing_examples.len() < 3 {
+            missing_examples.push(row.section_key.clone());
+        }
+        tracing::warn!(
+            section_key = %row.section_key,
+            missing = ?missing,
+            "required attrs missing; skipping to avoid destructive resend"
+        );
+    }
+
+    if total_candidates > 0 {
+        let skip_ratio = skipped_missing_attrs as f64 / total_candidates as f64;
+        if skip_ratio > MAX_SKIP_RATIO {
+            anyhow::bail!(
+                "{skipped_missing_attrs}/{total_candidates} update-candidate ManualSection(s) \
+                 ({:.1}%) are missing required attrs, exceeding the {:.0}% safety threshold; a \
+                 full-attribute resend on a section missing required attrs would drop body/TOC \
+                 order (retrieval.rs order parses via unwrap_or(0), so the failure is silent) — \
+                 aborting before writing anything this run (representative section_key(s): {:?})",
+                skip_ratio * 100.0,
+                MAX_SKIP_RATIO * 100.0,
+                missing_examples
+            );
+        }
+    }
+
+    let mut updated = 0usize;
+    let mut batches = 0usize;
+    for chunk in writable.chunks(UPSERT_BATCH_SIZE) {
+        let nodes: Vec<GraphNode> = chunk.iter().map(|row| build_backfill_node(row)).collect();
+        let n = nodes.len();
+        client
+            .upsert_nodes(nodes)
+            .await
+            .with_context(|| format!("upsert concept_keys batch #{batches}"))?;
+        updated += n;
+        batches += 1;
+        tracing::info!(
+            updated,
+            total_candidates,
+            batches,
+            "backfill write progress"
+        );
+    }
+
+    Ok(json!({
+        "total_sections": total_sections,
+        "updated": updated,
+        "skipped_missing_attrs": skipped_missing_attrs,
+        "skipped_up_to_date": skipped_up_to_date,
+        "batches": batches,
+        "truncated": false,
+    }))
 }
 
 #[tokio::main]
@@ -311,10 +468,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    anyhow::bail!(
-        "default write mode is not implemented in this build yet (Issue #8 Phase B2-1 Task 4); \
-         rerun after that commit lands, or pass --probe-only for the B2-0 measurement"
-    );
+    let summary = write_backfill(&client, &rows).await?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -329,7 +485,64 @@ mod tests {
             node_id: format!("node-{section_key}"),
             concept_keys: keys,
             attr_concept_keys: None,
+            attrs: HashMap::new(),
         }
+    }
+
+    /// 8 required 属性が全部入った最小 HashMap（`missing_required_attrs` のテストで使う）。
+    fn full_attrs() -> HashMap<String, String> {
+        REQUIRED_ATTRS
+            .iter()
+            .map(|k| (k.to_string(), "x".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn missing_required_attrs_lists_each_absent_key() {
+        let mut attrs = full_attrs();
+        attrs.remove("body");
+        attrs.remove("order");
+        assert_eq!(missing_required_attrs(&attrs), vec!["body", "order"]);
+        assert!(missing_required_attrs(&full_attrs()).is_empty());
+    }
+
+    #[test]
+    fn needs_update_compares_as_set_not_string() {
+        // ingest は出現順、backfill はソート順で書くため、順序差は「同じ」と扱う
+        assert!(!needs_update(
+            Some(r#"["b","a"]"#),
+            &["a".into(), "b".into()]
+        ));
+        assert!(needs_update(Some(r#"["a"]"#), &["a".into(), "b".into()]));
+        assert!(needs_update(None, &["a".into()]));
+        assert!(!needs_update(None, &[])); // 両方空は書かない
+        assert!(needs_update(Some("not json"), &[])); // 不正 JSON は書き直して修復する
+    }
+
+    #[test]
+    fn build_backfill_node_replaces_concept_keys_and_keeps_other_attrs() {
+        let mut attrs = full_attrs();
+        attrs.insert("concept_keys".to_string(), r#"["stale"]"#.to_string());
+        let mut r = row("s1", &["a", "b"]);
+        r.attrs = attrs;
+        let node = build_backfill_node(&r);
+        assert_eq!(node.id, "node-s1");
+        let concept_keys_attr = node
+            .attributes
+            .iter()
+            .filter(|(k, _)| k == "concept_keys")
+            .count();
+        assert_eq!(concept_keys_attr, 1, "must not duplicate the attribute key");
+        let value = node
+            .attributes
+            .iter()
+            .find(|(k, _)| k == "concept_keys")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&value).unwrap();
+        assert_eq!(parsed, vec!["a".to_string(), "b".to_string()]);
+        // 他の必須属性はそのまま残る
+        assert!(node.attributes.iter().any(|(k, v)| k == "body" && v == "x"));
     }
 
     #[test]
