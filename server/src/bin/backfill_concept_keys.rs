@@ -1,0 +1,376 @@
+//! `ManualSection.concept_keys` backfill / 観測 CLI（Issue #8 Phase B2-0/B2-1）。
+//!
+//! 設計・仕様の正本は `docs/superpowers/specs/2026-08-02-concept-expansion-design.md`。
+//! `MENTIONS_CONCEPT` 辺はグラフの正、`concept_keys` 属性はその読み取り最適化の射影であり、
+//! 食い違ったら辺が正。
+//!
+//! 4 モード（相互排他。同時指定は clap が拒否する）:
+//! - `--probe-only`: 書き込まない。ManualSection 件数・Concept 件数・fan-in 分布を JSON で出す
+//!   （B2-0 の実測に使う）
+//! - `--verify`: 書き込まない。辺と `concept_keys` 属性の乖離件数を出す
+//! - `--probe-one <section_key>`: 指定 1 件だけに `concept_keys` を書き、`UpsertNodes` の意味論
+//!   （部分マージか全置換か）を実測してから即座に全属性で復旧する
+//! - （既定）: 全 ManualSection に `concept_keys` を書き込む（既に一致していれば skip、冪等）
+use anyhow::{Context, Result};
+use clap::Parser;
+use cs_support_mcp::{
+    manual::schema_ids::{with_schema_name, KIND_CONCEPT, KIND_SECTION},
+    vegapunk::VegapunkClient,
+};
+use serde_json::{json, Value};
+use std::{collections::HashMap, env, fs, path::PathBuf};
+
+/// `query_nodes_paged` / `traverse_neighbors_paged` の 1 ページあたり件数。backend 上限 1000。
+const PAGE_SIZE: i32 = 1000;
+
+#[derive(Debug, Parser)]
+struct Args {
+    #[arg(
+        long,
+        env = "VEGAPUNK_ENDPOINT",
+        default_value = "http://vegapunk.local:6840"
+    )]
+    endpoint: String,
+    #[arg(long, default_value = "urtect")]
+    schema: String,
+    #[arg(long, default_value = "VEGAPUNK_BEARER_TOKEN")]
+    token_env: String,
+    /// bearer token ファイル（主経路）。無い/読めない場合のみ --token-env にフォールバックする。
+    #[arg(
+        long,
+        env = "VEGAPUNK_BEARER_TOKEN_FILE",
+        default_value = "/private/tmp/vegapunk-bearer-token"
+    )]
+    token_file: Option<PathBuf>,
+    #[arg(long, default_value = "../schema/cs-support.yml")]
+    schema_file: PathBuf,
+    /// 書き込まず、Concept 分布（fan-in）を JSON で出す（B2-0 の実測）。
+    #[arg(long, conflicts_with_all = ["verify", "probe_one"])]
+    probe_only: bool,
+    /// 書き込まず、MENTIONS_CONCEPT 辺と concept_keys 属性の乖離を出す。
+    #[arg(long, conflicts_with_all = ["probe_only", "probe_one"])]
+    verify: bool,
+    /// 指定 1 件に concept_keys だけの最小ノードを upsert して UpsertNodes の意味論を実測する。
+    #[arg(long, conflicts_with_all = ["probe_only", "verify"])]
+    probe_one: Option<String>,
+    /// この section_key より後（辞書順）から再開する。
+    #[arg(long)]
+    start_after: Option<String>,
+}
+
+/// token 解決: 既定は --token-file、ファイルが無い/読めない場合のみ --token-env。
+/// `ingest_alarmcom.rs` の `read_token` と同じ挙動（Args の型が異なるため関数は複製する）。
+fn read_token(args: &Args) -> Result<String> {
+    if let Some(path) = &args.token_file {
+        match fs::read_to_string(path) {
+            Ok(body) => {
+                let trimmed = body.trim();
+                if !trimmed.is_empty() {
+                    return Ok(trimmed.to_string());
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    "token file is empty; falling back to --token-env"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "token file unreadable; falling back to --token-env"
+                );
+            }
+        }
+    }
+    let token = env::var(&args.token_env).with_context(|| {
+        format!(
+            "vegapunk bearer token not found (tried --token-file {:?} and env {})",
+            args.token_file, args.token_env
+        )
+    })?;
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("vegapunk bearer token env {} is empty", args.token_env);
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 1 ManualSection と、それが MENTIONS_CONCEPT で outgoing 到達する Concept の集約。
+#[derive(Debug, Clone)]
+struct SectionConcepts {
+    section_key: String,
+    node_id: String,
+    /// 辺から集めた concept_key の集合（重複排除・ソート済み。辺が正）。
+    concept_keys: Vec<String>,
+    /// ManualSection.concept_keys 属性の生値（欠落なら None。射影の現在値）。
+    attr_concept_keys: Option<String>,
+}
+
+/// `--probe-only` の出力（B2-0 の実測 JSON）を組み立てる純関数。
+///
+/// fan-in の分母は spec で固定された `sections_with_concepts`（`concept_keys` が非空の
+/// section 数）。全 section を分母にすると、Concept 抽出が無い urtect 由来 section の分だけ
+/// 比率が希釈され、閾値判定が体系的にずれる（`ratio_denominator` で分母を明示する理由）。
+/// `name_ja` はこの関数の外（呼び出し側が traverse で得た Concept 属性）から埋める前提で、
+/// ここでは空文字を既定値として出す。
+fn probe_summary(rows: &[SectionConcepts], truncated: bool) -> Value {
+    let total_sections = rows.len();
+    let sections_with_concepts = rows.iter().filter(|r| !r.concept_keys.is_empty()).count();
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for row in rows {
+        for key in &row.concept_keys {
+            *counts.entry(key.clone()).or_insert(0) += 1;
+        }
+    }
+    let total_concepts = counts.len();
+
+    let mut ordered: Vec<(String, usize)> = counts.into_iter().collect();
+    // section_count 降順 → concept_key 昇順（決定論的な出力順）。
+    ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let concepts: Vec<Value> = ordered
+        .into_iter()
+        .map(|(concept_key, section_count)| {
+            let ratio = if sections_with_concepts == 0 {
+                0.0
+            } else {
+                section_count as f64 / sections_with_concepts as f64
+            };
+            json!({
+                "concept_key": concept_key,
+                "name_ja": "",
+                "section_count": section_count,
+                "ratio": ratio,
+            })
+        })
+        .collect();
+
+    json!({
+        "total_sections": total_sections,
+        "sections_with_concepts": sections_with_concepts,
+        "total_concepts": total_concepts,
+        "ratio_denominator": "sections_with_concepts",
+        "concepts": concepts,
+        "truncated": truncated,
+    })
+}
+
+/// 全 ManualSection と、それぞれの MENTIONS_CONCEPT outgoing 隣接（Concept）を集約する。
+///
+/// 戻り値は (行データ, concept_key → name_ja の観測済みマップ)。name_ja は traverse で得た
+/// Concept ノードの属性から拾えたときだけ埋める（未 ingest な Concept は無いはずだが、
+/// 属性欠落があっても fail closed にはしない。probe 出力の補助情報のため）。
+///
+/// `query_nodes_paged` / `traverse_neighbors_paged` は取りこぼしを検出したら自身が fail closed
+/// で bail するため、ここで受け取る `sections` / `neighbors` は常に完全集合である。
+async fn collect_section_concepts(
+    client: &VegapunkClient,
+    schema: &str,
+    start_after: Option<&str>,
+) -> Result<(Vec<SectionConcepts>, HashMap<String, String>)> {
+    let sections = client
+        .query_nodes_paged(schema, KIND_SECTION, Vec::new(), PAGE_SIZE)
+        .await
+        .context("load all ManualSection nodes")?;
+    tracing::info!(count = sections.len(), "loaded ManualSection nodes");
+
+    let mut filtered: Vec<_> = sections
+        .into_iter()
+        .filter(|n| {
+            let Some(after) = start_after else {
+                return true;
+            };
+            n.attributes
+                .get("section_key")
+                .map(|k| k.as_str() > after)
+                .unwrap_or(false)
+        })
+        .collect();
+    filtered.sort_by(|a, b| {
+        a.attributes
+            .get("section_key")
+            .cloned()
+            .unwrap_or_default()
+            .cmp(&b.attributes.get("section_key").cloned().unwrap_or_default())
+    });
+    let total = filtered.len();
+
+    let mut rows = Vec::with_capacity(total);
+    let mut name_ja: HashMap<String, String> = HashMap::new();
+    for (idx, section) in filtered.iter().enumerate() {
+        let section_key = section
+            .attributes
+            .get("section_key")
+            .cloned()
+            .unwrap_or_default();
+        let neighbors = client
+            .traverse_neighbors_paged(
+                schema,
+                KIND_CONCEPT,
+                "MENTIONS_CONCEPT",
+                "outgoing",
+                &section.node_id,
+                PAGE_SIZE,
+            )
+            .await
+            .with_context(|| format!("traverse MENTIONS_CONCEPT for section {section_key}"))?;
+        let mut keys: Vec<String> = Vec::new();
+        for n in &neighbors {
+            let Some(key) = n.attributes.get("concept_key") else {
+                tracing::warn!(
+                    section_key = %section_key,
+                    node_id = %n.node_id,
+                    "MENTIONS_CONCEPT neighbor missing concept_key attribute; skipping this mention"
+                );
+                continue;
+            };
+            if let Some(ja) = n.attributes.get("name_ja") {
+                if !ja.is_empty() {
+                    name_ja.insert(key.clone(), ja.clone());
+                }
+            }
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+        keys.sort();
+        rows.push(SectionConcepts {
+            section_key,
+            node_id: section.node_id.clone(),
+            concept_keys: keys,
+            attr_concept_keys: section.attributes.get("concept_keys").cloned(),
+        });
+        if (idx + 1) % 100 == 0 {
+            tracing::info!(processed = idx + 1, total, "collecting section concepts");
+        }
+    }
+    tracing::info!(total, "collected section concepts");
+    Ok((rows, name_ja))
+}
+
+/// `probe_summary` が既定値で埋めた `name_ja: ""` を、traverse で観測できた実値で上書きする。
+/// probe_summary 自体を純関数のまま保つため、name_ja の補完はここ（呼び出し側）で行う。
+fn apply_concept_names(mut summary: Value, name_ja: &HashMap<String, String>) -> Value {
+    if let Some(concepts) = summary.get_mut("concepts").and_then(|v| v.as_array_mut()) {
+        for concept in concepts.iter_mut() {
+            let key = concept
+                .get("concept_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(key) = key {
+                if let Some(ja) = name_ja.get(&key) {
+                    concept["name_ja"] = Value::String(ja.clone());
+                }
+            }
+        }
+    }
+    summary
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+    let token = read_token(&args)?;
+
+    let schema_yaml = with_schema_name(
+        &fs::read_to_string(&args.schema_file)
+            .with_context(|| format!("read schema file {}", args.schema_file.display()))?,
+        &args.schema,
+    )?;
+
+    let client = VegapunkClient::connect(&args.endpoint, &token).await?;
+    // backfill が concept_keys 追加後の最初の実行になるため、ここで schema を確定させる
+    // （spec: 属性追加は世代据え置き・既存ノード再投入不要。伝播は create_or_update_schema）。
+    client
+        .create_or_update_schema(&args.schema, schema_yaml)
+        .await
+        .context("register/update schema (adds concept_keys attribute)")?;
+
+    let (rows, name_ja) =
+        collect_section_concepts(&client, &args.schema, args.start_after.as_deref()).await?;
+
+    if args.probe_only {
+        let summary = apply_concept_names(probe_summary(&rows, false), &name_ja);
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    if args.verify {
+        anyhow::bail!(
+            "--verify is not implemented in this build yet (Issue #8 Phase B2-1 Task 6); \
+             rerun after that commit lands"
+        );
+    }
+
+    if args.probe_one.is_some() {
+        anyhow::bail!(
+            "--probe-one is not implemented in this build yet (Issue #8 Phase B2-1 Task 5); \
+             rerun after that commit lands"
+        );
+    }
+
+    anyhow::bail!(
+        "default write mode is not implemented in this build yet (Issue #8 Phase B2-1 Task 4); \
+         rerun after that commit lands, or pass --probe-only for the B2-0 measurement"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(section_key: &str, concept_keys: &[&str]) -> SectionConcepts {
+        let mut keys: Vec<String> = concept_keys.iter().map(|s| s.to_string()).collect();
+        keys.sort();
+        SectionConcepts {
+            section_key: section_key.to_string(),
+            node_id: format!("node-{section_key}"),
+            concept_keys: keys,
+            attr_concept_keys: None,
+        }
+    }
+
+    #[test]
+    fn probe_summary_reports_fan_in_with_declared_denominator() {
+        let rows = vec![
+            row("s1", &["a", "b"]),
+            row("s2", &["a"]),
+            row("s3", &[]), // concept 無し section
+        ];
+        let v = probe_summary(&rows, false);
+        assert_eq!(v["total_sections"], 3);
+        assert_eq!(v["sections_with_concepts"], 2);
+        assert_eq!(v["total_concepts"], 2);
+        assert_eq!(v["ratio_denominator"], "sections_with_concepts");
+        assert_eq!(v["truncated"], false);
+        // concepts は section_count 降順 → concept_key 昇順。ratio の分母は sections_with_concepts
+        assert_eq!(v["concepts"][0]["concept_key"], "a");
+        assert_eq!(v["concepts"][0]["section_count"], 2);
+        assert!((v["concepts"][0]["ratio"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(v["concepts"][1]["concept_key"], "b");
+        assert!((v["concepts"][1]["ratio"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn probe_summary_handles_zero_sections_without_division() {
+        let v = probe_summary(&[], false);
+        assert_eq!(v["total_sections"], 0);
+        assert_eq!(v["sections_with_concepts"], 0);
+        assert_eq!(v["concepts"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn apply_concept_names_fills_only_known_keys() {
+        let summary = probe_summary(&[row("s1", &["a", "b"])], false);
+        let mut names = HashMap::new();
+        names.insert("a".to_string(), "エー".to_string());
+        let patched = apply_concept_names(summary, &names);
+        let concepts = patched["concepts"].as_array().unwrap();
+        let a = concepts.iter().find(|c| c["concept_key"] == "a").unwrap();
+        let b = concepts.iter().find(|c| c["concept_key"] == "b").unwrap();
+        assert_eq!(a["name_ja"], "エー");
+        assert_eq!(b["name_ja"], "");
+    }
+}
