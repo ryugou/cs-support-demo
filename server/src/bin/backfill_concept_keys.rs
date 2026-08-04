@@ -346,6 +346,112 @@ fn build_backfill_node(row: &SectionConcepts) -> GraphNode {
     }
 }
 
+/// `UpsertNodes` が部分マージか全置換かを、`before`（probe 前の全属性）と `after`
+/// （`concept_keys` だけを持つ最小ノードを upsert して読み戻した後の全属性）から判定する。
+///
+/// `before` に `REQUIRED_ATTRS` が 1 つも無ければ判定材料が無いので `"inconclusive"`。
+/// それ以外は、`before` にあった required 属性が `after` にすべてそのまま残っていれば
+/// `"merge"`、1 つでも消えていれば `"replace"`。
+fn probe_one_verdict(
+    before: &HashMap<String, String>,
+    after: &HashMap<String, String>,
+) -> &'static str {
+    let before_required: Vec<&str> = REQUIRED_ATTRS
+        .iter()
+        .copied()
+        .filter(|k| before.contains_key(*k))
+        .collect();
+    if before_required.is_empty() {
+        return "inconclusive";
+    }
+    let retained = before_required
+        .iter()
+        .all(|k| after.get(*k) == before.get(*k));
+    if retained {
+        "merge"
+    } else {
+        "replace"
+    }
+}
+
+/// `--probe-one <section_key>` 本体。
+///
+/// 1. 対象 section の現属性（`row.attrs`）を退避（既に `collect_section_concepts` が読み出し
+///    済みのメモリ上の値。この関数自身が upsert する前の状態）
+/// 2. `concept_keys` だけを持つ最小ノードを 1 件 upsert
+/// 3. 読み戻して `probe_one_verdict` で判定
+/// 4. 判定結果によらず、退避した全属性 + 計算済み `concept_keys` で即座に再送して復旧する
+///    （`build_backfill_node` を再利用。全置換だった場合はこれが唯一の復旧手段）
+async fn run_probe_one(
+    client: &VegapunkClient,
+    schema: &str,
+    rows: &[SectionConcepts],
+    section_key: &str,
+) -> Result<Value> {
+    let row = rows
+        .iter()
+        .find(|r| r.section_key == section_key)
+        .with_context(|| {
+            format!(
+                "section_key {section_key} not found among loaded ManualSection nodes; \
+                 refusing to probe a section that does not exist"
+            )
+        })?;
+
+    let minimal_node = GraphNode {
+        id: row.node_id.clone(),
+        node_type: KIND_SECTION.to_string(),
+        attributes: vec![(
+            "concept_keys".to_string(),
+            serde_json::to_string(&row.concept_keys).unwrap_or_else(|_| "[]".to_string()),
+        )],
+    };
+    client
+        .upsert_nodes(vec![minimal_node])
+        .await
+        .context("probe-one: upsert concept_keys-only minimal node")?;
+
+    let read_back = client
+        .query_nodes(
+            schema,
+            KIND_SECTION,
+            vec![("section_key", "eq", section_key)],
+            5,
+        )
+        .await
+        .context("probe-one: read back section after minimal upsert")?;
+    let after = read_back
+        .first()
+        .with_context(|| {
+            format!(
+                "probe-one: section {section_key} vanished after minimal upsert (query_nodes \
+                 returned no match); cannot determine UpsertNodes semantics or restore"
+            )
+        })?
+        .attributes
+        .clone();
+    let verdict = probe_one_verdict(&row.attrs, &after);
+
+    // どちらの判定でも、退避した全属性 + concept_keys で即座に復旧する。
+    let restore_node = build_backfill_node(row);
+    let restored_count = client
+        .upsert_nodes(vec![restore_node])
+        .await
+        .context("probe-one: restore full attributes after minimal upsert probe")?;
+    tracing::info!(
+        section_key,
+        verdict,
+        restored_count,
+        "probe-one restored section to full attributes + concept_keys"
+    );
+
+    Ok(json!({
+        "section_key": section_key,
+        "verdict": verdict,
+        "restored": true,
+    }))
+}
+
 /// 既定モード（全件書き込み）本体。
 ///
 /// 対象件数は「未確定で増え続ける」ingest_alarmcom のクロールと違い、`rows` の時点で全件
@@ -461,11 +567,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    if args.probe_one.is_some() {
-        anyhow::bail!(
-            "--probe-one is not implemented in this build yet (Issue #8 Phase B2-1 Task 5); \
-             rerun after that commit lands"
-        );
+    if let Some(section_key) = &args.probe_one {
+        let summary = run_probe_one(&client, &args.schema, &rows, section_key).await?;
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
     }
 
     let summary = write_backfill(&client, &rows).await?;
@@ -543,6 +648,21 @@ mod tests {
         assert_eq!(parsed, vec!["a".to_string(), "b".to_string()]);
         // 他の必須属性はそのまま残る
         assert!(node.attributes.iter().any(|(k, v)| k == "body" && v == "x"));
+    }
+
+    #[test]
+    fn probe_one_verdict_detects_merge_and_replace() {
+        let before = full_attrs();
+        let mut after_merge = full_attrs();
+        after_merge.insert("concept_keys".into(), "[\"a\"]".into());
+        assert_eq!(probe_one_verdict(&before, &after_merge), "merge");
+        let mut after_replace = HashMap::new();
+        after_replace.insert("concept_keys".into(), "[\"a\"]".into());
+        assert_eq!(probe_one_verdict(&before, &after_replace), "replace");
+        assert_eq!(
+            probe_one_verdict(&HashMap::new(), &HashMap::new()),
+            "inconclusive"
+        );
     }
 
     #[test]
