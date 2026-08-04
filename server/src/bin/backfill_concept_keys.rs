@@ -79,9 +79,27 @@ struct Args {
     /// 指定 1 件に concept_keys だけの最小ノードを upsert して UpsertNodes の意味論を実測する。
     #[arg(long, conflicts_with_all = ["probe_only", "verify"])]
     probe_one: Option<String>,
-    /// この section_key より後（辞書順）から再開する。
-    #[arg(long)]
+    /// この section_key より後（辞書順）から再開する。**既定の書き込みモード専用。**
+    ///
+    /// 観測モード（`--probe-only` / `--verify`）では禁止する。母集団を縮めたまま
+    /// `ratio`（B2-0 の閾値決定の根拠）や `"diverged": 0`（B2-1 の受理条件）を出すと、
+    /// 部分集合に対する結果を全体の結果と誤読させる。spec L93「打ち切る場合は打ち切った旨と
+    /// 全件数を必ず出す」の再発防止として、観測モードは打ち切れない形にしておく。
+    #[arg(long, conflicts_with_all = ["probe_only", "verify"])]
     start_after: Option<String>,
+}
+
+/// `--start-after` の辞書順フィルタ判定（純関数）。
+///
+/// `start_after` が無ければ全件通す。`section_key` 属性が無いノードは、`start_after` 指定時
+/// のみ除外対象になる（辞書順の位置を決められないため）。**呼び出し側はこの除外を必ず warn
+/// すること** — フラグの有無で同じ異常がログ有りと無言に分かれるのを避ける。
+fn after_start(section_key: Option<&str>, start_after: Option<&str>) -> bool {
+    match (section_key, start_after) {
+        (_, None) => true,
+        (Some(key), Some(after)) => key > after,
+        (None, Some(_)) => false,
+    }
 }
 
 /// token 解決: 既定は --token-file、ファイルが無い/読めない場合のみ --token-env。
@@ -133,6 +151,26 @@ struct SectionConcepts {
     /// ManualSection の生の全属性（読み出したそのまま）。書き込み時の全属性再送に使う
     /// （`UpsertNodes` が部分マージか全置換か未確定なため、常に全属性を持たせて再送する）。
     attrs: HashMap<String, String>,
+}
+
+/// `collect_section_concepts` の戻り値。**打ち切りの有無を呼び出し側が必ず観測できるよう、
+/// 行データだけでなくフィルタ前の件数も返す**（spec L93: 打ち切った旨と全件数を必ず出す。
+/// B1 の `--jobs-limit` で「打ち切りに気づけない」問題を踏んだため）。
+struct Collected {
+    rows: Vec<SectionConcepts>,
+    /// concept_key → name_ja（traverse で観測できたものだけ）。
+    name_ja: HashMap<String, String>,
+    /// `--start-after` フィルタ適用**前**の ManualSection 総数。
+    total_before_start_after: usize,
+    /// `section_key` 属性が無く `--start-after` フィルタで除外された件数。
+    excluded_missing_section_key: usize,
+}
+
+impl Collected {
+    /// `--start-after` によって母集団が縮んでいるか。summary の `truncated` にそのまま出す。
+    fn truncated(&self) -> bool {
+        self.rows.len() != self.total_before_start_after
+    }
 }
 
 /// `--probe-only` の出力（B2-0 の実測 JSON）を組み立てる純関数。
@@ -197,23 +235,35 @@ async fn collect_section_concepts(
     client: &VegapunkClient,
     schema: &str,
     start_after: Option<&str>,
-) -> Result<(Vec<SectionConcepts>, HashMap<String, String>)> {
+) -> Result<Collected> {
     let sections = client
         .query_nodes_paged(schema, KIND_SECTION, Vec::new(), PAGE_SIZE)
         .await
         .context("load all ManualSection nodes")?;
-    tracing::info!(count = sections.len(), "loaded ManualSection nodes");
+    let total_before_start_after = sections.len();
+    tracing::info!(
+        count = total_before_start_after,
+        "loaded ManualSection nodes"
+    );
 
+    let mut excluded_missing_section_key = 0usize;
     let mut filtered: Vec<_> = sections
         .into_iter()
         .filter(|n| {
-            let Some(after) = start_after else {
-                return true;
-            };
-            n.attributes
-                .get("section_key")
-                .map(|k| k.as_str() > after)
-                .unwrap_or(false)
+            let section_key = n.attributes.get("section_key").map(|k| k.as_str());
+            let keep = after_start(section_key, start_after);
+            // section_key 欠落による除外は「読みが壊れている signal」なので必ず残す。
+            // --start-after 無しなら後段の missing_required_attrs が warn + skip するが、
+            // フィルタ経路では無言に消えるため、ここで明示的に記録する。
+            if !keep && section_key.is_none() {
+                excluded_missing_section_key += 1;
+                tracing::warn!(
+                    node_id = %n.node_id,
+                    "ManualSection has no section_key attribute; excluded by --start-after \
+                     filter (cannot place it in lexicographic order)"
+                );
+            }
+            keep
         })
         .collect();
     filtered.sort_by(|a, b| {
@@ -276,7 +326,12 @@ async fn collect_section_concepts(
         }
     }
     tracing::info!(total, "collected section concepts");
-    Ok((rows, name_ja))
+    Ok(Collected {
+        rows,
+        name_ja,
+        total_before_start_after,
+        excluded_missing_section_key,
+    })
 }
 
 /// `probe_summary` が既定値で埋めた `name_ja: ""` を、traverse で観測できた実値で上書きする。
@@ -417,6 +472,47 @@ fn probe_one_verdict(
     }
 }
 
+/// 最小ノード upsert 後の読み戻しと `probe_one_verdict` による判定。
+///
+/// `run_probe_one` から**切り出してある理由**: この関数の失敗を `?` で呼び出し元へ素通し
+/// させると、破壊的 upsert 済みの状態で復旧を飛ばして早期 return してしまう。呼び出し側は
+/// 戻り値を `Result` のまま受け、復旧を実行してから改めて評価すること。
+///
+/// 読み戻しは `.first()` ではなく `node_id` 一致で選ぶ。backend の `eq` が将来 prefix 的に
+/// 振る舞った場合、先頭要素だと**別ノードの属性で判定してしまう**（復旧自体は `row.node_id`
+/// を狙うので安全だが、判定だけ静かに嘘になる）。
+async fn read_back_verdict(
+    client: &VegapunkClient,
+    schema: &str,
+    section_key: &str,
+    row: &SectionConcepts,
+) -> Result<&'static str> {
+    let read_back = client
+        .query_nodes(
+            schema,
+            KIND_SECTION,
+            vec![("section_key", "eq", section_key)],
+            5,
+        )
+        .await
+        .context("probe-one: read back section after minimal upsert")?;
+    let after = read_back
+        .iter()
+        .find(|n| n.node_id == row.node_id)
+        .with_context(|| {
+            format!(
+                "probe-one: section {section_key} (node_id {}) not found after minimal upsert \
+                 (query_nodes returned {} node(s), none matching); cannot determine UpsertNodes \
+                 semantics",
+                row.node_id,
+                read_back.len()
+            )
+        })?
+        .attributes
+        .clone();
+    Ok(probe_one_verdict(&row.attrs, &after))
+}
+
 /// `--probe-one <section_key>` 本体。
 ///
 /// 1. 対象 section の現属性（`row.attrs`）を退避（既に `collect_section_concepts` が読み出し
@@ -454,33 +550,65 @@ async fn run_probe_one(
         .await
         .context("probe-one: upsert concept_keys-only minimal node")?;
 
-    let read_back = client
-        .query_nodes(
-            schema,
-            KIND_SECTION,
-            vec![("section_key", "eq", section_key)],
-            5,
-        )
-        .await
-        .context("probe-one: read back section after minimal upsert")?;
-    let after = read_back
-        .first()
-        .with_context(|| {
-            format!(
-                "probe-one: section {section_key} vanished after minimal upsert (query_nodes \
-                 returned no match); cannot determine UpsertNodes semantics or restore"
-            )
-        })?
-        .attributes
-        .clone();
-    let verdict = probe_one_verdict(&row.attrs, &after);
+    // ここから先は「破壊的 upsert 済み」の状態。判定が失敗しても復旧を飛ばしてはならないため、
+    // 判定は `?` で伝播させず Result のまま受ける（spec L89:「どちらの結果でも…即座に再送して
+    // 復旧する」）。`VegapunkClient::call` にリトライは無く per-request timeout は 120s なので、
+    // 読み戻し 1 発の一過性失敗（接続リセット・backend の一時停滞）はここに到達しうる。
+    let verdict_result = read_back_verdict(client, schema, section_key, row).await;
 
-    // どちらの判定でも、退避した全属性 + concept_keys で即座に復旧する。
+    // 判定の成否によらず、退避した全属性 + concept_keys で即座に復旧する。
     let restore_node = build_backfill_node(row);
-    let restored_count = client
+    let restore_result = client
         .upsert_nodes(vec![restore_node])
         .await
-        .context("probe-one: restore full attributes after minimal upsert probe")?;
+        .context("probe-one: restore full attributes after minimal upsert probe");
+
+    // 復旧が失敗したら、判定結果の有無に関わらず最優先で報告する。この時点で対象 section は
+    // 「concept_keys だけの最小ノード」に化けている可能性があり（UpsertNodes が全置換だった
+    // 場合）、放置すると body / order が失われたまま検索に残る。運用者が手で戻せるよう、
+    // 退避してあった全属性を stderr に JSON で吐いてから bail する。
+    let restored_count = match restore_result {
+        Ok(count) => count,
+        Err(err) => {
+            let salvage: HashMap<&str, &str> = row
+                .attrs
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "probe_one_restore_failed": true,
+                    "section_key": section_key,
+                    "node_id": row.node_id,
+                    "saved_attributes": salvage,
+                    "computed_concept_keys": row.concept_keys,
+                }))
+                .unwrap_or_else(|e| format!("{{\"salvage_serialization_failed\":\"{e}\"}}"))
+            );
+            return Err(err).with_context(|| {
+                format!(
+                    "probe-one: FAILED TO RESTORE section {section_key}. The minimal \
+                     concept_keys-only upsert already ran, so if UpsertNodes replaces attributes \
+                     this section now has no body/title/order and retrieval will silently rank it \
+                     at order=0. The full saved attributes were printed to stderr as JSON — \
+                     restore them manually (or rerun ingest for this section) before using this \
+                     schema for search"
+                )
+            });
+        }
+    };
+
+    // 復旧は成功した。判定自体が失敗していた場合は、復旧済みである事実を添えて報告する
+    // （データは安全なので、運用者は単に再実行すればよい）。
+    let verdict = verdict_result.with_context(|| {
+        format!(
+            "probe-one: could not determine UpsertNodes semantics for section {section_key}, \
+             but the full attributes were successfully restored ({restored_count} node(s) \
+             upserted) — the graph is intact; rerun --probe-one to retry the measurement"
+        )
+    })?;
+
     tracing::info!(
         section_key,
         verdict,
@@ -495,12 +623,44 @@ async fn run_probe_one(
     }))
 }
 
+/// missing-attrs skip が閾値を超えたか判定する純関数（`site_skip_bail` と同じ流儀）。
+///
+/// 分母は **更新候補数**（`needs_update` が true の行）であって全 section 数ではない。
+/// 全 section を分母にすると「候補が全体の 5% しかなく、その 5% が全部壊れている」ケースで
+/// 比率が 5% となり、ガードをすり抜けて壊れたデータを書きに行く。候補を分母にする方が厳密に
+/// 保守的である。
+///
+/// 返り値 `Some(ratio)` は「閾値超過 = bail すべき」の意。候補 0 件では除算せず常に `None`。
+/// 境界はちょうど閾値なら通す（`>` 判定）。
+fn exceeds_skip_threshold(skipped: usize, candidates: usize) -> Option<f64> {
+    if candidates == 0 {
+        return None;
+    }
+    let ratio = skipped as f64 / candidates as f64;
+    (ratio > MAX_SKIP_RATIO).then_some(ratio)
+}
+
+/// `write_backfill` の summary に載せる、打ち切り関連の文脈。
+///
+/// 書き込み件数だけを出すと `--start-after` で縮んだ母集団に対する結果を全体の結果と
+/// 誤読させる（spec L93）。呼び出し側が観測した実値をそのまま渡す。
+struct WriteContext<'a> {
+    truncated: bool,
+    total_before_start_after: usize,
+    excluded_missing_section_key: usize,
+    start_after: Option<&'a str>,
+}
+
 /// 既定モード（全件書き込み）本体。
 ///
 /// 対象件数は「未確定で増え続ける」ingest_alarmcom のクロールと違い、`rows` の時点で全件
 /// 確定している。したがって missing-attrs skip 率の判定は **書き込みを始める前に** 行う
 /// （閾値超過なら 1 件も書かずに bail する方が、書きかけの状態を残すより安全）。
-async fn write_backfill(client: &VegapunkClient, rows: &[SectionConcepts]) -> Result<Value> {
+async fn write_backfill(
+    client: &VegapunkClient,
+    rows: &[SectionConcepts],
+    ctx: WriteContext<'_>,
+) -> Result<Value> {
     let total_sections = rows.len();
     let candidates: Vec<&SectionConcepts> = rows
         .iter()
@@ -529,48 +689,75 @@ async fn write_backfill(client: &VegapunkClient, rows: &[SectionConcepts]) -> Re
         );
     }
 
-    if total_candidates > 0 {
-        let skip_ratio = skipped_missing_attrs as f64 / total_candidates as f64;
-        if skip_ratio > MAX_SKIP_RATIO {
-            anyhow::bail!(
-                "{skipped_missing_attrs}/{total_candidates} update-candidate ManualSection(s) \
-                 ({:.1}%) are missing required attrs, exceeding the {:.0}% safety threshold; a \
-                 full-attribute resend on a section missing required attrs would drop body/TOC \
-                 order (retrieval.rs order parses via unwrap_or(0), so the failure is silent) — \
-                 aborting before writing anything this run (representative section_key(s): {:?})",
-                skip_ratio * 100.0,
-                MAX_SKIP_RATIO * 100.0,
-                missing_examples
-            );
-        }
+    if let Some(skip_ratio) = exceeds_skip_threshold(skipped_missing_attrs, total_candidates) {
+        anyhow::bail!(
+            "{skipped_missing_attrs}/{total_candidates} update-candidate ManualSection(s) \
+             ({:.1}%) are missing required attrs, exceeding the {:.0}% safety threshold; a \
+             full-attribute resend on a section missing required attrs would drop body/TOC \
+             order (retrieval.rs order parses via unwrap_or(0), so the failure is silent) — \
+             aborting before writing anything this run (representative section_key(s): {:?})",
+            skip_ratio * 100.0,
+            MAX_SKIP_RATIO * 100.0,
+            missing_examples
+        );
     }
 
-    let mut updated = 0usize;
+    let mut requested = 0usize;
+    let mut upserted = 0i64;
     let mut batches = 0usize;
+    // 直前に成功したバッチの末尾 section_key。中断時に `--start-after` へそのまま渡せる形で
+    // エラーに載せる（CLAUDE.md「すべてのエラーパスに、運用者が次のアクションを判断できる
+    // 情報を含める」。これが無いと再開点が運用者に届かず、全件やり直しになる）。
+    let mut last_committed_key: Option<&str> = None;
     for chunk in writable.chunks(UPSERT_BATCH_SIZE) {
         let nodes: Vec<GraphNode> = chunk.iter().map(|row| build_backfill_node(row)).collect();
         let n = nodes.len();
-        client
-            .upsert_nodes(nodes)
-            .await
-            .with_context(|| format!("upsert concept_keys batch #{batches}"))?;
-        updated += n;
+        let count = client.upsert_nodes(nodes).await.with_context(|| {
+            let resume = last_committed_key
+                .map(|k| format!("--start-after {k}"))
+                .unwrap_or_else(|| {
+                    "no batch committed yet; rerun without --start-after".to_string()
+                });
+            format!(
+                "upsert concept_keys batch #{batches} ({n} node(s)) failed after {upserted} \
+                 node(s) already upserted across {batches} batch(es); resume with: {resume}"
+            )
+        })?;
+        requested += n;
+        upserted += i64::from(count);
         batches += 1;
+        last_committed_key = chunk.last().map(|row| row.section_key.as_str());
         tracing::info!(
-            updated,
+            requested,
+            upserted,
             total_candidates,
             batches,
             "backfill write progress"
         );
     }
 
+    // backend の申告値と要求件数が食い違ったら黙って成功と report しない。この summary は
+    // spec L39 の B2-1 完了条件（全 ManualSection に concept_keys が入った）の唯一の evidence。
+    if upserted != requested as i64 {
+        tracing::warn!(
+            requested,
+            upserted,
+            "backend reported a different upserted count than requested; the projection may be \
+             incomplete — rerun --verify to confirm edge/attribute agreement before accepting B2-1"
+        );
+    }
+
     Ok(json!({
         "total_sections": total_sections,
-        "updated": updated,
+        "requested": requested,
+        "updated": upserted,
         "skipped_missing_attrs": skipped_missing_attrs,
         "skipped_up_to_date": skipped_up_to_date,
         "batches": batches,
-        "truncated": false,
+        "truncated": ctx.truncated,
+        "total_sections_before_start_after": ctx.total_before_start_after,
+        "excluded_missing_section_key": ctx.excluded_missing_section_key,
+        "start_after": ctx.start_after,
     }))
 }
 
@@ -594,11 +781,21 @@ async fn main() -> Result<()> {
         .await
         .context("register/update schema (adds concept_keys attribute)")?;
 
-    let (rows, name_ja) =
+    let collected =
         collect_section_concepts(&client, &args.schema, args.start_after.as_deref()).await?;
+    let truncated = collected.truncated();
+    let Collected {
+        rows,
+        name_ja,
+        total_before_start_after,
+        excluded_missing_section_key,
+    } = collected;
 
     if args.probe_only {
-        let summary = apply_concept_names(probe_summary(&rows, false), &name_ja);
+        // clap の conflicts_with により --start-after とは併用できないため truncated は false に
+        // なるはずだが、値をハードコードせず実測値を出す（将来 conflicts を緩めたときに、
+        // 打ち切りが黙って `false` として出る事故を防ぐ）。
+        let summary = apply_concept_names(probe_summary(&rows, truncated), &name_ja);
         println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
     }
@@ -608,6 +805,11 @@ async fn main() -> Result<()> {
         let summary = json!({
             "total_sections": rows.len(),
             "diverged": diverged.len(),
+            // 乖離 0 件が「全件検査した結果の 0」なのか「部分集合に対する 0」なのかを
+            // 読み手が区別できるようにする（B2-1 の受理条件が「--verify の乖離 0 件」のため）。
+            "truncated": truncated,
+            "total_sections_before_start_after": total_before_start_after,
+            "excluded_missing_section_key": excluded_missing_section_key,
             "items": diverged,
         });
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -620,7 +822,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let summary = write_backfill(&client, &rows).await?;
+    let summary = write_backfill(
+        &client,
+        &rows,
+        WriteContext {
+            truncated,
+            total_before_start_after,
+            excluded_missing_section_key,
+            start_after: args.start_after.as_deref(),
+        },
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
@@ -726,6 +938,68 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0]["section_key"], "s1");
         assert!(d[0]["attr"].is_null());
+    }
+
+    #[test]
+    fn after_start_filters_lexicographically_and_drops_keyless_nodes_only_when_resuming() {
+        // フィルタ無効なら、section_key の有無に関わらず全件通す。
+        assert!(after_start(Some("a"), None));
+        assert!(after_start(None, None));
+        // 辞書順で「後」だけ通す。ちょうど一致は通さない（再開点自身は処理済みのため）。
+        assert!(after_start(Some("b"), Some("a")));
+        assert!(!after_start(Some("a"), Some("a")));
+        assert!(!after_start(Some("a"), Some("b")));
+        // section_key を持たないノードは辞書順の位置を決められないので除外する
+        // （呼び出し側が warn することで無言脱落にならないようにしてある）。
+        assert!(!after_start(None, Some("a")));
+    }
+
+    #[test]
+    fn exceeds_skip_threshold_guards_boundary_and_zero_candidates() {
+        // 候補 0 件では除算せず、常に None（bail しない）。
+        assert_eq!(exceeds_skip_threshold(0, 0), None);
+        assert_eq!(exceeds_skip_threshold(5, 0), None);
+        // ちょうど 10% は超過ではないので通す（`>` 判定）。
+        assert_eq!(exceeds_skip_threshold(10, 100), None);
+        // 10% を超えたら Some（bail）。
+        assert!(exceeds_skip_threshold(11, 100).is_some());
+        // 分母は「更新候補数」。全 section 数を分母にすると緩くなることを固定する:
+        // 候補 20 件中 10 件欠落（50%）は必ず bail する。
+        assert!(exceeds_skip_threshold(10, 20).is_some());
+    }
+
+    #[test]
+    fn needs_update_treats_duplicate_entries_as_the_same_set() {
+        // 集合比較なので重複は無視される（書き込みを無限に繰り返さない）。
+        assert!(!needs_update(Some(r#"["a","a"]"#), &["a".into()]));
+        assert!(!needs_update(
+            Some(r#"["a","b","a"]"#),
+            &["a".into(), "b".into()]
+        ));
+    }
+
+    #[test]
+    fn build_backfill_node_round_trips_every_attribute() {
+        // 必須 8 個だけでなく、doc_key / body_original など「読み出した全属性」が
+        // 1 つ残らず再送されることを固定する（全置換だった場合に失われないため）。
+        let mut attrs = full_attrs();
+        attrs.insert("doc_key".to_string(), "doc-alarmcom".to_string());
+        attrs.insert("body_original".to_string(), "English body".to_string());
+        attrs.insert("original_hash".to_string(), "deadbeef".to_string());
+        attrs.insert("section_no".to_string(), String::new());
+        let mut r = row("s1", &["a"]);
+        r.attrs = attrs.clone();
+        let node = build_backfill_node(&r);
+        for (key, value) in &attrs {
+            if key == "concept_keys" {
+                continue;
+            }
+            assert!(
+                node.attributes.iter().any(|(k, v)| k == key && v == value),
+                "attribute {key} must survive the resend"
+            );
+        }
+        assert_eq!(node.node_type, "ManualSection");
     }
 
     #[test]
