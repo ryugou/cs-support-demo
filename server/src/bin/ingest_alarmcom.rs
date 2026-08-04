@@ -890,7 +890,9 @@ async fn main() -> Result<()> {
             signal_values,
             body_original: Some(body_en),
             original_hash: Some(hash.clone()),
-            concept_keys: Vec::new(),
+            // 後段（MENTIONS_CONCEPT 辺を張るループ）でも concept_keys を使うため clone を渡す。
+            // 辺がグラフの正でこの属性は射影なので、辺を張るループ自体は変更しない。
+            concept_keys: concept_keys.clone(),
         };
         let build = build_section_graph(&args.schema, DOC_KEY, &input, &hash);
         let mut article_nodes = build.nodes;
