@@ -96,7 +96,10 @@ struct Args {
     /// `ratio`（B2-0 の閾値決定の根拠）や `"diverged": 0`（B2-1 の受理条件）を出すと、
     /// 部分集合に対する結果を全体の結果と誤読させる。spec L93「打ち切る場合は打ち切った旨と
     /// 全件数を必ず出す」の再発防止として、観測モードは打ち切れない形にしておく。
-    #[arg(long, conflicts_with_all = ["probe_only", "verify"])]
+    ///
+    /// `--probe-one` とも併用不可。probe-one は対象 1 件を自前で絞るため `--start-after` は
+    /// 無視されるが、受理してしまうと「指定したのに効かない」フラグになる。
+    #[arg(long, conflicts_with_all = ["probe_only", "verify", "probe_one"])]
     start_after: Option<String>,
 }
 
@@ -195,7 +198,11 @@ impl Collected {
 /// 比率が希釈され、閾値判定が体系的にずれる（`ratio_denominator` で分母を明示する理由）。
 /// `name_ja` はこの関数の外（呼び出し側が traverse で得た Concept 属性）から埋める前提で、
 /// ここでは空文字を既定値として出す。
-fn probe_summary(rows: &[SectionConcepts], truncated: bool) -> Value {
+fn probe_summary(
+    rows: &[SectionConcepts],
+    truncated: bool,
+    total_before_start_after: usize,
+) -> Value {
     let total_sections = rows.len();
     let sections_with_concepts = rows.iter().filter(|r| !r.concept_keys.is_empty()).count();
 
@@ -235,6 +242,10 @@ fn probe_summary(rows: &[SectionConcepts], truncated: bool) -> Value {
         "ratio_denominator": "sections_with_concepts",
         "concepts": concepts,
         "truncated": truncated,
+        // spec L93 は「打ち切った旨**と全件数**」の両方を要求している。truncated だけでは
+        // 「何件のうち何件を見たのか」が分からず、B2-0 の ratio をどれだけ信用してよいかを
+        // 読み手が判断できない。
+        "total_sections_before_start_after": total_before_start_after,
     })
 }
 
@@ -577,16 +588,32 @@ async fn run_probe_one(
             serde_json::to_string(&row.concept_keys).unwrap_or_else(|_| "[]".to_string()),
         )],
     };
-    client
+    // **最小 upsert の Err は「書かれなかった」を意味しない。** `vegapunk.rs` の実測コメントの
+    // とおり、tonic 0.12 では `Endpoint::timeout` の満了が `Code::Cancelled` に写像される
+    // （`DeadlineExceeded` にはならない）。timeout・接続リセットで Err が返っても、サーバ側では
+    // 適用済みでありうる（曖昧な書き込み）。したがって Err でも `?` で抜けず、復旧を試行する。
+    // 復旧が書くのは「全属性 + concept_keys」で、**最小 upsert が届いていなかった場合でも既定
+    // モードが最終的に書く内容と同一**なので、無条件に実行して無害である。
+    let minimal_result = client
         .upsert_nodes(vec![minimal_node])
         .await
-        .context("probe-one: upsert concept_keys-only minimal node")?;
+        .context("probe-one: upsert concept_keys-only minimal node");
+    let ambiguous_write = minimal_result.is_err();
 
-    // ここから先は「破壊的 upsert 済み」の状態。判定が失敗しても復旧を飛ばしてはならないため、
-    // 判定は `?` で伝播させず Result のまま受ける（spec L89:「どちらの結果でも…即座に再送して
-    // 復旧する」）。`VegapunkClient::call` にリトライは無く per-request timeout は 120s なので、
-    // 読み戻し 1 発の一過性失敗（接続リセット・backend の一時停滞）はここに到達しうる。
-    let verdict_result = read_back_verdict(client, schema, section_key, row).await;
+    // ここから先は「破壊的 upsert が走ったかもしれない」状態。判定が失敗しても復旧を飛ばしては
+    // ならないため、判定は `?` で伝播させず Result のまま受ける（spec L89:「どちらの結果でも…
+    // 即座に再送して復旧する」）。`VegapunkClient::call` にリトライは無く per-request timeout は
+    // 120s なので、読み戻し 1 発の一過性失敗（接続リセット・backend の一時停滞）も到達しうる。
+    //
+    // 最小 upsert 自体が曖昧な場合は読み戻しても意味論を判定できない（適用されたか不明なため）
+    // ので判定はスキップし、復旧だけ行う。
+    let verdict_result: Result<Option<&'static str>> = if ambiguous_write {
+        Ok(None)
+    } else {
+        read_back_verdict(client, schema, section_key, row)
+            .await
+            .map(Some)
+    };
 
     // 判定の成否によらず、退避した全属性 + concept_keys で即座に復旧する。
     let restore_node = build_backfill_node(row);
@@ -613,8 +640,12 @@ async fn run_probe_one(
                     "probe_one_restore_failed": true,
                     "section_key": section_key,
                     "node_id": row.node_id,
+                    // 手動復旧に必要な id / type / attributes がこの dump 単体で揃うようにする
+                    // （node_type は定数だが、salvage は自己完結しているべき）。
+                    "node_type": KIND_SECTION,
                     "saved_attributes": salvage,
                     "computed_concept_keys": row.concept_keys,
+                    "restore_attempted_after_ambiguous_write": ambiguous_write,
                 }))
                 .unwrap_or_else(|e| format!("{{\"salvage_serialization_failed\":\"{e}\"}}"))
             );
@@ -631,15 +662,32 @@ async fn run_probe_one(
         }
     };
 
-    // 復旧は成功した。判定自体が失敗していた場合は、復旧済みである事実を添えて報告する
-    // （データは安全なので、運用者は単に再実行すればよい）。
-    let verdict = verdict_result.with_context(|| {
-        format!(
-            "probe-one: could not determine UpsertNodes semantics for section {section_key}, \
-             but the full attributes were successfully restored ({restored_count} node(s) \
-             upserted) — the graph is intact; rerun --probe-one to retry the measurement"
-        )
-    })?;
+    // 復旧まで終えたので、ここから先は「データは安全」な状態で報告できる。
+
+    // 最小 upsert 自体が曖昧だった場合は測定不能。復旧は済んでいることを明記して bail する。
+    if let Err(err) = minimal_result {
+        return Err(err).with_context(|| {
+            format!(
+                "probe-one: the minimal upsert for section {section_key} returned an error, but a \
+                 gRPC error does not prove the write was rejected (tonic maps Endpoint::timeout \
+                 expiry to Code::Cancelled). Full attributes were re-sent as a precaution \
+                 ({restored_count} node(s) upserted), so this section now holds exactly what the \
+                 default backfill mode would write — the graph is intact. No verdict was measured; \
+                 rerun --probe-one"
+            )
+        });
+    }
+
+    // 判定だけ失敗していた場合も、復旧済みである事実を添えて報告する。
+    let verdict = verdict_result
+        .with_context(|| {
+            format!(
+                "probe-one: could not determine UpsertNodes semantics for section {section_key}, \
+                 but the full attributes were successfully restored ({restored_count} node(s) \
+                 upserted) — the graph is intact; rerun --probe-one to retry the measurement"
+            )
+        })?
+        .unwrap_or("inconclusive");
 
     tracing::info!(
         section_key,
@@ -648,11 +696,42 @@ async fn run_probe_one(
         "probe-one restored section to full attributes + concept_keys"
     );
 
+    // この 1 回の実行で、後続の判断に要る未確定事項をまとめて確定させる:
+    // (a) verdict           — UpsertNodes が部分マージか全置換か
+    // (b) upserted_count    — 既存ノードの更新を数えるか（既定モードの requested/upserted 警告の
+    //                         妥当性がこれで決まる。0 が返るなら「新規のみ」を数える意味論）
+    // (c) attribute_keys    — backend が読み出しで返す属性キーの全体
+    // (d) empty_value_keys  — backend が「宣言済みだが未設定」を空文字で返すか
+    //                         （返すなら divergences が全 urtect section を乖離と報告し、
+    //                           B2-1 の受理条件「乖離 0 件」が構造的に達成不能になる）
+    let (attribute_keys, empty_value_keys) = attribute_key_report(&row.attrs);
     Ok(json!({
         "section_key": section_key,
+        "node_id": row.node_id,
         "verdict": verdict,
         "restored": true,
+        "restored_count": restored_count,
+        "attribute_keys": attribute_keys,
+        "empty_value_keys": empty_value_keys,
     }))
+}
+
+/// 読み出した属性から (全キー, 値が空だったキー) をそれぞれソートして返す純関数。
+///
+/// `--probe-one` の JSON に載せて、backend が「schema 宣言済みだが未設定」の属性を空文字で
+/// 返すのかを**実測で確定させる**ために使う。これが確定しないと `missing_required_attrs` の
+/// 非空検査が実際に効いているのか、`divergences` が空文字を不正 JSON として全件乖離報告して
+/// しまわないかを判断できない。
+fn attribute_key_report(attrs: &HashMap<String, String>) -> (Vec<String>, Vec<String>) {
+    let mut all: Vec<String> = attrs.keys().cloned().collect();
+    all.sort();
+    let mut empty: Vec<String> = attrs
+        .iter()
+        .filter(|(_, v)| v.trim().is_empty())
+        .map(|(k, _)| k.clone())
+        .collect();
+    empty.sort();
+    (all, empty)
 }
 
 /// missing-attrs skip が閾値を超えたか判定する純関数（`site_skip_bail` と同じ流儀）。
@@ -771,11 +850,21 @@ async fn write_backfill(
     // backend の申告値と要求件数が食い違ったら黙って成功と report しない。この summary は
     // spec L39 の B2-1 完了条件（全 ManualSection に concept_keys が入った）の唯一の evidence。
     if upserted != requested as i64 {
+        // `UpsertNodesResponse.upserted_count` の意味論（insert+update の合計か、新規作成のみか）
+        // は proto に doc コメントが無く未確定。**新規のみを数える実装なら backfill は定義上
+        // 既存ノードしか触らないため毎回 0 が返り、この warn が全実行で出る**。毎回出る警告は
+        // 無視されるよう運用者を訓練し、本当に取りこぼしたときの唯一の信号を殺す（B1 の
+        // 「打ち切りに気づけない」と同型）。断定を避けて留保付きで出し、確定は `--probe-one`
+        // の `restored_count`（実在ノード 1 件への upsert 戻り値）に委ねる。
         tracing::warn!(
             requested,
             upserted,
-            "backend reported a different upserted count than requested; the projection may be \
-             incomplete — rerun --verify to confirm edge/attribute agreement before accepting B2-1"
+            "backend reported a different upserted count than requested. NOTE: the semantics of \
+             UpsertNodesResponse.upserted_count are unverified (it may count only newly created \
+             nodes, in which case a backfill that only updates existing nodes always reports 0 \
+             and this warning is expected). Check --probe-one's restored_count first: if it is 0 \
+             for a section that certainly exists, this warning carries no signal. Otherwise the \
+             projection may be incomplete — rerun --verify before accepting B2-1"
         );
     }
 
@@ -832,7 +921,10 @@ async fn main() -> Result<()> {
         // clap の conflicts_with により --start-after とは併用できないため truncated は false に
         // なるはずだが、値をハードコードせず実測値を出す（将来 conflicts を緩めたときに、
         // 打ち切りが黙って `false` として出る事故を防ぐ）。
-        let summary = apply_concept_names(probe_summary(&rows, truncated), &name_ja);
+        let summary = apply_concept_names(
+            probe_summary(&rows, truncated, total_before_start_after),
+            &name_ja,
+        );
         println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
     }
@@ -1072,6 +1164,22 @@ mod tests {
     }
 
     #[test]
+    fn attribute_key_report_sorts_and_separates_empty_values() {
+        // --probe-one の JSON に載せ、backend が「宣言済みだが未設定」の属性を空文字で返すのかを
+        // 実測で確定させるための出力。確定しないと非空ガードが効いているのか、divergences が
+        // 空文字を不正 JSON として全件乖離報告しないかを判断できない。
+        let mut attrs = HashMap::new();
+        attrs.insert("title".to_string(), "t".to_string());
+        attrs.insert("section_no".to_string(), String::new());
+        attrs.insert("body".to_string(), "b".to_string());
+        attrs.insert("breadcrumb".to_string(), "   ".to_string());
+        let (all, empty) = attribute_key_report(&attrs);
+        assert_eq!(all, vec!["body", "breadcrumb", "section_no", "title"]);
+        // 空白のみも空として報告する（非空ガードの判定と同じ基準）。
+        assert_eq!(empty, vec!["breadcrumb", "section_no"]);
+    }
+
+    #[test]
     fn probe_one_verdict_detects_merge_and_replace() {
         let before = full_attrs();
         let mut after_merge = full_attrs();
@@ -1093,12 +1201,13 @@ mod tests {
             row("s2", &["a"]),
             row("s3", &[]), // concept 無し section
         ];
-        let v = probe_summary(&rows, false);
+        let v = probe_summary(&rows, false, 3);
         assert_eq!(v["total_sections"], 3);
         assert_eq!(v["sections_with_concepts"], 2);
         assert_eq!(v["total_concepts"], 2);
         assert_eq!(v["ratio_denominator"], "sections_with_concepts");
         assert_eq!(v["truncated"], false);
+        assert_eq!(v["total_sections_before_start_after"], 3);
         // concepts は section_count 降順 → concept_key 昇順。ratio の分母は sections_with_concepts
         assert_eq!(v["concepts"][0]["concept_key"], "a");
         assert_eq!(v["concepts"][0]["section_count"], 2);
@@ -1109,7 +1218,7 @@ mod tests {
 
     #[test]
     fn probe_summary_handles_zero_sections_without_division() {
-        let v = probe_summary(&[], false);
+        let v = probe_summary(&[], false, 0);
         assert_eq!(v["total_sections"], 0);
         assert_eq!(v["sections_with_concepts"], 0);
         assert_eq!(v["concepts"].as_array().unwrap().len(), 0);
@@ -1117,7 +1226,7 @@ mod tests {
 
     #[test]
     fn apply_concept_names_fills_only_known_keys() {
-        let summary = probe_summary(&[row("s1", &["a", "b"])], false);
+        let summary = probe_summary(&[row("s1", &["a", "b"])], false, 1);
         let mut names = HashMap::new();
         names.insert("a".to_string(), "エー".to_string());
         let patched = apply_concept_names(summary, &names);
