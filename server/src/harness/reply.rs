@@ -147,7 +147,8 @@ pub fn build_reply_brief_with_resolution(
             //
             // **注意: 現行のいずれの `manual_schema` 経路でも、これは「hits 全件」と一致する。**
             // `harness::evaluate` の `best_manual_sections` は `match ctx.manual_schema` の**外**で
-            // `section_hits` 全件から作られ（mod.rs:716-717）、そのまま `decide` へ渡る（同 726）。
+            // `section_hits` 全件から `section_keys` として作られ、そのまま
+            // `decision::decide` の `best_manual_sections` に渡る。
             // Allowed の `evidence_section_keys` はそれをそのまま持つ。**ManualV1 固有ではない**
             // （`ManualSchemaKind` の `#[default]` は `LegacySection` で、ローカル構成はそちら）。
             // つまりここでの絞り込みは**現状ほぼ無風**で、実質「上位 `top_k` 件のうち先頭

@@ -336,6 +336,86 @@ fn strip_markdown_fence(text: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// 固定 JSON を返す使い捨て Messages API stub（`oauth::verifier` の
+    /// `spawn_tokeninfo_stub` と同じ手法）。**この機能はテストされていない文字列 2 個
+    /// （serde のフィールド名 `stop_reason` と値 `"max_tokens"`）に全体重が乗っている**ため、
+    /// 実 HTTP 経路を通して固定する。どちらかが typo / API 側の表記変更 / リファクタで
+    /// 壊れると `truncated` が常に false へ落ち、**テストは緑のまま**危険な挙動へ静かに戻る。
+    async fn spawn_messages_stub(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/v1/messages")
+    }
+
+    fn stub_client(endpoint: String) -> AnthropicClient {
+        AnthropicClient {
+            http: reqwest::Client::new(),
+            endpoint,
+            model: "test-model".to_string(),
+            max_tokens: 300,
+            api_key: "test-key".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_reply_reports_truncation_when_stop_reason_is_max_tokens() {
+        let endpoint = spawn_messages_stub(
+            r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"途中まで書いた下書き"}]}"#,
+        )
+        .await;
+        let draft = stub_client(endpoint)
+            .draft_reply("sys", "user", 700)
+            .await
+            .expect("stub returns a usable draft");
+        assert_eq!(draft.text, "途中まで書いた下書き");
+        assert!(
+            draft.truncated,
+            "stop_reason=max_tokens must surface as truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_reply_reports_complete_when_stop_reason_is_end_turn() {
+        let endpoint = spawn_messages_stub(
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"完成した下書き"}]}"#,
+        )
+        .await;
+        let draft = stub_client(endpoint)
+            .draft_reply("sys", "user", 700)
+            .await
+            .unwrap();
+        assert!(!draft.truncated);
+    }
+
+    /// `stop_reason` が欠けたレスポンスでも panic せず、**切れていない扱い**になること。
+    /// `#[serde(default)]` の挙動をここで固定する（欠落を truncated 扱いにすると、
+    /// API 仕様変更のたびに全下書きが「要編集」になって警告が形骸化する）。
+    #[tokio::test]
+    async fn draft_reply_treats_a_missing_stop_reason_as_not_truncated() {
+        let endpoint =
+            spawn_messages_stub(r#"{"content":[{"type":"text","text":"下書き"}]}"#).await;
+        let draft = stub_client(endpoint)
+            .draft_reply("sys", "user", 700)
+            .await
+            .unwrap();
+        assert!(!draft.truncated);
+    }
+
     #[test]
     fn parses_signal_array_from_model_text() {
         let out =
