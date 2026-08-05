@@ -599,7 +599,7 @@ impl CsSupportRmcpServer {
 
     #[tool(
         name = "evaluate_answerability",
-        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。customer_reply_draft は検証前の下書きであり承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れており、NG 表現の検査が構造的に迂回されうるうえ末尾の注意書きが欠けている可能性があるため、そのまま顧客へ送らず hits と突き合わせて補完すること。"
+        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。customer_reply_draft は検証前の下書きであり承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れており、NG 表現の検査が構造的に迂回されうるうえ末尾の注意書きが欠けている可能性があるため、そのまま顧客へ送らないこと。decision が allowed の場合に限り hits と突き合わせて補完してよい。decision が escalate の場合は解決方法・手順を一切補わず取り次ぐ旨に留めること（サーバは escalate の下書きにマニュアル本文を渡しておらず、hits から手順を補うことは回答してはいけない場面で答えることに等しい）。"
     )]
     async fn evaluate_answerability(
         &self,

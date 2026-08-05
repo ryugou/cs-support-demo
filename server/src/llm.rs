@@ -341,15 +341,27 @@ mod tests {
     /// （serde のフィールド名 `stop_reason` と値 `"max_tokens"`）に全体重が乗っている**ため、
     /// 実 HTTP 経路を通して固定する。どちらかが typo / API 側の表記変更 / リファクタで
     /// 壊れると `truncated` が常に false へ落ち、**テストは緑のまま**危険な挙動へ静かに戻る。
-    async fn spawn_messages_stub(body: &'static str) -> String {
+    /// stub が受け取った生リクエスト（`spawn_tokeninfo_stub` の `RequestLog` と同じ用途）。
+    type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    async fn spawn_messages_stub(body: &'static str) -> (String, RequestLog) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let requests: RequestLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests_for_task = requests.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                let log = requests_for_task.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    log.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                    // content-length は **バイト長**（`str::len()`）で出す。日本語本文を
+                    // `chars().count()` で数えると実バイト数より小さくなり、client 側で
+                    // body が欠けるかハングする。
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -359,13 +371,22 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}/v1/messages")
+        (format!("http://{addr}/v1/messages"), requests)
     }
 
     fn stub_client(endpoint: String) -> AnthropicClient {
         AnthropicClient {
-            http: reqwest::Client::new(),
+            // **timeout を必ず入れる。** 無いと stub が応答前に落ちたとき
+            // `cargo test` が赤くならず**ハング**し、CI はジョブ timeout まで気づけない。
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
             endpoint,
+            // **本番と違う値を入れておく。** `draft_reply` は `max_tokens` を引数で受ける
+            // 設計（signal 抽出の `self.max_tokens` とは別枠）で、ここが `self.max_tokens` に
+            // 取り違えられると truncation が例外から常態に変わる。300 を入れておけば
+            // `request_uses_the_argument_max_tokens_not_the_client_default` が検出する。
             model: "test-model".to_string(),
             max_tokens: 300,
             api_key: "test-key".to_string(),
@@ -374,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn draft_reply_reports_truncation_when_stop_reason_is_max_tokens() {
-        let endpoint = spawn_messages_stub(
+        let (endpoint, _log) = spawn_messages_stub(
             r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"途中まで書いた下書き"}]}"#,
         )
         .await;
@@ -391,7 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn draft_reply_reports_complete_when_stop_reason_is_end_turn() {
-        let endpoint = spawn_messages_stub(
+        let (endpoint, _log) = spawn_messages_stub(
             r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"完成した下書き"}]}"#,
         )
         .await;
@@ -407,13 +428,45 @@ mod tests {
     /// API 仕様変更のたびに全下書きが「要編集」になって警告が形骸化する）。
     #[tokio::test]
     async fn draft_reply_treats_a_missing_stop_reason_as_not_truncated() {
-        let endpoint =
+        let (endpoint, _log) =
             spawn_messages_stub(r#"{"content":[{"type":"text","text":"下書き"}]}"#).await;
         let draft = stub_client(endpoint)
             .draft_reply("sys", "user", 700)
             .await
             .unwrap();
         assert!(!draft.truncated);
+    }
+
+    /// **リクエスト側の前提を固定する。**
+    ///
+    /// `draft_reply` は `max_tokens` を**引数**で受ける（signal 抽出の `self.max_tokens` =
+    /// 既定 300 とは別枠）。ここが `self.max_tokens` に取り違えられても、レスポンス側だけを
+    /// 見るテストは全部緑のまま通る。しかし 300 に落ちると**返信文は必ず途中で切れ、
+    /// truncation が例外から常態に変わる** —— 今回入れた安全シグナルが鳴りっぱなしになり、
+    /// 警告として機能しなくなる回帰である。
+    ///
+    /// `temperature: 0` も併せて固定する（下書きがデモのたびに変わらないための前提）。
+    #[tokio::test]
+    async fn request_uses_the_argument_max_tokens_not_the_client_default() {
+        let (endpoint, log) = spawn_messages_stub(
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"x"}]}"#,
+        )
+        .await;
+        // stub_client の self.max_tokens は 300。引数には 700 を渡す。
+        stub_client(endpoint)
+            .draft_reply("SYSTEM-MARKER", "USER-MARKER", 700)
+            .await
+            .unwrap();
+        let raw = log.lock().unwrap().first().cloned().expect("one request");
+        assert!(
+            raw.contains("\"max_tokens\":700"),
+            "draft_reply must send the argument, not self.max_tokens (300): {raw}"
+        );
+        assert!(!raw.contains("\"max_tokens\":300"));
+        assert!(raw.contains("\"temperature\":0"));
+        // system / user がそれぞれ正しい位置に載ること（入れ替わりの検出）。
+        assert!(raw.contains("SYSTEM-MARKER"));
+        assert!(raw.contains("USER-MARKER"));
     }
 
     #[test]
