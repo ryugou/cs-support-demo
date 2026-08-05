@@ -6,6 +6,7 @@ pub mod egress;
 pub mod extraction;
 pub mod grading;
 pub mod knowledge;
+pub mod reply;
 pub mod rules;
 pub mod scope;
 pub mod signal;
@@ -54,6 +55,12 @@ pub struct Harness {
     /// 意味検索（ベクトル経路）を manual retrieval に合成するか
     /// （config.harness.vector_route_enabled、urtect design §2.3）。
     pub vector_route_enabled: bool,
+    /// 顧客向け返信文の**下書き**生成に使う LLM（デモ用）。
+    /// `harness.customer_reply_draft_enabled = false`（既定）なら `None` で、
+    /// `evaluate` は下書きを作らない。詳細は `harness::reply` の doc を参照。
+    pub reply_drafter: Option<crate::llm::AnthropicClient>,
+    /// 返信文下書きの `max_tokens`（config.harness.customer_reply_draft_max_tokens）。
+    pub reply_draft_max_tokens: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +91,11 @@ pub struct EvaluationOutcome {
     pub related_cases: Vec<RelatedCase>,
     /// 今ターンの signal 抽出がどの経路を通ったか（S1-11 改訂・WORM 監査にも記録済み）。
     pub extraction_mode: extraction::ExtractionMode,
+    /// 顧客向け返信文の**下書き**（デモ用シミュレーション出力）。
+    ///
+    /// `harness.customer_reply_draft_enabled = false`（既定）、LLM 未設定、生成失敗のいずれでも
+    /// `None`。**権威ある回答ではない**（文面の正本は client 側という spec の結論は不変）。
+    pub customer_reply_draft: Option<String>,
 }
 
 /// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
@@ -144,6 +156,20 @@ impl Harness {
         // `from_config` が Err を返し、ここで起動が fail closed する。
         let anthropic_client = crate::llm::AnthropicClient::from_config(&config.llm)
             .context("configure llm signal extraction client")?;
+        // 返信文下書き（デモ用）は同じクライアントを使い回す。`customer_reply_draft_enabled`
+        // が true でも `[llm] enabled = false` なら client が無いので、下書きは黙って出ない
+        // （signal 抽出が lexicon 単独へフォールバックするのと同じ degrade。起動は止めない）。
+        let reply_drafter = if config.harness.customer_reply_draft_enabled {
+            if anthropic_client.is_none() {
+                tracing::warn!(
+                    "harness.customer_reply_draft_enabled = true ですが [llm] enabled = false の\
+                     ため下書きは生成されません（customer_reply_draft は常に null になります）"
+                );
+            }
+            anthropic_client.clone()
+        } else {
+            None
+        };
         let llm_classifier: Option<Arc<dyn extraction::ClassifyLlm>> =
             anthropic_client.map(|client| {
                 Arc::new(extraction::AnthropicSignalClassifier::new(
@@ -180,6 +206,8 @@ impl Harness {
             corpus: Some(corpus),
             default_route: config.harness.default_escalation_route.clone(),
             vector_route_enabled: config.harness.vector_route_enabled,
+            reply_drafter,
+            reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
         })
     }
 
@@ -807,6 +835,13 @@ impl Harness {
                 Some(extraction_mode),
             )
             .await?;
+        // [デモ] 顧客向け返信文の下書き。**判定が確定した後**に、その判定の制約下でだけ作る。
+        // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
+        // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
+        let customer_reply_draft = self
+            .draft_customer_reply(question, &decision_result, &section_hits)
+            .await;
+
         Ok(EvaluationOutcome {
             decision: decision_result,
             signals,
@@ -817,7 +852,40 @@ impl Harness {
             audit_event_id,
             related_cases,
             extraction_mode,
+            customer_reply_draft,
         })
+    }
+
+    /// 顧客向け返信文の下書きを 1 案作る（デモ用）。無効化時・LLM 未設定時・生成失敗時は
+    /// `None` を返し、**評価そのものは成功させる**。
+    ///
+    /// 材料の選別（Escalate ではマニュアル本文を一切渡さない）は `reply::build_reply_brief`
+    /// が担う。ここはその結果を送るだけで、安全判断をこの関数に持ち込まない。
+    async fn draft_customer_reply(
+        &self,
+        question: &str,
+        decision: &decision::AnswerDecision,
+        hits: &[SectionHit],
+    ) -> Option<String> {
+        let drafter = self.reply_drafter.as_ref()?;
+        let brief = reply::build_reply_brief(decision, hits);
+        let system = reply::build_reply_system_prompt(&brief);
+        let user = reply::build_reply_user_message(question, &brief);
+        match drafter
+            .draft_reply(&system, &user, self.reply_draft_max_tokens)
+            .await
+        {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    kind = ?brief.kind,
+                    "customer reply draft generation failed; returning the evaluation without a \
+                     draft (customer_reply_draft = null). The decision itself is unaffected"
+                );
+                None
+            }
+        }
     }
 
     /// record_answer_attempt の入口強制（S1-1 の短絡順序を emit 側でも閉じる）:
@@ -976,6 +1044,9 @@ mod tests {
             corpus: None,
             default_route: "triage".to_string(),
             vector_route_enabled: false,
+            // 返信文下書きはデモ用で既定 off。テストは判定そのものを見るため常に無効。
+            reply_drafter: None,
+            reply_draft_max_tokens: 700,
         }
     }
 

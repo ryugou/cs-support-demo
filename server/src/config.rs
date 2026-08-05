@@ -156,6 +156,21 @@ pub struct HarnessConfig {
     /// embeddings を ingest 済みのテナントでのみ有効化する（urtect design §2.3）。
     #[serde(default)]
     pub vector_route_enabled: bool,
+    /// `evaluate_answerability` が顧客向け返信文の**下書き**を返すか（デモ用）。
+    ///
+    /// **既定 false。** 有効化すると評価 1 回につき Anthropic API 呼び出しが 1 回増え、
+    /// 顧客問い合わせ本文と（Allowed 時のみ）マニュアル抜粋が Anthropic へ送信される。
+    /// 文面の正本は client 側という spec の結論は変わらない（`harness::reply` の doc を参照）。
+    #[serde(default)]
+    pub customer_reply_draft_enabled: bool,
+    /// 返信文下書きの `max_tokens`。signal 抽出用（`[llm] max_tokens`、既定 300）とは別枠。
+    /// 返信文は数百字必要で、抽出用の上限では途中で切れる。
+    #[serde(default = "default_reply_draft_max_tokens")]
+    pub customer_reply_draft_max_tokens: u32,
+}
+
+fn default_reply_draft_max_tokens() -> u32 {
+    700
 }
 
 fn default_audit_log_path() -> String {
@@ -187,6 +202,8 @@ impl Default for HarnessConfig {
             policy: default_policy(),
             thresholds: ThresholdsConfig::default(),
             grading: GradingConfig::default(),
+            customer_reply_draft_enabled: false,
+            customer_reply_draft_max_tokens: default_reply_draft_max_tokens(),
             default_escalation_route: default_escalation_route(),
             vector_route_enabled: false,
         }

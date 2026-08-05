@@ -88,6 +88,14 @@ pub struct EvaluateAnswerabilityResponse {
     /// 今ターンの signal 抽出モード（S1-11 改訂）: `lexicon_only` / `hybrid` /
     /// `lexicon_fallback`。WORM 監査にも同値を記録している。
     pub extraction_mode: String,
+    /// 顧客へ送る返信文の**下書き**（デモ用。無効化時・生成失敗時は null）。
+    ///
+    /// **これは検証前の下書きであって、承認された回答ではない。** 送信前に必ず担当者が
+    /// 内容を確認すること。`decision` が escalate のときは解決方法を含まず、取り次ぐ旨
+    /// だけになる（サーバ側で回答材料を渡していないため構造的に保証される）。
+    /// 開示範囲の正本は `decision.disclosure_scope` であり、この文面ではない。
+    #[serde(default)]
+    pub customer_reply_draft: Option<String>,
 }
 
 /// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
@@ -615,6 +623,7 @@ impl CsSupportRmcpServer {
                 .map(RelatedCaseJson::from)
                 .collect(),
             extraction_mode: outcome.extraction_mode.as_str().to_string(),
+            customer_reply_draft: outcome.customer_reply_draft,
         }))
     }
 

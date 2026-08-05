@@ -130,6 +130,77 @@ impl AnthropicClient {
             .ok_or_else(|| anyhow!("anthropic messages api response has no text content block"))?;
         parse_signal_response(&text_block.text)
     }
+
+    /// 顧客向け返信文の**下書き**を 1 案生成する（デモ用シミュレーション出力）。
+    ///
+    /// system / user とも呼び出し側（`harness::reply`）が純関数で組み立てたものを渡す。
+    /// **何を材料として渡すかの安全判断は `build_reply_brief` 側で済んでおり**、ここは
+    /// 単に送って本文を受け取るだけの層である（signal 抽出と同じ役割分担）。
+    ///
+    /// `max_tokens` は signal 抽出用（既定 300）とは別に引数で受ける。返信文は数百字必要で、
+    /// 抽出用の上限では途中で切れるため。
+    pub(crate) async fn draft_reply(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        let payload = serde_json::json!({
+            "model": self.model,
+            "max_tokens": max_tokens,
+            // 下書きは決定論に寄せる（同じ問い合わせでデモのたびに文面が変わると
+            // 「毎回違う」ことの説明に時間を取られる）。
+            "temperature": 0,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": user_message},
+            ],
+        });
+        let body = serde_json::to_vec(&payload).context("serialize anthropic reply request")?;
+
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .context("call anthropic messages api for customer reply draft")?;
+
+        let status = response.status();
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let text = response
+            .text()
+            .await
+            .context("read anthropic reply draft response body")?;
+        if !status.is_success() {
+            bail!(
+                "anthropic messages api returned {status} for reply draft (request-id: {request_id})"
+            );
+        }
+
+        let parsed: MessagesResponse =
+            serde_json::from_str(&text).context("parse anthropic reply draft response as json")?;
+        let drafted = parsed
+            .content
+            .into_iter()
+            .find(|block| block.block_type == "text")
+            .ok_or_else(|| anyhow!("anthropic reply draft response has no text content block"))?
+            .text
+            .trim()
+            .to_string();
+        if drafted.is_empty() {
+            bail!("anthropic reply draft response text block was empty");
+        }
+        Ok(drafted)
+    }
 }
 
 /// env `CS_SUPPORT_LLM_API_KEY` → `api_key_file` の順に鍵を解決する。
