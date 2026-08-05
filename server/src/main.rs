@@ -121,11 +121,18 @@ async fn main() -> Result<()> {
     // - Google の client_id / client_secret はサーバ側 env に閉じ込め、
     //   `/oauth/callback` と `/oauth/token` のトークン交換・中継にだけ使う
     //
-    // 署名鍵は env から取らない。起動時に CSPRNG で生成してメモリに置く
-    // （`SigningKey::generate`）。守る対象が client_id / state / 認可コードに
-    // 限られ、再起動の影響が「最長 600 秒のログインフロー」と「自動回復する
-    // DCR 登録」だけになったため、鍵を運用物として抱える理由が無くなった。
-    // **アクセストークンは Google 発行なので、再起動で利用者はログアウトしない。**
+    // 署名鍵は `CS_SUPPORT_OAUTH_SIGNING_KEY`（Secret Manager 注入）から読む。
+    //
+    // **かつては起動時に CSPRNG で生成していたが、それでは利用者が再ログインを強いられる。**
+    // 根拠: `token_from_refresh` は毎回 `client_id`（この鍵で封緘した DCR 登録ブロブ）を
+    // 署名検証しており、鍵が変わると `unverifiable_client_id` → `invalid_grant` を返す。
+    // OAuth クライアントは `invalid_grant` を受けると仕様どおり refresh_token を破棄するため、
+    // **デプロイのたび、かつゼロスケールからのコールドスタートのたびに接続が切れていた**
+    // （`minScale` 未設定なのでアイドルで必ず起きる）。旧コメントの「再起動で利用者は
+    // ログアウトしない」は Google のトークンだけを見た記述で、この経路を見落としていた。
+    //
+    // 未設定なら従来どおり生成して警告する（ローカル開発は Google の callback が
+    // 通らずログインフロー自体を完走できないため、生成鍵で足りる）。
     //
     // 以下 2 つの env は未設定・空文字なら起動を止める（fail closed）。
     // `env::var` は「設定されているが空文字」を `Ok(String::new())` で返すため、
@@ -143,8 +150,9 @@ async fn main() -> Result<()> {
         env::var("CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET").ok(),
         "set it to the Google OAuth Client Secret from Google Cloud Console (inject it via Secret Manager; it never leaves this server) before starting the server",
     )?;
-    // 署名鍵はプロセス限り。env / Secret Manager からは読まない（上のコメント参照）。
-    let signing_key = Arc::new(cs_support_mcp::oauth::signing::SigningKey::generate());
+    let signing_key = Arc::new(resolve_signing_key(
+        env::var("CS_SUPPORT_OAUTH_SIGNING_KEY").ok(),
+    )?);
     let verifier = Arc::new(cs_support_mcp::oauth::verifier::GoogleTokenVerifier::new(
         google_client_id.clone(),
     ));
@@ -301,6 +309,41 @@ fn read_bearer_token(args: &Args) -> Result<String> {
 /// 空白が混入していたこと」に気づけない。ここで trim した上で空文字を弾き、
 /// 以降は trim 済みの値だけが下流（tokeninfo への aud 送信、metadata URL 組み立て）
 /// に渡るようにする（`read_secret_file` が trim 後に空文字を弾くのと同じ方針）。
+/// OAuth 署名鍵を解決する純関数（env 値を引数で受けるのでテストできる）。
+///
+/// - 値がある → `SigningKey::from_secret`。**短すぎる材料は起動時に弾く**（fail closed）。
+///   設定したつもりで脆い鍵を使い続ける事故を防ぐ
+/// - 値が無い → 生成鍵にフォールバックし、**警告する**。この状態では再起動・コールド
+///   スタートのたびに DCR 登録が無効になり、refresh が `invalid_grant` で落ちて利用者が
+///   再ログインを強いられる。本番でこれに気づかないのが最悪なので黙って落とさない
+///
+/// 空文字・空白のみは「未設定」ではなく**設定ミス**として扱い、生成鍵へ落とさずエラーに
+/// する（Secret Manager のマウント漏れを、動くけれど毎回ログアウトする状態として
+/// 通過させないため）。
+fn resolve_signing_key(
+    configured: Option<String>,
+) -> Result<cs_support_mcp::oauth::signing::SigningKey> {
+    use cs_support_mcp::oauth::signing::SigningKey;
+    match configured {
+        Some(secret) => SigningKey::from_secret(&secret).map_err(|e| {
+            anyhow::anyhow!(
+                "CS_SUPPORT_OAUTH_SIGNING_KEY is set but unusable: {e}. \
+                 It gates the OAuth refresh path (client_id verification), so a bad value \
+                 would log every user out on each restart"
+            )
+        }),
+        None => {
+            tracing::warn!(
+                "CS_SUPPORT_OAUTH_SIGNING_KEY is not set; falling back to a per-process key. \
+                 Client registrations (DCR) will not survive a restart or a cold start, so \
+                 token refresh will fail with invalid_grant and users will be asked to \
+                 reconnect. Set it (Secret Manager) for any deployment that stays connected"
+            );
+            Ok(SigningKey::generate())
+        }
+    }
+}
+
 fn require_nonempty_env(name: &str, value: Option<String>, guidance: &str) -> Result<String> {
     value
         .map(|s| s.trim().to_string())

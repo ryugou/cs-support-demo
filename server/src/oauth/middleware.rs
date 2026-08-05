@@ -63,14 +63,14 @@ pub async fn require_google_auth(
     let token = match bearer {
         None => {
             tracing::info!(reason = "missing_bearer", "auth rejected");
-            return unauthorized(&state.resource_metadata_url);
+            return unauthorized(&state.resource_metadata_url, false);
         }
         // `Bearer ` の後ろが空文字（ヘッダはあるがトークンが空）。署名検証でも弾けるが、
         // 「ヘッダ自体が無い」と「ヘッダはあるがトークンが空」はクライアント側の
         // 不具合として原因が違うため、reason を分けて残す。
         Some(t) if t.is_empty() => {
             tracing::info!(reason = "empty_bearer", "auth rejected");
-            return unauthorized(&state.resource_metadata_url);
+            return unauthorized(&state.resource_metadata_url, true);
         }
         Some(t) => t,
     };
@@ -82,11 +82,11 @@ pub async fn require_google_auth(
         }
         Err(AuthError::Invalid(msg)) => {
             tracing::info!(reason = "invalid_token", error = %msg, "auth rejected");
-            unauthorized(&state.resource_metadata_url)
+            unauthorized(&state.resource_metadata_url, true)
         }
         Err(AuthError::Missing) => {
             tracing::info!(reason = "missing_bearer", "auth rejected");
-            unauthorized(&state.resource_metadata_url)
+            unauthorized(&state.resource_metadata_url, false)
         }
         Err(AuthError::Unreachable(msg)) => {
             // Google に届かなかった。**401 に倒さない**（上のドキュメント参照）。
@@ -125,10 +125,33 @@ fn parse_bearer(header_value: &str) -> Option<&str> {
     Some(rest.trim_matches([' ', '\t']))
 }
 
-/// 401 + RFC 9728 の発見用 `WWW-Authenticate: Bearer resource_metadata="..."` を組み立てる。
-fn unauthorized(resource_metadata_url: &str) -> Response {
+/// `WWW-Authenticate` の値を組み立てる純関数。
+///
+/// `credentials_presented` が true（トークンを提示したが無効・期限切れだった）のときだけ、
+/// RFC 6750 §3 の `error` / `error_description` を載せる。**認証情報を一切提示していない
+/// リクエストには載せない** — 同 §3 が明示しており、載せると「持っているトークンが無効」と
+/// いう誤情報をクライアントへ渡すことになる。
+///
+/// `error_description` はヘッダ値なので、二重引用符・改行を含めない固定文にする
+/// （動的な文字列を入れるとヘッダを壊しうる。トークン由来の情報は絶対に入れない）。
+fn challenge_value(resource_metadata_url: &str, credentials_presented: bool) -> String {
+    let base = format!("Bearer resource_metadata=\"{resource_metadata_url}\"");
+    if !credentials_presented {
+        return base;
+    }
+    format!(
+        "{base}, error=\"invalid_token\", \
+         error_description=\"The access token is expired or invalid. \
+         Reconnect this connector to sign in again.\""
+    )
+}
+
+/// 401 + RFC 9728 の発見用 `WWW-Authenticate` を組み立てる。
+///
+/// `credentials_presented` は [`challenge_value`] へそのまま渡す（意味はそちらの doc を参照）。
+fn unauthorized(resource_metadata_url: &str, credentials_presented: bool) -> Response {
     let mut res = StatusCode::UNAUTHORIZED.into_response();
-    let value = format!("Bearer resource_metadata=\"{resource_metadata_url}\"");
+    let value = challenge_value(resource_metadata_url, credentials_presented);
     match HeaderValue::from_str(&value) {
         Ok(hv) => {
             res.headers_mut().insert(header::WWW_AUTHENTICATE, hv);
@@ -322,6 +345,38 @@ mod tests {
             .unwrap();
         assert!(wa.contains("resource_metadata="));
         assert!(wa.contains("/.well-known/oauth-protected-resource/urtect/mcp"));
+        // RFC 6750 §3: 認証情報を一切提示していないリクエストには error を載せない
+        // （「持っているトークンが無効」という誤った情報をクライアントへ渡さないため）。
+        assert!(
+            !wa.contains("error="),
+            "a request with no credentials must not be told its token is invalid: {wa}"
+        );
+    }
+
+    #[test]
+    fn invalid_token_challenge_carries_rfc6750_error_and_description() {
+        // トークンを提示したが無効／期限切れだった場合は、RFC 6750 §3 に従って
+        // error="invalid_token" と人間可読な説明を載せる。クライアント（claude.ai）が
+        // 「再接続が必要」と表示する材料になる。表示するかは client 側の裁量。
+        let wa = challenge_value(
+            "https://h/.well-known/oauth-protected-resource/urtect/mcp",
+            true,
+        );
+        assert!(wa.starts_with("Bearer "));
+        assert!(wa.contains("resource_metadata=\"https://h/"));
+        assert!(wa.contains("error=\"invalid_token\""));
+        assert!(wa.contains("error_description=\""));
+        // 説明文はヘッダ値なので、二重引用符や制御文字を含めない（ヘッダを壊す）。
+        let description = wa.split("error_description=\"").nth(1).unwrap();
+        let description = description.trim_end_matches('"');
+        assert!(!description.contains('"'));
+        assert!(!description.contains('\n'));
+    }
+
+    #[test]
+    fn challenge_without_credentials_omits_error_params() {
+        let wa = challenge_value("https://h/meta", false);
+        assert_eq!(wa, "Bearer resource_metadata=\"https://h/meta\"");
     }
 
     /// `Bearer ` の後ろが空文字のケース。verifier を呼ばず即 401 になることを

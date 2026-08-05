@@ -7,23 +7,32 @@
 //! 外部ストア（Firestore / Redis）は追加しない方針のため、**状態は署名付きの値そのものに
 //! 埋め込む**。ここはその署名・検証の唯一の経路である。
 //!
-//! # 鍵はプロセスごとに使い捨て（env / Secret Manager から読まない）
+//! # 鍵は運用者が管理する（`CS_SUPPORT_OAUTH_SIGNING_KEY` / Secret Manager）
 //!
-//! 鍵は起動時に OS CSPRNG から生成してメモリにだけ置く（`SigningKey::generate`）。
-//! env にも Secret Manager にも鍵は無く、運用者が管理する鍵材料は存在しない。
+//! **2026-08 改訂。それ以前は起動時に CSPRNG で生成してメモリにだけ置いていたが、
+//! その設計は「再起動しても利用者はログアウトしない」という誤った前提に立っていた。**
 //!
-//! **再起動で鍵が変わることの影響**:
-//! - 進行中のログインフロー（`Blob::State` / `Blob::Code`、
-//!   最長 600 秒）は無効になる。利用者はログインをやり直す。
-//! - DCR で発行済みのクライアント登録（`Blob::Client`）は無効になる。claude.ai は
-//!   接続時に登録をやり直すため、**再登録で自動的に回復する**。
-//! - **アクセストークンとリフレッシュトークンは影響を受けない。** これらは Google が
-//!   発行した値をそのまま中継しており、この鍵は一切関与しない。したがって
-//!   **再起動しても利用者はログアウトしない**。自前トークン発行を廃止したことの
-//!   直接の利点がこれであり、鍵を使い捨てにできる根拠でもある。
+//! 誤りの中身: `authserver::token_from_refresh` は、リフレッシュのたびに
+//! `client_id`（＝この鍵で封緘した `Blob::Client`）を署名検証する。鍵が変わると
+//! `unverifiable_client_id` → `invalid_grant` を返す。OAuth クライアントは
+//! `invalid_grant` を受けると**仕様どおり refresh_token を破棄**するため、
+//! Google のトークンがまだ有効でも接続は切れる。旧コメントは「Google 発行の
+//! トークンはこの鍵に関与しない」ところまでは正しかったが、**リフレッシュの
+//! 入口にこの鍵のゲートが座っていること**を見落としていた。
 //!
-//! 影響が「最長 600 秒のログインフロー」と「自動回復する DCR 登録」に限られるため、
-//! 鍵の寿命・配布・ローテーションを運用作業として抱える価値が無いと判断した。
+//! しかもこのサービスは `maxScale=1` / `minScale` 未設定でゼロスケールするため、
+//! デプロイ時だけでなく**アイドル明けのコールドスタートのたびに**同じことが起きる。
+//! 「DCR は再登録で自動回復する」も、リフレッシュ経路には当てはまらない
+//! （claude.ai はリフレッシュ前に登録をやり直さない。`invalid_grant` を受け取るだけ）。
+//!
+//! **現在の挙動**:
+//! - env に鍵があれば `SigningKey::from_secret` で復元する。**同じ鍵材料なら別プロセスでも
+//!   同じ鍵**になり、DCR 登録と進行中のログインフローが再起動をまたいで有効なままになる
+//! - env が無ければ従来どおり生成し、**警告を出す**（`main::resolve_signing_key`）。
+//!   この状態は「動くが再起動のたびにログアウトする」ので、黙って落とさない
+//!
+//! 鍵のローテーション（secret の差し替え）は、全 DCR 登録と進行中のログインフローを
+//! 無効化する手段としても使える。自前トークン廃止で失われていた一括失効の代替になる。
 
 // `KeyInit` は import しない。`hmac::Mac` と `new` / `new_from_slice` が同名で衝突し、
 // 既存の HMAC 側の呼び出しが曖昧になるため、暗号鍵の生成だけ完全修飾で書く。
@@ -97,13 +106,18 @@ impl fmt::Debug for SigningKey {
 /// （256 bit）で、これ以上長くしても HMAC の強度は上がらない。
 const GENERATED_KEY_BYTES: usize = 32;
 
+/// 運用者が設定する鍵材料の最小バイト数（`SigningKey::from_secret`）。
+/// 生成鍵と同じ強度を下限として要求する。
+const MIN_CONFIGURED_KEY_BYTES: usize = 32;
+
 impl SigningKey {
-    /// **本番で使う唯一のコンストラクタ。** OS の CSPRNG から 32 バイトを引いて
-    /// プロセス限りの鍵を作る。
+    /// OS の CSPRNG から 32 バイトを引いてプロセス限りの鍵を作る。
     ///
-    /// 鍵を env / Secret Manager から読まない理由と、再起動時の影響範囲は
-    /// モジュールコメントを参照（要点: アクセストークンは Google 発行なので
-    /// 再起動しても利用者はログアウトしない）。
+    /// **本番では使わない。** `CS_SUPPORT_OAUTH_SIGNING_KEY` 未設定時のフォールバック
+    /// 専用で、この鍵だと再起動・コールドスタートのたびに DCR 登録が無効になり、
+    /// refresh が `invalid_grant` で落ちて利用者が再ログインを強いられる
+    /// （経緯はモジュールコメント）。呼び出し側（`main::resolve_signing_key`）は
+    /// このフォールバックに落ちたことを必ず warn する。
     ///
     /// `OsRng` は `getrandom` 経由で OS のエントロピー源を直接読む。失敗は
     /// OS がエントロピーを供給できない場合のみで、そのまま起動を続けると
@@ -116,8 +130,30 @@ impl SigningKey {
         Self::from_bytes(secret)
     }
 
-    /// テスト用。決まった鍵材料から作る（同じ入力なら同じ鍵になり、
-    /// 「別プロセスが同じ鍵を持つ」状況を再現できる）。
+    /// 運用者が管理する鍵材料から作る。**同じ材料なら同じ鍵**になるので、
+    /// プロセスを跨いで署名済みブロブを検証できる。
+    ///
+    /// これが本番で使われるのは、`Blob::Client`（DCR 登録）が **refresh 経路のゲート**に
+    /// なっているためである。`token_from_refresh` は毎回 `client_id` を署名検証しており、
+    /// 鍵が変わると `unverifiable_client_id` → `invalid_grant` を返す。OAuth クライアントは
+    /// `invalid_grant` を受けると仕様どおり refresh_token を破棄するので、**再起動やゼロ
+    /// スケールからのコールドスタートのたびに利用者が再ログインを強いられる**。
+    ///
+    /// 鍵材料は最低 32 バイト要求する。短い材料を黙って受けると、運用者が「設定した」と
+    /// 思ったまま脆い鍵で署名し続けることになる（設定ミスは起動時に気づける形にする）。
+    pub fn from_secret(secret: &str) -> Result<Self, String> {
+        let trimmed = secret.trim();
+        if trimmed.len() < MIN_CONFIGURED_KEY_BYTES {
+            return Err(format!(
+                "the OAuth signing key must be at least {MIN_CONFIGURED_KEY_BYTES} bytes \
+                 (got {}); generate one with `openssl rand -base64 32`",
+                trimmed.len()
+            ));
+        }
+        Ok(Self::from_bytes(trimmed.as_bytes().to_vec()))
+    }
+
+    /// テスト用。長さ検査を通さずに決まった鍵材料から作る。
     #[cfg(test)]
     pub fn new(secret: &str) -> Self {
         Self::from_bytes(secret.as_bytes().to_vec())
@@ -476,10 +512,10 @@ mod tests {
         assert_eq!(key.open::<Sample>(&sealed).unwrap(), secret_sample());
     }
 
-    /// **これが「再起動すると進行中のログインフローが無効になる」の実体である。**
-    /// 別プロセス（= 別の生成鍵）は、前のプロセスが発行した値を一切受理しない。
-    /// ここが通ってしまう実装（固定鍵へのフォールバック等）は、鍵を使い捨てに
-    /// している前提そのものを崩す。
+    /// 生成鍵どうしは互いのブロブを受理しない。**これが `CS_SUPPORT_OAUTH_SIGNING_KEY`
+    /// 未設定時に「再起動のたびに接続が切れる」ことの実体である**（refresh 経路の
+    /// `client_id` 検証が落ちる）。ここが通ってしまう実装＝生成鍵が実は固定、という
+    /// バグの検出も兼ねる。
     #[test]
     fn two_generated_keys_do_not_accept_each_others_blobs() {
         let blob = SigningKey::generate().sign(&sample()).unwrap();
@@ -487,6 +523,40 @@ mod tests {
             SigningKey::generate().verify::<Sample>(&blob).unwrap_err(),
             SignError::BadSignature
         );
+    }
+
+    /// **これが「鍵を永続化すれば再起動をまたいでも DCR 登録が有効なままになる」の実体。**
+    /// 同じ鍵材料から作った 2 つの鍵は、互いのブロブを受理する。refresh 経路の
+    /// `client_id` 検証がこれに依存しており、成立しないと再起動のたびに
+    /// `invalid_grant` になって利用者が再ログインを強いられる。
+    #[test]
+    fn two_keys_from_the_same_secret_accept_each_others_blobs() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let blob = SigningKey::from_secret(secret)
+            .unwrap()
+            .sign(&sample())
+            .unwrap();
+        let restored = SigningKey::from_secret(secret)
+            .unwrap()
+            .verify::<Sample>(&blob)
+            .unwrap();
+        assert_eq!(restored, sample());
+    }
+
+    #[test]
+    fn from_secret_rejects_material_that_is_too_short() {
+        // 短い鍵材料を黙って受けると、運用者が「設定した」と思ったまま脆い鍵で
+        // 署名し続ける。設定ミスは起動時に気づける形にする（fail closed）。
+        let err = SigningKey::from_secret("short").unwrap_err();
+        assert!(
+            err.contains("32"),
+            "the error must state the requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn from_secret_rejects_surrounding_whitespace_only_material() {
+        assert!(SigningKey::from_secret("   ").is_err());
     }
 
     /// 生成鍵も `Debug` に出さない。
