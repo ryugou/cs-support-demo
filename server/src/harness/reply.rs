@@ -31,8 +31,9 @@
 use crate::harness::decision::{AnswerDecision, AnswerSource, DisclosureScope};
 use crate::model::SectionHit;
 
-/// 問い合わせ本文の最大文字数。マニュアル抜粋（600 字）を切っているのに、より信用できない
-/// 入力である問い合わせ本文が無制限なのは筋が通らない。注入面積・コスト・レイテンシに効く。
+/// 問い合わせ本文の最大文字数。`MAX_EXCERPT_CHARS` で資料側を切っているのに、より信用
+/// できない入力である問い合わせ本文が無制限なのは筋が通らない。注入面積・コスト・
+/// レイテンシに効く。**具体値を書かないのは、片方を変えたときに他方の doc が腐るため。**
 const MAX_QUESTION_CHARS: usize = 2000;
 
 /// LLM に渡す抜粋 1 件あたりの最大文字数。プロンプト肥大とコストの抑制のために切るが、
@@ -142,9 +143,21 @@ pub fn build_reply_brief_with_resolution(
             evidence_section_keys,
             ..
         } => {
-            // 判定が根拠として採用した section だけを材料にする（hits 全部ではない）。
-            // 判定の根拠と文面の材料をずらさないため（「score は横断ページ、evidence は別
-            // ページ」という不整合を作らない、という evaluate 側の方針と揃える）。
+            // 判定が `evidence_section_keys` に採った section だけを材料にする。
+            //
+            // **注意: ManualV1 経路ではこれは「hits 全件」と一致する。** `harness::evaluate` は
+            // `section_hits` 全件をそのまま `best_manual_sections` に渡しており（`decide` の
+            // 入力）、Allowed の `evidence_section_keys` はそれをそのまま持つ。つまりここでの
+            // 絞り込みは**現状ほぼ無風**で、実質「上位 `top_k` 件のうち先頭 `MAX_EXCERPTS` 件」を
+            // 渡している。
+            //
+            // したがって**材料の質は retrieval の順位品質に直結する**。順位が汚染されていると
+            // （実測: 型番だけ一致する無関係記事が正解より高スコア）、無関係な記事の手順が
+            // そのままモデルへ渡る。`MAX_EXCERPT_CHARS` を伸ばした分、この経路で入る雑音も
+            // 比例して増えている点に注意。
+            //
+            // `evidence_section_keys` で絞る形自体は維持する。将来 `decide` が根拠を絞り込む
+            // ようになったとき、ここが自動的に追随するため（判定根拠と文面材料をずらさない）。
             let excerpts = hits
                 .iter()
                 .filter(|h| evidence_section_keys.contains(&h.section_key))
@@ -455,18 +468,34 @@ mod tests {
     /// この用途に構造的に合わない。
     #[test]
     fn answer_brief_keeps_material_that_appears_late_in_a_long_article() {
-        // 実記事と同じ位置関係を再現する: 手順が 1,048 文字目から始まる。
+        // **下限そのものを固定する。** filler の長さだけを assert すると、上限を 1,200 等へ
+        // 下げる変更が緑のまま通り、実記事では手順の途中切れが復活する（テスト名が
+        // "late material survives" なので守られていると誤読される）。
+        assert!(
+            MAX_EXCERPT_CHARS >= 2_500,
+            "excerpts must be long enough to hold a whole procedure section; the real article's \
+             reset steps start at 1,048 chars and run on from there"
+        );
+
+        // 実記事と同じ位置関係を再現する: 手順が 1,048 文字目から始まり、そこから
+        // さらに続く（手順が丸ごと入ることを見る。冒頭だけ入って末尾が落ちるのは不可）。
         let filler = "あ".repeat(1_048);
-        let body = format!("{filler}パスワードのリセット方法 1. アプリを開きます。");
+        let steps = "手順です。".repeat(200); // 約 1,000 字
+        let body = format!("{filler}パスワードのリセット方法 {steps}末尾マーカ");
         let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", &body)]);
         assert_eq!(brief.excerpts.len(), 1);
         assert!(
             brief.excerpts[0].contains("パスワードのリセット方法"),
             "material that appears late in the article must survive truncation"
         );
+        assert!(
+            brief.excerpts[0].contains("末尾マーカ"),
+            "the whole procedure must fit, not just its heading"
+        );
         // user メッセージに結合した後も残っていること（切り詰めは結合前に効くため）。
         let msg = build_reply_user_message("パスワードを忘れました", &brief);
         assert!(msg.contains("パスワードのリセット方法"));
+        assert!(msg.contains("末尾マーカ"));
     }
 
     #[test]

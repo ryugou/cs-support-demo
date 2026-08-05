@@ -188,6 +188,7 @@ impl AnthropicClient {
 
         let parsed: MessagesResponse =
             serde_json::from_str(&text).context("parse anthropic reply draft response as json")?;
+        let truncated = parsed.stop_reason.as_deref() == Some("max_tokens");
         let drafted = parsed
             .content
             .into_iter()
@@ -198,6 +199,19 @@ impl AnthropicClient {
             .to_string();
         if drafted.is_empty() {
             bail!("anthropic reply draft response text block was empty");
+        }
+        // **途中で切れた下書きを完成品として返さない。** `egress_gate` は長さを見ないので
+        // ここで警告しないと、文が途中で終わった下書きがそのまま担当者へ渡る。
+        // 判定自体は無傷なので null には倒さず（下書きが無いより不完全でもある方が
+        // デモの材料になる）、運用者が気づける形で残す。頻発するなら
+        // `customer_reply_draft_max_tokens` を上げるか、抜粋量を見直す合図。
+        if truncated {
+            tracing::warn!(
+                draft_chars = drafted.chars().count(),
+                "customer reply draft hit max_tokens and is cut off mid-sentence; it is returned \
+                 as-is but must not be sent to a customer without editing. Raise \
+                 harness.customer_reply_draft_max_tokens or reduce the excerpt volume"
+            );
         }
         Ok(drafted)
     }
@@ -245,6 +259,13 @@ pub(crate) fn build_system_prompt(vocabulary_prompt: &str) -> String {
 #[derive(Debug, Deserialize)]
 struct MessagesResponse {
     content: Vec<ContentBlock>,
+    /// 生成の停止理由。`"max_tokens"` なら**出力が途中で切れている**。
+    ///
+    /// 検査しないと、途中で切れた文が完成品として返る（`egress_gate` は長さを見ないので
+    /// そのまま通る）。「答えを渡しておきながら答えられない」下書きと同種の、静かな壊れ方。
+    /// 未知の値・欠落もありうるので `Option<String>` で受ける。
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
