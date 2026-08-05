@@ -96,6 +96,12 @@ pub struct EvaluationOutcome {
     /// `harness.customer_reply_draft_enabled = false`（既定）、LLM 未設定、生成失敗のいずれでも
     /// `None`。**権威ある回答ではない**（文面の正本は client 側という spec の結論は不変）。
     pub customer_reply_draft: Option<String>,
+    /// 上記の下書きが `max_tokens` で**途中で切れている**か。
+    ///
+    /// 切れ目がたまたま「。」の直後に落ちると下書きは完成文に見えるため、これを client へ
+    /// 伝えないと、**末尾の注意書きだけが落ちた案内**がそのまま顧客へ送られうる。
+    /// 下書きが無いとき（`customer_reply_draft` が `None`）は常に `false`。
+    pub customer_reply_draft_truncated: bool,
 }
 
 /// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
@@ -846,9 +852,11 @@ impl Harness {
         // [デモ] 顧客向け返信文の下書き。**判定が確定した後**に、その判定の制約下でだけ作る。
         // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
         // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
-        let customer_reply_draft = self
+        let reply_draft = self
             .draft_customer_reply(question, &decision_result, &section_hits, &resolutions)
             .await;
+        let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
+        let customer_reply_draft = reply_draft.map(|d| d.text);
 
         Ok(EvaluationOutcome {
             decision: decision_result,
@@ -861,6 +869,7 @@ impl Harness {
             related_cases,
             extraction_mode,
             customer_reply_draft,
+            customer_reply_draft_truncated,
         })
     }
 
@@ -875,7 +884,7 @@ impl Harness {
         decision: &decision::AnswerDecision,
         hits: &[SectionHit],
         resolutions: &[rules::KnownResolution],
-    ) -> Option<String> {
+    ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
         // 引いて渡す（引けなければ材料ゼロのまま = でっち上げない。reply.rs の doc を参照）。
@@ -893,11 +902,11 @@ impl Harness {
         let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
         let system = reply::build_reply_system_prompt(&brief);
         let user = reply::build_reply_user_message(question, &brief);
-        let text = match drafter
+        let draft = match drafter
             .draft_reply(&system, &user, self.reply_draft_max_tokens)
             .await
         {
-            Ok(text) => text,
+            Ok(draft) => draft,
             Err(err) => {
                 tracing::warn!(
                     error = %err,
@@ -918,9 +927,9 @@ impl Harness {
         let ctx = egress::EmitContext {
             channel: egress::EmitChannel::Operator,
         };
-        let verdict = egress::egress_gate(&text, &ctx, &self.ng);
+        let verdict = egress::egress_gate(&draft.text, &ctx, &self.ng);
         match verdict {
-            egress::EgressVerdict::Pass => Some(text),
+            egress::EgressVerdict::Pass => Some(draft),
             ref blocked => {
                 // 一致した NG 語は**サーバ自身の辞書由来**（顧客データではない）ので、ログへ
                 // 出して安全であり原因特定が一気に速くなる。下書き本文そのものは出さない
@@ -933,7 +942,7 @@ impl Harness {
                 tracing::warn!(
                     verdict = blocked.label(),
                     term,
-                    draft_chars = text.chars().count(),
+                    draft_chars = draft.text.chars().count(),
                     kind = ?brief.kind,
                     "customer reply draft was blocked by the egress gate; returning \
                      customer_reply_draft = null. The decision itself is unaffected. Inspect the \

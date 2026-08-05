@@ -101,6 +101,13 @@ pub struct EvaluateAnswerabilityResponse {
     ///
     /// 開示範囲の正本は `decision.disclosure_scope` であり、この文面ではない。
     pub customer_reply_draft: Option<String>,
+    /// `customer_reply_draft` が生成上限で**途中で切れている**か。
+    ///
+    /// **true のときは、そのまま顧客へ送ってはならない。** 切れ目がたまたま句点の直後に
+    /// 落ちると文面は完成しているように見えるが、日本語のビジネス文は結び・注意書き
+    /// （「電源を切ってから作業してください」等）が末尾に来るため、**安全上の但し書きだけが
+    /// 欠けた案内**になっている可能性がある。必ず原文（`hits`）と突き合わせて補うこと。
+    pub customer_reply_draft_truncated: bool,
 }
 
 /// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
@@ -629,6 +636,7 @@ impl CsSupportRmcpServer {
                 .collect(),
             extraction_mode: outcome.extraction_mode.as_str().to_string(),
             customer_reply_draft: outcome.customer_reply_draft,
+            customer_reply_draft_truncated: outcome.customer_reply_draft_truncated,
         }))
     }
 

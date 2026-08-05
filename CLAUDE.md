@@ -405,7 +405,7 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
   - **警告（2026-08 まで実際に起きていた不具合）**: 署名鍵をプロセスごとに生成していた頃は、**デプロイのたび・アイドル明けのコールドスタートのたびに接続が切れていた**。`/oauth/token` の `grant_type=refresh_token` は毎回 `client_id`（署名鍵で封緘した DCR 登録ブロブ）を検証しており、鍵が変わると `unverifiable_client_id` → `invalid_grant` を返す。OAuth クライアントは `invalid_grant` を受けると仕様どおり refresh_token を破棄するため、Google のトークンが有効でも再ログインになる。`minScale` 未設定でゼロスケールするので、**放置しておくだけで切れる**。「Google 発行だから再起動に強い」という以前の説明はこの経路を見落としていた。
 - **一括失効は署名鍵のローテーションで行う。** Secret Manager の `CS_SUPPORT_OAUTH_SIGNING_KEY` を差し替えて再デプロイすると、全 DCR 登録と進行中のログインフローが無効になり、全クライアントが再接続を要求される。個別利用者の失効は従来どおり Google 側（アカウントのアクセス権限管理）で行う。
 - `[llm] enabled = true` のため、**顧客問い合わせ本文が Anthropic API へ送信される**。運用上の注意点として認識しておくこと。
-  さらに `[harness] customer_reply_draft_enabled = true`（デモ用の返信文下書き）のときは、**evaluate 1 回につき Anthropic 呼び出しが 1 回増え、Allowed 時はマニュアル抜粋（最大 2,500 字 × 3 件）または known_resolution の回答本文も送信される**（質問本文 2,000 字と合わせて 1 下書きあたり概ね 8〜11k トークン）。切り戻しは `server/config.cloudrun.toml` のこの行を `false` にして再デプロイするだけ。下書きは `egress_gate` を通っており、NG 表現が出た場合は `customer_reply_draft` が `null` になる（理由は warn ログに出る）。
+  さらに `[harness] customer_reply_draft_enabled = true`（デモ用の返信文下書き）のときは、**evaluate 1 回につき Anthropic 呼び出しが 1 回増え、Allowed 時はマニュアル抜粋（最大 2,500 字 × 3 件）または known_resolution の回答本文も送信される**（質問本文 2,000 字と合わせて、**抜粋が上限まで埋まった場合の最大で** 1 下書きあたり概ね 8〜11k トークン。短い記事ではこれを大きく下回る）。切り戻しは `server/config.cloudrun.toml` のこの行を `false` にして再デプロイするだけ。下書きは `egress_gate` を通っており、NG 表現が出た場合は `customer_reply_draft` が `null` になる（理由は warn ログに出る）。
   `VEGAPUNK_BEARER_TOKEN` 未設定時は起動自体は成功するが、vegapunk 呼び出し（`search_manual` 等）だけが
   失敗する（`server/src/main.rs` の `read_bearer_token`。空文字がそのまま使われるため fail-closed にならない点に注意）。
 

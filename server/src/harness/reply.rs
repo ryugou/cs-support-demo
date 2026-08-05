@@ -145,11 +145,13 @@ pub fn build_reply_brief_with_resolution(
         } => {
             // 判定が `evidence_section_keys` に採った section だけを材料にする。
             //
-            // **注意: ManualV1 経路ではこれは「hits 全件」と一致する。** `harness::evaluate` は
-            // `section_hits` 全件をそのまま `best_manual_sections` に渡しており（`decide` の
-            // 入力）、Allowed の `evidence_section_keys` はそれをそのまま持つ。つまりここでの
-            // 絞り込みは**現状ほぼ無風**で、実質「上位 `top_k` 件のうち先頭 `MAX_EXCERPTS` 件」を
-            // 渡している。
+            // **注意: 現行のいずれの `manual_schema` 経路でも、これは「hits 全件」と一致する。**
+            // `harness::evaluate` の `best_manual_sections` は `match ctx.manual_schema` の**外**で
+            // `section_hits` 全件から作られ（mod.rs:716-717）、そのまま `decide` へ渡る（同 726）。
+            // Allowed の `evidence_section_keys` はそれをそのまま持つ。**ManualV1 固有ではない**
+            // （`ManualSchemaKind` の `#[default]` は `LegacySection` で、ローカル構成はそちら）。
+            // つまりここでの絞り込みは**現状ほぼ無風**で、実質「上位 `top_k` 件のうち先頭
+            // `MAX_EXCERPTS` 件」を渡している。
             //
             // したがって**材料の質は retrieval の順位品質に直結する**。順位が汚染されていると
             // （実測: 型番だけ一致する無関係記事が正解より高スコア）、無関係な記事の手順が

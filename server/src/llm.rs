@@ -17,6 +17,18 @@ use std::{env, path::Path, time::Duration};
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const API_KEY_ENV: &str = "CS_SUPPORT_LLM_API_KEY";
 
+/// 返信文の下書きと、**それが途中で切れているか**。
+///
+/// `truncated` を呼び出し側へ返すのは、**切れ目がたまたま「。」の直後に落ちると下書きが
+/// 完成文に見える**ため。日本語のビジネス文は結び・注意書き（「電源を切ってから作業して
+/// ください」等）が末尾に来るので、**見た目は完成しているのに安全上の但し書きだけが落ちた**
+/// 下書きが成立しうる。「途中で切れれば人間が気づく」という前提は成り立たない。
+/// ログの warn だけでは、その下書きを顧客へ送る担当者には届かない。
+pub(crate) struct ReplyDraft {
+    pub text: String,
+    pub truncated: bool,
+}
+
 /// Anthropic Messages API を signal 抽出専用に叩くクライアント。
 ///
 /// `enabled = false` の設定からは構築されない（`from_config` が `Ok(None)` を返す）。
@@ -144,7 +156,7 @@ impl AnthropicClient {
         system_prompt: &str,
         user_message: &str,
         max_tokens: u32,
-    ) -> Result<String> {
+    ) -> Result<ReplyDraft> {
         let payload = serde_json::json!({
             "model": self.model,
             "max_tokens": max_tokens,
@@ -189,16 +201,25 @@ impl AnthropicClient {
         let parsed: MessagesResponse =
             serde_json::from_str(&text).context("parse anthropic reply draft response as json")?;
         let truncated = parsed.stop_reason.as_deref() == Some("max_tokens");
+        // 下記 2 つの失敗文脈にも `stop_reason` を載せる。`stop_reason = "refusal"` は
+        // まさにこの形（text ブロック無し・空）で返るため、載せておくと「モデルが拒否した」
+        // のか「レスポンス形が想定外」なのかをログだけで切り分けられる。
+        let stop = parsed
+            .stop_reason
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
         let drafted = parsed
             .content
             .into_iter()
             .find(|block| block.block_type == "text")
-            .ok_or_else(|| anyhow!("anthropic reply draft response has no text content block"))?
+            .ok_or_else(|| {
+                anyhow!("anthropic reply draft response has no text content block (stop_reason: {stop})")
+            })?
             .text
             .trim()
             .to_string();
         if drafted.is_empty() {
-            bail!("anthropic reply draft response text block was empty");
+            bail!("anthropic reply draft response text block was empty (stop_reason: {stop})");
         }
         // **途中で切れた下書きを完成品として返さない。** `egress_gate` は長さを見ないので
         // ここで警告しないと、文が途中で終わった下書きがそのまま担当者へ渡る。
@@ -208,12 +229,15 @@ impl AnthropicClient {
         if truncated {
             tracing::warn!(
                 draft_chars = drafted.chars().count(),
-                "customer reply draft hit max_tokens and is cut off mid-sentence; it is returned \
-                 as-is but must not be sent to a customer without editing. Raise \
+                "customer reply draft hit max_tokens and is cut off; it is returned as-is with \
+                 truncated=true but must not be sent to a customer without editing. Raise \
                  harness.customer_reply_draft_max_tokens or reduce the excerpt volume"
             );
         }
-        Ok(drafted)
+        Ok(ReplyDraft {
+            text: drafted,
+            truncated,
+        })
     }
 }
 
