@@ -160,6 +160,14 @@ impl Harness {
         // が true でも `[llm] enabled = false` なら client が無いので、下書きは黙って出ない
         // （signal 抽出が lexicon 単独へフォールバックするのと同じ degrade。起動は止めない）。
         let reply_drafter = if config.harness.customer_reply_draft_enabled {
+            // max_tokens = 0 は API エラーになるだけで、毎回 warn + null という分かりにくい
+            // 壊れ方をする。設定ミスは起動時に気づける形で弾く。
+            anyhow::ensure!(
+                config.harness.customer_reply_draft_max_tokens > 0,
+                "harness.customer_reply_draft_max_tokens must be greater than 0 when \
+                 customer_reply_draft_enabled = true (got 0; every draft would fail at the API \
+                 and silently return null)"
+            );
             if anthropic_client.is_none() {
                 tracing::warn!(
                     "harness.customer_reply_draft_enabled = true ですが [llm] enabled = false の\
@@ -839,7 +847,7 @@ impl Harness {
         // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
         // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
         let customer_reply_draft = self
-            .draft_customer_reply(question, &decision_result, &section_hits)
+            .draft_customer_reply(question, &decision_result, &section_hits, &resolutions)
             .await;
 
         Ok(EvaluationOutcome {
@@ -866,22 +874,61 @@ impl Harness {
         question: &str,
         decision: &decision::AnswerDecision,
         hits: &[SectionHit],
+        resolutions: &[rules::KnownResolution],
     ) -> Option<String> {
         let drafter = self.reply_drafter.as_ref()?;
-        let brief = reply::build_reply_brief(decision, hits);
+        // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
+        // 引いて渡す（引けなければ材料ゼロのまま = でっち上げない。reply.rs の doc を参照）。
+        let kr_answer = match decision {
+            decision::AnswerDecision::Allowed {
+                source: decision::AnswerSource::KnownResolution,
+                known_resolution_id: Some(kr_id),
+                ..
+            } => resolutions
+                .iter()
+                .find(|kr| &kr.id == kr_id)
+                .map(|kr| kr.answer.as_str()),
+            _ => None,
+        };
+        let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
         let system = reply::build_reply_system_prompt(&brief);
         let user = reply::build_reply_user_message(question, &brief);
-        match drafter
+        let text = match drafter
             .draft_reply(&system, &user, self.reply_draft_max_tokens)
             .await
         {
-            Ok(text) => Some(text),
+            Ok(text) => text,
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     kind = ?brief.kind,
                     "customer reply draft generation failed; returning the evaluation without a \
                      draft (customer_reply_draft = null). The decision itself is unaffected"
+                );
+                return None;
+            }
+        };
+
+        // [S1-4] 出口ゲート。spec「egress 位置の固定」は AI 生成 draft も人間製 outbound も
+        // 同一の egress_gate を通すと定めている（人間製も信頼しない）。**サーバ生成の下書きは
+        // その筆頭**であり、ここを迂回すると新経路だけ NG 表現・暗示効能の統制が外れる。
+        // block / abstain は黙って null にせず、必ず理由付きで warn する（規約: 握りつぶし禁止）。
+        // チャネルは Step 1 の固定値 operator（S1-4 / 遵守事項 4。rmcp_server の
+        // operator_emit_context と同じ）。Step 1 の判定は channel 非依存。
+        let ctx = egress::EmitContext {
+            channel: egress::EmitChannel::Operator,
+        };
+        let verdict = egress::egress_gate(&text, &ctx, &self.ng);
+        match verdict {
+            egress::EgressVerdict::Pass => Some(text),
+            ref blocked => {
+                tracing::warn!(
+                    verdict = blocked.label(),
+                    kind = ?brief.kind,
+                    "customer reply draft was blocked by the egress gate; returning \
+                     customer_reply_draft = null. The decision itself is unaffected. Inspect the \
+                     manual excerpts or the known_resolution behind this decision — the draft \
+                     contained a term the NG dictionary rejects"
                 );
                 None
             }

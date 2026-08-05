@@ -403,6 +403,7 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 - **再デプロイ・再起動で利用者はログアウトしない。** アクセストークンとリフレッシュトークンは Google が発行した値をそのまま中継しているため、こちらのプロセス状態に依存しない。再起動で失われるのは進行中のログインフロー（最長 600 秒）と DCR 登録だけで、後者は claude.ai の再登録で自動的に回復する。
 - **一括失効手段は無い。** 旧構成では署名鍵の差し替えが全トークンの一括失効になっていたが、自前トークンを廃止した現在その手段は存在しない。失効は Google 側（アカウントのアクセス権限管理）で行う。
 - `[llm] enabled = true` のため、**顧客問い合わせ本文が Anthropic API へ送信される**。運用上の注意点として認識しておくこと。
+  さらに `[harness] customer_reply_draft_enabled = true`（デモ用の返信文下書き）のときは、**evaluate 1 回につき Anthropic 呼び出しが 1 回増え、Allowed 時はマニュアル抜粋（最大 600 字 × 3 件）または known_resolution の回答本文も送信される**。切り戻しは `server/config.cloudrun.toml` のこの行を `false` にして再デプロイするだけ。下書きは `egress_gate` を通っており、NG 表現が出た場合は `customer_reply_draft` が `null` になる（理由は warn ログに出る）。
   `VEGAPUNK_BEARER_TOKEN` 未設定時は起動自体は成功するが、vegapunk 呼び出し（`search_manual` 等）だけが
   失敗する（`server/src/main.rs` の `read_bearer_token`。空文字がそのまま使われるため fail-closed にならない点に注意）。
 
