@@ -922,8 +922,18 @@ impl Harness {
         match verdict {
             egress::EgressVerdict::Pass => Some(text),
             ref blocked => {
+                // 一致した NG 語は**サーバ自身の辞書由来**（顧客データではない）ので、ログへ
+                // 出して安全であり原因特定が一気に速くなる。下書き本文そのものは出さない
+                // （NG 表現をログへ転記しない）。文字数だけ添えて切り分けの材料にする。
+                let term = match blocked {
+                    egress::EgressVerdict::Block { term }
+                    | egress::EgressVerdict::Abstain { term } => term.as_str(),
+                    egress::EgressVerdict::Pass => "",
+                };
                 tracing::warn!(
                     verdict = blocked.label(),
+                    term,
+                    draft_chars = text.chars().count(),
                     kind = ?brief.kind,
                     "customer reply draft was blocked by the egress gate; returning \
                      customer_reply_draft = null. The decision itself is unaffected. Inspect the \
