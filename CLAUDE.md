@@ -438,8 +438,8 @@ openssl rand -base64 32 | gcloud secrets create cs-support-oauth-signing-key --p
 
 # **IAM 付与を忘れないこと。** ランタイム SA がこの secret を読めないと revision の起動に
 # 失敗し、デプロイごとサービスが落ちる（新 secret を足すときの定番の踏み外し）。
-# <runtime-sa> は既存 3 secret と同じ SA。`gcloud run services describe cs-support-mcp
-# --format='value(spec.template.spec.serviceAccountName)'` で確認する。
+# <runtime-sa> は既存 3 secret と同じ SA。次のコマンドで確認する（1 行で実行すること）:
+#   gcloud run services describe cs-support-mcp --project sivira-cs-support --region asia-northeast1 --format='value(spec.template.spec.serviceAccountName)'
 gcloud secrets add-iam-policy-binding cs-support-oauth-signing-key --project sivira-cs-support --member serviceAccount:<runtime-sa> --role roles/secretmanager.secretAccessor
 
 # バージョンは :latest ではなく番号で固定する（理由は下記ローテート手順）。
