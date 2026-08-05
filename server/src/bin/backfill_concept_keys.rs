@@ -570,6 +570,42 @@ async fn read_back_verdict(
     Ok(probe_one_verdict(&row.attrs, &after))
 }
 
+/// 辺から引けた Concept の被覆（`concept_keys` が非空な section 数, 辺の総数）を返す純関数。
+///
+/// **「全件既に正しい」と「Concept が 1 件も引けていない」を summary 上で区別するために使う。**
+/// 両者はどちらも `updated: 0` / `diverged: 0` になるが、意味は正反対である。
+fn concept_coverage(rows: &[SectionConcepts]) -> (usize, usize) {
+    let with_concepts = rows.iter().filter(|r| !r.concept_keys.is_empty()).count();
+    let mentions = rows.iter().map(|r| r.concept_keys.len()).sum();
+    (with_concepts, mentions)
+}
+
+/// 手動復旧用の salvage dump（stderr へ出す JSON 文字列）を組み立てる。
+///
+/// `tracing` ではなく `eprintln!` で出す前提の関数である（`RUST_LOG` の設定で落とされうる
+/// 経路に salvage を乗せない）。手動復旧に必要な id / node_type / 全属性 / 計算済み
+/// concept_keys が **この dump 単体で揃う**ようにしてある。
+///
+/// `label` で発生地点を区別する（`probe_one_pre_write_salvage` = 破壊的 upsert の直前に
+/// 予防的に出したもの / `probe_one_restore_failed` = 復旧 upsert が失敗したもの）。
+fn salvage_dump(row: &SectionConcepts, label: &str, ambiguous_write: bool) -> String {
+    let salvage: HashMap<&str, &str> = row
+        .attrs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    serde_json::to_string_pretty(&json!({
+        label: true,
+        "section_key": row.section_key,
+        "node_id": row.node_id,
+        "node_type": KIND_SECTION,
+        "saved_attributes": salvage,
+        "computed_concept_keys": row.concept_keys,
+        "restore_attempted_after_ambiguous_write": ambiguous_write,
+    }))
+    .unwrap_or_else(|e| format!("{{\"salvage_serialization_failed\":\"{e}\"}}"))
+}
+
 /// `--probe-one <section_key>` 本体。
 ///
 /// 1. 対象 section の現属性（`row.attrs`）を退避（既に `collect_section_concepts` が読み出し
@@ -593,6 +629,32 @@ async fn run_probe_one(
                  refusing to probe a section that does not exist"
             )
         })?;
+
+    // **既定モードと同じ required 属性ガードを、破壊的 upsert より前に必ず通す。**
+    // この経路の復旧（`build_backfill_node(row)`）も「読み出した全属性の再送」であり、
+    // spec L88 の「再送前に検査する」が等しく掛かる。むしろ probe-one は故意に破壊的
+    // upsert を先に行い、かつ runbook で最初に実行するよう指示されているため、CLI 内で
+    // 最も危険な書き込み経路である。ガードが無いと、読み出しに `body` が欠けた section を
+    // probe した場合、全置換の下で本文が永久に失われたうえ `"restored": true` と報告して
+    // しまう（`--verify` は辺==属性で乖離 0、既定モードは skipped_up_to_date、
+    // `retrieval.rs` の `order` は `unwrap_or(0)` なので、その後どのモードでも検出できない）。
+    let missing = missing_required_attrs(&row.attrs);
+    anyhow::ensure!(
+        missing.is_empty(),
+        "probe-one: section {section_key} is missing required attrs {missing:?}; refusing to \
+         probe because the restore would resend an incomplete attribute set and (under replace \
+         semantics) drop those attributes permanently — pick a section whose attributes are \
+         complete, or investigate why this section is incomplete before probing"
+    );
+
+    // **破壊的 upsert を出す前に退避属性を stderr へ吐く。** 復旧 Err 時の dump だけでは、
+    // 最小 upsert と復旧の間でプロセスが死んだ場合（Cloud Run task-timeout / SIGKILL / OOM）
+    // に手掛かりが 1 バイトも残らない。その壊れ方は本 CLI のどのモードでも検出できないため、
+    // 「殺されても手で戻せる」状態を書き込み前に作っておく。
+    eprintln!(
+        "{}",
+        salvage_dump(row, "probe_one_pre_write_salvage", false)
+    );
 
     let minimal_node = GraphNode {
         id: row.node_id.clone(),
@@ -643,34 +705,26 @@ async fn run_probe_one(
     let restored_count = match restore_result {
         Ok(count) => count,
         Err(err) => {
-            let salvage: HashMap<&str, &str> = row
-                .attrs
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
             eprintln!(
                 "{}",
-                serde_json::to_string_pretty(&json!({
-                    "probe_one_restore_failed": true,
-                    "section_key": section_key,
-                    "node_id": row.node_id,
-                    // 手動復旧に必要な id / type / attributes がこの dump 単体で揃うようにする
-                    // （node_type は定数だが、salvage は自己完結しているべき）。
-                    "node_type": KIND_SECTION,
-                    "saved_attributes": salvage,
-                    "computed_concept_keys": row.concept_keys,
-                    "restore_attempted_after_ambiguous_write": ambiguous_write,
-                }))
-                .unwrap_or_else(|e| format!("{{\"salvage_serialization_failed\":\"{e}\"}}"))
+                salvage_dump(row, "probe_one_restore_failed", ambiguous_write)
             );
+            // 最小 upsert が曖昧だった場合、それが適用されたかは**不明**である。断定すると
+            // 運用者の状況判断を誤らせるので、確定している場合とだけ「already ran」と言う。
+            // 推奨する行動（手動復旧）はどちらでも同じ。
+            let write_state = if ambiguous_write {
+                "The minimal concept_keys-only upsert returned an error, so it may or may not \
+                 have been applied (tonic maps Endpoint::timeout expiry to Code::Cancelled)"
+            } else {
+                "The minimal concept_keys-only upsert already ran"
+            };
             return Err(err).with_context(|| {
                 format!(
-                    "probe-one: FAILED TO RESTORE section {section_key}. The minimal \
-                     concept_keys-only upsert already ran, so if UpsertNodes replaces attributes \
-                     this section now has no body/title/order and retrieval will silently rank it \
-                     at order=0. The full saved attributes were printed to stderr as JSON — \
-                     restore them manually (or rerun ingest for this section) before using this \
-                     schema for search"
+                    "probe-one: FAILED TO RESTORE section {section_key}. {write_state}, so if \
+                     UpsertNodes replaces attributes this section may now have no \
+                     body/title/order and retrieval will silently rank it at order=0. The full \
+                     saved attributes were printed to stderr as JSON — restore them manually \
+                     (or rerun ingest for this section) before using this schema for search"
                 )
             });
         }
@@ -701,6 +755,10 @@ async fn run_probe_one(
                  upserted) — the graph is intact; rerun --probe-one to retry the measurement"
             )
         })?
+        // `None` はここに到達しない（`ambiguous_write` のときだけ `Ok(None)` になり、その場合は
+        // 直前の `if let Err(err) = minimal_result` で必ず return するため）。防御のための既定値
+        // であって、**この経路から `inconclusive` が出ることはない**（`inconclusive` 自体は
+        // `probe_one_verdict` が before に required 属性を見つけられないときに返す正当な値）。
         .unwrap_or("inconclusive");
 
     tracing::info!(
@@ -787,6 +845,7 @@ async fn write_backfill(
     ctx: WriteContext<'_>,
 ) -> Result<Value> {
     let total_sections = rows.len();
+    let (sections_with_concepts, total_edge_mentions) = concept_coverage(rows);
     let candidates: Vec<&SectionConcepts> = rows
         .iter()
         .filter(|r| needs_update(r.attr_concept_keys.as_deref(), &r.concept_keys))
@@ -884,6 +943,15 @@ async fn write_backfill(
 
     Ok(json!({
         "total_sections": total_sections,
+        // **「既に全件正しい」と「Concept が 1 件も引けていない」を区別するための指標。**
+        // traverse の引数が実 backend と食い違う、または MENTIONS_CONCEPT 辺が未投入だと、
+        // 全 section の concept_keys が空になる。`traverse_neighbors_paged` は total_count が
+        // 非正なら完全性検査を skip するため 0 件は fail closed にならず、候補 0 件 →
+        // exceeds_skip_threshold(0, 0) == None → bail せず {"updated": 0} で正常終了する。
+        // これを出さないと、射影が完全に空のまま B2-1 の完了条件を満たしたと誤読できる
+        // （B1 の `--jobs-limit` と同型）。
+        "sections_with_concepts": sections_with_concepts,
+        "total_edge_mentions": total_edge_mentions,
         "requested": requested,
         "updated": upserted,
         "skipped_missing_attrs": skipped_missing_attrs,
@@ -945,9 +1013,15 @@ async fn main() -> Result<()> {
 
     if args.verify {
         let diverged = divergences(&rows);
+        // 乖離 0 件が「全件一致」なのか「辺も属性も空」なのかを読み手が区別できるようにする。
+        // B2-1 の受理条件が「--verify の乖離 0 件」なので、ここを出さないと射影が完全に空の
+        // まま受理できてしまう。
+        let (sections_with_concepts, total_edge_mentions) = concept_coverage(&rows);
         let summary = json!({
             "total_sections": rows.len(),
             "diverged": diverged.len(),
+            "sections_with_concepts": sections_with_concepts,
+            "total_edge_mentions": total_edge_mentions,
             // 乖離 0 件が「全件検査した結果の 0」なのか「部分集合に対する 0」なのかを
             // 読み手が区別できるようにする（B2-1 の受理条件が「--verify の乖離 0 件」のため）。
             "truncated": truncated,
@@ -996,7 +1070,8 @@ mod tests {
         }
     }
 
-    /// 8 required 属性が全部入った最小 HashMap（`missing_required_attrs` のテストで使う）。
+    /// required 属性が全部入った最小 HashMap（`missing_required_attrs` のテストで使う）。
+    /// `REQUIRED_ATTRS` から生成するので、属性が増えてもこのヘルパは追随する。
     fn full_attrs() -> HashMap<String, String> {
         REQUIRED_ATTRS
             .iter()
@@ -1175,6 +1250,19 @@ mod tests {
             );
         }
         assert_eq!(node.node_type, "ManualSection");
+    }
+
+    #[test]
+    fn concept_coverage_distinguishes_all_correct_from_nothing_retrieved() {
+        // 「全件既に正しい」と「Concept が 1 件も引けていない」はどちらも updated:0 /
+        // diverged:0 になるが意味は正反対。summary でこれを区別するための指標。
+        let all_empty = vec![row("s1", &[]), row("s2", &[])];
+        assert_eq!(concept_coverage(&all_empty), (0, 0));
+
+        let mixed = vec![row("s1", &["a", "b"]), row("s2", &["a"]), row("s3", &[])];
+        assert_eq!(concept_coverage(&mixed), (2, 3));
+
+        assert_eq!(concept_coverage(&[]), (0, 0));
     }
 
     #[test]
