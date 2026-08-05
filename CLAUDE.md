@@ -213,7 +213,8 @@ cs-support-mcp/
 - **confused deputy 対策は redirect_uri の許可リスト。** `/oauth/register`（DCR）は無認証のため、redirect_uri を無制限に受け付けると第三者が任意ホストの redirect_uri を登録でき、`callback` がその第三者へ認可コードを配送してしまう。`is_acceptable_redirect_uri`（`server/src/oauth/authserver.rs`）が https を `claude.ai` へのホスト完全一致（サフィックス一致ではない）に、http を loopback のみに絞ることでこの経路を閉じている。一時期はこれを自前の同意画面（`/oauth/consent`）で塞いでいたが、許可リスト導入により経路自体が消えたため撤去済み。**2 段目のリダイレクト（この AS → 動的登録クライアント）は Google 側の redirect_uri 設定では一切守られない**点に注意（1 段目の `https://<host>/oauth/callback` 登録とは別物）。詳細: `docs/superpowers/specs/2026-07-22-restrict-redirect-uri-design.md`。
 - **失効は Google 側で行う。** このサーバは失効台帳を持たないため、個別のトークン失効手段が無い。利用者単位の失効は Google アカウントのアクセス権限管理から行う。
 - 署名が必要なのは client_id / state / 認可コードだけ（改竄されると redirect_uri の書き換えや認可コード偽造が成立するため）。**署名鍵は `CS_SUPPORT_OAUTH_SIGNING_KEY`（Secret Manager 注入）から読む。** 未設定だと起動時に CSPRNG で生成して warn するが、その状態では**再起動・コールドスタートのたびに利用者の接続が切れる**（下記）。
-- **再起動時の影響**: 進行中のログインフロー（state / 認可コード、最長 600 秒）と DCR 登録は無効になる。DCR は claude.ai が再登録すれば自動的に回復する。**アクセストークンとリフレッシュトークンは Google 発行なので、再起動しても利用者はログアウトしない。**
+- **再起動時の影響**: **署名鍵が同一なら、進行中のログインフロー（state / 認可コード、最長 600 秒）も DCR 登録も再起動をまたいで有効**。アクセストークンとリフレッシュトークンは Google 発行なのでそもそもプロセス状態に依存しない。
+  - **鍵が変わると（＝未注入時は毎回）両方が無効になり、`grant_type=refresh_token` が `unverifiable_client_id` → `invalid_grant` で落ちて全利用者が再ログインになる。** 「DCR は claude.ai が再登録すれば自動回復する」はリフレッシュ経路には当てはまらない（claude.ai はリフレッシュ前に登録をやり直さず、`invalid_grant` を受け取るだけ）。**これが 2026-08 まで実際に起きていた不具合である。**
 - リクエスト経路の Bearer 検証は `GoogleTokenVerifier`（tokeninfo 照会）。`aud` の完全一致・`email_verified`・安定した `sub` の取得・TTL キャッシュを行う。Google に到達できない場合は **503** を返す（401 に倒すと Google 障害が全利用者の強制ログアウトに化けるため）。
 - **警告**: 現状、Google アカウントで認証さえ通れば誰でも supervisor として `add_known_resolution` を含む全操作を実行できる（`server/src/harness/authn.rs` の `lookup_by_identity` が突合を行わず無条件に supervisor 解決するため）。actor 突合表の DB 実装が入るまで、アクセス制御としては不十分と扱うこと。詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
 - **警告（上記の規模）**: Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済みで、テストユーザによる制限は無い。したがって上記「誰でも」の母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。OAuth クライアントが Internal（組織限定）だと仮定しないこと。
@@ -430,21 +431,46 @@ gcloud run jobs update backfill-concept-keys --project sivira-cs-support --regio
 
 `CS_SUPPORT_OAUTH_SIGNING_KEY` が未注入だと、デプロイ・コールドスタートのたびに利用者の接続が切れる（上記「警告」を参照）。secret を 1 度だけ作り、service に注入する。
 
+**鍵材料は必ず `openssl rand -base64 32` の出力を使うこと。** 実装の長さ検査（32 バイト）は長さしか見ておらず、覚えやすい 32 文字も通る。鍵が推測されると redirect_uri 許可リストの迂回と、認可コードの復号（＝利用者の Google トークン取得）が両方成立する（下記「blast radius」）。
+
 ```sh
 openssl rand -base64 32 | gcloud secrets create cs-support-oauth-signing-key --project sivira-cs-support --data-file=-
 
-gcloud run services update cs-support-mcp --project sivira-cs-support --region asia-northeast1 --update-secrets CS_SUPPORT_OAUTH_SIGNING_KEY=cs-support-oauth-signing-key:latest
+# **IAM 付与を忘れないこと。** ランタイム SA がこの secret を読めないと revision の起動に
+# 失敗し、デプロイごとサービスが落ちる（新 secret を足すときの定番の踏み外し）。
+# <runtime-sa> は既存 3 secret と同じ SA。`gcloud run services describe cs-support-mcp
+# --format='value(spec.template.spec.serviceAccountName)'` で確認する。
+gcloud secrets add-iam-policy-binding cs-support-oauth-signing-key --project sivira-cs-support --member serviceAccount:<runtime-sa> --role roles/secretmanager.secretAccessor
+
+# バージョンは :latest ではなく番号で固定する（理由は下記ローテート手順）。
+gcloud run services update cs-support-mcp --project sivira-cs-support --region asia-northeast1 --update-secrets CS_SUPPORT_OAUTH_SIGNING_KEY=cs-support-oauth-signing-key:1
 ```
 
 注入後の 1 回だけは全クライアントが再接続を要求される（鍵が変わるため）。以降は切れない。
+
+**デプロイ後に必ず確認すること**（これをやらないと「直った」と言えない）:
+
+1. ログに `CS_SUPPORT_OAUTH_SIGNING_KEY is not set` の warn が**出ていない**こと。出ていたら注入が効いておらず何も直っていない
+2. ログに `google did not return a refresh_token` の warn が**出ていない**こと。出ていたら原因は別で、この修正では解決しない
+3. **コールドスタートを 1 回はさんで（15 分以上アイドル → 再アクセス）接続が維持されること。** これが受け入れ基準そのもの
 
 鍵をローテートする（＝全 DCR 登録と進行中ログインフローを一括無効化する）場合:
 
 ```sh
 openssl rand -base64 32 | gcloud secrets versions add cs-support-oauth-signing-key --project sivira-cs-support --data-file=-
 
-gcloud run services update cs-support-mcp --project sivira-cs-support --region asia-northeast1 --update-secrets CS_SUPPORT_OAUTH_SIGNING_KEY=cs-support-oauth-signing-key:latest
+# **バージョンを番号で指定する。** `:latest` のままだと service spec が変化せず
+# `gcloud run services update` が no-op になり、新 revision が作られない。Cloud Run が
+# `:latest` を解決するのはインスタンス起動時なので、鍵が実際に切り替わるのは「たまたま
+# 次にコールドスタートしたとき」になり、失効したつもりで失効していない状態が生まれる。
+gcloud run services update cs-support-mcp --project sivira-cs-support --region asia-northeast1 --update-secrets CS_SUPPORT_OAUTH_SIGNING_KEY=cs-support-oauth-signing-key:<new-version>
 ```
+
+**この secret の blast radius（受容したリスクとして記録）**: `authorize` は署名済み `Blob::Client` 内の `redirect_uris` へのメンバシップ照合しか行わず、`is_acceptable_redirect_uri`（claude.ai へのホスト完全一致）を再適用しない。したがって**この鍵を読める者は任意の redirect_uri を持つ client_id を自分で鋳造でき、許可リストを完全に迂回できる**。`/oauth/callback` が封緘済み認可コードを攻撃者ホストへ配送し、同じ鍵から派生した AEAD 鍵で復号すれば、ログインした利用者の Google access_token / refresh_token が手に入る。
+
+- 鍵をプロセスメモリのみに置いていた頃は、奪取に稼働中コンテナへの侵入が必要だった。**永続化により、Secret Manager・Cloud Run の env 設定・`gcloud secrets create` を叩いた端末のシェル履歴に残る長寿命の値になった**
+- したがって `roles/secretmanager.secretAccessor` は**この secret 単体に対してランタイム SA のみ**へ付与する（プロジェクト全体付与にしない）
+- 恒久対処は `authorize` とリダイレクト直前で `is_acceptable_redirect_uri` を**再適用**すること。鍵漏洩だけでは confused deputy が成立しなくなる（別途対応）
 
 ### 認証（OAuth 2.1 フェデレーション、実測済み）
 

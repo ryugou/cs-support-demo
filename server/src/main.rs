@@ -309,6 +309,13 @@ fn read_bearer_token(args: &Args) -> Result<String> {
 /// 空白が混入していたこと」に気づけない。ここで trim した上で空文字を弾き、
 /// 以降は trim 済みの値だけが下流（tokeninfo への aud 送信、metadata URL 組み立て）
 /// に渡るようにする（`read_secret_file` が trim 後に空文字を弾くのと同じ方針）。
+fn require_nonempty_env(name: &str, value: Option<String>, guidance: &str) -> Result<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .with_context(|| format!("{name} is required and must not be empty; {guidance}"))
+}
+
 /// OAuth 署名鍵を解決する純関数（env 値を引数で受けるのでテストできる）。
 ///
 /// - 値がある → `SigningKey::from_secret`。**短すぎる材料は起動時に弾く**（fail closed）。
@@ -317,9 +324,11 @@ fn read_bearer_token(args: &Args) -> Result<String> {
 ///   スタートのたびに DCR 登録が無効になり、refresh が `invalid_grant` で落ちて利用者が
 ///   再ログインを強いられる。本番でこれに気づかないのが最悪なので黙って落とさない
 ///
-/// 空文字・空白のみは「未設定」ではなく**設定ミス**として扱い、生成鍵へ落とさずエラーに
-/// する（Secret Manager のマウント漏れを、動くけれど毎回ログアウトする状態として
-/// 通過させないため）。
+/// **空文字・空白のみは「未設定」ではなく設定ミスとして扱い、生成鍵へ落とさずエラーにする。**
+/// 上の `require_nonempty_env` は `None` と `Some("")` を同じ扱いにするが、**ここでその
+/// イディオムに揃えてはいけない** — Secret Manager のマウント漏れ（空文字が入る）が
+/// silent に生成鍵フォールバックへ落ち、warn だけ出して「動くが毎回ログアウトする」状態が
+/// 再発する。この非対称は意図的であり、テストで固定してある。
 fn resolve_signing_key(
     configured: Option<String>,
 ) -> Result<cs_support_mcp::oauth::signing::SigningKey> {
@@ -342,13 +351,6 @@ fn resolve_signing_key(
             Ok(SigningKey::generate())
         }
     }
-}
-
-fn require_nonempty_env(name: &str, value: Option<String>, guidance: &str) -> Result<String> {
-    value
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .with_context(|| format!("{name} is required and must not be empty; {guidance}"))
 }
 
 #[cfg(test)]
@@ -388,6 +390,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, "abc");
+    }
+
+    /// 未設定は生成鍵へフォールバックする（ローカル開発を壊さないため）。
+    /// **これが許されるのは「未設定」だけ**である（下の 2 件と対で読むこと）。
+    #[test]
+    fn resolve_signing_key_falls_back_to_a_generated_key_when_unset() {
+        assert!(resolve_signing_key(None).is_ok());
+    }
+
+    /// **`require_nonempty_env` のイディオムへ揃えてはいけない**ことを固定する。
+    ///
+    /// あちらは `None` と `Some("")` を同じ扱い（どちらもエラー）にしているが、こちらは
+    /// `None` = 生成鍵 / `Some("")` = **エラー**という非対称を意図的に持つ。将来「一貫性の
+    /// ために揃えよう」と `.filter(|s| !s.is_empty())` を挟むと、Secret Manager のマウント
+    /// 漏れ（空文字が入る）が silent に生成鍵フォールバックへ落ち、warn だけ出して
+    /// 「動くが再起動のたびに全利用者がログアウトする」という本番障害が完全に再発する。
+    #[test]
+    fn resolve_signing_key_rejects_empty_value_instead_of_falling_back() {
+        let err = resolve_signing_key(Some(String::new())).unwrap_err();
+        assert!(
+            err.to_string().contains("CS_SUPPORT_OAUTH_SIGNING_KEY"),
+            "the error must name the env var so the operator can act: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_signing_key_rejects_whitespace_only_value_instead_of_falling_back() {
+        assert!(resolve_signing_key(Some("   ".to_string())).is_err());
+    }
+
+    /// 十分な長さの材料は受理する（`openssl rand -base64 32` は 44 バイトを出力する）。
+    #[test]
+    fn resolve_signing_key_accepts_material_from_openssl_rand_base64_32() {
+        let realistic = "K7dQ2mVx8pL4nR6tY9wZ1aB3cD5eF0gH2iJ4kL6mN8o=";
+        assert_eq!(realistic.len(), 44);
+        assert!(resolve_signing_key(Some(realistic.to_string())).is_ok());
     }
 
     /// W2（reviewer 指摘）: 空白のみの値（例: Secret Manager に誤って " " だけが

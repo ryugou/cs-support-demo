@@ -107,7 +107,12 @@ impl fmt::Debug for SigningKey {
 const GENERATED_KEY_BYTES: usize = 32;
 
 /// 運用者が設定する鍵材料の最小バイト数（`SigningKey::from_secret`）。
-/// 生成鍵と同じ強度を下限として要求する。
+///
+/// **これは長さの下限であって、エントロピーの保証ではない。** `"password123password123password12"`
+/// のような 32 文字も通る。鍵が推測可能だと、①`Blob::Client` の偽造（＝ redirect_uri 許可リストの
+/// 迂回）と ②認可コード・state ブロブの復号（＝ Google の access_token / refresh_token の平文取得）
+/// の**両方**が成立する（AEAD 鍵も `BLOB_ENCRYPTION_INFO` により同じ秘密から派生しているため）。
+/// **必ず `openssl rand -base64 32` の出力を使うこと。**
 const MIN_CONFIGURED_KEY_BYTES: usize = 32;
 
 impl SigningKey {
@@ -141,6 +146,8 @@ impl SigningKey {
     ///
     /// 鍵材料は最低 32 バイト要求する。短い材料を黙って受けると、運用者が「設定した」と
     /// 思ったまま脆い鍵で署名し続けることになる（設定ミスは起動時に気づける形にする）。
+    /// **ただしこれは長さの検査であって、エントロピーの検査ではない**
+    /// （`MIN_CONFIGURED_KEY_BYTES` の doc を参照。必ず `openssl rand -base64 32` を使う）。
     pub fn from_secret(secret: &str) -> Result<Self, String> {
         let trimmed = secret.trim();
         if trimmed.len() < MIN_CONFIGURED_KEY_BYTES {

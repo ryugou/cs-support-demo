@@ -21,7 +21,11 @@ use std::sync::Arc;
 ///   トークンがこのサーバの全 project の endpoint で通る**（`authserver` の
 ///   モジュールコメント参照）。旧実装の `aud` 照合はここで失われている。
 /// - 利点: 失効が Google 側の操作でそのまま効く。こちらは失効台帳を持たない。
-/// - 利点: 署名鍵に依存しないので、**プロセス再起動で利用者がログアウトしない**。
+/// - 利点: **このミドルウェア自体は**署名鍵に依存しない（検証は Google tokeninfo のみ）。
+///   ただし**リフレッシュ経路（`authserver::token_from_refresh`）は署名鍵に依存する**ので、
+///   「再起動で利用者がログアウトしない」は署名鍵が同一である場合に限る。鍵が起動ごとに
+///   変わると、アクセストークンが切れた時点の refresh が `invalid_grant` で落ちて再ログインに
+///   なる（`signing.rs` のモジュールコメント参照）。
 ///
 /// `verifier` は project 間で共有する（Google の client_id 単位の検証であり
 /// project 非依存）。`resource_metadata_url` は project ごとに異なるため、
