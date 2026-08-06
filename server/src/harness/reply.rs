@@ -666,10 +666,13 @@ mod tests {
     }
 
     #[test]
-    fn generated_draft_is_subject_to_the_egress_gate() {
-        // spec「egress 位置の固定」: AI 生成 draft も人間製 outbound も同一ゲートを通す。
-        // Harness::draft_customer_reply が egress_gate を呼ぶことの根拠となる挙動を、
-        // ゲート単体で固定する（LLM 応答はモックできないため、gate の判定側を押さえる）。
+    fn egress_gate_blocks_and_abstains_on_ng_terms() {
+        // **これはゲート単体の判定テストであり、配線の検証ではない。**
+        // 「`draft_customer_reply` が生成結果を実際に `egress_gate` へ通していること」
+        // （spec S1-4「egress 位置の固定」）は、stub LLM に下書きを喋らせる
+        // `harness::mod` の tests（`a_generated_draft_with_a_blocked_ng_term_is_dropped` /
+        // `..._abstain_...` / `a_clean_generated_draft_is_returned_as_is`）が見ている。
+        // ここで配線を主張しないこと（このテストは呼び出し側を一切見ていない）。
         use crate::harness::egress::{
             egress_gate, EgressVerdict, EmitChannel, EmitContext, NgDictionary,
         };

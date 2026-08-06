@@ -1263,4 +1263,159 @@ mod tests {
             )
             .is_err());
     }
+
+    // ---- 下書き生成と出口ゲートの**配線**（spec S1-4「egress 位置の固定」）----
+    //
+    // 以下 3 件は `draft_customer_reply` が生成結果を実際に `egress_gate` へ通していることを、
+    // stub LLM に下書きを喋らせて検証する。**ゲート単体の判定テストではない**
+    // （それは `egress.rs` の tests と `reply.rs` の
+    // `egress_gate_blocks_and_abstains_on_ng_terms` が持つ）。
+    //
+    // ここを間接的な検証（ゲート単体の呼び出し）で済ませると、`draft_customer_reply` から
+    // `egress_gate` の呼び出しを外しても**全テストが緑のまま NG 表現の統制だけが外れる**。
+
+    /// 本番（Cloud Run）が読むのと同じ NG 辞書。**推測の NG 語をテストに書かない**ため、
+    /// 実データを読み、そこから語を取る（`server/config.cloudrun.toml` の
+    /// `ng_dictionary_path = "data/urtect/ng-dictionary.json"`）。
+    /// パスは cwd 非依存にする（`cargo test` の起動位置に依存させない）。
+    fn production_ng_dictionary() -> egress::NgDictionary {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/urtect/ng-dictionary.json"
+        ));
+        egress::NgDictionary::from_path(path).expect("production ng dictionary must load and parse")
+    }
+
+    fn operator_emit_context() -> egress::EmitContext {
+        egress::EmitContext {
+            channel: egress::EmitChannel::Operator,
+        }
+    }
+
+    /// stub LLM に `draft_text` をそのまま返させ、`draft_customer_reply` の結果を返す。
+    ///
+    /// `AnthropicClient` のフィールドは `llm.rs` で private なので `from_config` 経由で組む。
+    /// API キーは env `CS_SUPPORT_LLM_API_KEY` が優先されるが、未設定の環境でも構築できるよう
+    /// 一時ファイルを置く（stub は鍵を検証しない。ここで必要なのは「鍵が解決できて client が
+    /// 構築されること」だけ）。env を書き換えないのは、並行テストと競合させないため。
+    async fn draft_customer_reply_via_stub(draft_text: &str) -> Option<crate::llm::ReplyDraft> {
+        let body = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": draft_text}],
+        })
+        .to_string();
+        let (endpoint, _log) = crate::llm::test_support::spawn_messages_stub(body).await;
+
+        let dir = std::env::temp_dir().join(format!("harness-reply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let key_path = dir.join("llm-api-key");
+        std::fs::write(&key_path, "test-key\n").expect("write api key file");
+        let drafter = crate::llm::AnthropicClient::from_config(&crate::config::LlmConfig {
+            enabled: true,
+            endpoint,
+            api_key_file: Some(key_path.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .expect("llm client must build from the stub config")
+        .expect("enabled = true with a readable key file must yield a client");
+
+        let harness = Harness {
+            reply_drafter: Some(drafter),
+            ng: production_ng_dictionary(),
+            ..harness_for_test()
+        };
+        let decision = decision::AnswerDecision::Allowed {
+            source: decision::AnswerSource::Manual,
+            evidence_section_keys: vec!["sec-a".to_string()],
+            known_resolution_id: None,
+            stakes: decision::Stakes::Low,
+            threshold: 0.6,
+        };
+        let hits = vec![SectionHit {
+            section_key: "sec-a".to_string(),
+            title_ja: "タイトル".to_string(),
+            body_ja: Some("マニュアル本文".to_string()),
+            body_en: None,
+            translation_status: None,
+            breadcrumb: Vec::new(),
+            score: 0.9,
+            source_url: None,
+        }];
+        harness
+            .draft_customer_reply("カメラが反応しません", &decision, &hits, &[])
+            .await
+    }
+
+    /// 「NG 表現を含まない下書きなら通る」ことは、**下記 2 件の偽陽性を潰すために必須**。
+    /// これが無いと、`reply_drafter` を無効化しただけ（＝そもそも生成されない）でも
+    /// 「ゲートが効いた」ように見えて 2 件とも緑になる。
+    #[tokio::test]
+    async fn a_clean_generated_draft_is_returned_as_is() {
+        const CLEAN: &str =
+            "お問い合わせありがとうございます。担当部署より改めてご連絡いたします。";
+        // 前提の明示: この文面は NG 辞書に触れていない（辞書が育って触れた場合は
+        // ここが落ち、テスト本体の失敗と区別できる）。
+        assert!(
+            matches!(
+                egress::egress_gate(CLEAN, &operator_emit_context(), &production_ng_dictionary()),
+                egress::EgressVerdict::Pass
+            ),
+            "precondition: pick a draft text that the current NG dictionary passes"
+        );
+        let draft = draft_customer_reply_via_stub(CLEAN)
+            .await
+            .expect("a draft with no NG term must survive the gate");
+        // 生成結果がそのまま返ること。null でないだけでなく**本文が一致する**ことを見るのは、
+        // 下書きが実際に stub から流れてきた証拠にするため。
+        assert_eq!(draft.text, CLEAN);
+        assert!(!draft.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_generated_draft_with_a_blocked_ng_term_is_dropped() {
+        let ng = production_ng_dictionary();
+        let term = ng
+            .block_terms
+            .first()
+            .expect("the production NG dictionary must have at least one block term")
+            .clone();
+        let drafted =
+            format!("お問い合わせありがとうございます。本製品は「{term}」とご案内しております。");
+        assert!(
+            matches!(
+                egress::egress_gate(&drafted, &operator_emit_context(), &ng),
+                egress::EgressVerdict::Block { .. }
+            ),
+            "precondition: the term taken from the dictionary must actually block"
+        );
+        assert!(
+            draft_customer_reply_via_stub(&drafted).await.is_none(),
+            "draft_customer_reply must run the generated draft through egress_gate and drop a \
+             blocked one (customer_reply_draft = null)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generated_draft_with_an_abstain_ng_term_is_dropped() {
+        // block だけを特別扱いする実装（abstain を素通し）を許さない。
+        let ng = production_ng_dictionary();
+        let term = ng
+            .abstain_terms
+            .first()
+            .expect("the production NG dictionary must have at least one abstain term")
+            .clone();
+        let drafted =
+            format!("お問い合わせありがとうございます。本製品は「{term}」とご案内しております。");
+        assert!(
+            matches!(
+                egress::egress_gate(&drafted, &operator_emit_context(), &ng),
+                egress::EgressVerdict::Abstain { .. }
+            ),
+            "precondition: the term taken from the dictionary must actually abstain"
+        );
+        assert!(
+            draft_customer_reply_via_stub(&drafted).await.is_none(),
+            "abstain is 'do not emit' too; the draft must be dropped, not passed through"
+        );
+    }
 }

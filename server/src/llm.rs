@@ -332,19 +332,24 @@ fn strip_markdown_fence(text: &str) -> &str {
         .trim()
 }
 
+/// テスト専用の Anthropic Messages API stub。**`llm` と `harness` の両方から使う。**
+///
+/// 固定 JSON を返す使い捨てサーバ（`oauth::verifier` の `spawn_tokeninfo_stub` と同じ手法）。
+///
+/// - `llm` 側の用途: この機能はテストされていない文字列 2 個（serde のフィールド名
+///   `stop_reason` と値 `"max_tokens"`）に全体重が乗っているため、実 HTTP 経路を通して固定する。
+///   どちらかが typo / API 側の表記変更 / リファクタで壊れると `truncated` が常に false へ落ち、
+///   **テストは緑のまま**危険な挙動へ静かに戻る。
+/// - `harness` 側の用途: `Harness::draft_customer_reply` が生成した下書きを `egress_gate` に
+///   通していること（spec S1-4「egress 位置の固定」）を、**実際に下書きを生成させて**検証する。
+///   モデル応答を差し替えられないと、この配線は間接的にしか確かめられない。
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    /// stub が受け取った生リクエスト（`oauth::verifier` の `RequestLog` と同じ用途）。
+    pub(crate) type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-    /// 固定 JSON を返す使い捨て Messages API stub（`oauth::verifier` の
-    /// `spawn_tokeninfo_stub` と同じ手法）。**この機能はテストされていない文字列 2 個
-    /// （serde のフィールド名 `stop_reason` と値 `"max_tokens"`）に全体重が乗っている**ため、
-    /// 実 HTTP 経路を通して固定する。どちらかが typo / API 側の表記変更 / リファクタで
-    /// 壊れると `truncated` が常に false へ落ち、**テストは緑のまま**危険な挙動へ静かに戻る。
-    /// stub が受け取った生リクエスト（`spawn_tokeninfo_stub` の `RequestLog` と同じ用途）。
-    type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
-
-    async fn spawn_messages_stub(body: &'static str) -> (String, RequestLog) {
+    /// `body` を返す stub を起動し、`(endpoint, request_log)` を返す。
+    pub(crate) async fn spawn_messages_stub(body: String) -> (String, RequestLog) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests: RequestLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -352,13 +357,35 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let log = requests_for_task.clone();
+                let body = body.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = [0u8; 8192];
-                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    // **リクエストを最後まで読み切ってから応答する。** 1 回の `read` で
+                    // 打ち切って応答すると、本文が 1 セグメントに収まらない場合
+                    // （harness の下書き要求は system prompt だけで数 KB になる）に、
+                    // client がまだ送信中の接続をこちらから閉じることになる。client 側は
+                    // `connection reset` を受け、テストが「生成失敗」経路へ落ちて**別のもの
+                    // を検証している**状態になる。
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => raw.extend_from_slice(&buf[..n]),
+                            Err(err) => {
+                                // 握り潰すと、client 側には「応答が来ない」としか見えず
+                                // 原因（stub がリクエストを読み切れなかった）に辿り着けない。
+                                eprintln!("messages stub: failed to read the request: {err}");
+                                break;
+                            }
+                        }
+                        if request_is_complete(&raw) {
+                            break;
+                        }
+                    }
                     log.lock()
                         .unwrap()
-                        .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                        .push(String::from_utf8_lossy(&raw).to_string());
                     // content-length は **バイト長**（`str::len()`）で出す。日本語本文を
                     // `chars().count()` で数えると実バイト数より小さくなり、client 側で
                     // body が欠けるかハングする。
@@ -373,6 +400,33 @@ mod tests {
         });
         (format!("http://{addr}/v1/messages"), requests)
     }
+
+    /// 受信済みバイト列が HTTP リクエスト 1 本として完結しているか
+    /// （ヘッダ終端 + `Content-Length` 分の本文が揃ったか）。
+    /// `Content-Length` が無いリクエストはヘッダ終端で完結とみなす。
+    fn request_is_complete(raw: &[u8]) -> bool {
+        let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&raw[..head_end]);
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if !name.trim().eq_ignore_ascii_case("content-length") {
+                    return None;
+                }
+                value.trim().parse::<usize>().ok()
+            })
+            .unwrap_or(0);
+        raw.len() >= head_end + 4 + content_length
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::spawn_messages_stub;
+    use super::*;
 
     fn stub_client(endpoint: String) -> AnthropicClient {
         AnthropicClient {
@@ -396,7 +450,8 @@ mod tests {
     #[tokio::test]
     async fn draft_reply_reports_truncation_when_stop_reason_is_max_tokens() {
         let (endpoint, _log) = spawn_messages_stub(
-            r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"途中まで書いた下書き"}]}"#,
+            r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"途中まで書いた下書き"}]}"#
+                .to_string(),
         )
         .await;
         let draft = stub_client(endpoint)
@@ -413,7 +468,8 @@ mod tests {
     #[tokio::test]
     async fn draft_reply_reports_complete_when_stop_reason_is_end_turn() {
         let (endpoint, _log) = spawn_messages_stub(
-            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"完成した下書き"}]}"#,
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"完成した下書き"}]}"#
+                .to_string(),
         )
         .await;
         let draft = stub_client(endpoint)
@@ -429,7 +485,8 @@ mod tests {
     #[tokio::test]
     async fn draft_reply_treats_a_missing_stop_reason_as_not_truncated() {
         let (endpoint, _log) =
-            spawn_messages_stub(r#"{"content":[{"type":"text","text":"下書き"}]}"#).await;
+            spawn_messages_stub(r#"{"content":[{"type":"text","text":"下書き"}]}"#.to_string())
+                .await;
         let draft = stub_client(endpoint)
             .draft_reply("sys", "user", 700)
             .await
@@ -449,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn request_uses_the_argument_max_tokens_not_the_client_default() {
         let (endpoint, log) = spawn_messages_stub(
-            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"x"}]}"#,
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"x"}]}"#.to_string(),
         )
         .await;
         // stub_client の self.max_tokens は 300。引数には 700 を渡す。
