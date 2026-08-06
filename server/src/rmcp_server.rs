@@ -617,7 +617,7 @@ impl CsSupportRmcpServer {
         //
         // 分節のラベル（【…】）は、呼び出し方の要件（case_id）と返却物の処理を
         // モデルが取り違えないために置いている。
-        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。【返却された customer_reply_draft の扱い】customer_reply_draft は検証前の下書きであり、承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れているため、そのまま顧客へ送らないこと。decision.decision が allowed の場合に限り、hits と突き合わせて補完してよい。decision.decision が escalate の場合は、解決方法・手順を一切補わず、取り次ぐ旨に留めること。"
+        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。【返却された customer_reply_draft の扱い】customer_reply_draft は検証前の下書きであり、承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れているため、そのまま顧客へ送らないこと。decision.decision が allowed の場合に限り、hits と突き合わせて補完してよい。decision.decision が escalate の場合は、解決方法・手順を一切補わず、取り次ぐ旨に留めること（判定を無効化するため）。"
     )]
     async fn evaluate_answerability(
         &self,

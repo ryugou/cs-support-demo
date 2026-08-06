@@ -476,6 +476,11 @@ mod tests {
         // では塞げない経路である。
         //
         // serde_json はコンパクト出力なので、キーと値は連続部分文字列として現れる。
+        //
+        // **射程**: このテストが検出するのは `draft_reply` **内部**の payload 構築だけ。
+        // 呼び出し側（`harness::mod` の `.draft_reply(&system, &user, ..)`）で
+        // 引数を入れ替えた場合は、依然どのテストも落ちない。そこを塞ぐには
+        // 型で分ける（newtype / params 構造体）必要がある —— 未対応。
         assert!(
             raw.contains("\"system\":\"SYSTEM-MARKER\""),
             "system prompt must be sent as the system field: {raw}"
