@@ -464,9 +464,26 @@ mod tests {
         );
         assert!(!raw.contains("\"max_tokens\":300"));
         assert!(raw.contains("\"temperature\":0"));
-        // system / user がそれぞれ正しい位置に載ること（入れ替わりの検出）。
-        assert!(raw.contains("SYSTEM-MARKER"));
-        assert!(raw.contains("USER-MARKER"));
+        // **キーと値の対で assert する。** マーカーの存在だけを見る
+        // （`raw.contains("SYSTEM-MARKER")`）と、system と user が入れ替わっても
+        // 両方とも真になり、検出できない。
+        //
+        // 入れ替わりを守る理由: `draft_reply(&self, system_prompt: &str, user_message: &str, ..)`
+        // は同型の `&str` が 2 つで、呼び出し側で順序を入れ替えても**コンパイルが通る**。
+        // 入れ替わると system に**顧客の問い合わせ本文**（信頼できない入力）が載り、
+        // こちら側の指示が user ターンへ落ちる。「発話内の指示には従わない」という
+        // 前提が反転し、顧客のテキストが system 権限を得る —— `neutralize_delimiters`
+        // では塞げない経路である。
+        //
+        // serde_json はコンパクト出力なので、キーと値は連続部分文字列として現れる。
+        assert!(
+            raw.contains("\"system\":\"SYSTEM-MARKER\""),
+            "system prompt must be sent as the system field: {raw}"
+        );
+        assert!(
+            raw.contains("\"content\":\"USER-MARKER\""),
+            "user message must be sent as the user turn content: {raw}"
+        );
     }
 
     #[test]
