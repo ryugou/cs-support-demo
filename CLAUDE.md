@@ -408,6 +408,11 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
   さらに `[harness] customer_reply_draft_enabled = true`（デモ用の返信文下書き）のときは、**evaluate 1 回につき Anthropic 呼び出しが 1 回増え、Allowed 時はマニュアル抜粋（最大 2,500 字 × 3 件）または known_resolution の回答本文も送信される**（質問本文 2,000 字と合わせて、**抜粋が上限まで埋まった場合の最大で** 1 下書きあたり概ね 8〜11k トークン。短い記事ではこれを大きく下回る）。切り戻しは `server/config.cloudrun.toml` のこの行を `false` にして再デプロイするだけ。下書きは `egress_gate` を通っており、NG 表現が出た場合は `customer_reply_draft` が `null` になる（理由は warn ログに出る）。
   `VEGAPUNK_BEARER_TOKEN` 未設定時は起動自体は成功するが、vegapunk 呼び出し（`search_manual` 等）だけが
   失敗する（`server/src/main.rs` の `read_bearer_token`。空文字がそのまま使われるため fail-closed にならない点に注意）。
+- **`[harness] manual_scoring_v2_enabled = true`（manual 検索スコア v2）**: 型番 run 除外 / TF / 長さ正規化 / 密度 tiebreak の **4 つをまとめて**切り替える kill switch（既定 false、Cloud Run 構成でのみ true）。**切り戻しは `server/config.cloudrun.toml` のこの行を `false` にして再デプロイするだけ**で、スコアも順位も従来へ完全に戻る。
+  - 入れた理由: 型番を書いて質問すると、**製品非依存で書かれた正解記事が構造的に減点され**、型番をたまたま含む無関係な長文が上位に来ていた（本番実測。詳細と実測値は `docs/superpowers/specs/2026-08-05-manual-scoring-tf-lengthnorm-design.md`）。順位は `evaluate_answerability` の返信文下書きが使う材料（上位 3 件）を決めるため、**順位汚染はそのまま下書きの品質に出る**。
+  - **corpus 全体の recall は未測定**（vegapunk 不介入のため）。保証しているのは実データ 5 記事に対する順位と、スコアが 0〜1 に収まることだけ。vegapunk 復旧後に `verify_alarmcom` で before/after を測り、閾値の妥当性を再確認すること。
+  - **既知の限界**: カテゴリのハブページ（`/Partner` 等の目次的な記事）は語彙統計では正解記事と区別できず、上位に残りうる。誤った手順は持ち込まないが、材料の 1 枠を消費する。
+- **抜粋の切り詰めは warn に出る**（`server/src/harness/reply.rs` の `truncate_material`）。実データでは記事 5 件中 2 件が `MAX_EXCERPT_CHARS = 2,500` を超え（5,175 字 / 5,477 字）、**半分近くが落ちる**。下書きが「資料に記載がありません」と答えたら、まずこの warn（`route` / `material_id` / `original_chars`）を確認すること。
 
 ビルド & デプロイ:
 
