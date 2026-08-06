@@ -101,6 +101,11 @@ struct Args {
     /// `vector_route_enabled = true` と揃え、本番 retrieval と同条件で計測する）。
     #[arg(long)]
     no_vector_route: bool,
+    /// manual スコア v2（TF / 長さ正規化 / 型番 run 除外）を無効化する。既定は ON
+    /// （本番 config.cloudrun.toml の `manual_scoring_v2_enabled = true` と揃え、本番
+    /// retrieval と同条件で計測する）。before/after の recall 比較にはこのフラグを使う。
+    #[arg(long)]
+    no_manual_scoring_v2: bool,
 }
 
 /// token 解決: 既定は --token-file、ファイルが無い/読めない場合のみ --token-env。
@@ -314,6 +319,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let token = read_token(&args)?;
     let vector_route = !args.no_vector_route;
+    let manual_scoring_v2 = !args.no_manual_scoring_v2;
     let top_k = args.top_k.max(1);
 
     let lexicon = LexiconNormalizer::from_path(&args.lexicon_file)
@@ -330,7 +336,7 @@ async fn main() -> Result<()> {
 
     let client = Arc::new(VegapunkClient::connect(&args.endpoint, &token).await?);
     let corpus = Arc::new(CorpusLoader::new(client.clone()));
-    let store = ManualStore::new(client.clone(), corpus);
+    let store = ManualStore::new(client.clone(), corpus, manual_scoring_v2);
 
     // ---- should-hit: alarmcom section を決定論サンプリングして質問→retrieval ----
     let mut sections = client
@@ -465,6 +471,7 @@ async fn main() -> Result<()> {
         "doc_key": DOC_KEY,
         "top_k": top_k,
         "vector_route_enabled": vector_route,
+        "manual_scoring_v2_enabled": manual_scoring_v2,
         "miss_threshold": args.miss_threshold,
         "note": "recall は aggregate 指標。alarm.com は重複/類似ページがあり、source が top-k 外でも \
                  別の妥当な section が上位に来ているだけのことがある。個別失敗は should_hit.failures の \

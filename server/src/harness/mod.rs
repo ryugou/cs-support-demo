@@ -216,6 +216,7 @@ impl Harness {
             manual: Some(crate::manual::retrieval::ManualStore::new(
                 client.clone(),
                 corpus.clone(),
+                config.harness.manual_scoring_v2_enabled,
             )),
             corpus: Some(corpus),
             default_route: config.harness.default_escalation_route.clone(),
