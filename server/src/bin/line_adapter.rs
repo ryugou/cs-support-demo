@@ -199,9 +199,10 @@ impl SessionStore {
             .map(|(key, _)| key)
     }
 
-    /// 該当ユーザーの一連の処理（get→応答生成 API 呼び出し→LINE 返信→(成功時のみ)update）
-    /// を直列化するロックを取得する。返り値の `OwnedMutexGuard` を保持し続けている間、
-    /// 同一ユーザーの他の呼び出しはこの `await` で待たされる。
+    /// 該当ユーザーの一連の処理（get→応答生成 API 呼び出し→(200 なら) case_id + customer
+    /// ターン保存→LINE 返信→(成功時のみ) assistant ターン追記）を直列化するロックを取得する。
+    /// 返り値の `OwnedMutexGuard` を保持し続けている間、同一ユーザーの他の呼び出しはこの
+    /// `await` で待たされる。
     ///
     /// TTL を超過していた場合はここでセッションを空にリセットする（design doc §6:
     /// 「アクセス時 + 定期スイープ」の「アクセス時」側。以前は該当エントリをマップから
@@ -265,17 +266,27 @@ impl SessionStore {
     }
 }
 
-/// [`SessionStore::lock_session`] で得たロック済みセッションへ、customer/assistant の
-/// 2 ターンと `case_id` を書き込む（design doc §6 手順4: 応答生成 API が 200 を返し、かつ
-/// LINE への返信が成功した場合だけ呼ばれる。呼び出し元は `handle_event` を参照）。
+/// [`SessionStore::lock_session`] で得たロック済みセッションへ、`case_id` と customer
+/// ターンを書き込む（design doc §6 手順4: 応答生成 API が 200 を返した時点で、LINE への
+/// 返信を試みる**前**に呼ぶ）。
+///
+/// サーバ側では 200 の時点で case が確定し signal が追記済みのため、以降の発話を同じ case
+/// に必ず合流させる必要がある。この保存を LINE 返信の成否に左右させると、返信が失敗した
+/// ときに次の発話が新規 case として扱われ、蓄積済みの signal がエスカレーション判定から
+/// 脱落してしまう。呼び出し元は `handle_event` を参照。
 ///
 /// **保存前に `/api/reply` の入力契約（design doc §2、`server/src/api.rs`）へ正規化する
 /// （F1）**: history テキストは [`MAX_HISTORY_TEXT_CHARS`] へ切り詰め、trim 後に空になる
 /// テキストは保存しない。`case_id` は [`MAX_CASE_ID_CHARS`] を超えたら保存しない
 /// （切り詰めではなく非保存。理由は同定数のコメント）。これらを怠ると、次回リクエストが
 /// 必ず 400 になり、セッションが TTL 経過まで自己回復しない。
-fn apply_session_update(user_id: &str, session: &mut Session, update: SessionUpdate) {
-    let case_id_chars = update.case_id.chars().count();
+fn apply_customer_turn(
+    user_id: &str,
+    session: &mut Session,
+    case_id: String,
+    customer_text: String,
+) {
+    let case_id_chars = case_id.chars().count();
     if case_id_chars > MAX_CASE_ID_CHARS {
         // `session.case_id` への代入より前に評価すること: これから discard する
         // case_id ではなく、直前まで保持していた値の有無を報告するフィールドなので、
@@ -294,18 +305,34 @@ fn apply_session_update(user_id: &str, session: &mut Session, update: SessionUpd
              new case"
         );
     } else {
-        session.case_id = Some(update.case_id);
+        session.case_id = Some(case_id);
     }
 
-    push_history_entry(session, user_id, Role::Customer, update.customer_text);
-    push_history_entry(session, user_id, Role::Assistant, update.assistant_text);
+    push_history_entry(session, user_id, Role::Customer, customer_text);
     while session.history.len() > MAX_HISTORY_TURNS {
         session.history.pop_front();
     }
     session.last_at = Instant::now();
 }
 
-/// [`apply_session_update`] が保存直前に呼ぶ、history 1 エントリ分の正規化（F1）。
+/// [`SessionStore::lock_session`] で得たロック済みセッションへ、assistant ターンを書き込む
+/// （design doc §6 手順4: LINE への返信が成功した場合だけ呼ぶ）。
+///
+/// 顧客が実際に受信していない発話を履歴に残さないため、[`apply_customer_turn`] とは別に
+/// 呼び出しタイミングを分けている。呼び出し元は `handle_event` を参照。
+///
+/// 正規化（F1）は [`apply_customer_turn`] と同じ規律を使う（[`push_history_entry`] 経由で
+/// [`MAX_HISTORY_TEXT_CHARS`] へ切り詰め、trim 後に空になるテキストは保存しない）。
+fn apply_assistant_turn(user_id: &str, session: &mut Session, assistant_text: String) {
+    push_history_entry(session, user_id, Role::Assistant, assistant_text);
+    while session.history.len() > MAX_HISTORY_TURNS {
+        session.history.pop_front();
+    }
+    session.last_at = Instant::now();
+}
+
+/// [`apply_customer_turn`] / [`apply_assistant_turn`] が保存直前に呼ぶ、history 1 エントリ
+/// 分の正規化（F1）。
 ///
 /// 1. [`MAX_HISTORY_TEXT_CHARS`] へ切り詰める（切り詰め発生時は `tracing::warn!`。
 ///    本文そのものはログに出さない — 顧客の問い合わせ内容のため）。
@@ -505,7 +532,11 @@ fn route_event(event: &WebhookEvent) -> RoutedEvent {
     }
 }
 
-/// `assemble_reply` が返す、成功時に [`apply_session_update`] へ渡すべき値。
+/// `assemble_reply` が返す、応答生成 API が 200 を返した場合にセッションへ保存すべき値を
+/// まとめた中間値。`case_id` / `customer_text` は [`apply_customer_turn`] へ、
+/// `assistant_text` は [`apply_assistant_turn`] へ渡す。この 2 つの保存は呼び出しタイミングが
+/// 異なる（design doc §6 手順4: 前者は LINE 返信前に必ず、後者は返信成功時のみ）ため、
+/// 呼び出し元（`handle_event`）でフィールドを分けて使う。
 struct SessionUpdate {
     case_id: String,
     customer_text: String,
@@ -517,6 +548,9 @@ struct SessionUpdate {
 ///
 /// - `Some(response)`（200 で受理された）→ `reply_text` をそのまま使い、
 ///   `history` に customer/assistant の 2 ターンを追記・`case_id` を更新する指示を返す。
+///   ただしこの 2 ターンは同時には追記されない。追記タイミングは呼び出し元（`handle_event`）
+///   が customer 側（LINE 返信前・[`apply_customer_turn`]）と assistant 側（LINE 返信成功後・
+///   [`apply_assistant_turn`]）とで分けて適用する（[`SessionUpdate`] の doc comment 参照）。
 /// - `None`（非 200・タイムアウト・パース失敗。呼び出し側が既に warn/error ログ済み）→
 ///   `fallback_text` を使い、セッションは更新しない（design doc §6:
 ///   「非 200・タイムアウトなら...履歴と case_id は変更しない」）。
@@ -543,8 +577,8 @@ fn assemble_reply(
 const MAX_LINE_REPLY_CHARS: usize = 4_900;
 
 /// 文字境界を壊さずに `max` で切り詰める（`harness::reply::truncate_chars` と同じ規律。
-/// バイト数ではなく文字数で数える）。[`truncate_for_line`] と [`apply_session_update`]
-/// （F1: [`truncate_history_text`]）の両方から使う共通ユーティリティ。
+/// バイト数ではなく文字数で数える）。[`truncate_for_line`] と [`apply_customer_turn`] /
+/// [`apply_assistant_turn`]（F1: [`truncate_history_text`]）の両方から使う共通ユーティリティ。
 fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -647,17 +681,20 @@ async fn webhook_handler(
 
 /// 1 イベント分の処理（design doc §6 手順 2〜4）。
 ///
-/// テキストメッセージの処理順は design doc §6 手順4に準拠する（Stage 2 レビュー指摘。
-/// 以前は「LINE 返信が失敗してもセッションは更新する」順序を採っていたが、design doc の
-/// 記述どおりに改めた）: ① セッションから case_id・履歴を取得 → ② 応答生成 API を呼ぶ →
-/// ③ `assemble_reply` で reply_text と更新要否を決める → ④ LINE Reply API で返信する →
-/// ⑤ 返信が成功した場合のみ [`apply_session_update`] でセッション（history・case_id）を
-/// 更新する。LINE 返信が失敗した場合、顧客には返信が届いていないため会話としては完結して
-/// おらず、セッション側の履歴・case_id も進めるべきではない（進めてしまうと、顧客が返信を
-/// 受け取れないまま次のメッセージを送ったときに、サーバ側だけ会話が1ターン先に進んだ
-/// 状態になり局所的に食い違う）。
+/// テキストメッセージの処理順は design doc §6 手順4に準拠する: ① セッションから
+/// case_id・履歴を取得 → ② 応答生成 API を呼ぶ → ③ `assemble_reply` で reply_text と
+/// 更新要否を決める → ④ 応答生成 API が 200 を返していれば、LINE への返信を試みる**前**に
+/// [`apply_customer_turn`] で `case_id` と customer ターンを保存する → ⑤ LINE Reply API
+/// で返信する → ⑥ 返信が成功した場合のみ [`apply_assistant_turn`] で assistant ターンを
+/// 追記する。
 ///
-/// ①〜⑤の全体は、同一ユーザーの [`SessionStore::lock_session`] のロックを保持したまま
+/// ④を LINE 返信の成否より前に置く理由: サーバ側では 200 の時点で case が確定し signal が
+/// 追記済みのため、以降の発話を同じ case に必ず合流させる必要がある。これを返信の成否で
+/// 左右させると、返信失敗時に次の発話が新規 case となり、蓄積済みの signal がエスカレー
+/// ション判定から脱落する。一方 assistant ターンは顧客が実際に受信していない発話を履歴に
+/// 残さないため、返信成功時のみ追記する。
+///
+/// ①〜⑥の全体は、同一ユーザーの [`SessionStore::lock_session`] のロックを保持したまま
 /// 直列に実行される（Stage 2 レビュー指摘: 同一ユーザーからの並行イベントが get と update
 /// の間に割り込めないようにするため）。LINE push の失敗そのものは `send_line_reply` の
 /// `Err` を通じて呼び出し元（`webhook_handler`）が error ログを出す。
@@ -696,9 +733,9 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             user_id,
             text,
         } => {
-            // ロックはこの分岐を抜けるまで（LINE 返信・(成功時のみ)update を含めて）保持し
-            // 続ける。同一ユーザーの次のイベントは、この分岐が終わるまで get すら開始
-            // できない（`SessionStore` の doc comment 参照）。
+            // ロックはこの分岐を抜けるまで（LINE 返信・(成功時のみ)assistant ターンの保存を
+            // 含めて）保持し続ける。同一ユーザーの次のイベントは、この分岐が終わるまで get
+            // すら開始できない（`SessionStore` の doc comment 参照）。
             let mut session = state.sessions.lock_session(&user_id).await;
             let case_id = session.case_id.clone();
             let history = session.history.clone();
@@ -706,6 +743,14 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             let api_response = call_answer_api(state, &user_id, &text, case_id, &history).await;
             let (reply_text, update) =
                 assemble_reply(api_response.as_ref(), &text, &state.fallback_text);
+
+            // design doc §6 手順4 / handle_event の doc comment 参照: 応答生成 API が 200 を
+            // 返した時点（= update が Some）で、LINE への返信を試みる前に case_id と
+            // customer ターンを保存する。返信の成否に左右させない。
+            let pending_assistant_text = update.map(|update| {
+                apply_customer_turn(&user_id, &mut session, update.case_id, update.customer_text);
+                update.assistant_text
+            });
 
             let reply_result = send_line_reply(state, &reply_token, &reply_text)
                 .await
@@ -720,10 +765,10 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
                 });
 
             // design doc §6 手順4 / handle_event の doc comment 参照: LINE 返信が成功した
-            // 場合だけセッションを進める。
+            // 場合だけ assistant ターンを追記する。
             if reply_result.is_ok() {
-                if let Some(update) = update {
-                    apply_session_update(&user_id, &mut session, update);
+                if let Some(assistant_text) = pending_assistant_text {
+                    apply_assistant_turn(&user_id, &mut session, assistant_text);
                 }
             }
 
@@ -1077,11 +1122,11 @@ mod tests {
     //
     // Stage 2 レビュー指摘により、同一ユーザーの get→update は `lock_session` の
     // ロックを保持したまま直列に行う構造になった。テストは書き込みを
-    // `store_update`（`lock_session` → `apply_session_update`）ヘルパー経由で行い、
-    // 読み取りは読み取り専用の `snapshot` を使う。
+    // `store_update`（`lock_session` → `apply_customer_turn` → `apply_assistant_turn`）
+    // ヘルパー経由で行い、読み取りは読み取り専用の `snapshot` を使う。
 
-    /// 本番の `handle_event` と同じ経路（`lock_session` → `apply_session_update`）を
-    /// 経由するテスト用ヘルパー。
+    /// 本番の `handle_event` と同じ経路（`lock_session` → `apply_customer_turn` →
+    /// `apply_assistant_turn`）を経由するテスト用ヘルパー。
     async fn store_update(
         store: &SessionStore,
         user_id: &str,
@@ -1090,15 +1135,13 @@ mod tests {
         assistant_text: &str,
     ) {
         let mut session = store.lock_session(user_id).await;
-        apply_session_update(
+        apply_customer_turn(
             user_id,
             &mut session,
-            SessionUpdate {
-                case_id: case_id.to_string(),
-                customer_text: customer_text.to_string(),
-                assistant_text: assistant_text.to_string(),
-            },
+            case_id.to_string(),
+            customer_text.to_string(),
         );
+        apply_assistant_turn(user_id, &mut session, assistant_text.to_string());
     }
 
     #[tokio::test]
@@ -1356,15 +1399,13 @@ mod tests {
             // 応答生成 API 呼び出し + LINE 返信の待ち時間に相当する擬似的な非同期処理。
             // ロック（`session`）を保持したまま await することが直列化の要。
             tokio::time::sleep(simulated_work).await;
-            apply_session_update(
+            apply_customer_turn(
                 "u1",
                 &mut session,
-                SessionUpdate {
-                    case_id: format!("case-{label}"),
-                    customer_text: format!("q-{label}"),
-                    assistant_text: format!("a-{label}"),
-                },
+                format!("case-{label}"),
+                format!("q-{label}"),
             );
+            apply_assistant_turn("u1", &mut session, format!("a-{label}"));
             log.lock().unwrap().push(end_mark);
         }
 
@@ -1641,14 +1682,16 @@ mod tests {
         );
     }
 
-    // ---- handle_event（item 5: LINE 返信成功後にだけセッションを更新する） ----
+    // ---- handle_event（item 5: 応答生成 API の 200 で customer ターン+case_id を
+    // 即保存し、LINE 返信成功後にだけ assistant ターンを追記する） ----
     //
     // `send_line_reply` は本番では `https://api.line.me/...` を叩くため、成功・失敗を
     // 直接注入する手段が無い。`AppStateInner::line_reply_api_url` をテスト専用に
     // ローカルのモック HTTP サーバへ差し替えることで、実際の `handle_event` の経路
-    // （get→応答生成 API 呼び出し→LINE 返信→(成功時のみ)update）を実 HTTP 呼び出しで
-    // 検証する（本番コードは `line_reply_api_url` を [`DEFAULT_LINE_REPLY_API_URL`]
-    // 固定で使うため、この差し替えはテストにしか効かない）。
+    // （get→応答生成 API 呼び出し→(200 なら) case_id + customer ターン保存→LINE 返信→
+    // (成功時のみ) assistant ターン追記）を実 HTTP 呼び出しで検証する（本番コードは
+    // `line_reply_api_url` を [`DEFAULT_LINE_REPLY_API_URL`] 固定で使うため、この差し替えは
+    // テストにしか効かない）。
 
     /// `127.0.0.1:0`（OS が空きポートを割り当てる）でモック HTTP サーバを起動し、
     /// ベース URL（`http://127.0.0.1:<port>`）を返す。
@@ -1725,17 +1768,21 @@ mod tests {
         assert_eq!(
             case_id,
             Some("case-abc".to_string()),
-            "case_id from the answer api must be saved once the line reply has succeeded"
+            "case_id from the answer api must be saved (it is saved as soon as the answer api \
+             returns 200, and remains saved once the line reply also succeeds)"
         );
         assert_eq!(
             history.len(),
             2,
-            "both the customer and assistant turns must be recorded"
+            "both the customer and assistant turns must be recorded once the line reply has \
+             succeeded (the customer turn is saved immediately on the answer api's 200; the \
+             assistant turn is appended only after the line reply succeeds)"
         );
     }
 
     #[tokio::test]
-    async fn handle_event_leaves_the_session_untouched_when_the_line_reply_fails() {
+    async fn handle_event_saves_case_id_and_customer_turn_but_not_assistant_turn_when_the_line_reply_fails(
+    ) {
         let answer_api_base =
             spawn_http_mock(Router::new().route("/reply", post(answer_api_ok_handler))).await;
         let line_fail_base = spawn_http_mock(Router::new().route(
@@ -1758,12 +1805,67 @@ mod tests {
         );
 
         let (case_id, history) = state.sessions.snapshot("u1").await;
-        assert!(
-            case_id.is_none(),
-            "the answer api returned 200 but the line reply failed, so the session must remain \
-             untouched (design doc §6 step 4 / handle_event doc comment)"
+        assert_eq!(
+            case_id,
+            Some("case-abc".to_string()),
+            "the answer api returned 200, so case_id must be saved even though the line reply \
+             failed (design doc §6 step 4: this save must not depend on the line reply's \
+             outcome, or a subsequent message would start a new case and drop accumulated \
+             signal)"
         );
-        assert!(history.is_empty());
+        assert_eq!(
+            history.len(),
+            1,
+            "only the customer turn must be recorded; the assistant turn is appended only after \
+             a successful line reply, which did not happen here"
+        );
+        assert_eq!(
+            history[0],
+            (Role::Customer, "こんにちは".to_string()),
+            "the recorded turn must be the customer's message, not the assistant's reply"
+        );
+    }
+
+    /// 応答生成 API のモック: 常に 500 を返す（`api_response` が `None` になる経路を作る）。
+    async fn answer_api_failing_handler() -> impl axum::response::IntoResponse {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    #[tokio::test]
+    async fn handle_event_leaves_the_session_untouched_when_the_answer_api_fails() {
+        let answer_api_base =
+            spawn_http_mock(Router::new().route("/reply", post(answer_api_failing_handler))).await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+        );
+        let event = text_webhook_event("u1", "rt1", "こんにちは");
+
+        let result = handle_event(&state, &event).await;
+        assert!(
+            result.is_ok(),
+            "handle_event must succeed here: the answer api failed, so handle_event falls back \
+             to the fallback text, and the line reply (which is mocked to succeed) is what \
+             determines the Ok/Err of handle_event, not the answer api's status"
+        );
+
+        let (case_id, history) = state.sessions.snapshot("u1").await;
+        assert_eq!(
+            case_id, None,
+            "the answer api did not return 200, so no case was confirmed server-side; saving \
+             case_id here would let a later message use a case that never received this \
+             signal (design doc §6 step 4)"
+        );
+        assert!(
+            history.is_empty(),
+            "neither the customer nor the assistant turn may be recorded when the answer api \
+             fails: the answer api's 200 is what makes assemble_reply return Some(update) (and \
+             thus a customer-turn save) in the first place, so a failure must leave the session \
+             exactly as it was before this event"
+        );
     }
 
     // ---- truncate_for_line ----
