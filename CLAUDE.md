@@ -397,10 +397,10 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 - job の `--task-timeout` は CLI の `--timeout-secs`（既定 6h = 21600 秒）より長く取ること。**ちょうど同じ値にすると、CLI の per-request timeout と task-timeout が同着し、JSON summary が出力される前に task が kill される。** 実際の job は 7h（25200 秒）で作成済み。短いと Merge の途中で task が殺され、サーバ側だけ処理が続く状態になる。
 - ingest とは独立した job にしてある。`ingest_alarmcom` は実測約 6 時間かかるため、その末尾に Merge を積むと Merge だけの再実行ができない。
 - env（fail-closed 境界で2群に分けて扱うこと）:
-  - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs` の `AnthropicClient::from_config` で起動時 fail closed）
+  - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs` の `AnthropicClient::from_config` で起動時 fail closed）、`CS_SUPPORT_ANSWER_API_KEY`（`config.cloudrun.toml` が `[api] enabled = true` のため。`/{project_id}/api/reply` の Bearer 認証キーを解決できないと `server/src/main.rs` の起動時チェックで fail closed。これは `cs-support-mcp` 本体側の話で、`cs-support-line`（LINE アダプタ）側の必須 env は別立て。下記「LINE アダプタ」節を参照）
   - **未設定でも起動する**: `VEGAPUNK_ENDPOINT`（`config.cloudrun.toml` の `vegapunk_endpoint` キーの値にフォールバック。env があれば `server/src/config.rs` の `AppConfig::load` が上書き）、`VEGAPUNK_BEARER_TOKEN`
   - **未設定でも起動するが、設定しないと接続が切れ続ける**: `CS_SUPPORT_OAUTH_SIGNING_KEY`（OAuth 署名鍵）。未設定なら起動時に CSPRNG で生成し warn する（`server/src/main.rs` の `resolve_signing_key`）。**設定されているが 32 バイト未満の場合は起動時 fail closed**（設定したつもりで脆い鍵を使い続けないため）。
-- Secret Manager injection で注入するのは **`VEGAPUNK_BEARER_TOKEN` / `CS_SUPPORT_LLM_API_KEY` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET` / `CS_SUPPORT_OAUTH_SIGNING_KEY` の 4 つのみ**（真に秘密の値）。`CS_SUPPORT_PUBLIC_DOMAIN` は公開ホスト名、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は公開識別子であり、平文 env で構わない。非機密値まで Secret Manager に入れると「どれが本当の秘密か」の判断基準が失われる。
+- Secret Manager injection で `cs-support-mcp` 本体に注入するのは **`VEGAPUNK_BEARER_TOKEN` / `CS_SUPPORT_LLM_API_KEY` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET` / `CS_SUPPORT_OAUTH_SIGNING_KEY` / `CS_SUPPORT_ANSWER_API_KEY` の 5 つのみ**（真に秘密の値）。`CS_SUPPORT_PUBLIC_DOMAIN` は公開ホスト名、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は公開識別子であり、平文 env で構わない。非機密値まで Secret Manager に入れると「どれが本当の秘密か」の判断基準が失われる。`cs-support-line`（LINE アダプタ）側の Secret Manager 注入は別立て。下記「LINE アダプタ」節を参照。
 - **署名鍵を設定していれば、再デプロイ・再起動で利用者はログアウトしない。** アクセストークン／リフレッシュトークンは Google 発行の値をそのまま中継しているのでプロセス状態に依存せず、DCR 登録と進行中のログインフローは署名鍵さえ同じなら再起動をまたいで有効。
   - **警告（2026-08 まで実際に起きていた不具合）**: 署名鍵をプロセスごとに生成していた頃は、**デプロイのたび・アイドル明けのコールドスタートのたびに接続が切れていた**。`/oauth/token` の `grant_type=refresh_token` は毎回 `client_id`（署名鍵で封緘した DCR 登録ブロブ）を検証しており、鍵が変わると `unverifiable_client_id` → `invalid_grant` を返す。OAuth クライアントは `invalid_grant` を受けると仕様どおり refresh_token を破棄するため、Google のトークンが有効でも再ログインになる。`minScale` 未設定でゼロスケールするので、**放置しておくだけで切れる**。「Google 発行だから再起動に強い」という以前の説明はこの経路を見落としていた。
 - **一括失効は署名鍵のローテーションで行う。** Secret Manager の `CS_SUPPORT_OAUTH_SIGNING_KEY` を差し替えて再デプロイすると、全 DCR 登録と進行中のログインフローが無効になり、全クライアントが再接続を要求される。個別利用者の失効は従来どおり Google 側（アカウントのアクセス権限管理）で行う。
@@ -517,6 +517,19 @@ curl -sS -X POST -H 'Content-Type: application/json' \
 ```
 
 MCP tool 呼び出しは claude.ai のカスタムコネクタ経由で行う。**URL = 上記 MCP endpoint を入力するだけでよい**（Client ID / Secret の手入力は不要になった。claude.ai が DCR で自動登録する）。E2E のクライアントは claude.ai。
+
+### LINE アダプタ（`cs-support-line` service）
+
+`cs-support-mcp` 本体が内蔵する `POST /{project_id}/api/reply` を LINE から呼べるようにする webhook アダプタを、**同一イメージの別 Cloud Run service**として運用する。判定・応答文生成のロジックは一切持たず、署名検証・応答生成 API への 1 コール・LINE への返信だけを行う薄いアダプタ（`server/src/bin/line_adapter.rs`）。契約の正本は `docs/superpowers/specs/2026-08-11-answer-api-line-adapter-design.md` §6・§7（ここには複製しない）。
+
+- service: `cs-support-line`。`cs-support-mcp` と同一イメージを使い、起動コマンドだけ `/usr/local/bin/line_adapter` に上書きする（`Dockerfile` は両バイナリを同梱済み）
+- ingress: 公開（LINE Platform からの webhook を受けるため）。**VPC connector 不要**（vegapunk への直接到達が要らず、応答生成 API へは `cs-support-mcp` の公開 URL 経由で到達するため）
+- 新規 Secret Manager 3 件（既存の `openssl rand -base64 32` 相当以上の強度、または LINE Developers console 発行値をそのまま使う）:
+  - `cs-support-answer-api-key` → `cs-support-mcp` 本体の `CS_SUPPORT_ANSWER_API_KEY`（上記「未設定だと起動に失敗する」参照）と、`cs-support-line` の `CS_ANSWER_API_KEY` の**両方**に同じ値を注入する（応答生成 API 側は「この鍵を提示したリクエストを受理する」、LINE アダプタ側は「この鍵を `Authorization: Bearer` として送る」で対になっている必要がある）
+  - `line-channel-secret` → `cs-support-line` の `LINE_CHANNEL_SECRET`（webhook 署名検証。LINE Developers console で発行）
+  - `line-channel-access-token` → `cs-support-line` の `LINE_CHANNEL_ACCESS_TOKEN`（LINE Reply API 呼び出し。LINE Developers console で発行）
+- `cs-support-line` の必須 env（未設定・空文字は起動失敗。design doc §6）: `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `CS_ANSWER_API_URL`（`https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/api/reply`）/ `CS_ANSWER_API_KEY`。任意 env: `CS_LINE_FALLBACK_TEXT` / `CS_LINE_NONTEXT_TEXT`（既定値は design doc §6）
+- LINE Developers console の webhook URL に `https://<cs-support-line の URL>/line/webhook` を設定する
 
 ## 旧構成（参考、Cloud Run へ移行済み）
 
