@@ -159,6 +159,23 @@ fn extract_bearer_token(header_value: &str) -> Option<&str> {
     Some(rest.trim_matches([' ', '\t']))
 }
 
+/// 両辺を SHA-256 でハッシュしてから `constant_time_eq` で比較する。
+///
+/// **比較されるのは常に 32 バイト（SHA-256 の出力長）同士である。** `a` / `b` の元の長さが
+/// どれだけ異なっていても、ハッシュ後は必ず同じ長さになるため、`constant_time_eq` の
+/// 早期 return 分岐（`a.len() != b.len()` で即 `false`）は実質的に踏まれず、比較にかかる
+/// 時間から元の入力の長さの一致・不一致が漏れない（タイミングサイドチャネル対策）。
+///
+/// `authorize` から切り出した小さな関数（Stage 2 レビュー指摘: 切り出す前は、`authorize`
+/// が実際にハッシュ化しているかどうかをテストが呼び出し結果からしか確認できず、テストが
+/// 自前で SHA-256 を計算して `constant_time_eq` に渡すだけでは production の経路を
+/// 検証したことにならなかった）。
+fn hashed_constant_time_eq(a: &str, b: &str) -> bool {
+    let a_hash = Sha256::digest(a.as_bytes());
+    let b_hash = Sha256::digest(b.as_bytes());
+    constant_time_eq(&a_hash, &b_hash)
+}
+
 /// `Authorization: Bearer <key>` を `api_key` と定数時間比較する。
 ///
 /// ヘッダ欠落・スキーム不一致・トークン不一致はすべて `false`（呼び出し側は
@@ -170,11 +187,9 @@ fn extract_bearer_token(header_value: &str) -> Option<&str> {
 /// 単体の契約としても「空鍵は誰も認証されない」を保証する（設定不備の実質無認証化を
 /// 多重に防ぐ。`config.rs::read_secret_file` と同じ規律）。
 ///
-/// 比較の直前に両辺を SHA-256 でハッシュする（Stage 2 レビュー指摘）。ハッシュ前の
-/// `presented` / `api_key` は長さが一般に異なるため、`constant_time_eq` に生のまま渡すと
-/// その早期 return 分岐が実際に踏まれ、比較にかかる時間から長さの一致・不一致が漏れる
-/// （タイミングサイドチャネル）。ハッシュ後は常に 32 バイト同士の比較になり、長さという
-/// 情報自体が比較の手前で消えるため、この経路は早期 return を実質的に踏まなくなる。
+/// 実際の比較は [`hashed_constant_time_eq`] に委譲する（Stage 2 レビュー指摘: 比較の直前に
+/// 両辺を SHA-256 でハッシュすることで、`presented` / `api_key` の生の長さの違いに由来する
+/// タイミングサイドチャネルを消す）。
 pub fn authorize(headers: &HeaderMap, api_key: &str) -> bool {
     if api_key.is_empty() {
         return false;
@@ -186,9 +201,7 @@ pub fn authorize(headers: &HeaderMap, api_key: &str) -> bool {
     else {
         return false;
     };
-    let presented_hash = Sha256::digest(presented.as_bytes());
-    let api_key_hash = Sha256::digest(api_key.as_bytes());
-    constant_time_eq(&presented_hash, &api_key_hash)
+    hashed_constant_time_eq(presented, api_key)
 }
 
 /// `/api/reply` ルートが共有する状態。
@@ -593,25 +606,33 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
     }
 
-    /// `authorize` の実際の経路（Stage 2 レビュー指摘）: 生の `presented` / `api_key` を
-    /// 直接 `constant_time_eq` に渡すと、長さが異なる入力では早期 return 分岐が踏まれ、
-    /// 比較にかかる時間から長さの一致・不一致が漏れる。SHA-256 でハッシュしてから比較すると、
-    /// 元の長さがどれだけ違っても両辺は常に 32 バイトになり、長さが同じ入力と同一の
-    /// コードパス（早期 return を通らない固定長比較）を通ることを確認する。
+    // ---- hashed_constant_time_eq ----
+    //
+    // `authorize` が実際に呼ぶ関数を直接テストする（Stage 2 レビュー指摘: 以前はテストが
+    // 自前で SHA-256 を計算して `constant_time_eq` に渡すだけで、`authorize` がハッシュ化
+    // しているかどうかを一切検証しておらず、ハッシュ化を外す退行があっても検出できなかった）。
+
+    /// 元の長さが大きく異なる不一致入力でも `false` を返す。ハッシュ化を外して生の
+    /// バイト列比較へ戻す退行が起きると、この経路自体は生比較でも `false` になるため
+    /// この 1 件だけでは退行を検出できない（下の完全一致テストと対で意味を持つ）。
     #[test]
-    fn authorize_compares_hashed_keys_so_different_length_inputs_take_the_fixed_length_path() {
-        let short_hash = Sha256::digest(b"short");
-        let long_hash = Sha256::digest(b"a-much-longer-configured-api-key-value");
-        // ハッシュ後は常に 32 バイト: 元の長さの違いが比較の手前で消えている。
-        assert_eq!(short_hash.len(), 32);
-        assert_eq!(long_hash.len(), 32);
-        // 同じ長さ（32 バイト）同士の比較なので、`constant_time_eq` の早期 return 分岐
-        // ではなく、必ず XOR 畳み込みの経路を通って不一致と判定される。
-        assert!(!constant_time_eq(&short_hash, &long_hash));
+    fn hashed_constant_time_eq_rejects_mismatched_inputs_of_very_different_lengths() {
+        assert!(!hashed_constant_time_eq(
+            "short",
+            "a-much-longer-configured-api-key-value-that-does-not-match"
+        ));
     }
 
-    /// 上記経路が実際に `authorize` 経由でも成立すること（presented と configured の
-    /// 元の長さが大きく異なっていても、ハッシュ後の比較で不一致・一致が正しく判定される）。
+    /// 完全一致では `true` を返す。長さが大きく異なる入力同士でもハッシュ化さえしていれば
+    /// 一致判定は正しく行われることを確認する。
+    #[test]
+    fn hashed_constant_time_eq_accepts_identical_inputs() {
+        let value = "a-much-longer-configured-api-key-value-that-does-match";
+        assert!(hashed_constant_time_eq(value, value));
+    }
+
+    /// `authorize` 経由でも上記の性質が実際に成立すること（presented と configured の
+    /// 元の長さが大きく異なっていても、不一致は正しく判定される）。
     #[test]
     fn authorize_rejects_mismatched_keys_of_very_different_lengths() {
         let headers = headers_with_bearer("Bearer x");

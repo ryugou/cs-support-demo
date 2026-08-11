@@ -166,15 +166,29 @@ impl SessionStore {
         session
     }
 
-    /// エントリ上限超過時に破棄する対象を選ぶ。`last_at` は各セッションの内側
-    /// （`TokioMutex`）にあるため、`try_lock`（非同期ランタイムを介さない同期呼び出し）で
-    /// 読む。現在処理中（他のイベントがロックを保持中）のユーザーは `try_lock` が失敗する
-    /// ので対象から除外する（進行中の会話を破棄しないための安全側の判断。次回のエントリ
-    /// 追加時に再評価される。全ユーザーが処理中で候補が無い場合は `None` を返し、呼び出し元
-    /// は eviction をスキップする＝一時的に上限を超えることを許容する）。
+    /// エントリ上限超過時に破棄する対象を選ぶ。
+    ///
+    /// 生存判定は `Arc::strong_count(session) == 1`（このマップだけがこの `Arc` を握って
+    /// いる）で行う。以前は `try_lock()` の成否で判定していたが、それでは不十分だった:
+    /// `get_or_create` が呼び出し元へ `Arc` を返してから、呼び出し元が実際に
+    /// `arc.lock_owned().await` してロックを取得するまでの window では、誰もロックを
+    /// 保持していないのに処理中である。この window 中は `try_lock()` が成功してしまうため、
+    /// ロック取得前の handler が eviction 対象に含まってしまう欠陥があった（Stage 2 レビュー
+    /// 指摘・実際に発生した競合）。`strong_count` はロックの有無ではなく「誰かがこの
+    /// `Arc` を保持しているか」を直接見るため、この window も保護対象に含む。
+    ///
+    /// この関数は呼び出し元（[`Self::get_or_create`]）が外側の `users: Mutex<..>` を
+    /// 保持したまま呼ぶため、ここで読む `strong_count` は一貫したスナップショットになる
+    /// （呼び出し中に他スレッドがこのマップの外へ新たに clone/drop することはない）。
+    ///
+    /// 候補（`strong_count == 1`）に限って `last_at` を読む。この時点で他に保持者はいない
+    /// ので `try_lock()` は必ず成功するが、万一失敗しても `expect` で落とさず安全側に候補
+    /// から除外する。全ユーザーが処理中で候補が無い場合は `None` を返し、呼び出し元は
+    /// eviction をスキップする＝一時的に上限を超えることを許容する。
     fn pick_lru_key(users: &HashMap<String, Arc<TokioMutex<Session>>>) -> Option<String> {
         users
             .iter()
+            .filter(|(_, session)| Arc::strong_count(session) == 1)
             .filter_map(|(key, session)| {
                 session
                     .try_lock()
@@ -203,18 +217,26 @@ impl SessionStore {
     }
 
     /// TTL を超過した全エントリを破棄する（design doc §6: 「定期スイープ」側。呼び出し元の
-    /// `main` がバックグラウンドタスクで一定間隔ごとに呼ぶ）。現在処理中のユーザーは
-    /// `try_lock` が失敗するため対象から除外する（[`Self::pick_lru_key`] と同じ判断:
-    /// 進行中の会話は消さない。次回のスイープで再評価される）。
+    /// `main` がバックグラウンドタスクで一定間隔ごとに呼ぶ）。
+    ///
+    /// 生存判定は [`Self::pick_lru_key`] と同じ理由で `Arc::strong_count(session) == 1`
+    /// を使う（`try_lock` 単独では、ロック取得前に `Arc` だけを保持している window を
+    /// 処理中と認識できず、進行中の会話を誤って削除しうる）。`strong_count != 1`（処理中）
+    /// のエントリは TTL を超えていても保持し、次回のスイープで再評価する。
     fn sweep(&self) {
         let mut users = self
             .users
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ttl = self.ttl;
-        users.retain(|_, session| match session.try_lock() {
-            Ok(guard) => guard.last_at.elapsed() <= ttl,
-            Err(_) => true,
+        users.retain(|_, session| {
+            if Arc::strong_count(session) != 1 {
+                return true;
+            }
+            match session.try_lock() {
+                Ok(guard) => guard.last_at.elapsed() <= ttl,
+                Err(_) => true,
+            }
         });
     }
 
@@ -483,7 +505,7 @@ fn route_event(event: &WebhookEvent) -> RoutedEvent {
     }
 }
 
-/// `assemble_reply` が返す、成功時に [`SessionStore::update`] へ渡すべき値。
+/// `assemble_reply` が返す、成功時に [`apply_session_update`] へ渡すべき値。
 struct SessionUpdate {
     case_id: String,
     customer_text: String,
@@ -516,14 +538,12 @@ fn assemble_reply(
     }
 }
 
-/// LINE Reply API へ送るメッセージ本文の最大文字数（実行計画
-/// `docs/superpowers/plans/2026-08-11-answer-api-line-adapter.md` Task 7: 「4,900 字超は
-/// 末尾切り詰め」。LINE 自体の上限は 5,000 字だが、安全マージンを取った値。design doc §6
-/// 自体にはこの切り詰め値の記述は無い）。
+/// LINE Reply API へ送るメッセージ本文の最大文字数（design doc §6 に記述あり。LINE 自体の
+/// 上限は 5,000 字だが、安全マージンを取った値）。
 const MAX_LINE_REPLY_CHARS: usize = 4_900;
 
 /// 文字境界を壊さずに `max` で切り詰める（`harness::reply::truncate_chars` と同じ規律。
-/// バイト数ではなく文字数で数える）。[`truncate_for_line`] と `SessionStore::update`
+/// バイト数ではなく文字数で数える）。[`truncate_for_line`] と [`apply_session_update`]
 /// （F1: [`truncate_history_text`]）の両方から使う共通ユーティリティ。
 fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -954,6 +974,14 @@ async fn main() -> Result<()> {
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(50))
+        // このクライアントが叩く先は応答生成 API と LINE Reply API の 2 つだけで、どちらも
+        // redirect を返す正当な理由が無い。既定（最大 10 回追従）のままだと、
+        // `validate_answer_api_url` が起動時に強制した `https://` 境界を、応答生成 API が
+        // 307/308 で `http://` の外部ホストへ redirect するだけで迂回でき、307/308 は body を
+        // 保持して再送するため顧客の問い合わせ本文（`message` / `history`）が平文で
+        // 意図しないホストへ送られてしまう（Stage 2 レビュー指摘）。redirect を一切
+        // 追従しないことで、起動時検証の境界を実行時にも維持する。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build reqwest client for line_adapter")?;
 
@@ -1103,6 +1131,67 @@ mod tests {
         );
         assert!(store.snapshot("u2").await.0.is_some());
         assert!(store.snapshot("u3").await.0.is_some());
+    }
+
+    // ---- SessionStore の eviction/sweep 生存判定（Stage 2 レビュー指摘: `try_lock` では
+    // 「`Arc` を取得したがまだロックしていない」window を処理中と認識できず、進行中の
+    // handler を eviction/sweep 対象にしてしまう。`Arc::strong_count` ベースの判定へ
+    // 置き換えたので、その window を決定論的に再現して検証する（sleep によるタイミング
+    // 依存ではなく、Arc を保持し続けることで window そのものを固定する）。----
+
+    #[tokio::test]
+    async fn get_or_create_does_not_evict_a_user_whose_arc_is_held_but_not_yet_locked() {
+        // 容量 1: 2 人目の get_or_create が必ず eviction を試みる状況を作る。
+        let store = SessionStore::with_limits(Duration::from_secs(3600), 1);
+        // u1 の Arc を取得するが、ロックはしない
+        // （`get_or_create` を呼んでから `arc.lock_owned().await` するまでの window を模す）。
+        let u1_arc = store.get_or_create("u1");
+
+        // この間に別ユーザー u2 が上限到達で eviction を試みる。このテストが u1 の Arc を
+        // まだ保持しているので strong_count > 1 となり、候補から除外されるはず
+        // （`try_lock` ベースの旧実装では、ロック未取得のためここが破れていた）。
+        let _u2_arc = store.get_or_create("u2");
+
+        {
+            let users = store.users.lock().unwrap();
+            assert!(
+                users.contains_key("u1"),
+                "an entry whose Arc is held (even before its Mutex is locked) must not be \
+                 evicted, or the caller holding it becomes an orphaned session"
+            );
+        }
+
+        // 同一ユーザーに対して複数の mutex が作られていないこと（直列化保証そのもの）を
+        // 検証する: 再度 get_or_create すれば最初に取得したのと同じ Arc が返るはず。
+        let u1_arc_again = store.get_or_create("u1");
+        assert!(
+            Arc::ptr_eq(&u1_arc, &u1_arc_again),
+            "a held-but-unlocked session must not be replaced by a new Arc/Mutex, or \
+             concurrent handlers for the same user would race against different session \
+             state"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_ttl_expired_entries_whose_arc_is_held_but_not_locked() {
+        let store = SessionStore::with_limits(Duration::from_millis(20), 10);
+        store_update(&store, "u1", "case-1", "q", "a").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Arc だけを保持し、ロックはしない（get_or_create 直後・ロック取得前の window を
+        // 模す）。既存の `sweep_keeps_ttl_expired_entries_that_are_currently_locked` は
+        // ロック保持版であり、これは未ロック・Arc 保持のみの別ケース。
+        let _held = store.get_or_create("u1");
+
+        store.sweep();
+
+        let users = store.users.lock().unwrap();
+        assert!(
+            users.contains_key("u1"),
+            "sweep must not remove an entry whose Arc is held even if its Mutex is not \
+             locked and its TTL has elapsed, or an in-flight handler that has not yet \
+             locked becomes orphaned"
+        );
     }
 
     // ---- SessionStore::sweep（design doc §6: 定期スイープ側。一次レビュー指摘: 未検証） ----
