@@ -43,3 +43,7 @@ demote_rejections = 2
 # api_key_file = "/path/to/llm-api-key"   # または env CS_SUPPORT_LLM_API_KEY
 # timeout_secs = 20
 # max_tokens = 300
+
+# 応答生成 API（POST /{project_id}/api/reply）。ローカルでは使わない。
+[api]
+enabled = false

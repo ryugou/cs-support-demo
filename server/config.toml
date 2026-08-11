@@ -23,3 +23,7 @@ promote_approvals = 3
 promote_approvers = 2
 promote_max_rejection_rate = 0.2
 demote_rejections = 2
+
+# 応答生成 API（POST /{project_id}/api/reply）。ローカルでは使わない。
+[api]
+enabled = false

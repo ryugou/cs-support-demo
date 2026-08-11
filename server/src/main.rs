@@ -35,6 +35,20 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let config = AppConfig::load(&args.config)?;
+    // 応答生成 API（/api/reply）の fail-closed 起動検査。有効化されているのに
+    // env 未設定・空文字だと、認証チェックが実質無効な（誰も鍵を持てない＝誰も
+    // 通らない、または将来の実装ミスで誰でも通る）ルートを公開してしまう。
+    // `CS_SUPPORT_LLM_API_KEY`（LlmConfig）と同じ「設定不備は起動失敗」の方針。
+    let answer_api_key = env::var("CS_SUPPORT_ANSWER_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty());
+    if config.api.enabled && answer_api_key.is_none() {
+        anyhow::bail!(
+            "[api] enabled = true but CS_SUPPORT_ANSWER_API_KEY is not set (or empty); \
+             set it (Secret Manager injection) before starting the server, or set \
+             [api] enabled = false to disable the /api/reply route"
+        );
+    }
     let bearer_token = read_bearer_token(&args)?;
     let vegapunk = VegapunkClient::connect_lazy_with_limits(
         &config.vegapunk_endpoint,

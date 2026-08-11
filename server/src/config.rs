@@ -39,6 +39,32 @@ pub struct AppConfig {
     /// signal 抽出エージェント（LLM コンポーネント）の設定。既定は無効（lexicon 単独）。
     #[serde(default)]
     pub llm: LlmConfig,
+    /// 応答生成 API（`POST /{project_id}/api/reply`）の設定。既定は無効。
+    #[serde(default)]
+    pub api: ApiConfig,
+}
+
+/// 応答生成 API の設定。API キーは env `CS_SUPPORT_ANSWER_API_KEY`（Secret Manager 注入）
+/// からのみ読む（config への平文記載はしない）。`enabled = true` かつ鍵未設定は
+/// main.rs の起動時 fail-closed チェックで弾く（`LlmConfig` と同じパターン）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    pub enabled: bool,
+    pub fallback_reply_text: String,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fallback_reply_text: default_fallback_reply_text(),
+        }
+    }
+}
+
+fn default_fallback_reply_text() -> String {
+    "お問い合わせありがとうございます。担当者が確認のうえ、あらためてご連絡いたします。".to_string()
 }
 
 /// Anthropic Messages API による signal 抽出エージェントの設定。
@@ -374,6 +400,40 @@ manual_schema = "manual_v1"
             cfg.projects[0].manual_schema,
             ManualSchemaKind::ManualV1
         ));
+    }
+
+    #[test]
+    fn api_config_defaults_to_disabled_when_section_is_absent() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.api.enabled);
+        assert_eq!(
+            cfg.api.fallback_reply_text,
+            "お問い合わせありがとうございます。担当者が確認のうえ、あらためてご連絡いたします。"
+        );
+    }
+
+    #[test]
+    fn api_config_parses_section() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+[api]
+enabled = true
+fallback_reply_text = "テスト用フォールバック"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.api.enabled);
+        assert_eq!(cfg.api.fallback_reply_text, "テスト用フォールバック");
     }
 
     #[test]

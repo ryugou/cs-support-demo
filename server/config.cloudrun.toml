@@ -73,3 +73,10 @@ demote_rejections = 2
 # enabled = true で鍵を解決できない場合は起動時 fail closed で失敗する。
 [llm]
 enabled = true
+
+# 応答生成 API（POST /{project_id}/api/reply）。LINE アダプタ等の外部呼び出し用。
+# 認証キーは env CS_SUPPORT_ANSWER_API_KEY（Secret Manager injection）から注入する。
+# enabled = true で鍵が未設定・空文字の場合は起動時 fail closed で失敗する
+# （server/src/main.rs の起動時検査）。
+[api]
+enabled = true
