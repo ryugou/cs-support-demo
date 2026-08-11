@@ -34,7 +34,10 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
-    let config = AppConfig::load(&args.config)?;
+    // `Arc` にするのは `/api/reply`（api::ApiState.config）と `/{project_id}/mcp` ループの
+    // 両方が同じ `AppConfig` を共有するため。以降の `config.xxx` 参照は `Arc<AppConfig>` の
+    // `Deref` でそのまま動く（型を変えても呼び出し側の書き換えは不要）。
+    let config = Arc::new(AppConfig::load(&args.config)?);
     // 応答生成 API（/api/reply）の fail-closed 起動検査。有効化されているのに
     // env 未設定・空文字だと、認証チェックが実質無効な（誰も鍵を持てない＝誰も
     // 通らない、または将来の実装ミスで誰でも通る）ルートを公開してしまう。
@@ -47,6 +50,16 @@ async fn main() -> Result<()> {
             "[api] enabled = true but CS_SUPPORT_ANSWER_API_KEY is not set (or empty); \
              set it (Secret Manager injection) before starting the server, or set \
              [api] enabled = false to disable the /api/reply route"
+        );
+    }
+    // `fallback_reply_text` が空文字のまま起動すると、escalate / rule_match / 下書き失敗の
+    // すべてで `reply_text: ""` が返る。呼び出し元（LINE アダプタ等)は空メッセージ送信に
+    // 失敗し、顧客に何も返せないまま気づけない。起動時に弾く。
+    if config.api.enabled && config.api.fallback_reply_text.trim().is_empty() {
+        anyhow::bail!(
+            "[api] enabled = true but [api] fallback_reply_text is empty (or whitespace only); \
+             set a non-empty fallback reply text, or set [api] enabled = false to disable \
+             the /api/reply route"
         );
     }
     let bearer_token = read_bearer_token(&args)?;
@@ -239,6 +252,26 @@ async fn main() -> Result<()> {
                 ));
         let path = format!("/{}/mcp", project.project_id);
         app = app.nest_service(&path, guarded);
+    }
+
+    // `/{project_id}/api/reply`（design doc §3）。`require_google_auth` はここには適用しない
+    // — 認証は `api::authorize`（固定 API キーの定数時間比較）が単独で担う。
+    // `config.api.enabled = false`（既定）のときはルート自体を登録しない。
+    if config.api.enabled {
+        // 起動時 fail-closed チェック（本関数冒頭）が `enabled = true` のとき
+        // `answer_api_key` を必ず `Some` にしているので、ここでの `None` は
+        // 到達しない不変条件の破れであり、`expect` で早期に気づけるようにする。
+        let api_key = answer_api_key.clone().expect(
+            "invariant violated: [api] enabled = true but CS_SUPPORT_ANSWER_API_KEY was not \
+             resolved at startup (the fail-closed check above should have aborted first)",
+        );
+        let api_state = cs_support_mcp::api::ApiState {
+            config: config.clone(),
+            harness: harness.clone(),
+            tools: tools.clone(),
+            api_key,
+        };
+        app = app.merge(cs_support_mcp::api::api_router(api_state));
     }
 
     if let (Some(cert), Some(key)) = (&config.tls_cert_path, &config.tls_key_path) {
