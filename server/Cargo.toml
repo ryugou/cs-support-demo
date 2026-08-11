@@ -86,3 +86,7 @@ path = "src/bin/ingest_alarmcom.rs"
 [[bin]]
 name = "merge_schema"
 path = "src/bin/merge_schema.rs"
+
+[[bin]]
+name = "line_adapter"
+path = "src/bin/line_adapter.rs"
