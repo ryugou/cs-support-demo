@@ -115,7 +115,7 @@ env（`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `CS_ANSWER_API_URL` 
 1. `X-Line-Signature` を channel secret の HMAC-SHA256（base64）で定数時間比較する。不一致は 400
 2. イベントを順に処理する。`message` かつ `text` 以外のメッセージは `CS_LINE_NONTEXT_TEXT` を返信、`message` 以外のイベントは無視
 3. テキストイベント: セッションストアから該当 user の履歴・case_id を取り、API を 1 回コール（タイムアウト 50 秒）
-4. 200 なら `reply_text` を Reply API で返信し、履歴に `customer` / `assistant` の 2 ターンを追記、`case_id` を保存。非 200・タイムアウトなら `CS_LINE_FALLBACK_TEXT` を返信し、履歴と case_id は変更しない
+4. API が 200 を返した時点で、`case_id` と顧客発話（customer ターン）を直ちにセッションへ保存する。サーバ側では 200 の時点で case が確定し signal が追記済みのため、以降の発話を同じ case に必ず合流させる（LINE 返信の成否でこの保存を左右させると、返信失敗時に次の発話が新規 case となり蓄積 signal が判定から脱落する）。その後 `reply_text` を Reply API で返信し、**返信成功時のみ** assistant ターンを履歴へ追記する（顧客が受信していない発話を履歴に残さない）。API が非 200・タイムアウトの場合は `CS_LINE_FALLBACK_TEXT` を返信し、セッションは変更しない
 5. 全イベント処理後に 200 を返す
 
 イベントは 1 リクエスト内・同一ユーザーとも逐次処理する（並行処理しない）。そのため 1 イベントあたりのタイムアウトは最大で約 100 秒（応答生成 API 呼び出し 50 秒 + LINE Reply API 呼び出し分）まで累積しうる。この累積は v1 の Accepted Risk として受容し、デプロイ後の E2E（第 8 節）で実測した往復時間をもとに妥当性を再評価する。
@@ -162,3 +162,4 @@ Secret Manager 追加（すべて `openssl rand -base64 32` 相当以上の強�
 - 担当者個人単位の identity・権限（actor 突合表 DB 化に従属）
 - crate / workspace 分離(#13)
 - アダプタのセッション永続化、push 再送、非テキストメッセージの内容処理
+- セッションストア上限（10,000 エントリ）到達時の eviction の構造的改善: デモ規模では到達しない条件のため v1 の Accepted Risk とする（構造改修は別スコープ）
