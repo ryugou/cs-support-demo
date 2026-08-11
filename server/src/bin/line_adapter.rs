@@ -858,29 +858,36 @@ async fn send_line_reply(state: &AppState, reply_token: &str, text: &str) -> Res
     Ok(())
 }
 
-/// `CS_ANSWER_API_URL` の形式検証（Stage 2 レビュー指摘）。
+/// `CS_ANSWER_API_URL` の形式検証（Stage 2 レビュー指摘、および一次レビュー指摘: 前方一致では
+/// `http://127.0.0.1.evil.com` 等の外部ホストが素通りしていた）。
 ///
 /// `require_env` は空白のみのチェックしかしないため、平文 `http://` の外部ホストのような
 /// URL でも起動できてしまう。応答生成 API へは顧客の問い合わせ本文（`message` / `history`）
 /// を送るため、経路が平文で外部に露出すると盗聴・改竄されうる。許可するのは:
 ///
-/// - `https://` で始まる任意ホスト（本番の Cloud Run URL）
-/// - `http://127.0.0.1`（ポート有無問わず）
-/// - `http://localhost`（ポート有無問わず）
+/// - `https` scheme で任意ホスト（本番の Cloud Run URL）
+/// - `http` scheme で host が `127.0.0.1` / `localhost` に**完全一致**（ポート有無問わず）
 ///
-/// のいずれか。ローカル検証用の 2 パターンだけを平文 `http://` の例外として許し、それ以外の
-/// `http://` は起動失敗させる（fail closed。設定ミスで平文外部送信のまま本番稼働に入るのを防ぐ）。
+/// のいずれか。判定は `url::Url::parse` してから `host_str()` の完全一致で行う
+/// （`server/src/oauth/authserver.rs` の `is_acceptable_redirect_uri` と同じ規律）。
+/// **前方一致（`starts_with`）にしない。** それだと `http://127.0.0.1.evil.com` や
+/// `http://localhost.attacker.example`、`http://localhost-evil.com` のような外部ホストが
+/// 文字列の先頭だけ一致して素通りしてしまう。ローカル検証用の 2 ホストだけを平文 `http://`
+/// の例外として許し、それ以外の `http://`（および `http`/`https` 以外の scheme、パース不能な
+/// 値）は起動失敗させる（fail closed。設定ミスで平文外部送信のまま本番稼働に入るのを防ぐ）。
 fn validate_answer_api_url(url: &str) -> Result<()> {
-    let is_allowed = url.starts_with("https://")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost");
+    let is_allowed = url::Url::parse(url).is_ok_and(|parsed| match parsed.scheme() {
+        "https" => true,
+        "http" => matches!(parsed.host_str(), Some("127.0.0.1" | "localhost")),
+        _ => false,
+    });
     if is_allowed {
         Ok(())
     } else {
         anyhow::bail!(
-            "CS_ANSWER_API_URL must start with https://, or http://127.0.0.1, or \
-             http://localhost (got {url:?}); plaintext http:// to a non-local host would send \
-             customer inquiry text unencrypted"
+            "CS_ANSWER_API_URL must be a valid URL with scheme https (any host), or http with \
+             host exactly 127.0.0.1 or localhost (got {url:?}); plaintext http:// to a \
+             non-local host would send customer inquiry text unencrypted"
         )
     }
 }
@@ -1096,6 +1103,45 @@ mod tests {
         );
         assert!(store.snapshot("u2").await.0.is_some());
         assert!(store.snapshot("u3").await.0.is_some());
+    }
+
+    // ---- SessionStore::sweep（design doc §6: 定期スイープ側。一次レビュー指摘: 未検証） ----
+
+    #[tokio::test]
+    async fn sweep_removes_ttl_expired_entries_that_are_not_locked() {
+        let store = SessionStore::with_limits(Duration::from_millis(20), 10);
+        store_update(&store, "u1", "case-1", "q", "a").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        store.sweep();
+
+        let users = store.users.lock().unwrap();
+        assert!(
+            !users.contains_key("u1"),
+            "sweep must remove an unlocked entry once its TTL has elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_ttl_expired_entries_that_are_currently_locked() {
+        let store = SessionStore::with_limits(Duration::from_millis(20), 10);
+        store_update(&store, "u1", "case-1", "q", "a").await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // 直接 Arc をロックして保持する（`lock_session` 経由だと TTL 超過時に `last_at` を
+        // リセットしてしまい、「TTL 超過中にロック保持」という前提条件が崩れるため）。
+        // 進行中リクエストが `session` を保持したまま await している状態を模す。
+        let arc = store.get_or_create("u1");
+        let _guard = arc.lock_owned().await;
+
+        store.sweep();
+
+        let users = store.users.lock().unwrap();
+        assert!(
+            users.contains_key("u1"),
+            "sweep must not remove a currently-locked entry even past its TTL, so an \
+             in-flight conversation is not dropped out from under the request handling it"
+        );
     }
 
     #[tokio::test]
@@ -1687,6 +1733,25 @@ mod tests {
     #[test]
     fn validate_answer_api_url_rejects_a_value_with_no_scheme() {
         assert!(validate_answer_api_url("cs-support-mcp-xxx.run.app/urtect/api/reply").is_err());
+    }
+
+    /// 一次レビュー指摘: 前方一致だと `http://127.0.0.1` で始まる別ホストが素通りする。
+    /// `host_str()` の完全一致に退行していないかを検出する回帰テスト。
+    #[test]
+    fn validate_answer_api_url_rejects_a_subdomain_prefixed_with_127_0_0_1() {
+        assert!(validate_answer_api_url("http://127.0.0.1.evil.com/reply").is_err());
+    }
+
+    /// 一次レビュー指摘: 前方一致だと `http://localhost` で始まる別ホストが素通りする。
+    #[test]
+    fn validate_answer_api_url_rejects_a_subdomain_prefixed_with_localhost() {
+        assert!(validate_answer_api_url("http://localhost.attacker.example/reply").is_err());
+    }
+
+    /// 一次レビュー指摘: 前方一致だと `localhost` に文字列が続くだけの別ホストが素通りする。
+    #[test]
+    fn validate_answer_api_url_rejects_a_hyphenated_localhost_lookalike_host() {
+        assert!(validate_answer_api_url("http://localhost-evil.com/reply").is_err());
     }
 
     // ---- reply_token_log_fragment（Stage 2 レビュー指摘: ログへ全文を出さない） ----
