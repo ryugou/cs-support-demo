@@ -71,7 +71,10 @@ const MAX_HISTORY_TEXT_CHARS: usize = 2_000;
 /// （design doc §2）と一致させる。これを超える case_id を保存すると、次回以降の
 /// リクエストが必ず 400 になり、history と同じ理由でセッションが自己回復不能になる。
 /// **切り詰めは行わない**（case_id は不透明な識別子であり、切り詰めると別の case を指す
-/// 壊れた id になるため）。超過時は保存せず、次回は新規 case として扱う。
+/// 壊れた id になるため）。超過時は保存せず、直前の有効な case_id をそのまま保持する
+/// （＝次回リクエストもその case_id を使って**同じ case へ継続する**。新規 case には
+/// ならない）。case の累積 signal を失わせて新規 case にするより、既知の有効な case へ
+/// 継続する方が安全側の判断。
 const MAX_CASE_ID_CHARS: usize = 128;
 
 /// LINE user 1 人分のセッション。
@@ -178,8 +181,9 @@ impl SessionStore {
                 case_id_chars,
                 max_chars = MAX_CASE_ID_CHARS,
                 "line webhook: case_id returned by the answer api exceeds the /api/reply \
-                 contract; not storing it (the next message from this user will start a new \
-                 case instead of resuming this one)"
+                 contract; discarding it and keeping the previous case_id instead (the next \
+                 message from this user will resume the existing case with the previous \
+                 case_id, not start a new one)"
             );
         } else {
             session.case_id = Some(case_id);
