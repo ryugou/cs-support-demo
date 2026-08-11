@@ -60,6 +60,12 @@ Content-Type: application/json
 
 未知の `case_id`（load 失敗）はエラーにせず新規 case として処理し、warn ログを出す。
 
+この fallback は `/api/reply` の契約としてのみ定義する。既存 MCP tool
+`evaluate_answerability`（`rmcp_server.rs`）は対象外で、未知 `case_id` は従来どおり Err
+にする（`Harness::evaluate` の `allow_unknown_case_id` 引数で経路ごとに分岐する）。CS 担当が
+MCP 経由で case_id を打ち間違えたときに黙って新規 case へ合流すると、会話層の累積 signal
+（エスカレーション判定の根拠）が失われたまま気づけなくなるため。
+
 ## 3. 認証
 
 - env `CS_SUPPORT_ANSWER_API_KEY`（Secret Manager 注入）と `Authorization: Bearer` の値を定数時間比較する。Google OAuth（`require_google_auth`）はこのルートに適用しない
@@ -72,12 +78,14 @@ Content-Type: application/json
 | --- | --- |
 | allowed かつ下書きあり | `customer_reply_draft`（LLM 生成・egress gate 通過済み）をそのまま使う |
 | allowed かつ下書き null（LLM 失敗・egress 却下） | `[api] fallback_reply_text` |
+| allowed かつ下書きが truncated（生成上限で途中切断） | `[api] fallback_reply_text`（切れた文を顧客へ送らない。§4 の他行と同じくフォールバック扱い） |
 | escalate | `[api] fallback_reply_text` |
 | rule_match | `[api] fallback_reply_text` |
 
 - `[api] fallback_reply_text` の既定値: 「お問い合わせありがとうございます。担当者が確認のうえ、あらためてご連絡いたします。」
+- truncated な下書きを捨てる理由: 生成上限で途中切断された下書きは、切れ目がたまたま「。」の直後に落ちると完成文に見え、日本語のビジネス文では末尾に来る安全上の但し書きだけが欠落しうる（`llm.rs` の `ReplyDraft` doc コメント）。MCP 経路は人間の CS 担当が下書きを検分してから送るため `truncated=true` を返すだけで足りるが、`/api/reply` は人間の検分が一切入らない自動送信経路のため同じ扱いにはできない
 - decision・evidence はレスポンスに含めない。判定内訳は既存の audit log（`audit_event_id`）で追跡する
-- フォールバックに落ちた場合は warn ログに `request_id` / 判定 / 理由を出す
+- フォールバックに落ちた場合は warn ログに `request_id` / 判定 / 理由 / `draft_truncated` を出す（truncation が原因か運用者が切り分けられるようにする）
 
 ## 5. 会話履歴の扱い
 
