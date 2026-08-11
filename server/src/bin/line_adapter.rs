@@ -758,6 +758,23 @@ const DEFAULT_FALLBACK_TEXT: &str =
     "申し訳ありません。ただいま応答できません。時間をおいてもう一度お試しください。";
 const DEFAULT_NONTEXT_TEXT: &str = "恐れ入りますが、テキストでお送りください。";
 
+/// 任意 env（`CS_LINE_FALLBACK_TEXT` / `CS_LINE_NONTEXT_TEXT`）の値を確定する。
+/// 未設定・空文字列・空白のみのいずれも既定文へ正規化する（fail closed にはしない —
+/// 呼び出し元は必須の4つとは違い、この2つは無くても起動を続けてよい任意設定のため）。
+///
+/// これが必要な理由: 空文字列がそのまま LINE Reply API に渡ると 400 で拒否され
+/// `send_line_reply` が `bail!` する。しかもこの2値は「応答生成APIが落ちている最中」
+/// （フォールバックが最も必要な場面）に使われるため、設定ミスが最悪のタイミングで顕在化し、
+/// 顧客への応答が完全に無くなる。
+///
+/// `env::var` を直接受けず `Option<String>` を引数分離しているのは、`require_env` の
+/// コメントと同じ理由（実プロセスの環境変数を書き換えるテストは並列実行で不安定になる）。
+fn resolve_optional_text_env(raw: Option<String>, default: &str) -> String {
+    raw.map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -770,10 +787,12 @@ async fn main() -> Result<()> {
     let channel_access_token = require_env("LINE_CHANNEL_ACCESS_TOKEN")?;
     let answer_api_url = require_env("CS_ANSWER_API_URL")?;
     let answer_api_key = require_env("CS_ANSWER_API_KEY")?;
-    let fallback_text =
-        env::var("CS_LINE_FALLBACK_TEXT").unwrap_or_else(|_| DEFAULT_FALLBACK_TEXT.to_string());
+    let fallback_text = resolve_optional_text_env(
+        env::var("CS_LINE_FALLBACK_TEXT").ok(),
+        DEFAULT_FALLBACK_TEXT,
+    );
     let nontext_text =
-        env::var("CS_LINE_NONTEXT_TEXT").unwrap_or_else(|_| DEFAULT_NONTEXT_TEXT.to_string());
+        resolve_optional_text_env(env::var("CS_LINE_NONTEXT_TEXT").ok(), DEFAULT_NONTEXT_TEXT);
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(50))
@@ -1269,5 +1288,45 @@ mod tests {
         let long = "あ".repeat(MAX_LINE_REPLY_CHARS + 100);
         let truncated = truncate_for_line(&long);
         assert_eq!(truncated.chars().count(), MAX_LINE_REPLY_CHARS);
+    }
+
+    // ---- resolve_optional_text_env ----
+    //
+    // W3 (CONFIRMED, reviewer): CS_LINE_FALLBACK_TEXT / CS_LINE_NONTEXT_TEXT are optional
+    // env vars, but "unset -> default" alone let an empty or whitespace-only value pass
+    // straight through as the reply text. LINE's Reply API rejects an empty message body
+    // with 400, so send_line_reply would bail! at exactly the moment the fallback text is
+    // needed most (the answer API is already down). Both "unset" and "blank" must resolve
+    // to the default. We test the pure decision function directly instead of env::var,
+    // per the note on require_env above: mutating real process env vars is flaky under
+    // parallel test execution.
+
+    #[test]
+    fn resolve_optional_text_env_uses_default_when_unset() {
+        assert_eq!(resolve_optional_text_env(None, "default"), "default");
+    }
+
+    #[test]
+    fn resolve_optional_text_env_uses_default_when_empty() {
+        assert_eq!(
+            resolve_optional_text_env(Some(String::new()), "default"),
+            "default"
+        );
+    }
+
+    #[test]
+    fn resolve_optional_text_env_uses_default_when_whitespace_only() {
+        assert_eq!(
+            resolve_optional_text_env(Some("   ".to_string()), "default"),
+            "default"
+        );
+    }
+
+    #[test]
+    fn resolve_optional_text_env_uses_trimmed_value_when_present() {
+        assert_eq!(
+            resolve_optional_text_env(Some("  カスタム文言  ".to_string()), "default"),
+            "カスタム文言"
+        );
     }
 }
