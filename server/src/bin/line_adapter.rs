@@ -27,6 +27,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tower_http::trace::TraceLayer;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -45,6 +46,33 @@ const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_MAX_SESSIONS: usize = 10_000;
 /// 保持する会話履歴ターン数の上限（design doc §6: 20 ターンのリング）。
 const MAX_HISTORY_TURNS: usize = 20;
+
+/// 会話履歴 1 ターンの本文を**保存する際**の上限文字数。
+///
+/// `server/src/api.rs` の `MAX_HISTORY_TEXT_CHARS`（design doc §2）と一致させる。
+/// ここを超える履歴を `/api/reply` へ送ると、その API は 400 `invalid_request` を返す。
+/// `call_answer_api` はそれを `None` として扱い `assemble_reply` がフォールバック文へ倒し、
+/// かつセッションは更新しない（design doc §6 手順4）。つまり一度 2,000 字超の
+/// customer_text / assistant_text が history に混入すると、以後そのユーザの**全**
+/// メッセージが TTL（60 分）経過までフォールバック文しか返せなくなり、`last_at` も
+/// 成功時にしか進まないため自己回復しない（F1）。`message` 自体は 5,000 字まで
+/// 許されるため、この事故は「2,001〜5,000 字の問い合わせを 1 通送る」だけで発生する。
+/// これを防ぐため、応答生成 API へ送る直前ではなく**保存時**に切り詰める。
+///
+/// 切り詰めても意味的な損失が実質無い根拠: サーバ側は生成プロンプトへ注入する際に
+/// 新しい側から最大 6 ターン・合計 4,000 字しか採用しない
+/// （`server/src/harness/reply.rs` の `select_history`、`MAX_HISTORY_TURNS = 6` /
+/// `MAX_HISTORY_CHARS = 4000`）。1 ターンで 2,000 字を超える発話は、その予算の半分以上を
+/// 単独で使い切る想定外の長さであり、末尾を切り詰めても生成プロンプトに載る実効情報量への
+/// 影響は小さい。
+const MAX_HISTORY_TEXT_CHARS: usize = 2_000;
+
+/// `case_id` を**保存する際**の上限文字数。`server/src/api.rs` の `MAX_CASE_ID_CHARS`
+/// （design doc §2）と一致させる。これを超える case_id を保存すると、次回以降の
+/// リクエストが必ず 400 になり、history と同じ理由でセッションが自己回復不能になる。
+/// **切り詰めは行わない**（case_id は不透明な識別子であり、切り詰めると別の case を指す
+/// 壊れた id になるため）。超過時は保存せず、次回は新規 case として扱う。
+const MAX_CASE_ID_CHARS: usize = 128;
 
 /// LINE user 1 人分のセッション。
 struct Session {
@@ -84,7 +112,11 @@ impl SessionStore {
     /// TTL を超過したエントリはここで破棄し、無いものとして扱う（design doc §6:
     /// 「アクセス時 + 定期スイープ」の「アクセス時」側）。
     fn get(&self, user_id: &str) -> (Option<String>, VecDeque<(Role, String)>) {
-        let mut sessions = self.sessions.lock().expect("session store mutex poisoned");
+        // F7: poison からの復旧については `update` の同種コメントを参照。
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(session) = sessions.get(user_id) {
             if session.last_at.elapsed() > self.ttl {
                 sessions.remove(user_id);
@@ -100,6 +132,12 @@ impl SessionStore {
     /// ユーザが未登録なら新規作成する。新規作成時、既にエントリ数が上限に達していれば
     /// `last_at` が最古のエントリを 1 件破棄してから挿入する（design doc §6:
     /// 「エントリ上限 10,000、超過時は `last_at` 最古を破棄」）。
+    ///
+    /// **保存前に `/api/reply` の入力契約（design doc §2、`server/src/api.rs`）へ正規化する
+    /// （F1）**: history テキストは [`MAX_HISTORY_TEXT_CHARS`] へ切り詰め、trim 後に空になる
+    /// テキストは保存しない。`case_id` は [`MAX_CASE_ID_CHARS`] を超えたら保存しない
+    /// （切り詰めではなく非保存。理由は同定数のコメント）。これらを怠ると、次回リクエストが
+    /// 必ず 400 になり、セッションが TTL 経過まで自己回復しない。
     fn update(
         &self,
         user_id: &str,
@@ -107,7 +145,15 @@ impl SessionStore {
         customer_text: String,
         assistant_text: String,
     ) {
-        let mut sessions = self.sessions.lock().expect("session store mutex poisoned");
+        let mut sessions = self
+            .sessions
+            .lock()
+            // ロック保持中のコードは短く panic 要因も乏しいが、万一 panic してもミューテックス
+            // を毒で恒久停止させない（F7）。セッション状態は失われても design doc §6 の
+            // 想定範囲内（「プロセス再起動で消える。その場合は新規 case として継続する」）
+            // なので、毒された内容をそのまま引き継いで復旧する方が「以後 500 が返り続ける」
+            // より安全。
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !sessions.contains_key(user_id) && sessions.len() >= self.max_entries {
             if let Some(oldest_key) = sessions
                 .iter()
@@ -124,9 +170,23 @@ impl SessionStore {
                 history: VecDeque::new(),
                 last_at: Instant::now(),
             });
-        session.case_id = Some(case_id);
-        session.history.push_back((Role::Customer, customer_text));
-        session.history.push_back((Role::Assistant, assistant_text));
+
+        let case_id_chars = case_id.chars().count();
+        if case_id_chars > MAX_CASE_ID_CHARS {
+            tracing::warn!(
+                user_id,
+                case_id_chars,
+                max_chars = MAX_CASE_ID_CHARS,
+                "line webhook: case_id returned by the answer api exceeds the /api/reply \
+                 contract; not storing it (the next message from this user will start a new \
+                 case instead of resuming this one)"
+            );
+        } else {
+            session.case_id = Some(case_id);
+        }
+
+        push_history_entry(session, user_id, Role::Customer, customer_text);
+        push_history_entry(session, user_id, Role::Assistant, assistant_text);
         while session.history.len() > MAX_HISTORY_TURNS {
             session.history.pop_front();
         }
@@ -136,10 +196,59 @@ impl SessionStore {
     /// TTL を超過した全エントリを破棄する（design doc §6: 「定期スイープ」側。呼び出し元の
     /// `main` がバックグラウンドタスクで一定間隔ごとに呼ぶ）。
     fn sweep(&self) {
-        let mut sessions = self.sessions.lock().expect("session store mutex poisoned");
+        // F7: poison からの復旧については `update` の同種コメントを参照。
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ttl = self.ttl;
         sessions.retain(|_, session| session.last_at.elapsed() <= ttl);
     }
+}
+
+/// [`SessionStore::update`] が保存直前に呼ぶ、history 1 エントリ分の正規化（F1）。
+///
+/// 1. [`MAX_HISTORY_TEXT_CHARS`] へ切り詰める（切り詰め発生時は `tracing::warn!`。
+///    本文そのものはログに出さない — 顧客の問い合わせ内容のため）。
+/// 2. trim 後に空になった場合は保存しない（`/api/reply` は `history[].text` を trim 後
+///    1 字以上必須にしている。空文字列を積むと次回リクエストが必ず 400 になる。通常の
+///    経路では起きないが、応答生成 API が `reply_text: ""` を返した場合に発生しうるので
+///    ここで防御する）。
+fn push_history_entry(session: &mut Session, user_id: &str, role: Role, text: String) {
+    let role_label = match role {
+        Role::Customer => "customer",
+        Role::Assistant => "assistant",
+    };
+    let text = truncate_history_text(user_id, role_label, text);
+    if text.trim().is_empty() {
+        tracing::warn!(
+            user_id,
+            role = role_label,
+            "line webhook: text is empty after trimming; not storing it in history (an empty \
+             history entry would make every subsequent /api/reply request from this user fail \
+             with 400)"
+        );
+        return;
+    }
+    session.history.push_back((role, text));
+}
+
+/// [`MAX_HISTORY_TEXT_CHARS`] へ切り詰める。バイト境界ではなく文字数で切り詰める規律は
+/// [`truncate_chars`] に共通化してある（`truncate_for_line` も同じ関数を使う）。
+fn truncate_history_text(user_id: &str, role: &'static str, text: String) -> String {
+    let original_chars = text.chars().count();
+    if original_chars <= MAX_HISTORY_TEXT_CHARS {
+        return text;
+    }
+    tracing::warn!(
+        user_id,
+        role,
+        original_chars,
+        max_chars = MAX_HISTORY_TEXT_CHARS,
+        "line webhook: history text exceeds the /api/reply contract; truncating before storing \
+         it in the session"
+    );
+    truncate_chars(&text, MAX_HISTORY_TEXT_CHARS)
 }
 
 /// `X-Line-Signature` を channel secret の HMAC-SHA256(base64) で検証する。
@@ -234,41 +343,66 @@ enum RoutedEvent {
     },
     /// テキスト以外のメッセージ（画像・スタンプ等）。`CS_LINE_NONTEXT_TEXT` を返信する。
     NonText { reply_token: String },
-    /// message 以外のイベント（follow 等）、または message イベントだが
-    /// `replyToken` / `source.userId` / `message.text` を欠く不正な payload。無視する。
+    /// message 以外のイベント（follow 等）。**想定内**の無視。LINE の webhook は
+    /// message 以外のイベント種別を頻繁に送ってくるため、ログは出さない
+    /// （呼び出し側で無言 `Ok(())` にする）。
     Ignore,
+    /// message イベントだが `replyToken` / `source.userId` / `message.text` を欠く。
+    /// LINE の実仕様では起こらない想定の契約違反であり、`unwrap` で panic させるより
+    /// 当該イベントだけ無視して他のイベント処理を継続する方が安全だが、これは
+    /// **想定外**の無視なので呼び出し側が `tracing::warn!` を出す（F3: グループ会話等で
+    /// `source.userId` が欠けたテキストメッセージを無言で握りつぶすと、顧客には
+    /// 「Bot が無反応」に見え、運用者にも気づく手段が無くなるため）。
+    IgnoreMalformed {
+        event_type: String,
+        /// 欠けていたフィールド（`"replyToken"` / `"message"` / `"source.userId"` /
+        /// `"message.text"` / 両方欠落時は `"source.userId and message.text"`）。
+        missing_field: &'static str,
+    },
 }
 
 /// `WebhookEvent` を [`RoutedEvent`] に振り分ける純関数（design doc §6 手順 2）。
-///
-/// `replyToken` / `source.userId` / テキスト本文の欠落は LINE の実仕様では起こらない想定だが、
-/// 万一欠けていた場合に `unwrap` で panic させるより、当該イベントだけ無視して他のイベント処理
-/// を継続できる方が安全なので `Ignore` に倒す（呼び出し側が warn ログを出す）。
 fn route_event(event: &WebhookEvent) -> RoutedEvent {
     if event.event_type != "message" {
         return RoutedEvent::Ignore;
     }
     let Some(reply_token) = &event.reply_token else {
-        return RoutedEvent::Ignore;
+        return RoutedEvent::IgnoreMalformed {
+            event_type: event.event_type.clone(),
+            missing_field: "replyToken",
+        };
     };
     let Some(message) = &event.message else {
-        return RoutedEvent::Ignore;
+        return RoutedEvent::IgnoreMalformed {
+            event_type: event.event_type.clone(),
+            missing_field: "message",
+        };
     };
     if message.message_type != "text" {
         return RoutedEvent::NonText {
             reply_token: reply_token.clone(),
         };
     }
-    let (Some(user_id), Some(text)) = (
-        event.source.as_ref().and_then(|s| s.user_id.clone()),
-        message.text.clone(),
-    ) else {
-        return RoutedEvent::Ignore;
-    };
-    RoutedEvent::Text {
-        reply_token: reply_token.clone(),
-        user_id,
-        text,
+    let user_id = event.source.as_ref().and_then(|s| s.user_id.clone());
+    let text = message.text.clone();
+    match (user_id, text) {
+        (Some(user_id), Some(text)) => RoutedEvent::Text {
+            reply_token: reply_token.clone(),
+            user_id,
+            text,
+        },
+        (None, Some(_)) => RoutedEvent::IgnoreMalformed {
+            event_type: event.event_type.clone(),
+            missing_field: "source.userId",
+        },
+        (Some(_), None) => RoutedEvent::IgnoreMalformed {
+            event_type: event.event_type.clone(),
+            missing_field: "message.text",
+        },
+        (None, None) => RoutedEvent::IgnoreMalformed {
+            event_type: event.event_type.clone(),
+            missing_field: "source.userId and message.text",
+        },
     }
 }
 
@@ -305,17 +439,25 @@ fn assemble_reply(
     }
 }
 
-/// LINE Reply API へ送るメッセージ本文の最大文字数（design doc §6: 「4,900 字超は末尾切り詰め」。
-/// LINE 自体の上限は 5,000 字だが、安全マージンを取った値）。
+/// LINE Reply API へ送るメッセージ本文の最大文字数（実行計画
+/// `docs/superpowers/plans/2026-08-11-answer-api-line-adapter.md` Task 7: 「4,900 字超は
+/// 末尾切り詰め」。LINE 自体の上限は 5,000 字だが、安全マージンを取った値。design doc §6
+/// 自体にはこの切り詰め値の記述は無い）。
 const MAX_LINE_REPLY_CHARS: usize = 4_900;
 
-/// 文字境界を壊さずに [`MAX_LINE_REPLY_CHARS`] で切り詰める
-/// （`harness::reply::truncate_chars` と同じ規律。バイト数ではなく文字数で数える）。
-fn truncate_for_line(text: &str) -> String {
-    if text.chars().count() <= MAX_LINE_REPLY_CHARS {
+/// 文字境界を壊さずに `max` で切り詰める（`harness::reply::truncate_chars` と同じ規律。
+/// バイト数ではなく文字数で数える）。[`truncate_for_line`] と `SessionStore::update`
+/// （F1: [`truncate_history_text`]）の両方から使う共通ユーティリティ。
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
         return text.to_string();
     }
-    text.chars().take(MAX_LINE_REPLY_CHARS).collect()
+    text.chars().take(max).collect()
+}
+
+/// [`MAX_LINE_REPLY_CHARS`] で切り詰める。
+fn truncate_for_line(text: &str) -> String {
+    truncate_chars(text, MAX_LINE_REPLY_CHARS)
 }
 
 /// `line_adapter` のプロセス全体で共有する状態。`Arc` で安価に clone してハンドラへ渡す。
@@ -393,8 +535,25 @@ async fn webhook_handler(
 async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
     match route_event(event) {
         RoutedEvent::Ignore => Ok(()),
+        // F3: 想定外の無視（message イベントなのに必須フィールドを欠く）。無言で握りつぶすと
+        // 顧客には「Bot が無反応」に見え、運用者にも気づく手段が無くなるため warn する。
+        RoutedEvent::IgnoreMalformed {
+            event_type,
+            missing_field,
+        } => {
+            tracing::warn!(
+                event_type,
+                missing_field,
+                "line webhook: a message event is missing a required field; ignoring this \
+                 event (the customer will see no reply)"
+            );
+            Ok(())
+        }
         RoutedEvent::NonText { reply_token } => {
-            send_line_reply(state, &reply_token, &state.nontext_text).await
+            send_line_reply(state, &reply_token, &state.nontext_text)
+                .await
+                // F2: reply_token を context に載せる（秘匿値ではないので出してよい）。
+                .with_context(|| format!("send line reply (non-text) reply_token={reply_token}"))
         }
         RoutedEvent::Text {
             reply_token,
@@ -402,7 +561,7 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             text,
         } => {
             let (case_id, history) = state.sessions.get(&user_id);
-            let api_response = call_answer_api(state, &text, case_id, &history).await;
+            let api_response = call_answer_api(state, &user_id, &text, case_id, &history).await;
             let (reply_text, update) =
                 assemble_reply(api_response.as_ref(), &text, &state.fallback_text);
 
@@ -415,7 +574,13 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
                 );
             }
 
-            send_line_reply(state, &reply_token, &reply_text).await
+            send_line_reply(state, &reply_token, &reply_text)
+                .await
+                // F2: どのユーザ/イベントの返信が失敗したか webhook_handler の error ログで
+                // 分かるようにする。
+                .with_context(|| {
+                    format!("send line reply user_id={user_id} reply_token={reply_token}")
+                })
         }
     }
 }
@@ -429,8 +594,13 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
 /// **ここで `Err` にして呼び出し元まで伝播させない**のは、LINE への返信は
 /// 「フォールバック文を返す」という具体的なフォールバック動作を持つため、
 /// エラーとして扱うより「材料が無かった」という状態として扱う方が呼び出し側の分岐が単純になる。
+///
+/// **F2**: すべてのログに `user_id` を含める（どの利用者の会話が壊れているか特定できるように
+/// する）。非 200 の warn には応答生成 API が返したエラーボディ（先頭 500 字。こちらの API が
+/// 生成したエラーメッセージであり秘密情報を含まない）も含める。
 async fn call_answer_api(
     state: &AppState,
+    user_id: &str,
     message: &str,
     case_id: Option<String>,
     history: &VecDeque<(Role, String)>,
@@ -450,7 +620,11 @@ async fn call_answer_api(
     let body = match serde_json::to_vec(&request) {
         Ok(b) => b,
         Err(err) => {
-            tracing::error!(error = ?err, "line webhook: failed to serialize answer api request");
+            tracing::error!(
+                user_id,
+                error = ?err,
+                "line webhook: failed to serialize answer api request"
+            );
             return None;
         }
     };
@@ -467,6 +641,7 @@ async fn call_answer_api(
         Ok(r) => r,
         Err(err) => {
             tracing::warn!(
+                user_id,
                 error = ?err,
                 "line webhook: answer api call failed (network/timeout); falling back to the \
                  fixed reply"
@@ -479,13 +654,19 @@ async fn call_answer_api(
     let text = match response.text().await {
         Ok(t) => t,
         Err(err) => {
-            tracing::error!(error = ?err, "line webhook: failed to read answer api response body");
+            tracing::error!(
+                user_id,
+                error = ?err,
+                "line webhook: failed to read answer api response body"
+            );
             return None;
         }
     };
     if !status.is_success() {
         tracing::warn!(
+            user_id,
             %status,
+            response_body = %truncate_chars(&text, 500),
             "line webhook: answer api returned a non-success status; falling back to the fixed \
              reply"
         );
@@ -495,6 +676,7 @@ async fn call_answer_api(
         Ok(resp) => Some(resp),
         Err(err) => {
             tracing::error!(
+                user_id,
                 error = ?err,
                 "line webhook: answer api returned 200 but the body failed to parse as the \
                  expected {{reply_text, case_id}} shape"
@@ -611,7 +793,10 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/line/webhook", post(webhook_handler))
         .with_state(state)
-        .merge(cs_support_mcp::health::health_router());
+        .merge(cs_support_mcp::health::health_router())
+        // F5: 正常系のリクエストが 1 行もログに残らないと、webhook が届いているか自体を
+        // 運用時に確認できない。main.rs のトップレベル app と同じパターン。
+        .layer(TraceLayer::new_for_http());
 
     // Cloud Run はコンテナに `PORT`/`BIND_ADDR` を渡す運用（Dockerfile の
     // `ENV BIND_ADDR=0.0.0.0:8080` を参照）。未設定時のローカル既定も同じ値にする。
@@ -716,6 +901,100 @@ mod tests {
         assert_eq!(
             history.back().unwrap(),
             &(Role::Assistant, "a14".to_string())
+        );
+    }
+
+    // ---- SessionStore の保存前正規化（F1: /api/reply の入力契約に必ず適合させる） ----
+
+    #[test]
+    fn session_store_truncates_history_text_over_2000_chars_on_update() {
+        let store = SessionStore::with_limits(Duration::from_secs(3600), 10);
+        let long_customer_text = "a".repeat(MAX_HISTORY_TEXT_CHARS + 500);
+        store.update(
+            "u1",
+            "case-1".into(),
+            long_customer_text,
+            "short reply".into(),
+        );
+        let (_, history) = store.get("u1");
+        let (role, text) = &history[0];
+        assert_eq!(*role, Role::Customer);
+        assert_eq!(
+            text.chars().count(),
+            MAX_HISTORY_TEXT_CHARS,
+            "text over the /api/reply history text limit must be truncated at save time, or \
+             the next request from this user will get a 400 and the session can never recover"
+        );
+    }
+
+    #[test]
+    fn session_store_truncates_multibyte_history_text_without_panicking_on_a_char_boundary() {
+        let store = SessionStore::with_limits(Duration::from_secs(3600), 10);
+        let long_ja_text = "あ".repeat(2_500);
+        store.update(
+            "u1",
+            "case-1".into(),
+            long_ja_text,
+            "assistant reply".into(),
+        );
+        let (_, history) = store.get("u1");
+        let (_, text) = &history[0];
+        assert_eq!(text.chars().count(), MAX_HISTORY_TEXT_CHARS);
+        assert_eq!(text, &"あ".repeat(MAX_HISTORY_TEXT_CHARS));
+    }
+
+    #[test]
+    fn session_store_leaves_history_text_at_or_under_2000_chars_untouched() {
+        let store = SessionStore::with_limits(Duration::from_secs(3600), 10);
+        let exact_limit_text = "b".repeat(MAX_HISTORY_TEXT_CHARS);
+        store.update(
+            "u1",
+            "case-1".into(),
+            exact_limit_text.clone(),
+            "reply".into(),
+        );
+        let (_, history) = store.get("u1");
+        assert_eq!(history[0], (Role::Customer, exact_limit_text));
+    }
+
+    #[test]
+    fn session_store_does_not_store_history_text_that_is_empty_after_trimming() {
+        // 応答生成 API が `reply_text: ""` を返した場合の防御（reviewer 追加指摘）。
+        let store = SessionStore::with_limits(Duration::from_secs(3600), 10);
+        store.update("u1", "case-1".into(), "question".into(), "   ".into());
+        let (_, history) = store.get("u1");
+        assert_eq!(
+            history.len(),
+            1,
+            "the whitespace-only assistant turn must not be stored, but the customer turn must"
+        );
+        assert_eq!(history[0], (Role::Customer, "question".to_string()));
+    }
+
+    #[test]
+    fn session_store_does_not_store_a_case_id_over_128_chars() {
+        // reviewer 追加指摘: 超過値を保存すると次回リクエストが必ず 400 になる。
+        let store = SessionStore::with_limits(Duration::from_secs(3600), 10);
+        let too_long_case_id = "c".repeat(MAX_CASE_ID_CHARS + 1);
+        store.update("u1", too_long_case_id, "q".into(), "a".into());
+        let (case_id, _) = store.get("u1");
+        assert!(
+            case_id.is_none(),
+            "a case_id over the /api/reply limit must not be stored"
+        );
+    }
+
+    #[test]
+    fn session_store_keeps_the_previous_case_id_when_a_new_one_exceeds_128_chars() {
+        let store = SessionStore::with_limits(Duration::from_secs(3600), 10);
+        store.update("u1", "case-1".into(), "q1".into(), "a1".into());
+        let too_long_case_id = "c".repeat(MAX_CASE_ID_CHARS + 1);
+        store.update("u1", too_long_case_id, "q2".into(), "a2".into());
+        let (case_id, _) = store.get("u1");
+        assert_eq!(
+            case_id,
+            Some("case-1".to_string()),
+            "an over-limit case_id must not overwrite the previous valid one"
         );
     }
 
@@ -851,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn route_event_ignores_a_message_event_missing_reply_token() {
+    fn route_event_flags_a_message_event_missing_reply_token_as_malformed() {
         let event = WebhookEvent {
             event_type: "message".to_string(),
             reply_token: None,
@@ -863,7 +1142,75 @@ mod tests {
                 text: Some("hi".to_string()),
             }),
         };
-        assert_eq!(route_event(&event), RoutedEvent::Ignore);
+        assert_eq!(
+            route_event(&event),
+            RoutedEvent::IgnoreMalformed {
+                event_type: "message".to_string(),
+                missing_field: "replyToken",
+            }
+        );
+    }
+
+    #[test]
+    fn route_event_flags_a_message_event_missing_the_message_field_as_malformed() {
+        let event = WebhookEvent {
+            event_type: "message".to_string(),
+            reply_token: Some("rt1".to_string()),
+            source: Some(EventSource {
+                user_id: Some("U1".to_string()),
+            }),
+            message: None,
+        };
+        assert_eq!(
+            route_event(&event),
+            RoutedEvent::IgnoreMalformed {
+                event_type: "message".to_string(),
+                missing_field: "message",
+            }
+        );
+    }
+
+    #[test]
+    fn route_event_flags_a_text_message_missing_source_user_id_as_malformed() {
+        // グループ会話等で source.userId が欠けたテキストメッセージ（F3）。
+        let event = WebhookEvent {
+            event_type: "message".to_string(),
+            reply_token: Some("rt1".to_string()),
+            source: Some(EventSource { user_id: None }),
+            message: Some(EventMessage {
+                message_type: "text".to_string(),
+                text: Some("hi".to_string()),
+            }),
+        };
+        assert_eq!(
+            route_event(&event),
+            RoutedEvent::IgnoreMalformed {
+                event_type: "message".to_string(),
+                missing_field: "source.userId",
+            }
+        );
+    }
+
+    #[test]
+    fn route_event_flags_a_text_message_missing_text_as_malformed() {
+        let event = WebhookEvent {
+            event_type: "message".to_string(),
+            reply_token: Some("rt1".to_string()),
+            source: Some(EventSource {
+                user_id: Some("U1".to_string()),
+            }),
+            message: Some(EventMessage {
+                message_type: "text".to_string(),
+                text: None,
+            }),
+        };
+        assert_eq!(
+            route_event(&event),
+            RoutedEvent::IgnoreMalformed {
+                event_type: "message".to_string(),
+                missing_field: "message.text",
+            }
+        );
     }
 
     // ---- assemble_reply（design doc §6 手順 4: API 応答からの文面決定） ----

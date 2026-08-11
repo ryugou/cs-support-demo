@@ -42,8 +42,16 @@ async fn main() -> Result<()> {
     // env 未設定・空文字だと、認証チェックが実質無効な（誰も鍵を持てない＝誰も
     // 通らない、または将来の実装ミスで誰でも通る）ルートを公開してしまう。
     // `CS_SUPPORT_LLM_API_KEY`（LlmConfig）と同じ「設定不備は起動失敗」の方針。
+    //
+    // F4（reviewer 指摘）: trim してから空判定する。`openssl rand -base64 32 |
+    // gcloud secrets create --data-file=-`（CLAUDE.md が推奨する secret 作成手順その
+    // もの）は値の末尾に改行を残す。ここで trim しないと、サーバ側の鍵は
+    // `"KEY\n"`、LINE アダプタ（`require_env` は既に trim 済み）が送るのは `"KEY"` になり、
+    // `api::authorize` の定数時間比較が必ず不一致になる。結果は全メッセージ 401 →
+    // フォールバック文の恒常化で、サービス自体は正常起動しているため気づきにくい。
     let answer_api_key = env::var("CS_SUPPORT_ANSWER_API_KEY")
         .ok()
+        .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
     if config.api.enabled && answer_api_key.is_none() {
         anyhow::bail!(
