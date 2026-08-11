@@ -534,6 +534,7 @@ impl Harness {
     /// 会話層（S1-0 / 遵守事項 1）: case_id 単位の累積 signal 集合をサーバ側で維持し、
     /// **毎ターン累積集合で再判定**する。条件が増えたら（変色 → 変色+カビ）再判定が
     /// 自動的にエスカレーションへ倒れる。会話履歴の言質は判定入力にしない。
+    #[allow(clippy::too_many_arguments)]
     pub async fn evaluate(
         &self,
         ctx: &RequestContext,

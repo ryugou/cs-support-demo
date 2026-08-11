@@ -143,13 +143,13 @@ Secret Manager 追加（すべて `openssl rand -base64 32` 相当以上の強�
 デプロイ:
 
 - 応答生成 API: 既存 service `cs-support-mcp` に同居（イメージ更新のみ）
-- LINE アダプタ: 新規 Cloud Run service `cs-support-line`。同一イメージ、`command = /usr/local/bin/line_adapter`。公開 ingress。VPC connector 不要（API へ公開 URL で到達）。LINE Developers console の webhook URL に `https://<cs-support-line の URL>/line/webhook` を設定する
+- LINE アダプタ: 新規 Cloud Run service `cs-support-line`。同一イメージ、`command = /usr/local/bin/line_adapter`。公開 ingress。VPC connector 不要（API へ公開 URL で到達）。**`--max-instances=1` で運用する**（セッションストアがプロセス内メモリのため、複数インスタンスに分散すると同一ユーザーの会話が非決定的に分裂する。セッション永続化を実装するまでこの制約を維持する）。LINE Developers console の webhook URL に `https://<cs-support-line の URL>/line/webhook` を設定する
 
 ## 8. テスト
 
 - API: 認証（ヘッダ欠落 / 不一致 / 一致）、入力制約（400 の各条件）、応答文決定表の 4 行（decision → reply_text を純関数として切り出して検証）、履歴の採用規則（6 ターン・4,000 字・古い側から破棄）、エラー分類（503 / 500 の判別関数）。`Harness::evaluate()` を通す全経路と未知 case_id の新規化は実 vegapunk が必要なためユニットテストの対象外とし、デプロイ後 E2E で検証する
 - LINE アダプタ: 署名検証（正・不正・欠落）、イベント振り分け（テキスト / 非テキスト / 非 message）、セッション TTL・上限・再起動相当（新規ストア）の挙動、API 非 200 時のフォールバック文
-- E2E（デプロイ後）: `curl` で `/api/reply` の 200 / 401 / 400 を確認後、実 LINE でテキスト往復とマルチターン（case_id 維持）を確認
+- E2E（デプロイ後）: `curl` で `/api/reply` の 200 / 401 / 400 を確認後、実 LINE でテキスト往復とマルチターン（case_id 維持）を確認。往復時間と reply token の失効有無を実測し、アダプタの API タイムアウト値（50 秒）の妥当性をこの実測で確定する
 
 ## 9. スコープ外（v1）と次フェーズ
 

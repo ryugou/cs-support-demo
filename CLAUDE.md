@@ -523,6 +523,7 @@ MCP tool 呼び出しは claude.ai のカスタムコネクタ経由で行う。
 `cs-support-mcp` 本体が内蔵する `POST /{project_id}/api/reply` を LINE から呼べるようにする webhook アダプタを、**同一イメージの別 Cloud Run service**として運用する。判定・応答文生成のロジックは一切持たず、署名検証・応答生成 API への 1 コール・LINE への返信だけを行う薄いアダプタ（`server/src/bin/line_adapter.rs`）。契約の正本は `docs/superpowers/specs/2026-08-11-answer-api-line-adapter-design.md` §6・§7（ここには複製しない）。
 
 - service: `cs-support-line`。`cs-support-mcp` と同一イメージを使い、起動コマンドだけ `/usr/local/bin/line_adapter` に上書きする（`Dockerfile` は両バイナリを同梱済み）
+- **`--max-instances=1` 必須**。セッションストア（userId → case_id / 履歴）がプロセス内メモリのため、複数インスタンスに分散すると同一ユーザーの会話が非決定的に分裂する。スケールが必要になったらセッション永続化（design doc §9 の次フェーズ）を先に実装する
 - ingress: 公開（LINE Platform からの webhook を受けるため）。**VPC connector 不要**（vegapunk への直接到達が要らず、応答生成 API へは `cs-support-mcp` の公開 URL 経由で到達するため）
 - 新規 Secret Manager 3 件（既存の `openssl rand -base64 32` 相当以上の強度、または LINE Developers console 発行値をそのまま使う）:
   - `cs-support-answer-api-key` → `cs-support-mcp` 本体の `CS_SUPPORT_ANSWER_API_KEY`（上記「未設定だと起動に失敗する」参照）と、`cs-support-line` の `CS_ANSWER_API_KEY` の**両方**に同じ値を注入する（応答生成 API 側は「この鍵を提示したリクエストを受理する」、LINE アダプタ側は「この鍵を `Authorization: Bearer` として送る」で対になっている必要がある）
