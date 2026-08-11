@@ -71,10 +71,17 @@ const MAX_HISTORY_TEXT_CHARS: usize = 2_000;
 /// （design doc §2）と一致させる。これを超える case_id を保存すると、次回以降の
 /// リクエストが必ず 400 になり、history と同じ理由でセッションが自己回復不能になる。
 /// **切り詰めは行わない**（case_id は不透明な識別子であり、切り詰めると別の case を指す
-/// 壊れた id になるため）。超過時は保存せず、直前の有効な case_id をそのまま保持する
-/// （＝次回リクエストもその case_id を使って**同じ case へ継続する**。新規 case には
-/// ならない）。case の累積 signal を失わせて新規 case にするより、既知の有効な case へ
-/// 継続する方が安全側の判断。
+/// 壊れた id になるため）。超過時は保存せず、`session.case_id` を**直前の値のまま**にする。
+/// この後の挙動は直前の値の有無で分かれる:
+///
+/// - 直前に有効な case_id があった場合: 次回リクエストもその case_id が送られ、**同じ case
+///   へ継続する**（新規 case にはならない）。case の累積 signal を失わせて新規 case にする
+///   より、既知の有効な case へ継続する方が安全側の判断。
+/// - 直前が `None` だった場合（新規セッションの初回ターン、TTL 失効直後、エントリ上限
+///   超過による eviction 直後）: `session.case_id` は `None` のままなので、次回リクエストは
+///   case_id 無しで送られ、`/api/reply` 側で**新規 case になる**。128 字超が構造的に
+///   起きる場合（応答生成 API が返す case_id の形式自体が契約を超えている場合）、これは
+///   全ユーザで初回ターンから発生するため、この分岐こそが常態になりうる。
 const MAX_CASE_ID_CHARS: usize = 128;
 
 /// LINE user 1 人分のセッション。
@@ -176,14 +183,21 @@ impl SessionStore {
 
         let case_id_chars = case_id.chars().count();
         if case_id_chars > MAX_CASE_ID_CHARS {
+            // `session.case_id` への代入より前に評価すること: これから discard する
+            // case_id ではなく、直前まで保持していた値の有無を報告するフィールドなので、
+            // 代入後に読むと常に「代入されなかった」ことしか分からず意味が無い。
+            let kept_previous_case_id = session.case_id.is_some();
             tracing::warn!(
                 user_id,
                 case_id_chars,
                 max_chars = MAX_CASE_ID_CHARS,
+                kept_previous_case_id,
                 "line webhook: case_id returned by the answer api exceeds the /api/reply \
-                 contract; discarding it and keeping the previous case_id instead (the next \
-                 message from this user will resume the existing case with the previous \
-                 case_id, not start a new one)"
+                 contract; discarding it without truncation. if a previous case_id was held \
+                 (kept_previous_case_id=true), the next message from this user resumes that \
+                 existing case. otherwise (kept_previous_case_id=false: new session, post-TTL, \
+                 or post-eviction) session.case_id stays None and the next message starts a \
+                 new case"
             );
         } else {
             session.case_id = Some(case_id);
