@@ -530,6 +530,7 @@ impl Harness {
         product_key: Option<&str>,
         case_id: Option<&str>,
         tools: &ToolService,
+        history: &[reply::ReplyHistoryTurn],
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
@@ -854,7 +855,13 @@ impl Harness {
         // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
         // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
         let reply_draft = self
-            .draft_customer_reply(question, &decision_result, &section_hits, &resolutions)
+            .draft_customer_reply(
+                question,
+                &decision_result,
+                &section_hits,
+                &resolutions,
+                history,
+            )
             .await;
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
         let customer_reply_draft = reply_draft.map(|d| d.text);
@@ -885,6 +892,7 @@ impl Harness {
         decision: &decision::AnswerDecision,
         hits: &[SectionHit],
         resolutions: &[rules::KnownResolution],
+        history: &[reply::ReplyHistoryTurn],
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
@@ -902,7 +910,7 @@ impl Harness {
         };
         let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
         let system = reply::build_reply_system_prompt(&brief);
-        let user = reply::build_reply_user_message(question, &brief);
+        let user = reply::build_reply_user_message(question, &brief, history);
         let draft = match drafter
             .draft_reply(&system, &user, self.reply_draft_max_tokens)
             .await
@@ -1342,7 +1350,7 @@ mod tests {
             source_url: None,
         }];
         harness
-            .draft_customer_reply("カメラが反応しません", &decision, &hits, &[])
+            .draft_customer_reply("カメラが反応しません", &decision, &hits, &[], &[])
             .await
     }
 

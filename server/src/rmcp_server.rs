@@ -633,6 +633,9 @@ impl CsSupportRmcpServer {
                 req.product_key.as_deref(),
                 req.case_id.as_deref(),
                 &self.tools,
+                // MCP 経路は会話履歴を持たない（呼び出し側は case_id による signal 累積で
+                // マルチターンを扱う）。応答生成 API（/api/reply）だけが履歴を渡す。
+                &[],
             )
             .await
             .map_err(to_error)?;
