@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 /// リクエストボディ（design doc §2）。
@@ -129,6 +130,12 @@ pub fn validate(req: &ReplyRequest) -> Result<(), String> {
 /// 通常の `==` は不一致箇所で早期リターンするため、比較にかかる時間から鍵の
 /// 先頭一致長を推測されうる（タイミングサイドチャネル）。ここでは長さが違っても
 /// 早期リターンせず、XOR を OR で畳み込んで最後に 0 判定する。
+///
+/// この早期 return 分岐自体は残す（`a` / `b` の長さが一般に異なりうる汎用ユーティリティ
+/// としての契約のため）が、`authorize` はこの関数を生の入力に対して直接は呼ばない。
+/// `authorize` は比較の前に両辺を SHA-256 でハッシュしてから渡すため、実際に比較される
+/// のは常に 32 バイト同士であり、この早期 return 分岐は `authorize` の経路では実質的に
+/// 通らない（長さの不一致という情報そのものが比較の手前で消える）。
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -162,6 +169,12 @@ fn extract_bearer_token(header_value: &str) -> Option<&str> {
 /// かつ env 未設定・空文字は起動失敗）により通常は空文字が渡ることはないが、この関数
 /// 単体の契約としても「空鍵は誰も認証されない」を保証する（設定不備の実質無認証化を
 /// 多重に防ぐ。`config.rs::read_secret_file` と同じ規律）。
+///
+/// 比較の直前に両辺を SHA-256 でハッシュする（Stage 2 レビュー指摘）。ハッシュ前の
+/// `presented` / `api_key` は長さが一般に異なるため、`constant_time_eq` に生のまま渡すと
+/// その早期 return 分岐が実際に踏まれ、比較にかかる時間から長さの一致・不一致が漏れる
+/// （タイミングサイドチャネル）。ハッシュ後は常に 32 バイト同士の比較になり、長さという
+/// 情報自体が比較の手前で消えるため、この経路は早期 return を実質的に踏まなくなる。
 pub fn authorize(headers: &HeaderMap, api_key: &str) -> bool {
     if api_key.is_empty() {
         return false;
@@ -173,7 +186,9 @@ pub fn authorize(headers: &HeaderMap, api_key: &str) -> bool {
     else {
         return false;
     };
-    constant_time_eq(presented.as_bytes(), api_key.as_bytes())
+    let presented_hash = Sha256::digest(presented.as_bytes());
+    let api_key_hash = Sha256::digest(api_key.as_bytes());
+    constant_time_eq(&presented_hash, &api_key_hash)
 }
 
 /// `/api/reply` ルートが共有する状態。
@@ -576,6 +591,34 @@ mod tests {
     #[test]
     fn constant_time_eq_treats_empty_slices_as_equal() {
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// `authorize` の実際の経路（Stage 2 レビュー指摘）: 生の `presented` / `api_key` を
+    /// 直接 `constant_time_eq` に渡すと、長さが異なる入力では早期 return 分岐が踏まれ、
+    /// 比較にかかる時間から長さの一致・不一致が漏れる。SHA-256 でハッシュしてから比較すると、
+    /// 元の長さがどれだけ違っても両辺は常に 32 バイトになり、長さが同じ入力と同一の
+    /// コードパス（早期 return を通らない固定長比較）を通ることを確認する。
+    #[test]
+    fn authorize_compares_hashed_keys_so_different_length_inputs_take_the_fixed_length_path() {
+        let short_hash = Sha256::digest(b"short");
+        let long_hash = Sha256::digest(b"a-much-longer-configured-api-key-value");
+        // ハッシュ後は常に 32 バイト: 元の長さの違いが比較の手前で消えている。
+        assert_eq!(short_hash.len(), 32);
+        assert_eq!(long_hash.len(), 32);
+        // 同じ長さ（32 バイト）同士の比較なので、`constant_time_eq` の早期 return 分岐
+        // ではなく、必ず XOR 畳み込みの経路を通って不一致と判定される。
+        assert!(!constant_time_eq(&short_hash, &long_hash));
+    }
+
+    /// 上記経路が実際に `authorize` 経由でも成立すること（presented と configured の
+    /// 元の長さが大きく異なっていても、ハッシュ後の比較で不一致・一致が正しく判定される）。
+    #[test]
+    fn authorize_rejects_mismatched_keys_of_very_different_lengths() {
+        let headers = headers_with_bearer("Bearer x");
+        assert!(!authorize(
+            &headers,
+            "a-much-longer-configured-api-key-that-does-not-match"
+        ));
     }
 
     // ---- authorize ----
