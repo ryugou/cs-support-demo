@@ -80,3 +80,10 @@ enabled = true
 # （server/src/main.rs の起動時検査）。
 [api]
 enabled = true
+clarify_max_turns = 3
+
+[api.business_hours]
+days = "mon-fri"
+start = "10:00"
+end = "18:00"
+tz = "Asia/Tokyo"

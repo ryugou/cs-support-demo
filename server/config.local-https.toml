@@ -47,3 +47,10 @@ demote_rejections = 2
 # 応答生成 API（POST /{project_id}/api/reply）。ローカルでは使わない。
 [api]
 enabled = false
+clarify_max_turns = 3
+
+[api.business_hours]
+days = "mon-fri"
+start = "10:00"
+end = "18:00"
+tz = "Asia/Tokyo"

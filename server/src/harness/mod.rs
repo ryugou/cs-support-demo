@@ -5,6 +5,7 @@ pub mod decision;
 pub mod egress;
 pub mod extraction;
 pub mod grading;
+pub mod hours;
 pub mod knowledge;
 pub mod reply;
 pub mod rules;
