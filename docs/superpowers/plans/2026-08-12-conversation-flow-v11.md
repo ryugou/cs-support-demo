@@ -153,17 +153,27 @@ fn clarification_is_allowed_for_layer3_gray() { /* InsufficientDirectness / Unkn
 ### Task 6: /api/reply オーケストレーション
 
 **Files:**
-- Modify: `server/src/api.rs`
+- Modify: `server/src/api.rs`（ReplyAction・decide_reply_action・ハンドラ配線・reply_text_for 撤去）
+- Modify: `server/src/harness/mod.rs`（`CaseConvState` に `time_pref_extraction_error_count: u32` を追加。`conv_state_from_attrs` / `merge_conv_state_attributes` も対応）
+- Modify: `server/src/main.rs`（`[api] enabled = true` 時の `business_hours.tz`/`start`/`end` 起動時バリデーション、fail closed）
 
-**Interfaces:**
-- Produces: `enum ReplyAction { Answer(String), Clarify, EscalationReply, TimePrefIntake(...) }` と純関数 `decide_reply_action(outcome: &EvaluationOutcome, conv: &CaseConvState, cfg: &ApiConfig) -> ReplyAction`（spec §2 の決定表 + clarify_turns 上限）
-- ハンドラの処理順: (1) case_id ありかつ `awaiting_time_pref` → 時間帯分類（Task 5）。false なら evaluate へ / (2) evaluate → `decide_reply_action` / (3) Clarify なら生成 + `clarify_turns += 1` 保存 / (4) EscalationReply なら組み立て + `awaiting_time_pref = true`・`time_pref_false_count = 0`・`clarify_turns = 0` 保存
-- レスポンス契約 `{ reply_text, case_id }` は不変
+**Interfaces（design doc §2・§5・§6 の最終版。字面が古い場合は design doc を正とする）:**
+- Produces: `enum ReplyAction { Answer(String), Clarify, EscalationReply }`（3値。時間帯受付は Task 5 の分岐が evaluate 到達前に解決するため、`decide_reply_action` 自体は design doc §2 の決定表 3 行だけを見る）と純関数 `decide_reply_action(outcome: &EvaluationOutcome, conv: &CaseConvState, cfg: &ApiConfig) -> ReplyAction`
+- ハンドラの処理順:
+  1. `req.case_id` が `Some` なら `load_conv_state` → `awaiting_time_pref` なら `extract_time_preference` → `Ok` なら `handle_time_pref`（Reply ならそのまま返す・保存して終了。PassToEvaluate なら保存して次へ） → `Err` なら `time_pref_extraction_error_count += 1`、3 到達で `awaiting_time_pref = false` かつ `time_pref_false_count = 0` へ自動解除（成功時は 0 に戻す）、保存して次へ
+  2. `evaluate()` を呼ぶ（evaluate 実行中は conv state を読み書きしないこと。上記 1 の保存は evaluate 呼び出し**前**に完了させる。`harness::mod::Harness::save_conv_state` の doc コメントにある lost-update 契約を守る）
+  3. `load_conv_state(&ctx, &outcome.case_id)` で最新状態を取り直し、`decide_reply_action` へ渡す
+  4. `Clarify`: `clarify::draft_clarify_question`（reply_drafter が `None` なら `FALLBACK_CLARIFY_TEXT` を直接使う。missing は `AnswerDecision::Escalate.missing: Vec<EvidenceRequirement>` を人間可読文へ変換） → `clarify_turns += 1` → 保存
+  5. `EscalationReply`: `escalation_reply::draft_ack_text` + `build_deterministic_block`（`hours::is_within_business_hours` / `business_hours_label`） → `assemble_escalation_reply` → `awaiting_time_pref = true`・`time_pref_false_count = 0`・`time_pref_extraction_error_count = 0`・`clarify_turns = 0` → 保存
+  6. `Answer`: `outcome.customer_reply_draft` をそのまま使う。conv state は変更しない（保存不要）
+- レスポンス契約 `{ reply_text, case_id }` は不変。`reply_text_for` と `config.api.fallback_reply_text` の呼び出し経路は本タスクで置き換える（`fallback_reply_text` の config フィールド自体は削除しない、既定値・TOML はそのまま）
+- 起動時バリデーション: `config.api.enabled` のとき `business_hours.tz` を `chrono_tz::Tz` へ、`start`/`end` を `NaiveTime::parse_from_str(..., "%H:%M")` へ parse し、失敗したら `anyhow::bail!`（main.rs の既存 `CS_SUPPORT_ANSWER_API_KEY` / `fallback_reply_text` 検査と同じ場所・同じ書式）
 
-- [ ] **Step 1: `decide_reply_action` の失敗するテストを書く**（決定表の全行: allowed+draft / allowed+truncated / escalate+clarifiable+残ターンあり / 残ターンなし / clarification_allowed=false / rule_match）
+- [ ] **Step 1: `decide_reply_action` の失敗するテストを書く**（決定表の全行: allowed+draft / allowed+truncated / escalate+clarifiable+残ターンあり / 残ターンなし / clarification_allowed=false / rule_match相当）
 - [ ] **Step 2: FAIL → 実装 → PASS**
-- [ ] **Step 3: ハンドラ配線**（evaluate に到達しない範囲の既存統合テストが壊れないこと + 新規分岐は純関数テストで担保。v1 と同じテスト境界）
-- [ ] **Step 4: fmt・全テスト・clippy → Commit** `feat(api): three-way reply flow with hearing loop (#17)`
+- [ ] **Step 3: `CaseConvState.time_pref_extraction_error_count` の読み書きテスト**（欠落→0 / 保存→文字列化 / 3到達で自動解除の組み立て）、main.rs の起動時バリデーションテスト（tz/start/end それぞれ不正値で bail、正常値で通過）
+- [ ] **Step 4: ハンドラ配線**（evaluate に到達しない範囲の既存統合テストが壊れないこと + 新規分岐は純関数テストで担保。v1 と同じテスト境界）
+- [ ] **Step 5: fmt・全テスト・clippy → Commit** `feat(api): three-way reply flow with hearing loop (#17)`
 
 ---
 

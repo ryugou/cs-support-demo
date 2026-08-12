@@ -130,6 +130,13 @@ pub struct CaseConvState {
     pub time_pref_false_count: u32,
     /// 担当者への申し送り用の希望時間帯（時間外希望は付記を含む）。
     pub preferred_contact_time: Option<String>,
+    /// `awaiting_time_pref` 中に希望時間帯の抽出インフラが失敗（LLM 呼び出しエラー・
+    /// 応答 parse 失敗）した連続回数。`time_pref_false_count`（真の分類結果が false だった
+    /// 回数）とは別枠で数える。3 回に達したら `awaiting_time_pref = false` かつ
+    /// `time_pref_false_count = 0` へ自動解除し、自身も 0 へリセットする（design doc §5）。
+    /// この判定自体は `Harness` ではなくオーケストレーション層（`api.rs`）の責務で、
+    /// ここは読み書きの器のみを持つ。
+    pub time_pref_extraction_error_count: u32,
 }
 
 /// support_case の属性 map から [`CaseConvState`] を復元する純関数。
@@ -147,6 +154,9 @@ fn conv_state_from_attrs(attrs: &std::collections::HashMap<String, String>) -> C
             .get("preferred_contact_time")
             .filter(|s| !s.is_empty())
             .cloned(),
+        time_pref_extraction_error_count: get("time_pref_extraction_error_count")
+            .parse()
+            .unwrap_or(0),
     }
 }
 
@@ -172,6 +182,10 @@ fn merge_conv_state_attributes(
     merged.insert(
         "preferred_contact_time".to_string(),
         state.preferred_contact_time.clone().unwrap_or_default(),
+    );
+    merged.insert(
+        "time_pref_extraction_error_count".to_string(),
+        state.time_pref_extraction_error_count.to_string(),
     );
     merged
 }
@@ -1891,6 +1905,7 @@ mod tests {
                 awaiting_time_pref: false,
                 time_pref_false_count: 0,
                 preferred_contact_time: None,
+                time_pref_extraction_error_count: 0,
             }
         );
     }
@@ -1905,6 +1920,10 @@ mod tests {
                 "preferred_contact_time".to_string(),
                 "平日午後（対応時間外の希望）".to_string(),
             ),
+            (
+                "time_pref_extraction_error_count".to_string(),
+                "2".to_string(),
+            ),
         ]
         .into_iter()
         .collect();
@@ -1916,6 +1935,19 @@ mod tests {
             state.preferred_contact_time.as_deref(),
             Some("平日午後（対応時間外の希望）")
         );
+        assert_eq!(state.time_pref_extraction_error_count, 2);
+    }
+
+    #[test]
+    fn conv_state_from_attrs_defaults_time_pref_extraction_error_count_when_missing() {
+        // 古い case・time_pref_extraction_error_count 追加前の case のどちらもこのキーを
+        // 持たない。欠落は 0 に倒す（他の 3 属性と同じ後方互換の規律）。
+        let attrs: std::collections::HashMap<String, String> =
+            [("clarify_turns".to_string(), "1".to_string())]
+                .into_iter()
+                .collect();
+        let state = conv_state_from_attrs(&attrs);
+        assert_eq!(state.time_pref_extraction_error_count, 0);
     }
 
     #[test]
@@ -1942,6 +1974,7 @@ mod tests {
             awaiting_time_pref: true,
             time_pref_false_count: 0,
             preferred_contact_time: None,
+            time_pref_extraction_error_count: 2,
         };
         let merged = merge_conv_state_attributes(&existing, &state);
         assert_eq!(merged.get("question").map(String::as_str), Some("元の質問"));
@@ -1962,6 +1995,12 @@ mod tests {
             merged.get("preferred_contact_time").map(String::as_str),
             Some("")
         );
+        assert_eq!(
+            merged
+                .get("time_pref_extraction_error_count")
+                .map(String::as_str),
+            Some("2")
+        );
     }
 
     #[test]
@@ -1980,12 +2019,20 @@ mod tests {
             awaiting_time_pref: true,
             time_pref_false_count: 0,
             preferred_contact_time: None,
+            time_pref_extraction_error_count: 0,
         };
         let merged = merge_conv_state_attributes(&existing, &state);
         assert_eq!(merged.get("clarify_turns").map(String::as_str), Some("0"));
         assert_eq!(
             merged.get("preferred_contact_time").map(String::as_str),
             Some("")
+        );
+        assert_eq!(
+            merged
+                .get("time_pref_extraction_error_count")
+                .map(String::as_str),
+            Some("0"),
+            "自動解除時は time_pref_false_count と同じく 0 へリセットされる"
         );
     }
 
@@ -1997,12 +2044,14 @@ mod tests {
                 awaiting_time_pref: false,
                 time_pref_false_count: 0,
                 preferred_contact_time: None,
+                time_pref_extraction_error_count: 0,
             },
             CaseConvState {
                 clarify_turns: 3,
                 awaiting_time_pref: true,
                 time_pref_false_count: 2,
                 preferred_contact_time: Some("平日夕方（対応時間外の希望）".to_string()),
+                time_pref_extraction_error_count: 1,
             },
         ] {
             let merged = merge_conv_state_attributes(&std::collections::HashMap::new(), &state);

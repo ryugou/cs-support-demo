@@ -325,6 +325,7 @@ mod tests {
             awaiting_time_pref,
             time_pref_false_count,
             preferred_contact_time: preferred_contact_time.map(str::to_string),
+            time_pref_extraction_error_count: 0,
         }
     }
 

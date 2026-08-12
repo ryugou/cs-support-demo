@@ -56,7 +56,7 @@ case の `awaiting_time_pref = true` のとき、次の顧客発話を最初に�
 
 - 分類と抽出: LLM で `{ is_time_preference: bool, windows: [{ days: "weekday" | "weekend" | "any", start: "HH:MM" | null, end: "HH:MM" | null }], raw: string }` を構造化抽出する。「午後」「夕方以降」等の曖昧表現は windows の start/end を常識的な時刻に正規化させる（例: 午後 = 12:00–18:00）
 - `is_time_preference = false` の場合: case 属性 `time_pref_false_count` を +1 し、その発話を通常の evaluate フロー（第 2 節）に流す。**false 分類が 2 回連続したら `awaiting_time_pref = false` に自動解除する**（時間帯に言及しない顧客の全発話へ分類 LLM が挟まり続けることを防ぐ）。true 分類が来たら 0 に戻す
-- **抽出インフラの失敗（LLM 呼び出しエラー・応答 parse 失敗）は `is_time_preference = false`（真の分類結果）と区別し、`time_pref_false_count` を増やさない。** 混同すると、一時的な LLM 障害が 2 ターン続くだけで顧客が実際に答えた希望時間帯が恒久的に取りこぼされる（`awaiting_time_pref` が誤って自動解除される）。この場合は state を変更せず、その発話をそのまま通常の evaluate フロー（第 2 節）に流す。抽出インフラ失敗が連続する場合の `awaiting_time_pref` 解除は Task 6（オーケストレーション層）の責務とする（別カウンタで上限を設ける）
+- **抽出インフラの失敗（LLM 呼び出しエラー・応答 parse 失敗）は `is_time_preference = false`（真の分類結果）と区別し、`time_pref_false_count` を増やさない。** 混同すると、一時的な LLM 障害が 2 ターン続くだけで顧客が実際に答えた希望時間帯が恒久的に取りこぼされる（`awaiting_time_pref` が誤って自動解除される）。この場合は `time_pref_false_count` / `awaiting_time_pref` を変更せず、その発話をそのまま通常の evaluate フロー（第 2 節）に流す。**抽出インフラ失敗が連続する場合の解除は case 属性 `time_pref_extraction_error_count`（int、既定 0）で行う**: 失敗のたび +1 し、**3 回**に達したら `awaiting_time_pref = false` かつ `time_pref_false_count = 0` へ自動解除し、自身も 0 へリセットする（`time_pref_false_count` の 2 回連続解除と同じ「解除と同時にカウンタをリセットする」規律）。分類が成功した場合（true/false どちらでも）は 0 に戻す。この判定・保存は Task 6（オーケストレーション層、`/api/reply` ハンドラ）の責務とする（`time_pref.rs` は `Result` を返すだけで、このカウンタ自体は関知しない）
 - `is_time_preference = true` の場合、**営業時間との重なり判定はコードで行い、いずれの場合も 1 回で受け付ける（訂正の往復はしない）**:
   - 営業時間と重なる希望: 「承りました。{raw} の時間帯でご連絡できるよう担当者に申し伝えます。」
   - 重ならない希望: 「{raw} で承りました。なお、担当者からのご連絡は対応時間（{営業時間の表記}）の中となるため、ご希望に添えない場合があります。」（曖昧表現の正規化揺れで機械的に突き返さない。最終判断は担当者に委ねる）
@@ -85,6 +85,9 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 | `awaiting_time_pref` | bool（既定 false） | 次発話を時間帯返信として解釈するか。false 分類 2 連続で自動解除、新エスカレーションで再セット |
 | `time_pref_false_count` | int（既定 0） | 自動解除用の連続 false カウント |
 | `preferred_contact_time` | string（任意） | 担当者への申し送り（時間外希望はその旨を付記） |
+| `time_pref_extraction_error_count` | int（既定 0） | 抽出インフラ失敗（`time_pref_false_count` とは別枠）の連続回数。3 回で自動解除 |
+
+起動時検証: `[api] enabled = true` のとき、`business_hours.tz` / `start` / `end` / `days`（`"mon-fri"` または `"everyday"` のいずれかであること）はサーバ起動時に検証し、失敗したら `anyhow::bail!` で起動を止める（fail closed）。実行時に `hours.rs` が同じ値を fail-closed で「営業時間外」に倒す経路はあるが、設定ミスに気づかないまま「常に営業時間外」の案内が出続ける事故を起動時点で防ぐ。`days` を検証対象から外すと、`business_hours_label` が未知値を黙って「平日」表示に倒すため、「常に対応時間外」の案内がもっともらしいラベル付きで出続ける同種の事故が別経路から起きる。
 
 ## 7. LLM 呼び出しの増分（運用注意）
 
