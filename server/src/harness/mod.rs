@@ -14,6 +14,7 @@ pub mod reply;
 pub mod rules;
 pub mod scope;
 pub mod signal;
+pub mod time_pref;
 
 use crate::config::AppConfig;
 use crate::mcp::ToolService;

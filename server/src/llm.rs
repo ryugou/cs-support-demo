@@ -319,7 +319,10 @@ pub fn parse_signal_response(text: &str) -> Result<Vec<String>> {
 }
 
 /// 先頭の ```json / ``` フェンスと末尾の ``` を取り除く（無ければ何もしない）。
-fn strip_markdown_fence(text: &str) -> &str {
+///
+/// `pub(crate)`: `harness::time_pref::parse_time_pref_response` も同じ「```json フェンスを
+/// 許容してから serde_json::from_str」というパターンを再利用する（re-implement しない）。
+pub(crate) fn strip_markdown_fence(text: &str) -> &str {
     let trimmed = text.trim();
     let without_prefix = trimmed
         .strip_prefix("```json")

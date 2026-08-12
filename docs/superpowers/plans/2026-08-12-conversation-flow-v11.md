@@ -136,7 +136,7 @@ fn clarification_is_allowed_for_layer3_gray() { /* InsufficientDirectness / Unkn
 
 **Interfaces:**
 - Produces: `TimePrefExtraction { is_time_preference: bool, windows: Vec<PrefWindow>, raw: String }`, `PrefWindow { days: PrefDays, start: Option<NaiveTime>, end: Option<NaiveTime> }`, `enum PrefDays { Weekday, Weekend, Any }`
-- LLM 構造化抽出関数（JSON 出力を強制するプロンプト + serde parse。parse 失敗は `is_time_preference = false` 扱いで warn）
+- LLM 構造化抽出関数（JSON 出力を強制するプロンプト + serde parse）。**抽出インフラ失敗（LLM 呼び出しエラー・parse 失敗）は `is_time_preference = false`（真の分類結果）とは型で区別し `Result<TimePrefExtraction, TimePrefExtractionError>` を返す**（design doc §5 追記事項。理由もそちらを参照）。呼び出し側（Task 6）は `Err` の場合 `handle_time_pref` を呼ばず state 変更なしで通常の evaluate フローへ流し、`Err` の連続回数は別カウンタで数えて上限到達時に `awaiting_time_pref` を解除すること（Task 6 の受け入れ条件に含める）
 - `handle_time_pref(extraction, state: &mut CaseConvState, cfg: &BusinessHoursConfig) -> TimePrefAction`（純関数）:
   - true かつ重なりあり → `Reply(承りましたテンプレ)` + `preferred_contact_time = raw` + awaiting 解除
   - true かつ重なりなし → `Reply(付記テンプレ)` + `preferred_contact_time = raw +「（対応時間外の希望）」` + awaiting 解除
