@@ -9,7 +9,8 @@ use crate::harness::prompt_input::{
     apply_egress_gate_or_fallback, neutralize_delimiters, truncate_question,
 };
 
-/// 受け止め文の生成失敗・egress gate 却下時の定型文（design doc §4 の文字列そのまま）。
+/// 受け止め文の生成失敗・生成上限による途中切断・egress gate 却下時の定型文
+/// （design doc §4 の文字列そのまま）。
 ///
 /// `config::default_fallback_reply_text()` と同一文字列だが、Task 4 の要件どおり本モジュール
 /// 内に独立した定数として持つ（用途が異なるため共有化しない）。
@@ -75,8 +76,8 @@ pub fn build_ack_prompt(question: &str) -> (String, String) {
     (system, user)
 }
 
-/// 受け止め文を 1 案生成する。生成失敗・egress gate 却下のいずれでも [`FALLBACK_ACK_TEXT`] へ
-/// 倒す（`harness::clarify::draft_clarify_question` と同じ型）。
+/// 受け止め文を 1 案生成する。生成失敗・生成上限による途中切断・egress gate 却下のいずれでも
+/// [`FALLBACK_ACK_TEXT`] へ倒す（`harness::clarify::draft_clarify_question` と同じ型）。
 pub async fn draft_ack_text(
     drafter: &crate::llm::AnthropicClient,
     ng: &NgDictionary,
@@ -94,6 +95,25 @@ pub async fn draft_ack_text(
             return FALLBACK_ACK_TEXT.to_string();
         }
     };
+    // 生成上限で途中切断された下書きは、切れ目次第で完成文に見えることがあり、egress gate
+    // （NG 語のブロックリストマッチ）では検知できない。`draft_customer_reply`（mod.rs）は
+    // 戻り値が `ReplyDraft` のままなので `truncated` を呼び出し側へ surface できるが、この
+    // 関数は戻り値が `String` 一本なので surface できない。したがって egress gate に通す前に
+    // ここでフォールバックへ倒す（Issue #14 と同じ問題を、この関数の型に合わせて塞ぐ）。
+    if draft.truncated {
+        tracing::warn!(
+            route = "escalation_ack",
+            setting = "harness.customer_reply_draft_max_tokens",
+            draft_chars = draft.text.chars().count(),
+            "escalation ack draft hit max_tokens and is cut off; it could look like a complete \
+             sentence depending on where it was cut, so the egress gate (which only matches NG \
+             terms, not sentence completeness) cannot catch it. Falling back to \
+             FALLBACK_ACK_TEXT. Raise harness.customer_reply_draft_max_tokens if this recurs \
+             (shared by the customer reply / clarify question / escalation ack routes; raising \
+             it also raises the customer reply route's output cap, cost, and latency)"
+        );
+        return FALLBACK_ACK_TEXT.to_string();
+    }
     let ctx = EmitContext {
         channel: EmitChannel::Operator,
     };
@@ -235,6 +255,75 @@ mod tests {
     fn assemble_escalation_reply_joins_with_blank_line() {
         let joined = assemble_escalation_reply("受け止め文です。", "受付番号: 12345678");
         assert_eq!(joined, "受け止め文です。\n\n受付番号: 12345678");
+    }
+
+    /// stub LLM に `draft_text` / `stop_reason` を返させ、`draft_ack_text` の結果を返す。
+    ///
+    /// `AnthropicClient` のフィールドは `llm.rs` で private なので `from_config` 経由で組む
+    /// （`harness::mod::draft_customer_reply_via_stub` / `clarify.rs` と同じパターン）。
+    async fn draft_ack_text_via_stub(
+        draft_text: &str,
+        stop_reason: &str,
+    ) -> (String, crate::llm::test_support::RequestLog) {
+        let body = serde_json::json!({
+            "stop_reason": stop_reason,
+            "content": [{"type": "text", "text": draft_text}],
+        })
+        .to_string();
+        let (endpoint, log) = crate::llm::test_support::spawn_messages_stub(body).await;
+
+        let dir = std::env::temp_dir().join(format!("harness-ack-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let key_path = dir.join("llm-api-key");
+        std::fs::write(&key_path, "test-key\n").expect("write api key file");
+        let drafter = crate::llm::AnthropicClient::from_config(&crate::config::LlmConfig {
+            enabled: true,
+            endpoint,
+            api_key_file: Some(key_path.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .expect("llm client must build from the stub config")
+        .expect("enabled = true with a readable key file must yield a client");
+
+        let out = draft_ack_text(&drafter, &ng(), 700, "エラーが出て困っています").await;
+        (out, log)
+    }
+
+    /// 生成上限で途中切断された下書きは、切れ目次第で完成文に見えることがあり、egress gate
+    /// （NG 語のブロックリストマッチ）では検知できない。このテストは呼び出し順序（gate の前に
+    /// 倒すか後に倒すか）は検証しない。外部から観測できる結果だけを固定する: `truncated = true`
+    /// なら、たとえ本文が NG 辞書に一切触れない完成文に見えても、最終的な戻り値は必ず
+    /// `FALLBACK_ACK_TEXT` になること。
+    ///
+    /// stub の応答本文は完成文に見える普通の日本語文（NG 辞書に触れない）にしてある。もし
+    /// egress gate 通過後の文をそのまま返す退行が起きた場合、このテストは FALLBACK_ACK_TEXT
+    /// ではなく stub の本文と比較して赤くなる。
+    #[tokio::test]
+    async fn truncated_draft_falls_back_even_when_text_looks_complete() {
+        let (out, log) = draft_ack_text_via_stub(
+            "ご質問いただいている件、担当者が確認のうえご連絡いたします。",
+            "max_tokens",
+        )
+        .await;
+        assert_eq!(out, FALLBACK_ACK_TEXT);
+        // stub に実際にリクエストが届いたことを確認する。これが無いと、`draft_reply` が
+        // stub 未起動等で `Err` を返す生成失敗経路（`escalation_reply.rs` 冒頭の match アーム）
+        // でも同じ FALLBACK_ACK_TEXT が返るため、このテストは truncated 分岐ではなく
+        // 生成失敗分岐を検証してしまっていても気づけない。
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "stub に実際にリクエストが届いていること（生成失敗経路でのフォールバックと識別するため）"
+        );
+    }
+
+    /// 対照テスト: `stop_reason = "end_turn"`（切れていない）なら、同じ NG に触れない文が
+    /// そのまま通ること。truncated チェック追加が非 truncated 経路を壊していないことの確認。
+    #[tokio::test]
+    async fn non_truncated_draft_passes_through_the_egress_gate() {
+        const CLEAN: &str = "ご質問いただいている件、担当者が確認のうえご連絡いたします。";
+        let (out, _log) = draft_ack_text_via_stub(CLEAN, "end_turn").await;
+        assert_eq!(out, CLEAN);
     }
 
     #[test]
