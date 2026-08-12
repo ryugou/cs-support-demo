@@ -63,6 +63,50 @@ pub(crate) fn neutralize_delimiters(s: &str) -> String {
     s.replace('<', "＜").replace('>', "＞")
 }
 
+/// LLM 下書き（`ReplyDraft`）を受け取り、「truncated 判定 → egress gate → フォールバック」を
+/// 1 関数にまとめる（Warning 1: `clarify.rs` / `escalation_reply.rs` に同型ロジックが複製され
+/// ていた）。`ReplyDraft` を受ける形にしているのは、呼び出し側が truncated チェックを書き忘れて
+/// 直接 `String` を渡す退行を型で防ぐため(新経路が安全側デフォルトになる)。この保証は
+/// [`apply_egress_gate_or_fallback`] がモジュール外へ公開されていないことで初めて成立する
+/// （公開されていれば、新しい呼び出し元がそちらを直接呼んで truncated チェックを迂回できる）。
+///
+/// `route` はログ相関用ラベル（例: `"clarify_question"` / `"escalation_ack"`）。
+///
+/// **前提条件**: この関数の truncated warn は `setting` を
+/// `"harness.customer_reply_draft_max_tokens"` に固定でハードコードしている。現行の呼び出し元
+/// （clarify_question / escalation_ack）はどちらもこの設定値で駆動されるため正しいが、
+/// 将来別の max_tokens 設定（例: `time_pref::TIME_PREF_EXTRACTION_MAX_TOKENS`）で駆動される
+/// 経路からこの関数を呼ぶ場合は、運用者に誤った設定値を案内しないよう `setting` も引数化する
+/// こと（現状はシグネチャに含めていない）。
+pub(crate) fn apply_draft_gate_or_fallback(
+    draft: crate::llm::ReplyDraft,
+    ctx: &EmitContext,
+    ng: &NgDictionary,
+    fallback: &str,
+    fallback_name: &str,
+    route: &str,
+    inspect_hint: &str,
+) -> String {
+    // 生成上限で途中切断された下書きは、切れ目次第で完成文に見えることがあり、egress gate
+    // （NG 語のブロックリストマッチ）では検知できない。egress gate に通す前にここで
+    // フォールバックへ倒す。
+    if draft.truncated {
+        tracing::warn!(
+            route,
+            setting = "harness.customer_reply_draft_max_tokens",
+            draft_chars = draft.text.chars().count(),
+            "draft hit max_tokens and is cut off; it could look like a complete sentence \
+             depending on where it was cut, so the egress gate (which only matches NG terms, \
+             not sentence completeness) cannot catch it. Falling back to {fallback_name}. Raise \
+             harness.customer_reply_draft_max_tokens if this recurs (shared by the customer \
+             reply / clarify question / escalation ack routes; raising it also raises the \
+             customer reply route's output cap, cost, and latency)"
+        );
+        return fallback.to_string();
+    }
+    apply_egress_gate_or_fallback(draft.text, ctx, ng, fallback, fallback_name, inspect_hint)
+}
+
 /// 生成結果を egress gate に通し、block/abstain 時は warn してフォールバック文字列へ倒す。
 /// gate 判定 → フォールバック分岐の純粋ロジックだけを独立させ、実際の Anthropic API 呼び出しを
 /// 伴わずにテストできるようにする。
@@ -71,7 +115,7 @@ pub(crate) fn neutralize_delimiters(s: &str) -> String {
 /// （例: `"FALLBACK_CLARIFY_TEXT"`）、`inspect_hint` は「何を調べればよいか」（例:
 /// `"the question/missing material"`）。呼び出し元ごとに異なるこの 3 つだけを引数化し、
 /// warn の情報量（verdict / term / draft_chars / 次のアクション）は落とさない。
-pub(crate) fn apply_egress_gate_or_fallback(
+fn apply_egress_gate_or_fallback(
     text: String,
     ctx: &EmitContext,
     ng: &NgDictionary,
@@ -188,5 +232,69 @@ mod tests {
             "the question",
         );
         assert_eq!(out, "FALLBACK_TEXT");
+    }
+
+    // --- apply_draft_gate_or_fallback: 「truncated 判定 → egress gate → フォールバック」の
+    // 集約先そのもの（`clarify.rs` / `escalation_reply.rs` の production 経路が実際に呼ぶ関数）
+    // を直接検証する。呼び出し側のテスト（stub 経由の E2E）だけでは、`apply_egress_gate_or_fallback`
+    // 呼び出しを丸ごと消しても NG に触れないクリーン文では検知できない（Warning 1）。
+
+    #[test]
+    fn draft_gate_falls_back_when_truncated_even_if_clean() {
+        // truncated = true は、本文が NG 辞書に一切触れないクリーン文でもフォールバックへ倒れる
+        // ことを固定する。egress gate 呼び出しの有無に関わらず truncated 分岐だけで結果が決まる。
+        let draft = crate::llm::ReplyDraft {
+            text: "製品名と発生時期を教えてください。".to_string(),
+            truncated: true,
+        };
+        let out = apply_draft_gate_or_fallback(
+            draft,
+            &ctx(),
+            &ng(),
+            "FALLBACK_TEXT",
+            "FALLBACK_TEXT",
+            "test_route",
+            "the input",
+        );
+        assert_eq!(out, "FALLBACK_TEXT");
+    }
+
+    #[test]
+    fn draft_gate_falls_back_on_block_when_not_truncated() {
+        // truncated = false かつ block 語を含む文。egress gate 呼び出しを消して draft.text を
+        // そのまま返す退行が起きると、このテストは "FALLBACK_TEXT" ではなく draft.text と比較
+        // して赤くなる。
+        let draft = crate::llm::ReplyDraft {
+            text: "この方法で絶対に治りますのでご安心ください。".to_string(),
+            truncated: false,
+        };
+        let out = apply_draft_gate_or_fallback(
+            draft,
+            &ctx(),
+            &ng(),
+            "FALLBACK_TEXT",
+            "FALLBACK_TEXT",
+            "test_route",
+            "the input",
+        );
+        assert_eq!(out, "FALLBACK_TEXT");
+    }
+
+    #[test]
+    fn draft_gate_passes_through_clean_non_truncated_draft() {
+        let draft = crate::llm::ReplyDraft {
+            text: "問題ありません。".to_string(),
+            truncated: false,
+        };
+        let out = apply_draft_gate_or_fallback(
+            draft,
+            &ctx(),
+            &ng(),
+            "FALLBACK_TEXT",
+            "FALLBACK_TEXT",
+            "test_route",
+            "the input",
+        );
+        assert_eq!(out, "問題ありません。");
     }
 }

@@ -6,7 +6,7 @@
 
 use crate::harness::egress::{EmitChannel, EmitContext, NgDictionary};
 use crate::harness::prompt_input::{
-    apply_egress_gate_or_fallback, neutralize_delimiters, truncate_question,
+    apply_draft_gate_or_fallback, neutralize_delimiters, truncate_question,
 };
 
 /// 受け止め文の生成失敗・生成上限による途中切断・egress gate 却下時の定型文
@@ -85,7 +85,10 @@ pub async fn draft_ack_text(
     question: &str,
 ) -> String {
     let (system, user) = build_ack_prompt(question);
-    let draft = match drafter.draft_reply(&system, &user, max_tokens).await {
+    let draft = match drafter
+        .draft_reply(&system, &user, max_tokens, "escalation_ack")
+        .await
+    {
         Ok(draft) => draft,
         Err(err) => {
             tracing::warn!(
@@ -95,34 +98,16 @@ pub async fn draft_ack_text(
             return FALLBACK_ACK_TEXT.to_string();
         }
     };
-    // 生成上限で途中切断された下書きは、切れ目次第で完成文に見えることがあり、egress gate
-    // （NG 語のブロックリストマッチ）では検知できない。`draft_customer_reply`（mod.rs）は
-    // 戻り値が `ReplyDraft` のままなので `truncated` を呼び出し側へ surface できるが、この
-    // 関数は戻り値が `String` 一本なので surface できない。したがって egress gate に通す前に
-    // ここでフォールバックへ倒す（Issue #14 と同じ問題を、この関数の型に合わせて塞ぐ）。
-    if draft.truncated {
-        tracing::warn!(
-            route = "escalation_ack",
-            setting = "harness.customer_reply_draft_max_tokens",
-            draft_chars = draft.text.chars().count(),
-            "escalation ack draft hit max_tokens and is cut off; it could look like a complete \
-             sentence depending on where it was cut, so the egress gate (which only matches NG \
-             terms, not sentence completeness) cannot catch it. Falling back to \
-             FALLBACK_ACK_TEXT. Raise harness.customer_reply_draft_max_tokens if this recurs \
-             (shared by the customer reply / clarify question / escalation ack routes; raising \
-             it also raises the customer reply route's output cap, cost, and latency)"
-        );
-        return FALLBACK_ACK_TEXT.to_string();
-    }
     let ctx = EmitContext {
         channel: EmitChannel::Operator,
     };
-    apply_egress_gate_or_fallback(
-        draft.text,
+    apply_draft_gate_or_fallback(
+        draft,
         &ctx,
         ng,
         FALLBACK_ACK_TEXT,
         "FALLBACK_ACK_TEXT",
+        "escalation_ack",
         "the question",
     )
 }
@@ -141,12 +126,6 @@ mod tests {
             r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"]}"#,
         )
         .unwrap()
-    }
-
-    fn ctx() -> EmitContext {
-        EmitContext {
-            channel: EmitChannel::Operator,
-        }
     }
 
     #[test]
@@ -209,45 +188,26 @@ mod tests {
         assert_eq!(user.matches("</顧客からの問い合わせ>").count(), 1);
     }
 
-    #[test]
-    fn clean_ack_draft_passes_through_unchanged() {
-        let out = apply_egress_gate_or_fallback(
-            "ご質問いただいている件、担当者が確認のうえご連絡いたします。".to_string(),
-            &ctx(),
-            &ng(),
-            FALLBACK_ACK_TEXT,
-            "FALLBACK_ACK_TEXT",
-            "the question",
-        );
-        assert_eq!(
-            out,
-            "ご質問いただいている件、担当者が確認のうえご連絡いたします。"
-        );
-    }
+    // クリーン文の素通しは `non_truncated_draft_passes_through_the_egress_gate`（下記、stub 経由）
+    // が production 経路で既にカバーしているため、ここでは重複させない。
+    //
+    // block / abstain は `apply_egress_gate_or_fallback` を直接呼ぶのではなく、
+    // `draft_ack_text_via_stub` 経由で production が実際に通る `draft_ack_text` →
+    // `apply_draft_gate_or_fallback` の経路を検証する（Warning 1: 直接呼び出しのテストは
+    // `apply_draft_gate_or_fallback` 内の egress gate 呼び出しを消しても検知できない）。
 
-    #[test]
-    fn blocked_ack_draft_falls_back() {
-        let out = apply_egress_gate_or_fallback(
-            "この方法で絶対に治りますのでご安心ください。".to_string(),
-            &ctx(),
-            &ng(),
-            FALLBACK_ACK_TEXT,
-            "FALLBACK_ACK_TEXT",
-            "the question",
-        );
+    #[tokio::test]
+    async fn blocked_ack_draft_falls_back() {
+        let (out, _log) =
+            draft_ack_text_via_stub("この方法で絶対に治りますのでご安心ください。", "end_turn")
+                .await;
         assert_eq!(out, FALLBACK_ACK_TEXT);
     }
 
-    #[test]
-    fn abstain_ack_draft_falls_back() {
-        let out = apply_egress_gate_or_fallback(
-            "継続すると効果がありますと言われています。".to_string(),
-            &ctx(),
-            &ng(),
-            FALLBACK_ACK_TEXT,
-            "FALLBACK_ACK_TEXT",
-            "the question",
-        );
+    #[tokio::test]
+    async fn abstain_ack_draft_falls_back() {
+        let (out, _log) =
+            draft_ack_text_via_stub("継続すると効果がありますと言われています。", "end_turn").await;
         assert_eq!(out, FALLBACK_ACK_TEXT);
     }
 

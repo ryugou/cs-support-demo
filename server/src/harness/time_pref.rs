@@ -276,7 +276,12 @@ pub async fn extract_time_preference(
     // ここで切り詰めた `raw` をそのまま渡す（`build_time_pref_prompt` 内部では再度切り詰めない）。
     let (system, user) = build_time_pref_prompt(&raw);
     let draft = match drafter
-        .draft_reply(&system, &user, TIME_PREF_EXTRACTION_MAX_TOKENS)
+        .draft_reply(
+            &system,
+            &user,
+            TIME_PREF_EXTRACTION_MAX_TOKENS,
+            "time_pref_extraction",
+        )
         .await
     {
         Ok(draft) => draft,
@@ -289,6 +294,10 @@ pub async fn extract_time_preference(
         }
     };
 
+    // 構造化抽出は truncated でも不完全な JSON として parse 失敗に倒れるため、
+    // clarify/ack のような明示的な truncated チェックは対象外でよい。ただし完全な JSON
+    // オブジェクトの直後で max_tokens に到達した場合は truncated = true でも parse に成功する
+    // （その場合は内容も完全なので無害）。
     if draft.truncated {
         tracing::warn!("time preference extraction hit max_tokens; response may be malformed JSON");
     }
@@ -505,6 +514,15 @@ mod tests {
     #[test]
     fn parse_rejects_syntactically_broken_json() {
         assert!(parse_time_pref_response("not json at all", "raw").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_json_truncated_mid_object() {
+        // max_tokens で生成が途中切断された場合の再現: 完全な JSON オブジェクトの手前で
+        // 文字列が終わっている。この不変条件（truncated な JSON は parse 失敗に倒れる）に
+        // 固定するテストが無かった（指摘 3(c)）。
+        let text = r#"{"is_time_preference": true, "windows": [{"days": "weekd"#;
+        assert!(parse_time_pref_response(text, "raw").is_err());
     }
 
     #[test]

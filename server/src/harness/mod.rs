@@ -1135,7 +1135,12 @@ impl Harness {
         let system = reply::build_reply_system_prompt(&brief);
         let user = reply::build_reply_user_message(question, &brief, history);
         let draft = match drafter
-            .draft_reply(&system, &user, self.reply_draft_max_tokens)
+            .draft_reply(
+                &system,
+                &user,
+                self.reply_draft_max_tokens,
+                "customer_reply",
+            )
             .await
         {
             Ok(draft) => draft,
