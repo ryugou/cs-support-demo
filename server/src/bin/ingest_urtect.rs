@@ -6,12 +6,13 @@ use cs_support_mcp::{
     harness::signal::{LexiconNormalizer, SignalNormalizer},
     manual::{
         ingest_model::{
-            build_document_node, build_product_node, build_section_graph, content_hash,
-            ManualProductInput, ManualSectionInput,
+            build_document_node, build_section_graph, content_hash, ManualSectionInput,
         },
         schema_ids::section_slug,
+        vectors::{embed_all, vector_entry, EMBED_CONCURRENCY},
     },
     model::GraphBuild,
+    proto::graphrag::NodeResult,
     vegapunk::VegapunkClient,
 };
 use scraper::{Html, Selector};
@@ -27,19 +28,21 @@ use url::Url;
 /// （Task 3 サンプルテストと同じ規約 "doc-manual"）。
 const DOC_KEY: &str = "doc-manual";
 
-/// embed 呼び出しの同時実行数上限。vegapunk backend への負荷配慮のため固定値とする
-/// （ingest 規模は ~数十〜百件程度で、動的なチューニングが要る負荷特性ではない）。
-const EMBED_CONCURRENCY: usize = 4;
-
-/// 本文中に出現しうる既知型番。"ADC-V724" は "ADC-V724X" の前方一致になるため、
-/// detect_product_models 側で英数字境界を見て誤爆(V724X ページを V724 とも誤判定)を防ぐ。
+/// 本文中の型番検出語彙は vegapunk の Product ノードが正本（Issue #6: KNOWN_MODELS 廃止）。
+/// ingest 開始時に Product ノード一覧を取得し、`model` 属性と `aliases` 属性
+/// （カンマ区切り）から表層形 → product_key の対応表を組み立てる
+/// （`build_product_lexicon` 参照）。製品の追加・変更は `ingest_products` CLI で
+/// products.json を投入するだけで反映され、本バイナリの再ビルドは不要になった。
+///
+/// "ADC-V724" は "ADC-V724X" の前方一致になるため、detect_product_models 側で英数字境界を
+/// 見て誤爆(V724X ページを V724 とも誤判定)を防ぐ（`contains_as_token`）。
 ///
 /// data/urtect/signal-lexicon.json の model_adc_v724 / model_adc_v724x / model_adc_vc727p
-/// signal と同じ 3 型番を指す。あちらは MENTIONS_SIGNAL（表現ゆれ吸収・normalize_key 部分一致）
-/// 用、こちらは DESCRIBES（型番の厳密な同一性）用で、判定基準が異なるため意図的に別管理にして
-/// いる（lexicon の surface_forms は normalize_key で "-" ごと失われ、境界チェック付きの厳密
-/// 一致には使えない）。型番を増減する際は両ファイルを合わせて更新すること。
-const KNOWN_MODELS: &[&str] = &["ADC-V724", "ADC-V724X", "ADC-VC727P"];
+/// signal は今も型番をハードコードしている（Issue #7、本件のスコープ外）。あちらは
+/// MENTIONS_SIGNAL（表現ゆれ吸収・normalize_key 部分一致）用、こちらは DESCRIBES（型番の
+/// 厳密な同一性）用で判定基準が異なるため別管理になっている（lexicon の surface_forms は
+/// normalize_key で "-" ごと失われ、境界チェック付きの厳密一致には使えない）。Issue #7 で
+/// signal-lexicon 側も Product ノード起点に統一するまでは、二重管理のままである点に注意。
 
 /// 定型の免責文（変更予告）。footer/header/nav などの意味タグに入っていなくても
 /// 本文中に平文で混ざるケースを想定し、文字列一致で除去する。
@@ -121,57 +124,48 @@ fn contains_as_token(haystack: &str, needle: &str) -> bool {
     })
 }
 
-/// body に出現する既知型番を検出する（DESCRIBES 辺のもとになる）。
-fn detect_product_models(body: &str) -> Vec<String> {
-    // KNOWN_MODELS は元から大文字なので、比較対象の body 側だけ大文字化すれば足りる。
+/// vegapunk から取得した Product ノード一覧を検出語彙（表層形 → product_key）に変換する。
+/// 表層形は `model` 属性自身と `aliases` 属性（カンマ区切り・trim・空要素除去）の両方を含み、
+/// 大文字化して保持する（detect_product_models 側は body を大文字化するだけで比較できる）。
+/// `model` 属性が空/欠落の Product ノードは検出語彙に加えない（fail closed にはしない。
+/// ingest_products 側の投入時点バリデーションで既に弾かれているはずだが、直接 vegapunk に
+/// 投入された不正データで crawl 全体を止めないための防御的スキップ）。
+fn build_product_lexicon(products: &[NodeResult]) -> HashMap<String, String> {
+    let mut lexicon = HashMap::new();
+    for product in products {
+        let model = match product.attributes.get("model") {
+            Some(m) if !m.trim().is_empty() => m.clone(),
+            _ => continue,
+        };
+        lexicon.insert(model.to_uppercase(), model.clone());
+        if let Some(aliases) = product.attributes.get("aliases") {
+            for alias in aliases.split(',') {
+                let trimmed = alias.trim();
+                if !trimmed.is_empty() {
+                    lexicon.insert(trimmed.to_uppercase(), model.clone());
+                }
+            }
+        }
+    }
+    lexicon
+}
+
+/// body に出現する型番を検出する（DESCRIBES 辺のもとになる）。`lexicon` は
+/// `build_product_lexicon` が組み立てた表層形（大文字）→ product_key の対応表。
+/// 同一 product が model と alias の両方でヒットしても 1 回だけ返す。戻り値の順序は
+/// product_key の文字列昇順で決定論的にする（差分 ingest のハッシュ計算に混ぜるため
+/// 安定した順序が必須）。
+fn detect_product_models(body: &str, lexicon: &HashMap<String, String>) -> Vec<String> {
     let upper = body.to_uppercase();
-    KNOWN_MODELS
-        .iter()
-        .filter(|model| contains_as_token(&upper, model))
-        .map(|model| model.to_string())
-        .collect()
-}
-
-/// vector entry の metadata を組み立てる純関数。
-///
-/// vegapunk `UpsertVectors` の `VectorEntry.metadata` は自由なメタデータ領域ではなく、
-/// 固定列へのキー名マッピングである（2026-07-18 backend チーム回答で確定）。認識される
-/// キーは `node_id` / `text` / `source_type` / `timestamp_ms` の 4 つのみで、それ以外の
-/// キーは backend 側で保存されない。
-///
-/// 契約: `node_id` は呼び出し側の entry `id`（graph node_id）と同一文字列でなければならない。
-/// `GetVectors` / `Search(local)` の schema スコープは `node_id` 列への
-/// `starts_with("{schema}:gen{N}:")` で効くため、ここがずれると当該 entry は
-/// 全読み出し経路から不可視になる（過去の投入分が見えなかった原因そのもの）。
-fn vector_metadata(
-    node_id: &str,
-    text: &str,
-    source_type: &str,
-    timestamp_ms: &str,
-) -> Vec<(String, String)> {
-    vec![
-        ("node_id".to_string(), node_id.to_string()),
-        ("text".to_string(), text.to_string()),
-        ("source_type".to_string(), source_type.to_string()),
-        ("timestamp_ms".to_string(), timestamp_ms.to_string()),
-    ]
-}
-
-/// vector entry 1 件 `(id, vector, metadata)` を組み立てる。
-///
-/// entry の `id`（graph node_id）と `metadata` 内の `node_id` は同一文字列でなければ
-/// ならない契約（`vector_metadata` のコメント参照）。呼び出し側が `id` を 2 回書いて
-/// 別値が入り込む余地をなくすため、ここで `id` を 1 回だけ受け取り内部で
-/// `vector_metadata(&id, ...)` に渡してから entry を返す。
-fn vector_entry(
-    id: String,
-    vector: Vec<f32>,
-    text: &str,
-    source_type: &str,
-    timestamp_ms: &str,
-) -> (String, Vec<f32>, Vec<(String, String)>) {
-    let metadata = vector_metadata(&id, text, source_type, timestamp_ms);
-    (id, vector, metadata)
+    let mut hit_keys: HashSet<String> = HashSet::new();
+    for (surface_form, product_key) in lexicon {
+        if contains_as_token(&upper, surface_form) {
+            hit_keys.insert(product_key.clone());
+        }
+    }
+    let mut result: Vec<String> = hit_keys.into_iter().collect();
+    result.sort();
+    result
 }
 
 /// nav リンク 1 件（同一ホスト・manual 配下のみ列挙。列挙順を保つ Vec）。
@@ -367,6 +361,32 @@ async fn main() -> Result<()> {
     client
         .create_or_update_schema(&args.schema, schema_yaml)
         .await?;
+
+    // 製品マスタは vegapunk の Product ノードが正本（Issue #6: KNOWN_MODELS 廃止）。
+    // crawl を始める前に取得し、型番検出語彙（表層形 → product_key）を組み立てる。
+    // limit は他の query_nodes 呼び出し（resolve_product 等）と揃えて 1000 とし、取りこぼしを
+    // 検出できるようにする。
+    const PRODUCT_QUERY_LIMIT: i32 = 1000;
+    let product_nodes = client
+        .query_nodes(&args.schema, "Product", Vec::new(), PRODUCT_QUERY_LIMIT)
+        .await
+        .context("query existing Product nodes (product master lookup)")?;
+    if product_nodes.is_empty() {
+        anyhow::bail!(
+            "no Product nodes found in schema {}; the product master is empty — run \
+             `ingest_products` first to seed it before running ingest_urtect",
+            args.schema
+        );
+    }
+    if product_nodes.len() as i32 == PRODUCT_QUERY_LIMIT {
+        anyhow::bail!(
+            "Product node query returned exactly the limit ({PRODUCT_QUERY_LIMIT}); this may \
+             indicate silent truncation and an incomplete product master — aborting ingest \
+             (raise the limit or investigate the product count in schema {})",
+            args.schema
+        );
+    }
+    let product_lexicon = build_product_lexicon(&product_nodes);
 
     // redirect は top_url と同一 scheme/host のみ追従する（nav 由来 URL が 3xx で
     // 外部ホストへ誘導された場合の意図しない外部フェッチ/SSRF を防ぐ）。
@@ -570,7 +590,7 @@ async fn main() -> Result<()> {
         // 派生属性（型番検出・signal 検出）は skip 判定より前に計算する。ハッシュに
         // これらも含めることで、本文が変わらなくても nav 構造・lexicon・型番検出ロジックの
         // 変更が diff-ingest の skip 判定に反映される（本文だけを見ると変更を見逃す）。
-        let product_models = detect_product_models(&body);
+        let product_models = detect_product_models(&body, &product_lexicon);
         let signal_values: Vec<String> = lexicon
             .normalize(&body)
             .iter()
@@ -691,7 +711,8 @@ async fn main() -> Result<()> {
         ingested += 1;
     }
 
-    // 5. build_document_node 1 回 + build_product_node（3 型番）を集約する。
+    // 5. build_document_node を集約する。Product ノードは ingest_products の責務
+    // （Issue #6: KNOWN_MODELS 廃止）で、ここでは生成しない。
     nodes.push(build_document_node(
         &args.schema,
         DOC_KEY,
@@ -699,16 +720,6 @@ async fn main() -> Result<()> {
         top_url.as_str(),
         &chrono::Utc::now().to_rfc3339(),
     ));
-    let mut product_inputs: Vec<ManualProductInput> = Vec::new();
-    for &model in KNOWN_MODELS {
-        let input = ManualProductInput {
-            model: model.to_string(),
-            name: model.to_string(),
-            aliases: Vec::new(),
-        };
-        nodes.push(build_product_node(&args.schema, &input));
-        product_inputs.push(input);
-    }
 
     // 同一 id のノード重複を除去してから upsert する（Signal ノードは節ごとに生成されるため
     // 共通 signal が節数ぶん重複しやすい。冪等 upsert なので正しさには影響しないが、
@@ -717,7 +728,8 @@ async fn main() -> Result<()> {
     let mut nodes = nodes;
     nodes.retain(|n| seen_node_ids.insert(n.id.clone()));
 
-    // 5. embedding: 今回 ingest された section と全 product を embed し、一括 upsert する。
+    // 5. embedding: 今回 ingest された section を embed し、一括 upsert する。Product の
+    // embed/upsert は ingest_products の責務（Issue #6: KNOWN_MODELS 廃止）。
     // embed は fail closed（1 件でも失敗したらベクトル無しの中途半端な状態を作らず abort）。
     // `--no-vectors` は明示的な opt-out のみで、途中失敗の代替経路にはしない。
     //
@@ -741,7 +753,7 @@ async fn main() -> Result<()> {
         0
     } else {
         let mut entries: Vec<(String, Vec<f32>, Vec<(String, String)>)> =
-            Vec::with_capacity(section_bodies.len() + product_inputs.len());
+            Vec::with_capacity(section_bodies.len());
 
         // section_bodies はここ以降使わないため move で消費する。body は section 本文の
         // 全文で ingest 中最大級の String だが、embed 後も vector metadata の `text`
@@ -782,41 +794,6 @@ async fn main() -> Result<()> {
             ));
         }
 
-        // text は embed 入力と metadata の両方で同じ値を使う契約（vector metadata の `text` は
-        // 埋め込み元テキストそのもの）。sections と同様、1 回だけ計算して両者に渡し、
-        // 片側だけ組み立て式を変更して契約が乖離する余地を無くす。
-        let mut product_texts: Vec<String> = Vec::with_capacity(product_inputs.len());
-        let product_items: Vec<(String, String)> = product_inputs
-            .iter()
-            .map(|input| {
-                let text = format!("{} {}", input.name, input.aliases.join(" "));
-                product_texts.push(text.clone());
-                (format!("product {}", input.model), text)
-            })
-            .collect();
-        let product_vectors = embed_all(&client, product_items, EMBED_CONCURRENCY).await?;
-        for ((input, text), vector) in product_inputs
-            .iter()
-            .zip(product_texts.iter())
-            .zip(product_vectors)
-        {
-            let id = cs_support_mcp::manual::schema_ids::manual_node_id(
-                &args.schema,
-                cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
-                &input.model,
-            );
-            // metadata は固定列マッピングで認識キーは node_id/text/source_type/timestamp_ms
-            // のみ（2026-07-18 backend 契約）。旧キー node_type/product_key は backend に
-            // 保存されない dead weight だったため削除した。id と metadata.node_id の一致は
-            // vector_entry ヘルパが構造的に保証する。
-            entries.push(vector_entry(
-                id,
-                vector,
-                text,
-                cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
-                &ingest_timestamp_ms,
-            ));
-        }
         let entries_len = entries.len();
         client
             .upsert_vectors(entries)
@@ -854,70 +831,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// `items`（`(label, text)`）を最大 `concurrency` 件まで同時実行で embed する。
-///
-/// - 全タスクを先に spawn するが、各タスクは Semaphore permit を取ってから embed RPC を
-///   発行するため、実行中の RPC は常に最大 `concurrency` 件に制限される。
-/// - fail-closed: 1 件でも失敗したら失敗 label を context に含めて即座に bail する。
-///   early return による `JoinSet` の drop が未完了タスクを abort するため、部分的な
-///   ベクトル状態を後続処理に渡さない（呼び出し側は成功時の `Vec` を丸ごと使うか、
-///   エラーで ingest 全体を abort するかの二択になる）。
-/// - 返り値は `items` と同じ順序を保つ（呼び出し側が id/attrs を zip で組み立てられるように）。
-///   completion 順は不定なので、`idx` 付きで結果を集めてから index 順に並べ直す。
-async fn embed_all(
-    client: &VegapunkClient,
-    items: Vec<(String, String)>,
-    concurrency: usize,
-) -> Result<Vec<Vec<f32>>> {
-    // concurrency = 0 は permit が永久に取れず全タスクがハングする（プログラミングエラー）。
-    // 静かなデッドロックより即時失敗を選ぶ。
-    anyhow::ensure!(concurrency > 0, "embed_all: concurrency must be > 0");
-    let total = items.len();
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let mut set: tokio::task::JoinSet<(usize, String, Result<Vec<f32>>)> =
-        tokio::task::JoinSet::new();
-    // JoinError（タスク panic / cancel）経路でも失敗 label を報告できるように、
-    // task id -> label を控えておく（成功/embed エラー経路は tuple の label を使う）。
-    let mut labels_by_task: HashMap<tokio::task::Id, String> = HashMap::with_capacity(total);
-
-    for (idx, (label, text)) in items.into_iter().enumerate() {
-        let client = client.clone();
-        let semaphore = semaphore.clone();
-        let label_for_join_error = label.clone();
-        let handle = set.spawn(async move {
-            // owned permit: 同時実行数を concurrency 件に絞る。Semaphore を close() する
-            // 経路が無いため acquire_owned が Err になることは実運用上ないが、パニックせず
-            // 呼び出し元まで context 付きでエラーを伝搬させる（観測性優先、unwrap しない）。
-            let result = match semaphore.acquire_owned().await {
-                Ok(_permit) => client.embed(&text).await,
-                Err(err) => Err(anyhow::anyhow!("embed concurrency semaphore closed: {err}")),
-            };
-            (idx, label, result)
-        });
-        labels_by_task.insert(handle.id(), label_for_join_error);
-    }
-
-    let mut results: Vec<(usize, Vec<f32>)> = Vec::with_capacity(total);
-    while let Some(joined) = set.join_next().await {
-        // JoinError（タスク panic / cancel）自体も fail-closed の対象。
-        let (idx, label, result) = joined.map_err(|err| {
-            let label = labels_by_task
-                .get(&err.id())
-                .map(String::as_str)
-                .unwrap_or("<unknown item>");
-            anyhow::anyhow!(err)
-                .context(format!("embed task for {label} panicked or was cancelled"))
-        })?;
-        let vector = result.with_context(|| format!("embed {label}"))?;
-        results.push((idx, vector));
-    }
-
-    // 全 join が成功した場合のみここへ到達する（= results は必ず total 件）。
-    // idx は enumerate 由来で一意なので、sort 後は入力順と一致する。
-    results.sort_by_key(|(idx, _)| *idx);
-    Ok(results.into_iter().map(|(_, vector)| vector).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,16 +852,29 @@ mod tests {
         assert!(!body.contains("color:red"));
     }
 
+    /// テスト用の型番検出語彙: ADC-V724 / ADC-V724X / ADC-VC727P の 3 型番を、
+    /// それぞれ自分自身を表層形として登録する（現行 products.json の seed と同じ形）。
+    fn sample_lexicon() -> HashMap<String, String> {
+        let mut lexicon = HashMap::new();
+        lexicon.insert("ADC-V724".to_string(), "ADC-V724".to_string());
+        lexicon.insert("ADC-V724X".to_string(), "ADC-V724X".to_string());
+        lexicon.insert("ADC-VC727P".to_string(), "ADC-VC727P".to_string());
+        lexicon
+    }
+
     #[test]
     fn detects_model_without_false_positive_on_prefix() {
         // "ADC-V724X" は "ADC-V724" の前方一致だが、V724 単体としては誤検出しない。
-        let models = detect_product_models("この設定は ADC-V724X 専用です。");
+        let models = detect_product_models("この設定は ADC-V724X 専用です。", &sample_lexicon());
         assert_eq!(models, vec!["ADC-V724X".to_string()]);
     }
 
     #[test]
     fn detects_multiple_models_when_both_mentioned() {
-        let models = detect_product_models("ADC-V724 と ADC-V724X の両方に対応します。");
+        let models = detect_product_models(
+            "ADC-V724 と ADC-V724X の両方に対応します。",
+            &sample_lexicon(),
+        );
         assert_eq!(
             models,
             vec!["ADC-V724".to_string(), "ADC-V724X".to_string()]
@@ -956,82 +882,74 @@ mod tests {
     }
 
     #[test]
-    fn vector_metadata_node_id_matches_given_id() {
-        // node_id は id（graph node_id）と三者一致する契約（2026-07-18 backend 契約）。
-        // ここがずれると schema スコープの starts_with フィルタから外れ、全読み出し経路から
-        // 不可視になる（今回の修正対象そのもの）。
-        let metadata = vector_metadata(
-            "urtect:gen1:ManualSection:sec-1",
-            "本文",
-            "ManualSection",
-            "1737200000000",
-        );
-        let node_id = metadata
-            .iter()
-            .find(|(k, _)| k == "node_id")
-            .map(|(_, v)| v.as_str());
-        assert_eq!(node_id, Some("urtect:gen1:ManualSection:sec-1"));
+    fn detects_model_directly_via_exact_match() {
+        let models = detect_product_models("ADC-VC727P の設定手順です。", &sample_lexicon());
+        assert_eq!(models, vec!["ADC-VC727P".to_string()]);
     }
 
     #[test]
-    fn vector_metadata_has_exactly_four_recognized_keys() {
-        // backend は固定列マッピングで、認識キー以外は保存されない。旧キー
-        // (node_type/section_key/doc_key) を混ぜても無視されるだけの dead weight になるため、
-        // 4 キーちょうどであることをテストで固定する。
-        // 値も key/value を取り違えていないことを見るため、4 引数それぞれ異なるリテラルにする。
-        let metadata = vector_metadata(
-            "urtect:gen1:ManualSection:sec-1",
-            "抜き差ししてください",
-            "ManualSection",
-            "1737200000000",
-        );
-        let mut keys: Vec<&str> = metadata.iter().map(|(k, _)| k.as_str()).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, vec!["node_id", "source_type", "text", "timestamp_ms"]);
-
-        let get = |key: &str| {
-            metadata
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-        };
-        // text は embed 元テキストそのもの、source_type は呼び出し側が渡した kind 文字列と
-        // 一致する契約。キー名だけでなく値も引数と食い違っていないことを固定する。
-        assert_eq!(get("text"), Some("抜き差ししてください"));
-        assert_eq!(get("source_type"), Some("ManualSection"));
+    fn resolves_alias_hit_to_product_key() {
+        // alias は product_key（= model）と異なる表層形になり得る。ヒットは alias の
+        // 文字列ではなく product_key（対応表の値）で返す。
+        let mut lexicon = HashMap::new();
+        lexicon.insert("ADC-V724".to_string(), "ADC-V724".to_string());
+        lexicon.insert("V724 PRO".to_string(), "ADC-V724".to_string());
+        let models = detect_product_models("V724 PRO の設定について。", &lexicon);
+        assert_eq!(models, vec!["ADC-V724".to_string()]);
     }
 
     #[test]
-    fn vector_entry_id_matches_metadata_node_id() {
-        // entry の id と metadata.node_id が別値になる余地をコンパイル構造で消すための
-        // ヘルパ。返る (id, _, metadata) の id と metadata 内 node_id が同一値であることを固定する。
-        let (id, vector, metadata) = vector_entry(
-            "urtect:gen1:ManualSection:sec-1".to_string(),
-            vec![0.1, 0.2],
-            "本文",
-            "ManualSection",
-            "1737200000000",
-        );
-        let node_id = metadata
-            .iter()
-            .find(|(k, _)| k == "node_id")
-            .map(|(_, v)| v.as_str());
-        assert_eq!(id, "urtect:gen1:ManualSection:sec-1");
-        assert_eq!(node_id, Some(id.as_str()));
-        assert_eq!(vector, vec![0.1, 0.2]);
+    fn dedupes_when_model_and_alias_both_hit_same_product() {
+        // 本文中に model と alias の両方が出現しても、同一 product は 1 回だけ返す。
+        let mut lexicon = HashMap::new();
+        lexicon.insert("ADC-V724".to_string(), "ADC-V724".to_string());
+        lexicon.insert("V724 PRO".to_string(), "ADC-V724".to_string());
+        let models = detect_product_models("ADC-V724（別名 V724 PRO）です。", &lexicon);
+        assert_eq!(models, vec!["ADC-V724".to_string()]);
     }
 
     #[test]
-    fn vector_metadata_timestamp_is_all_digits() {
-        // timestamp_ms は時刻フィルタ用の数値文字列という契約。空文字や非数字が混ざると
-        // backend 側のフィルタが機能しない。
-        let metadata = vector_metadata("id", "text", "ManualSection", "1737200000000");
-        let timestamp = metadata
-            .iter()
-            .find(|(k, _)| k == "timestamp_ms")
-            .map(|(_, v)| v.as_str())
-            .expect("timestamp_ms key present");
-        assert!(!timestamp.is_empty());
-        assert!(timestamp.chars().all(|c| c.is_ascii_digit()));
+    fn detection_is_case_insensitive() {
+        // body 側だけ大文字化して比較するため、小文字表記の本文でもヒットする。
+        let models = detect_product_models("adc-v724 は防水です。", &sample_lexicon());
+        assert_eq!(models, vec!["ADC-V724".to_string()]);
+    }
+
+    fn node_result(model: &str, aliases: &str) -> NodeResult {
+        let mut attributes = HashMap::new();
+        attributes.insert("model".to_string(), model.to_string());
+        attributes.insert("aliases".to_string(), aliases.to_string());
+        NodeResult {
+            node_id: format!("urtect:gen1:Product:{model}"),
+            node_type: "Product".to_string(),
+            attributes,
+        }
+    }
+
+    #[test]
+    fn lexicon_includes_model_and_aliases_uppercased() {
+        let products = vec![node_result("ADC-V724", "V724 Pro, 旧型番V724")];
+        let lexicon = build_product_lexicon(&products);
+        assert_eq!(lexicon.get("ADC-V724"), Some(&"ADC-V724".to_string()));
+        assert_eq!(lexicon.get("V724 PRO"), Some(&"ADC-V724".to_string()));
+        assert_eq!(lexicon.get("旧型番V724"), Some(&"ADC-V724".to_string()));
+    }
+
+    #[test]
+    fn lexicon_skips_empty_alias_segments() {
+        // "A,,B" のような空要素混じりの aliases でも trim・空要素除去して安全に扱う。
+        let products = vec![node_result("ADC-V724", " , ,")];
+        let lexicon = build_product_lexicon(&products);
+        // aliases 側は全部空なので、model 自身のキーしか登録されない。
+        assert_eq!(lexicon.len(), 1);
+        assert_eq!(lexicon.get("ADC-V724"), Some(&"ADC-V724".to_string()));
+    }
+
+    #[test]
+    fn lexicon_skips_product_with_empty_model_attribute() {
+        // model 属性が空/欠落の Product ノードは検出語彙に加えない（防御的スキップ）。
+        let products = vec![node_result("", "")];
+        let lexicon = build_product_lexicon(&products);
+        assert!(lexicon.is_empty());
     }
 }

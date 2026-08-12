@@ -16,6 +16,17 @@ vegapunk_endpoint = "http://10.10.0.2:6840"
 # 既存の全 Google 利用者へ自動的に公開される。email ホワイトリスト廃止後はこれを止める
 # 認可境界が無いので、露出面を最小化するためレガシーの sivira-cs-demo を外した。
 # 新しい project を足すときは、テナント分離が成立しているかを先に確認すること。
+#
+# さらに、**ここを 2 件以上にすると OAuth の挙動が破壊的に変わる**。
+# project が 1 件のうちは RFC 8707 の `resource` の省略を許すが、2 件以上になると
+# `resource` が **必須** になり、送らないクライアントは invalid_target で拒否される
+# （server/src/oauth/authserver.rs の resolve_resource。2 件以上を検知すると
+# 起動時に警告ログを 1 回出す）。既存クライアントの接続が一斉に落ちる形で現れる。
+#
+# **ただし `resource` を送ってもテナント分離にはならない。** クライアントが持つのは
+# Google 発行のアクセストークンで、こちらの project_id を載せる余地が無いため、
+# ある project 向けに取得したトークンは全 project の endpoint で通る。
+# project を足す前に、認可境界そのものを設計し直すこと。
 [[projects]]
 project_id = "urtect"
 schema = "urtect"

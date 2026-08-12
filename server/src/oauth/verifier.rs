@@ -173,7 +173,7 @@ fn sanitize_url(url: &reqwest::Url) -> String {
 /// Cloud Logging（トークン本体より遥かに広い閲覧母集団と長い保持期間を持つ）へ
 /// 残っていた。ここで `Display` を絶対に埋め込まないことが、POST 化と並ぶ
 /// 二層目の防御になる。
-fn describe_transport_error(stage: &str, err: &reqwest::Error) -> String {
+pub(crate) fn describe_transport_error(stage: &str, err: &reqwest::Error) -> String {
     let kind = if err.is_timeout() {
         "timed out"
     } else if err.is_connect() {
@@ -216,6 +216,21 @@ pub struct GoogleTokenVerifier {
     client_id: String,
     http: reqwest::Client,
     tokeninfo_url: String,
+    /// **このキャッシュの期限は `Instant`（実時計）で持つ。**
+    ///
+    /// `authserver.rs` は時刻源を注入 `Clock` に統一しているが、**その統一は
+    /// `authserver.rs` 内に限った話**であり、ここは含まれない。したがって、
+    /// このキャッシュの期限切れは論理時計で進められず、テストで直接固定できない。
+    ///
+    /// 現状これを許容できる理由: このキャッシュは `authserver.rs` の
+    /// `refresh_upstream` 経路では**原理的にヒットしない**。同経路は毎回 Google から
+    /// 新しい access token を受け取って検証するため、キャッシュキー（トークンの
+    /// ハッシュ）が毎回異なる。ヒットするのは同一トークンを短時間に複数回検証する
+    /// 呼び出しだけで、現在その経路は無い。
+    ///
+    /// 副作用として、上流リフレッシュキャッシュ（`authserver.rs`）の TTL が切れた後の
+    /// リフレッシュは、**Google への 2 往復**（token endpoint + tokeninfo）になる。
+    /// 1 時間あたり最大 1 回・利用者あたりなので許容している。
     cache: Mutex<HashMap<String, (VerifiedIdentity, Instant)>>,
 }
 
@@ -230,7 +245,9 @@ impl GoogleTokenVerifier {
     }
 
     /// endpoint と timeout を明示して構築する（本番は `new`、テストは stub サーバを指す）。
-    fn with_settings(
+    /// `authserver` のテストも Google tokeninfo を stub に差し替える必要があるため
+    /// crate 内に公開する（本番経路は `new` だけを使う）。
+    pub(crate) fn with_settings(
         client_id: String,
         tokeninfo_url: String,
         connect_timeout: Duration,
@@ -338,7 +355,9 @@ impl GoogleTokenVerifier {
 /// `cached` / `store` の両方が必ずこの関数だけを経由するようにする（呼び出し口で直接
 /// `token.to_string()` をキーに使わない）。片方だけ生トークンを使ってしまう事故を、
 /// 呼び出し規約ではなく構造で防ぐのが目的。
-fn cache_key(token: &str) -> String {
+/// `authserver.rs` の上流リフレッシュキャッシュ（W4）も同じ理由で生の値をキーに
+/// できないため、crate 内へ公開する。ハッシュ化の方針を 2 箇所で二重実装しない。
+pub(crate) fn cache_key(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 

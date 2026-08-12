@@ -7,9 +7,25 @@ use axum::{extract::Request, middleware::Next};
 use std::sync::Arc;
 
 /// `/{project_id}/mcp` を包む認証ミドルウェアの状態。
-/// `verifier` は project 間で共有する（Google 検証は project 非依存）。
-/// `resource_metadata_url` は project ごとに異なるため、project 単位で
-/// `AuthState` を構築して layer する（main.rs 側の責務）。
+///
+/// 2026-07 改訂 / 自前トークン発行の廃止:
+/// 一時期このサービスは自前の署名付きアクセストークンを発行し、ここでその署名を
+/// 検証していた。トークンの寿命・失効・鍵管理を自前で抱える設計を撤回したため、
+/// クライアントが提示する Bearer は **Google が発行したアクセストークン**に戻った。
+/// したがって検証も Google tokeninfo への照会（`GoogleTokenVerifier`）に戻る。
+///
+/// この形の代償と利点:
+/// - 代償: リクエスト経路が Google への RTT と障害に晒される。`GoogleTokenVerifier`
+///   の TTL キャッシュがこれを緩和する。
+/// - 代償: トークンに project_id を載せられないため、**ある project 向けに取得した
+///   トークンがこのサーバの全 project の endpoint で通る**（`authserver` の
+///   モジュールコメント参照）。旧実装の `aud` 照合はここで失われている。
+/// - 利点: 失効が Google 側の操作でそのまま効く。こちらは失効台帳を持たない。
+/// - 利点: 署名鍵に依存しないので、**プロセス再起動で利用者がログアウトしない**。
+///
+/// `verifier` は project 間で共有する（Google の client_id 単位の検証であり
+/// project 非依存）。`resource_metadata_url` は project ごとに異なるため、
+/// project 単位で `AuthState` を構築して layer する（main.rs 側の責務）。
 #[derive(Clone)]
 pub struct AuthState {
     pub verifier: Arc<GoogleTokenVerifier>,
@@ -19,16 +35,19 @@ pub struct AuthState {
 
 /// `/{project_id}/mcp` を包む認証ミドルウェア。
 ///
-/// - Bearer 無し / 検証失敗（無効・期限切れ・aud 不一致・email 未検証）→ 401 + `WWW-Authenticate`
-///   （Claude 側の OAuth 発見フローのトリガ。RFC 9728 準拠）。
-/// - Google tokeninfo 到達不能 → 503（クライアント側のトークン不備ではなく運用側の障害だと
-///   運用者が切り分けられるよう、401 とは区別する）。
-/// - 成功 → 検証済み identity（安定した `sub` + 当時の email）を `request.extensions` に
+/// - Bearer 無し / 検証失敗（無効・期限切れ・aud 不一致・email 未検証）
+///   → 401 + `WWW-Authenticate`（Claude 側の OAuth 発見フローのトリガ。RFC 9728 準拠）。
+/// - Google 到達不能 → 503。**401 に倒さない**。到達できないことは「トークンが
+///   無効である」ことの証拠ではなく、401 を返すとクライアントは再ログインを
+///   試み、Google 障害が全利用者の強制ログアウトに化ける。
+/// - 成功 → 検証済み identity（安定した `sub` + 認証時点の email）を `request.extensions` に
 ///   注入して次のハンドラへ渡す。
 ///   下流の `Harness::begin` はこの extensions を読み、Authorization ヘッダを直接見ない。
 ///
-/// 失敗理由は分類（missing_bearer / invalid_token / google_unreachable）のみを
+/// 失敗理由は分類（missing_bearer / empty_bearer / invalid_token）のみを
 /// tracing に残す。トークン文字列そのものは絶対にログしない（漏洩防止）。
+/// `GoogleTokenVerifier` が返すメッセージもトークン本体を含まない
+/// （`verifier.rs` の `describe_transport_error` / `sanitize_url` 参照）。
 pub async fn require_google_auth(
     State(state): State<AuthState>,
     mut request: Request,
@@ -46,9 +65,9 @@ pub async fn require_google_auth(
             tracing::info!(reason = "missing_bearer", "auth rejected");
             return unauthorized(&state.resource_metadata_url);
         }
-        // `Bearer ` の後ろが空文字（ヘッダはあるがトークンが空）。ここで弾かないと
-        // 空トークンのまま Google tokeninfo に問い合わせてしまう（無駄なリクエスト、かつ
-        // 呼び出しごとに区別できないログになる）。missing_bearer とは reason を分けて残す。
+        // `Bearer ` の後ろが空文字（ヘッダはあるがトークンが空）。署名検証でも弾けるが、
+        // 「ヘッダ自体が無い」と「ヘッダはあるがトークンが空」はクライアント側の
+        // 不具合として原因が違うため、reason を分けて残す。
         Some(t) if t.is_empty() => {
             tracing::info!(reason = "empty_bearer", "auth rejected");
             return unauthorized(&state.resource_metadata_url);
@@ -61,10 +80,6 @@ pub async fn require_google_auth(
             request.extensions_mut().insert(identity);
             next.run(request).await
         }
-        Err(AuthError::Unreachable(msg)) => {
-            tracing::error!(reason = "google_unreachable", error = %msg, "auth check failed");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
         Err(AuthError::Invalid(msg)) => {
             tracing::info!(reason = "invalid_token", error = %msg, "auth rejected");
             unauthorized(&state.resource_metadata_url)
@@ -72,6 +87,11 @@ pub async fn require_google_auth(
         Err(AuthError::Missing) => {
             tracing::info!(reason = "missing_bearer", "auth rejected");
             unauthorized(&state.resource_metadata_url)
+        }
+        Err(AuthError::Unreachable(msg)) => {
+            // Google に届かなかった。**401 に倒さない**（上のドキュメント参照）。
+            tracing::error!(reason = "verifier_unreachable", error = %msg, "auth check failed");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
@@ -135,27 +155,156 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt;
 
-    fn app() -> Router {
+    use crate::oauth::VerifiedIdentity;
+
+    const GOOGLE_CLIENT_ID: &str = "google-client-id.apps.googleusercontent.com";
+
+    /// 固定 JSON を返す使い捨て tokeninfo stub。実 Google を叩かずに、
+    /// 「検証を通ったリクエストが 200 になり identity が注入されること」まで
+    /// 確認できるようにする（この経路が無いと 401 系のテストしか書けない）。
+    async fn spawn_tokeninfo(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// tokeninfo が到達不能な AS（誰も listen していないポートを指す）。
+    async fn dead_tokeninfo() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}/")
+    }
+
+    fn app_with(tokeninfo_url: String) -> Router {
         let state = AuthState {
-            verifier: Arc::new(crate::oauth::verifier::GoogleTokenVerifier::new(
-                "client-x".into(),
+            verifier: Arc::new(GoogleTokenVerifier::with_settings(
+                GOOGLE_CLIENT_ID.to_string(),
+                tokeninfo_url,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
             )),
             resource_metadata_url: "https://h/.well-known/oauth-protected-resource/urtect/mcp"
                 .into(),
         };
         Router::new()
-            .route("/urtect/mcp", get(|| async { "ok" }))
+            // 認証を通ったハンドラが、注入された identity を実際に読めることまで
+            // 確認する（extensions への注入が抜けても 200 になってしまうため）。
+            .route(
+                "/urtect/mcp",
+                get(|req: axum::extract::Request| async move {
+                    match req.extensions().get::<VerifiedIdentity>() {
+                        Some(id) => format!("ok:{}", id.sub),
+                        None => "ok:no-identity".to_string(),
+                    }
+                }),
+            )
             .layer(axum::middleware::from_fn_with_state(
                 state,
                 require_google_auth,
             ))
     }
 
+    /// tokeninfo を一切叩かずに 401 になる経路のテスト用。到達不能な URL を
+    /// 指しておくことで、「verifier を呼んでしまったら 503 になる」= テストが
+    /// 失敗する形にしてある（401 と 503 の区別がそのまま短絡の生死を表す）。
+    async fn app_without_upstream() -> Router {
+        app_with(dead_tokeninfo().await)
+    }
+
+    async fn get_with_bearer(app: Router, token: &str) -> axum::http::Response<Body> {
+        app.oneshot(
+            Request::builder()
+                .uri("/urtect/mcp")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    const VALID_TOKENINFO: &str = concat!(
+        r#"{"aud":"google-client-id.apps.googleusercontent.com","#,
+        r#""azp":"google-client-id.apps.googleusercontent.com","sub":"1122334455","#,
+        r#""email":"cs@example.com","email_verified":"true","expires_in":"3599"}"#
+    );
+
+    /// Google が発行したトークンで通り、identity が下流に届くこと。
+    /// 自前トークン発行を廃止した後の**正常系そのもの**である。
+    #[tokio::test]
+    async fn a_google_token_is_accepted_and_injects_identity() {
+        let app = app_with(spawn_tokeninfo(VALID_TOKENINFO).await);
+        let res = get_with_bearer(app, "google-access-token").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes), "ok:1122334455");
+    }
+
+    /// `aud` が別の OAuth クライアント宛のトークンは 401。これが無いと、
+    /// 任意の Google アプリ向けに発行されたトークンでこの MCP が開通する
+    /// （OAuth の confused deputy の典型）。
+    #[tokio::test]
+    async fn a_token_for_another_google_client_yields_401() {
+        const OTHER_AUD: &str = concat!(
+            r#"{"aud":"someone-else.apps.googleusercontent.com","#,
+            r#""azp":"someone-else.apps.googleusercontent.com","sub":"1122334455","#,
+            r#""email":"cs@example.com","email_verified":"true","expires_in":"3599"}"#
+        );
+        let app = app_with(spawn_tokeninfo(OTHER_AUD).await);
+        let res = get_with_bearer(app, "token-for-another-app").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 未検証 email は 401。email は下流の actor 表示に使われるため、
+    /// 検証されていない値を identity として通さない。
+    #[tokio::test]
+    async fn an_unverified_email_yields_401() {
+        const UNVERIFIED: &str = concat!(
+            r#"{"aud":"google-client-id.apps.googleusercontent.com","#,
+            r#""azp":"google-client-id.apps.googleusercontent.com","sub":"1122334455","#,
+            r#""email":"cs@example.com","email_verified":"false","expires_in":"3599"}"#
+        );
+        let app = app_with(spawn_tokeninfo(UNVERIFIED).await);
+        let res = get_with_bearer(app, "unverified-email-token").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// **Google に届かないときは 503 で、401 ではない。**
+    /// 401 に倒すとクライアントは再ログインを試み、Google 側の一時障害が
+    /// 全利用者の強制ログアウトに化ける。
+    #[tokio::test]
+    async fn an_unreachable_google_yields_503_not_401() {
+        let app = app_without_upstream().await;
+        let res = get_with_bearer(app, "some-token").await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test]
     async fn missing_bearer_yields_401_with_www_authenticate() {
-        let res = app()
+        let res = app_without_upstream()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/urtect/mcp")
@@ -175,12 +324,13 @@ mod tests {
         assert!(wa.contains("/.well-known/oauth-protected-resource/urtect/mcp"));
     }
 
-    /// `Bearer ` の後ろが空文字のケース。実 Google エンドポイントに到達できない
-    /// テスト環境でも、このケースは verifier を呼ばず即 401 になることを保証する
-    /// （呼んでしまうと到達不能で 503 になり得るため、このテストが両者を区別する）。
+    /// `Bearer ` の後ろが空文字のケース。verifier を呼ばず即 401 になることを
+    /// 保証する。呼んでしまうとこの構成では到達不能で 503 になるため、
+    /// ステータスの違いがそのまま短絡の生死を表す。
     #[tokio::test]
-    async fn empty_bearer_yields_401_without_calling_verifier() {
-        let res = app()
+    async fn empty_bearer_yields_401_without_calling_the_verifier() {
+        let res = app_without_upstream()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/urtect/mcp")
@@ -193,11 +343,12 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// auth-scheme が `bearer` 以外（例: `Basic`）の場合は、旧実装と同じく
-    /// verifier を呼ばず即 401 になることを保証する（退行防止）。
+    /// auth-scheme が `bearer` 以外（例: `Basic`）の場合も、verifier を呼ばず
+    /// 即 401 になること（退行防止）。
     #[tokio::test]
-    async fn basic_scheme_yields_401_without_calling_verifier() {
-        let res = app()
+    async fn basic_scheme_yields_401_without_calling_the_verifier() {
+        let res = app_without_upstream()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/urtect/mcp")
@@ -216,13 +367,6 @@ mod tests {
     // `strip_prefix("Bearer ")` という固定文字列一致だったため、`bearer x` /
     // `BEARER x` や、スキームとトークンの間がタブ・複数スペースの正当な
     // ヘッダを誤って 401 で拒否していた。
-    //
-    // 「200 相当」を実際の HTTP ステータスとして確認するには本物の Google
-    // tokeninfo に到達させる必要があり、外部ネットワーク依存になってテストが
-    // 不安定になる（到達できれば 401/503、到達できなければ 503 になり得て、
-    // どちらも「200 が返る」ことの確認にならない）。パース結果が
-    // `Some(token)`（= verifier まで到達する形）になることを、ネットワークを
-    // 一切使わないこのユニットテストで直接保証する。
 
     #[test]
     fn parse_bearer_accepts_canonical_scheme() {
@@ -286,8 +430,7 @@ mod tests {
     }
 
     /// 区切りとなる空白が無い（`"Bearer"` 単体、トークンが続かない）場合は
-    /// 分割できないため `None`。旧実装の `strip_prefix("Bearer ")` でも
-    /// 一致せず `None` になっていた経路と同じ扱い。
+    /// 分割できないため `None`。
     #[test]
     fn parse_bearer_rejects_scheme_without_separator() {
         assert_eq!(parse_bearer("Bearer"), None);

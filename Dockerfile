@@ -13,7 +13,8 @@ RUN cargo build --release --locked \
     --bin ingest_demo \
     --bin verify_demo \
     --bin ingest_rules \
-    --bin ingest_urtect
+    --bin ingest_urtect \
+    --bin ingest_products
 
 FROM debian:bookworm-slim
 
@@ -23,6 +24,7 @@ COPY --from=builder /app/server/target/release/ingest_demo /usr/local/bin/ingest
 COPY --from=builder /app/server/target/release/verify_demo /usr/local/bin/verify_demo
 COPY --from=builder /app/server/target/release/ingest_rules /usr/local/bin/ingest_rules
 COPY --from=builder /app/server/target/release/ingest_urtect /usr/local/bin/ingest_urtect
+COPY --from=builder /app/server/target/release/ingest_products /usr/local/bin/ingest_products
 COPY server/config.gce.toml ./config.gce.toml
 COPY server/config.cloudrun.toml ./config.cloudrun.toml
 COPY server/data ./data
