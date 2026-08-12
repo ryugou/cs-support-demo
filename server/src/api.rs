@@ -253,6 +253,26 @@ fn note_time_pref_extraction_failure(conv: &mut crate::harness::CaseConvState) {
     }
 }
 
+/// 新しいエスカレーション応答（design doc §4）を送るときに希望時間帯の伺いを立てる純関数。
+///
+/// design doc §5: 「新しいエスカレーション応答（第 4 節）を送るときは
+/// `awaiting_time_pref = true` を上書きセットし、`time_pref_false_count` を 0 に戻す」。
+/// `clarify_turns` は聞き返しループとは別の会話段階へ移るため 0 に戻す。
+///
+/// **`time_pref_extraction_error_count` はここでは変更しない。** design doc §5 が
+/// このカウンタのリセット条件として列挙しているのは「分類が成功した場合」
+/// （`note_time_pref_extraction_failure` は関知しない）と「3 回到達で自動解除する瞬間」
+/// （`note_time_pref_extraction_failure` 内で完結）の 2 つだけで、新しいエスカレーション応答の
+/// 送信はそのどちらでもない。ここでリセットすると、`awaiting_time_pref = true` の間に抽出
+/// インフラが継続的に失敗しているケースで「失敗 → EscalationReply → 0 に巻き戻る」を繰り返し、
+/// 3 回連続到達による自動解除が永久に到達不能になる（他の 3 箇所と揃えて書き忘れに見えても、
+/// 意図的に外している）。
+fn arm_time_pref_solicitation(conv: &mut crate::harness::CaseConvState) {
+    conv.awaiting_time_pref = true;
+    conv.time_pref_false_count = 0;
+    conv.clarify_turns = 0;
+}
+
 /// `evaluate` の結果と会話状態から応答の種別を決める純関数（design doc §2 の決定表そのもの）。
 ///
 /// - `Allowed` かつ下書きあり かつ **非 truncated** → `Answer`
@@ -633,10 +653,7 @@ async fn reply_handler(
                     );
                     let reply_text = escalation_reply::assemble_escalation_reply(&ack_text, &block);
 
-                    conv.awaiting_time_pref = true;
-                    conv.time_pref_false_count = 0;
-                    conv.time_pref_extraction_error_count = 0;
-                    conv.clarify_turns = 0;
+                    arm_time_pref_solicitation(&mut conv);
                     if let Err(err) = state
                         .harness
                         .save_conv_state(&ctx, &outcome.case_id, &conv)
@@ -1037,6 +1054,43 @@ mod tests {
         assert!(!conv.awaiting_time_pref, "3回連続で自動解除する");
         assert_eq!(conv.time_pref_false_count, 0);
         assert_eq!(conv.time_pref_extraction_error_count, 0);
+    }
+
+    // --- arm_time_pref_solicitation ---
+
+    #[test]
+    fn arm_time_pref_solicitation_sets_awaiting_and_resets_false_and_clarify_counters() {
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = false;
+        conv.time_pref_false_count = 2;
+        conv.clarify_turns = 3;
+
+        arm_time_pref_solicitation(&mut conv);
+
+        assert!(
+            conv.awaiting_time_pref,
+            "新しいエスカレーション応答は希望時間帯を尋ねる"
+        );
+        assert_eq!(conv.time_pref_false_count, 0);
+        assert_eq!(conv.clarify_turns, 0);
+    }
+
+    /// design doc §5 はリセット対象を「分類成功時」と「3 回到達時」の 2 つに限定しており、
+    /// 新しいエスカレーション応答の送信はそのどちらでもない。ここで
+    /// `time_pref_extraction_error_count` を 0 に戻すと、抽出インフラが継続的に失敗している
+    /// 状況で毎ターン `EscalationReply` に倒れるたびカウンタが 0 に巻き戻り、3 回連続到達に
+    /// よる自動解除（`note_time_pref_extraction_failure`）が永久に到達不能になる。
+    #[test]
+    fn arm_time_pref_solicitation_does_not_touch_extraction_error_count() {
+        let mut conv = default_conv_state();
+        conv.time_pref_extraction_error_count = 2;
+
+        arm_time_pref_solicitation(&mut conv);
+
+        assert_eq!(
+            conv.time_pref_extraction_error_count, 2,
+            "3回連続の自動解除を到達可能に保つため、ここではリセットしない"
+        );
     }
 
     #[test]
