@@ -1,9 +1,9 @@
 use crate::harness::signal::SignalSet;
-use crate::manual::schema_ids::{manual_node_id, KIND_PRODUCT, KIND_SECTION};
+use crate::manual::schema_ids::{manual_node_id, KIND_DOC, KIND_PRODUCT, KIND_SECTION};
 
 /// node_id 内で kind を挟む marker（`{schema}:gen1:{kind}:{key}` の `:{kind}:` 部分）。
 /// Search 結果 id をノード種別で絞る際のリテラル散在を避ける。
-fn kind_marker(kind: &str) -> String {
+pub fn kind_marker(kind: &str) -> String {
     format!(":{kind}:")
 }
 use crate::model::{ManualHit, ManualProductCandidate, ManualSectionView, ProductView};
@@ -11,11 +11,38 @@ use crate::proto::graphrag::GetGraphSnapshotResponse;
 use crate::resolve::normalize_key;
 use crate::vegapunk::VegapunkClient;
 use anyhow::{anyhow, Context, Result};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use unicode_normalization::UnicodeNormalization;
 
-const SNAPSHOT_MAX_NODES: i32 = 5000;
+/// get_section の祖先チェーン traversal 上限（hop 数）。CLAUDE.md の論理スキーマ契約
+/// 「get_section の traversal は最大 2 hop に制限する」に合わせる。
+const MAX_ANCESTOR_HOPS: usize = 2;
+
+/// `NodeResult` を read tool が返す JSON ビュー（node_id / node_type / attributes）に整形する。
+/// 旧 snapshot 経路の `node_json` と同一形状を保つ（クライアント契約を変えない）。
+fn node_result_json(n: &crate::proto::graphrag::NodeResult) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": n.node_id,
+        "node_type": n.node_type,
+        "attributes": n.attributes,
+    })
+}
+
+/// `NodeResult` を部分グラフ組み立て用の proto `GraphNode` へ変換する。
+/// display_text / degree / community は `product_view_from_snapshot` が読まないため既定値。
+fn node_result_to_graph_node(
+    n: crate::proto::graphrag::NodeResult,
+) -> crate::proto::graphrag::GraphNode {
+    crate::proto::graphrag::GraphNode {
+        node_id: n.node_id,
+        node_type: n.node_type,
+        display_text: String::new(),
+        degree: 0,
+        community: None,
+        attributes: n.attributes,
+    }
+}
 
 /// 完全部分文字列 → 1.0 / normalize_key 正規化後の部分文字列 → 0.95 の fast path。
 /// どちらでもなければ None（呼び出し側が run カバレッジ等で判定する）。
@@ -413,22 +440,14 @@ fn fold_max_scores(hits: &[(String, f32)]) -> std::collections::HashMap<&str, f3
 
 pub struct ManualStore {
     client: Arc<VegapunkClient>,
+    /// 材料 corpus の共有ローダ。`search` は `graph_snapshot(5000)` の全件依存をやめ、
+    /// ここ経由の TTL キャッシュ付き manual_corpus（ページングで上限なし）を使う。
+    corpus: Arc<crate::corpus::CorpusLoader>,
 }
 
 impl ManualStore {
-    pub fn new(client: Arc<VegapunkClient>) -> Self {
-        Self { client }
-    }
-
-    async fn snapshot(&self, schema: &str) -> Result<GetGraphSnapshotResponse> {
-        let snap = self
-            .client
-            .graph_snapshot(schema, SNAPSHOT_MAX_NODES)
-            .await?;
-        if snap.truncated {
-            anyhow::bail!("manual snapshot truncated at node limit; refusing on incomplete data");
-        }
-        Ok(snap)
+    pub fn new(client: Arc<VegapunkClient>, corpus: Arc<crate::corpus::CorpusLoader>) -> Self {
+        Self { client, corpus }
     }
 
     /// signal 絞り込み(A) と body 全文(B) の max スコアで ManualSection を返す。
@@ -443,7 +462,7 @@ impl ManualStore {
         top_k: usize,
         vector_hits: &[(String, f32)],
     ) -> Result<Vec<ManualHit>> {
-        let snap = self.snapshot(schema).await?;
+        let snap = self.corpus.manual_corpus(schema).await?;
         self.search_with_snapshot(
             schema,
             question,
@@ -516,6 +535,10 @@ impl ManualStore {
     /// テキストのみは "text"、vector のみは "vector"、どちらも 0 で signal 絞り込みだけで
     /// 候補に残った場合は "signal" を `ManualHit.score_source` に残す（テキスト一致した
     /// かのような偽りの "text" にしない）。
+    // schema/question/signals/product_key/top_k/snapshot/vector_hits を受ける検索本体で
+    // 8 引数になる。入力構造体への集約はゲート経路の全 caller・テストに波及する再設計で、
+    // 挙動不変・最小差分の範囲を超えるため、意図した引数数として許可する。
+    #[allow(clippy::too_many_arguments)]
     pub fn search_with_snapshot(
         &self,
         schema: &str,
@@ -628,26 +651,37 @@ impl ManualStore {
     /// ManualSection + 祖先(PARENT_OF)・子を返す。
     /// BASED_ON 経由の Rationale は未実装（KR 側で辿れるため、section 視点の逆引きは Step 1 では省略）。
     pub async fn get_section(&self, schema: &str, section_key: &str) -> Result<ManualSectionView> {
-        let snap = self.snapshot(schema).await?;
-        let node_id = manual_node_id(schema, "ManualSection", section_key);
-        let node_json = |id: &str| -> Option<serde_json::Value> {
-            snap.nodes.iter().find(|n| n.node_id == id).map(|n| {
-                serde_json::json!({"node_id": n.node_id, "node_type": n.node_type, "attributes": n.attributes})
-            })
-        };
-        let section = node_json(&node_id)
+        // 全 snapshot をやめ、対象 section 1 件を起点に PARENT_OF を traverse する。
+        // 単一起点のため touch するノードは section 近傍だけで、グラフ規模に依存しない。
+        let node_id = manual_node_id(schema, KIND_SECTION, section_key);
+        let section_node = self
+            .client
+            .query_nodes(
+                schema,
+                KIND_SECTION,
+                vec![("section_key", "eq", section_key)],
+                1,
+            )
+            .await
+            .context("load manual section")?
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow!("manual section not found: {section_key}"))?;
-        // 祖先: PARENT_OF の to=node_id を辿って from を親に
+        let section = node_result_json(&section_node);
+
+        // 祖先: PARENT_OF は親→子なので、子（この section）から incoming で辿った from が親。
+        // 論理スキーマ契約（CLAUDE.md: get_section の traversal は最大 2 hop）に合わせ、
+        // 祖先チェーンは 2 hop に制限する。
         let mut ancestors = Vec::new();
         let mut cur = node_id.clone();
-        for _ in 0..8 {
-            // 親は高々 1 本のはず。複数付いている場合はデータ不整合（ingest 側で fail closed
-            // している想定が破れている）なので、非決定な traversal を返さずエラーで検出させる。
-            let parents: Vec<&crate::proto::graphrag::GraphEdge> = snap
-                .edges
-                .iter()
-                .filter(|e| e.edge_type == "PARENT_OF" && e.to_id == cur)
-                .collect();
+        for _ in 0..MAX_ANCESTOR_HOPS {
+            let parents = self
+                .client
+                .traverse_neighbors_paged(schema, KIND_SECTION, "PARENT_OF", "incoming", &cur, 1000)
+                .await
+                .with_context(|| format!("load PARENT_OF parents of {cur}"))?;
+            // 親は高々 1 本のはず。複数は ingest 側 fail closed 想定の破れ（データ不整合）なので、
+            // 非決定な traversal を返さずエラーで検出させる。
             if parents.len() > 1 {
                 anyhow::bail!(
                     "section {cur} has {} PARENT_OF edges (expected at most 1); \
@@ -655,21 +689,30 @@ impl ManualStore {
                     parents.len()
                 );
             }
-            let Some(parent) = parents.first() else {
+            let Some(parent) = parents.into_iter().next() else {
                 break;
             };
-            if let Some(j) = node_json(&parent.from_id) {
-                ancestors.push(j);
-            }
-            cur = parent.from_id.clone();
+            cur = parent.node_id.clone();
+            ancestors.push(node_result_json(&parent));
         }
-        // 子: PARENT_OF の from=node_id
-        let children: Vec<_> = snap
-            .edges
+
+        // 子: PARENT_OF は親→子なので、この section から outgoing で辿った to が子。
+        let children: Vec<serde_json::Value> = self
+            .client
+            .traverse_neighbors_paged(
+                schema,
+                KIND_SECTION,
+                "PARENT_OF",
+                "outgoing",
+                &node_id,
+                1000,
+            )
+            .await
+            .with_context(|| format!("load PARENT_OF children of {node_id}"))?
             .iter()
-            .filter(|e| e.edge_type == "PARENT_OF" && e.from_id == node_id)
-            .filter_map(|e| node_json(&e.to_id))
+            .map(node_result_json)
             .collect();
+
         // BASED_ON でこの section を根拠にする KR → その Rationale（参考情報）
         let based_on_rationale = Vec::new(); // Step 1 では section 視点の逆引きは省略（KR 側で辿れる）
         Ok(ManualSectionView {
@@ -681,9 +724,182 @@ impl ManualStore {
     }
 
     /// Product 概要 + DESCRIBES 節キー + document TOC を返す（S1-7）。
+    /// 全 snapshot をやめ、対象 product 1 件を起点にした traverse で必要部分グラフだけを
+    /// 組み立て、既存の純関数 `product_view_from_snapshot` に渡す（スコアリング/TOC 構築ロジックは不変）。
     pub async fn get_product(&self, schema: &str, product_key: &str) -> Result<ProductView> {
-        let snap = self.snapshot(schema).await?;
-        product_view_from_snapshot(product_key, &snap)
+        let subgraph = self.load_product_subgraph(schema, product_key).await?;
+        product_view_from_snapshot(product_key, &subgraph)
+    }
+
+    /// `product_view_from_snapshot` が必要とする最小部分グラフを単一起点の traverse で組み立てる。
+    ///
+    /// 必要なもの:
+    /// - Product ノード（対象）
+    /// - その product を DESCRIBES する節（describing sections）
+    /// - それら節が属する document（HAS_SECTION 逆引き）配下の全節（TOC 候補）
+    /// - 各 TOC 候補の DESCRIBES 辺全部（`describes_any` の判定に必要。他機種専用節の除外根拠）
+    /// - 各 TOC 候補の PARENT_OF 親（TOC の parent 表示）
+    ///
+    /// urtect の小規模 document でしか呼ばれず、touch 範囲は対象 product の document 部分木に限定される。
+    async fn load_product_subgraph(
+        &self,
+        schema: &str,
+        product_key: &str,
+    ) -> Result<GetGraphSnapshotResponse> {
+        let product_node = self
+            .client
+            .query_nodes(
+                schema,
+                KIND_PRODUCT,
+                vec![("product_key", "eq", product_key)],
+                1,
+            )
+            .await
+            .context("load product")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("product not found: {product_key}"))?;
+        let product_id = product_node.node_id.clone();
+
+        let mut nodes: HashMap<String, crate::proto::graphrag::GraphNode> = HashMap::new();
+        let mut edges: Vec<crate::proto::graphrag::GraphEdge> = Vec::new();
+        let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+        let mut push_edge =
+            |edges: &mut Vec<_>, from_id: String, to_id: String, edge_type: &str| {
+                if seen_edges.insert((from_id.clone(), to_id.clone(), edge_type.to_string())) {
+                    edges.push(crate::proto::graphrag::GraphEdge {
+                        edge_id: String::new(),
+                        from_id,
+                        to_id,
+                        edge_type: edge_type.to_string(),
+                    });
+                }
+            };
+        nodes.insert(product_id.clone(), node_result_to_graph_node(product_node));
+
+        // (1) この product を DESCRIBES する節（Product から incoming DESCRIBES）。
+        let describing = self
+            .client
+            .traverse_neighbors_paged(
+                schema,
+                KIND_SECTION,
+                "DESCRIBES",
+                "incoming",
+                &product_id,
+                1000,
+            )
+            .await
+            .context("load sections describing product")?;
+        for sec in &describing {
+            push_edge(
+                &mut edges,
+                sec.node_id.clone(),
+                product_id.clone(),
+                "DESCRIBES",
+            );
+            // 全 snapshot 経路は describing 節を必ずノードとして持っていた。document 列挙
+            // （step 3）に取りこぼされても describing_section_keys が解決できるよう、ここでも入れる。
+            nodes
+                .entry(sec.node_id.clone())
+                .or_insert_with(|| node_result_to_graph_node(sec.clone()));
+        }
+
+        // (2) describing 節が属する document（節から incoming HAS_SECTION の from が document）。
+        let mut doc_ids: HashSet<String> = HashSet::new();
+        for sec in &describing {
+            let docs = self
+                .client
+                .traverse_neighbor_ids(
+                    schema,
+                    KIND_DOC,
+                    "HAS_SECTION",
+                    "incoming",
+                    &sec.node_id,
+                    1000,
+                )
+                .await
+                .with_context(|| format!("load document of section {}", sec.node_id))?;
+            doc_ids.extend(docs);
+        }
+
+        // (3) 各 document 配下の全節（document から outgoing HAS_SECTION の to が節）＝ TOC 候補。
+        let mut candidates: Vec<crate::proto::graphrag::NodeResult> = Vec::new();
+        for doc_id in &doc_ids {
+            let secs = self
+                .client
+                .traverse_neighbors_paged(
+                    schema,
+                    KIND_SECTION,
+                    "HAS_SECTION",
+                    "outgoing",
+                    doc_id,
+                    1000,
+                )
+                .await
+                .with_context(|| format!("load sections of document {doc_id}"))?;
+            for sec in &secs {
+                push_edge(
+                    &mut edges,
+                    doc_id.clone(),
+                    sec.node_id.clone(),
+                    "HAS_SECTION",
+                );
+            }
+            candidates.extend(secs);
+        }
+        for sec in candidates {
+            nodes
+                .entry(sec.node_id.clone())
+                .or_insert_with(|| node_result_to_graph_node(sec));
+        }
+
+        // (4) 各 TOC 候補の DESCRIBES 辺全部（他機種のみを DESCRIBES する節を除外する判定材料）と
+        //     PARENT_OF 親（TOC の親表示）。候補集合を確定してから走査する。
+        let candidate_ids: Vec<String> = nodes
+            .values()
+            .filter(|n| n.node_type == KIND_SECTION)
+            .map(|n| n.node_id.clone())
+            .collect();
+        for sec_id in &candidate_ids {
+            let described = self
+                .client
+                .traverse_neighbor_ids(schema, KIND_PRODUCT, "DESCRIBES", "outgoing", sec_id, 1000)
+                .await
+                .with_context(|| format!("load DESCRIBES targets of section {sec_id}"))?;
+            for product_target in described {
+                push_edge(&mut edges, sec_id.clone(), product_target, "DESCRIBES");
+            }
+            let parents = self
+                .client
+                .traverse_neighbors_paged(
+                    schema,
+                    KIND_SECTION,
+                    "PARENT_OF",
+                    "incoming",
+                    sec_id,
+                    1000,
+                )
+                .await
+                .with_context(|| format!("load PARENT_OF parent of section {sec_id}"))?;
+            for parent in parents {
+                push_edge(
+                    &mut edges,
+                    parent.node_id.clone(),
+                    sec_id.clone(),
+                    "PARENT_OF",
+                );
+                nodes
+                    .entry(parent.node_id.clone())
+                    .or_insert_with(|| node_result_to_graph_node(parent));
+            }
+        }
+
+        Ok(GetGraphSnapshotResponse {
+            nodes: nodes.into_values().collect(),
+            edges,
+            truncated: false,
+            total_node_count: 0,
+        })
     }
 
     /// Product ノードを name/model/aliases の正規化一致で解決する。
@@ -1027,9 +1243,12 @@ mod tests {
 
     /// 実ネットワークに繋がない dummy client（connect_lazy は遅延接続で即座に返る）。
     fn dummy_store() -> ManualStore {
-        let client = crate::vegapunk::VegapunkClient::connect_lazy("http://127.0.0.1:1", "test")
-            .expect("connect_lazy");
-        ManualStore::new(Arc::new(client))
+        let client = Arc::new(
+            crate::vegapunk::VegapunkClient::connect_lazy("http://127.0.0.1:1", "test")
+                .expect("connect_lazy"),
+        );
+        let corpus = Arc::new(crate::corpus::CorpusLoader::new(client.clone()));
+        ManualStore::new(client, corpus)
     }
 
     // connect_lazy は tonic の内部リアクタが Tokio ランタイム下での呼び出しを要求するため、
@@ -1293,6 +1512,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn degrades_gracefully_when_snapshot_has_no_mentions_signal_edges() {
+        // corpus loader は hot Signal の traverse timeout を避けるため MENTIONS_SIGNAL 辺を
+        // 載せなくなった。その結果 snapshot は Signal ノードを持つが section->Signal 辺を持たない。
+        // このとき、質問が signal を運んでいても:
+        //   (a) text/vector スコアが立つ節は従来どおり候補として返る（検索は生き続ける）、
+        //   (b) signal 絞り込みだけで残っていた節（text/vector=0）は候補から落ちる（縮退）。
+        // を search_with_snapshot 層で直接固定する。
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphNode as PN};
+        let schema = "urtect";
+        let question = "SDカードが認識されない場合の対処";
+        let signal_node = PN {
+            node_id: "urtect:gen1:Signal:sd_not_recognized".to_string(),
+            node_type: "Signal".to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [("value".to_string(), "sd_not_recognized".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let mk_section = |key: &str, body: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: [
+                    ("section_key".to_string(), key.to_string()),
+                    ("title".to_string(), "見出し".to_string()),
+                    ("body".to_string(), body.to_string()),
+                    ("source_url".to_string(), String::new()),
+                    ("breadcrumb".to_string(), String::new()),
+                ]
+                .into_iter()
+                .collect(),
+            }
+        };
+        // text_match: 本文が質問を含む（text score が立つ）。signal_only: 本文が無関係で、
+        // 従来なら MENTIONS_SIGNAL 辺だけで候補に残っていた節。辺が無いので今回は落ちる。
+        let text_match = mk_section("sec-text-match", question);
+        let signal_only = mk_section("sec-signal-only", "全く関係のない本文です。");
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![signal_node, text_match, signal_only],
+            edges: Vec::new(), // ← MENTIONS_SIGNAL 辺を一切持たない（corpus loader の新挙動）
+            truncated: false,
+            total_node_count: 0,
+        };
+        let signals: SignalSet = [Signal::new("sd_not_recognized")].into_iter().collect();
+        let store = dummy_store();
+        let hits = store
+            .search_with_snapshot(schema, question, &signals, None, 10, &snap, &[])
+            .expect("search_with_snapshot");
+        assert!(
+            hits.iter().any(|h| h.section_key == "sec-text-match"),
+            "text-matching section must still be returned without signal edges: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| h.section_key != "sec-signal-only"),
+            "signal-only section must drop when MENTIONS_SIGNAL edges are absent: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn vector_id_absent_from_snapshot_is_ignored() {
         let schema = "urtect";
         let section_key = "sec-real";
@@ -1421,6 +1704,111 @@ mod tests {
         assert!(keys.contains("sec-a"));
         assert!(keys.contains("sec-b"));
         assert!(keys.contains("sec-c"));
+    }
+
+    /// 機種横断 how-to（例: パスワードリセット）が product スコープで沈み、answerable なのに
+    /// best_manual_score から消える false-escalate の回帰テスト。`evaluate`（ManualV1）が
+    /// coverage 判定を product_key=None で走らせるようにした変更（harness/mod.rs）が前提とする
+    /// 性質を search_with_snapshot 層で直接検証する。
+    /// 構成: 横断ページ sec-howto は product B のみを DESCRIBES（他機種専用扱い）だが本文は質問の
+    /// 完全部分文字列で fast path 1.0。product A 専用ページ sec-a は本文が質問と弱くしか一致しない。
+    #[tokio::test]
+    async fn cross_product_howto_reaches_best_score_only_when_unscoped() {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge as PE, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let product_a = "ADC-V724";
+        let product_b = "ADC-VC727P";
+        let question = "パスワードをリセットする方法";
+        let section_node = |key: &str, body: &str| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), key.to_string()),
+                ("title".to_string(), key.to_string()),
+                ("body".to_string(), body.to_string()),
+                ("source_url".to_string(), String::new()),
+                ("breadcrumb".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        let product_node = |key: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, "Product", key),
+                node_type: "Product".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: HashMap::new(),
+            }
+        };
+        let describes_edge = |section_key: &str, product_key: &str| -> PE {
+            PE {
+                edge_id: String::new(),
+                from_id: manual_node_id(schema, "ManualSection", section_key),
+                to_id: manual_node_id(schema, "Product", product_key),
+                edge_type: "DESCRIBES".to_string(),
+            }
+        };
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![
+                // 横断 how-to: 本文＝質問（fast path 1.0）。product B のみを DESCRIBES する。
+                section_node("sec-howto", question),
+                // product A 専用ページ: 「方法」だけ一致する弱いページ（best にならない）。
+                section_node("sec-a", "カメラの設置方法について説明します。"),
+                product_node(product_a),
+                product_node(product_b),
+            ],
+            edges: vec![
+                describes_edge("sec-howto", product_b),
+                describes_edge("sec-a", product_a),
+            ],
+            truncated: false,
+            total_node_count: 0,
+        };
+        let store = dummy_store();
+
+        // product A で hard-scope すると横断ページ(sec-howto)は「他機種のみ DESCRIBES」で除外され、
+        // best は弱い sec-a に落ちる（＝ answerable なのに coverage が下がる false-escalate の芽）。
+        let scoped = store
+            .search_with_snapshot(
+                schema,
+                question,
+                &SignalSet::new(),
+                Some(product_a),
+                10,
+                &snap,
+                &[],
+            )
+            .expect("search_with_snapshot scoped");
+        assert!(
+            scoped.iter().all(|h| h.section_key != "sec-howto"),
+            "product scope must drop the cross-product how-to: {scoped:?}"
+        );
+        let scoped_best = scoped.first().map(|h| h.score).unwrap_or(0.0);
+        assert!(
+            scoped_best < 1.0,
+            "scoped best must be the weak product page, not the 1.0 how-to: {scoped_best}"
+        );
+
+        // product_key=None（evaluate の coverage 検索が使う経路）なら横断ページが候補に戻り、
+        // best_manual_score が 1.0 になる（＝沈まず反映される）。
+        let unscoped = store
+            .search_with_snapshot(schema, question, &SignalSet::new(), None, 10, &snap, &[])
+            .expect("search_with_snapshot unscoped");
+        let best = unscoped.first().expect("at least one hit");
+        assert_eq!(best.section_key, "sec-howto");
+        assert_eq!(
+            best.score, 1.0,
+            "cross-product how-to must drive best_manual_score when unscoped"
+        );
     }
 
     #[test]

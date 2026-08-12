@@ -45,6 +45,10 @@ pub struct Harness {
     /// manual_v1 スキーマ向けの manual 取得。project.manual_schema が LegacySection のみの
     /// 構成では未使用（None でも動く）。
     pub manual: Option<crate::manual::retrieval::ManualStore>,
+    /// 材料 corpus の共有ローダ。`evaluate`（ManualV1）が manual_corpus / live_corpus を、
+    /// ManualStore が manual_corpus を、同一インスタンス経由で使い TTL キャッシュを共有する。
+    /// LegacySection 専用構成（テスト含む）では未使用（None でも動く）。
+    pub corpus: Option<Arc<crate::corpus::CorpusLoader>>,
     /// 第3層エスカレーションの既定 route（config.harness.default_escalation_route）。
     pub default_route: String,
     /// 意味検索（ベクトル経路）を manual retrieval に合成するか
@@ -150,6 +154,9 @@ impl Harness {
         let extractor: Arc<dyn extraction::AsyncSignalExtractor> = Arc::new(
             extraction::HybridExtractor::new(lexicon.clone(), llm_classifier),
         );
+        // 材料 corpus ローダは 1 インスタンスを ManualStore と evaluate で共有し、
+        // manual_corpus の TTL キャッシュを read 経路・評価経路の双方で使い回す。
+        let corpus = Arc::new(crate::corpus::CorpusLoader::new(client.clone()));
         Ok(Self {
             authenticator: authn::Authenticator::new(
                 config.projects.iter().map(|p| p.schema.clone()).collect(),
@@ -166,7 +173,11 @@ impl Harness {
             grading: (&config.harness.grading).into(),
             queue_path: resolve_path(&config.harness.search_improvement_queue_path),
             grade_lock: tokio::sync::Mutex::new(()),
-            manual: Some(crate::manual::retrieval::ManualStore::new(client)),
+            manual: Some(crate::manual::retrieval::ManualStore::new(
+                client.clone(),
+                corpus.clone(),
+            )),
+            corpus: Some(corpus),
             default_route: config.harness.default_escalation_route.clone(),
             vector_route_enabled: config.harness.vector_route_enabled,
         })
@@ -176,6 +187,12 @@ impl Harness {
         self.knowledge
             .as_ref()
             .ok_or_else(|| anyhow!("knowledge store is not configured"))
+    }
+
+    fn corpus(&self) -> Result<&crate::corpus::CorpusLoader> {
+        self.corpus
+            .as_deref()
+            .ok_or_else(|| anyhow!("corpus loader is not configured"))
     }
 
     /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
@@ -475,21 +492,42 @@ impl Harness {
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
         // 独立な読み取りは並列に発行し、graph snapshot は 1 回だけ取得して
         // KR 復元・マニュアル検索・case signal 復元で共有する（重複取得を避ける）。
-        let (rules, domains, snapshot) = tokio::try_join!(
+        let (rules, domains) = tokio::try_join!(
             knowledge.load_escalation_rules(&ctx.schema),
             knowledge.load_prohibited_domains(&ctx.schema),
-            knowledge.fetch_snapshot(&ctx.schema),
         )?;
         // ルールの signal が語彙外だと「決してマッチしないルール」＝サイレントな
         // fail open になるため、判定前に語彙と突合して fail closed にする。
         self.validate_rule_vocabulary(&rules, &domains)?;
+        // 判定入力（support_case / Signal / HAS_SIGNAL）に使う live corpus と、マニュアル検索に
+        // 使う corpus を manual_schema で分けて取得する。graph_snapshot(5000) の全件依存・
+        // truncate 停止を ManualV1 で撤去する（数万ノード規模でも読み取りを止めない）。
+        // - ManualV1: live_corpus（都度取得・小）を KR/case/related に、manual_corpus
+        //   （TTL キャッシュ・ページングで上限なし）を manual 検索に。
+        // - LegacySection: 従来どおり graph_snapshot を全消費で共有（sivira-cs-demo 専用・本番外）。
+        let (live_snapshot, manual_corpus): (
+            crate::proto::graphrag::GetGraphSnapshotResponse,
+            Option<Arc<crate::proto::graphrag::GetGraphSnapshotResponse>>,
+        ) = match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let corpus = self.corpus()?;
+                let (live, manual) = tokio::try_join!(
+                    corpus.live_corpus(&ctx.schema),
+                    corpus.manual_corpus(&ctx.schema),
+                )?;
+                (live, Some(manual))
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                (knowledge.fetch_snapshot(&ctx.schema).await?, None)
+            }
+        };
         // manual 検索は accumulated signal 集合（会話層）を使うため、hits の取得は
         // accumulated が確定した後ろに回す（下記 manual 取得ブロック）。
         // [正規化] lexicon ∪ LLM のハイブリッド抽出（S1-11 改訂）。今ターン分。
         // KR 読み込み（gRPC）と signal 抽出（LLM 有効時は HTTP 往復を伴う）は互いに
         // 依存しないため並列発行し、LLM 往復レイテンシを KR 読み込みの裏に隠す。
         let (resolutions, extraction_outcome) = tokio::join!(
-            knowledge.load_known_resolutions_with(&ctx.schema, &snapshot),
+            knowledge.load_known_resolutions_with(&ctx.schema, &live_snapshot),
             self.extractor.extract(question),
         );
         let resolutions = resolutions?;
@@ -507,7 +545,7 @@ impl Harness {
                     .ok_or_else(|| anyhow!("unknown case_id: {id}"))?;
                 (
                     id.to_string(),
-                    knowledge::case_signals_from_snapshot(&ctx.schema, id, &snapshot),
+                    knowledge::case_signals_from_snapshot(&ctx.schema, id, &live_snapshot),
                     attrs,
                 )
             }
@@ -582,13 +620,28 @@ impl Harness {
                             EVALUATE_TOP_K,
                         )
                         .await;
+                    let manual_corpus = manual_corpus
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("manual corpus missing for ManualV1 evaluate"))?;
+                    // 回答可能性（coverage / best_manual_score）は product で hard-scope しない。
+                    // product スコープは「当該 Product を DESCRIBES する節 or 機種非依存の節」だけを
+                    // 残し、他機種のみを DESCRIBES する節を除外する。ところがパスワードリセットのような
+                    // 機種横断 how-to は特定機種ページとして DESCRIBES 辺を持つことがあり、resolve 済み
+                    // product で絞ると本来 answerable なページが候補から消え、best_manual_score が低く
+                    // 出て false-escalate する（実測: スコープ有 0.561 < 閾値、スコープ無 0.917）。
+                    // そこで evaluate の内部検索は product_key=None で走らせ、best_manual_score と
+                    // best_manual_sections（＝ evidence lineage）を同一 hit 列から coherent に導出する
+                    // （score は横断ページ、evidence は別ページ、という不整合を作らない）。
+                    // product は「絞り込み」から「（任意の）加点」へ格下げする方針で、現状は加点も
+                    // 掛けない（最小差分・ゲート挙動優先）。search_manual ツールが明示 product_key を
+                    // 尊重する挙動は search_with_snapshot 側で不変（本変更は evaluate の呼び出しのみ）。
                     let hits = store.search_with_snapshot(
                         &ctx.schema,
                         question,
                         &accumulated,
-                        product_key,
+                        None,
                         EVALUATE_TOP_K,
-                        &snapshot,
+                        manual_corpus,
                         &vector_hits,
                     )?;
                     let ids = hits
@@ -612,7 +665,7 @@ impl Harness {
                             question,
                             product_key,
                             5,
-                            snapshot.clone(),
+                            live_snapshot.clone(),
                         )
                         .await?;
                     let ids = hits
@@ -705,15 +758,19 @@ impl Harness {
         };
         // [取得] S1-1: past_case も取得する（参考情報として返すのみ・decide() には渡さない）。
         // 追加 RPC なしで、evaluate 冒頭で取得済みの snapshot を再利用する。自 case は除外する。
-        let related_cases: Vec<RelatedCase> =
-            knowledge::search_cases_from_snapshot(&snapshot, question, 3, Some(case_id.as_str()))
-                .into_iter()
-                .map(|(case, _score)| RelatedCase {
-                    case_id: case.case_id,
-                    question: case.question,
-                    last_decision: case.last_decision,
-                })
-                .collect();
+        let related_cases: Vec<RelatedCase> = knowledge::search_cases_from_snapshot(
+            &live_snapshot,
+            question,
+            3,
+            Some(case_id.as_str()),
+        )
+        .into_iter()
+        .map(|(case, _score)| RelatedCase {
+            case_id: case.case_id,
+            question: case.question,
+            last_decision: case.last_decision,
+        })
+        .collect();
         let mut retrieved_node_ids: Vec<String> = retrieved_manual_ids;
         retrieved_node_ids.push(knowledge::harness_node_id(
             &ctx.schema,
@@ -916,6 +973,7 @@ mod tests {
             queue_path: dir.join("queue.jsonl"),
             grade_lock: tokio::sync::Mutex::new(()),
             manual: None,
+            corpus: None,
             default_route: "triage".to_string(),
             vector_route_enabled: false,
         }

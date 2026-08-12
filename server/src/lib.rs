@@ -1,4 +1,5 @@
 pub mod config;
+pub mod corpus;
 pub mod harness;
 pub mod health;
 pub mod ingest;

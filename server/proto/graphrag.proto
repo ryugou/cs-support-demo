@@ -127,6 +127,10 @@ message IngestResponse {
   int32 ingested_count = 1;
   optional string job_id = 2;
   string ingest_id = 3;
+  // Number of messages skipped as exact-match duplicates (already registered
+  // in the live graph with byte-identical text + metadata). See design D5:
+  // Ingest short-circuits these instead of re-processing them.
+  int32 already_registered_count = 4;
 }
 
 // ── Search ────────────────────────────────────────────────────────────────
@@ -651,7 +655,7 @@ message MaintenanceModeResponse {
 // ── ListJobs ─────────────────────────────────────────────────────────────
 
 message ListJobsRequest {
-  optional string status = 1;      // "pending" | "running" | "completed" | "dead_letter". empty = all
+  optional string status = 1;      // "pending" | "running" | "completed" | "failed". empty = all
   optional int64 since_ms = 2;     // epoch ms. unset = no lower bound
   optional int64 until_ms = 3;     // epoch ms. unset = no upper bound
   optional int32 offset = 4;       // default 0
@@ -749,6 +753,7 @@ message SearchHistoryItem {
   int64 timestamp = 5;                 // epoch ms (search execution time)
   int32 result_count = 6;
   optional FeedbackSummary feedback = 7;
+  SearchExecution execution = 8;
 }
 
 message FeedbackSummary {

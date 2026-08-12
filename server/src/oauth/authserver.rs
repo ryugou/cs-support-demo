@@ -1446,9 +1446,9 @@ impl UsedJtis {
             self.prunes += 1;
             // 次の刈り取りは生存件数の 2 倍で。生存件数が少なければ最低閾値に戻る。
             // **上限で頭打ちにする**（超えると満杯後に刈り取りが走らなくなる）。
-            self.prune_at = (self.entries.len() * 2)
-                .max(PRUNE_THRESHOLD)
-                .min(MAX_USED_JTIS);
+            // PRUNE_THRESHOLD(=下限) <= MAX_USED_JTIS(=上限) は定数で常に成立するため
+            // clamp は panic せず、max().min() と挙動が一致する（clippy::manual_clamp）。
+            self.prune_at = (self.entries.len() * 2).clamp(PRUNE_THRESHOLD, MAX_USED_JTIS);
         }
         if self.entries.len() >= MAX_USED_JTIS {
             // **fail closed。** 上限に達した状態で新しいブロブを通すと、その 1 件は
@@ -3098,7 +3098,14 @@ mod tests {
             assert!(exp <= now, "exp {exp} must be treated as expired");
         }
         // 旧実装の `0` では、逆に何ひとつ期限切れにならなかったことを対比で示す。
-        assert!(!(1_700_000_000u64 <= 0));
+        // broken clock を 0 に潰していたため、正の `exp` は `exp <= now(=0)` が常に false ＝
+        // 期限切れにならなかった。「exp が broken now を上回る」形で同じ意味を表す
+        // （u64 の `<= 0` リテラル比較は absurd_extreme_comparisons に触れるため避ける）。
+        let old_broken_now: u64 = 0;
+        assert!(
+            1_700_000_000u64 > old_broken_now,
+            "old impl (now=0) treated a positive exp as not-yet-expired"
+        );
     }
 
     /// 時計異常時に `exp` の計算が桁溢れしないこと（飽和して「常に期限切れ」になる）。

@@ -86,6 +86,9 @@ impl AppConfig {
                 .vegapunk_max_decode_mb
                 .max(1)
                 .saturating_mul(1024 * 1024),
+            // keepalive は既定のまま。常駐サーバは長寿命チャネルを使い回すため、
+            // アイドル後の死んだ接続を h2 PING で検知する必要がある（config で切らせない）。
+            ..crate::vegapunk::GrpcLimits::default()
         }
     }
 }
@@ -344,5 +347,28 @@ manual_schema = "manual_v1"
     #[test]
     fn default_escalation_route_defaults_to_triage() {
         assert_eq!(HarnessConfig::default().default_escalation_route, "triage");
+    }
+
+    #[test]
+    fn grpc_limits_keeps_resident_server_keep_alive_default() {
+        // 常駐サーバ（main.rs）が使う `grpc_limits()` は keepalive を config から
+        // 変更できない安全前提（`..GrpcLimits::default()` の 1 行とコメントだけで守られている）。
+        // merge_schema CLI は自前の `merge_cli_limits()` で別途 `keep_alive: None` を組む
+        // （こちらは通らない）ので、config 経路の既定が変わっていないことをここで固定する。
+        // config から keepalive を切れるようにする変更が将来入っても、この assert が
+        // 赤くならない限り「常駐サーバの keepalive は不変」という前提は検出できない。
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.grpc_limits().keep_alive,
+            Some(crate::vegapunk::KeepAlive::default()),
+            "常駐サーバの h2 PING keepalive は既定のまま（config からは切れない）"
+        );
     }
 }

@@ -383,20 +383,28 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 - image: `asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>`（`<tag>` は git short SHA を使う運用）
 - public URL: `https://cs-support-mcp-235108918288.asia-northeast1.run.app`
 - MCP endpoint: `https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp`
-- Cloud Run jobs（service と同一イメージ）: `ingest-rules`, `ingest-urtect`
+- Cloud Run jobs（service と同一イメージ）: `ingest-rules`, `ingest-urtect`, `merge-schema`, `backfill-concept-keys`
 - **製品マスタの正本は vegapunk の Product ノード**（Issue #6: `KNOWN_MODELS` 定数は廃止済み）。`server/data/urtect/products.json` はコードではなく、`ingest_products` CLI に渡す seed 投入の入力記録である。
   - 製品を追加する手順: `products.json` に `{ "model", "name", "aliases" }` を追記 → `ingest_products` を実行する。**サービスの再ビルド・再デプロイは不要**（Product ノードは vegapunk 側にしか存在しないため）。
-  - 全体リセット後の ingest 実行順序は **`ingest_products` → `ingest_urtect`** の順を必ず守ること。`ingest_urtect` は起動時に vegapunk の Product ノード一覧を取得し、0 件なら「製品マスタが空。先に `ingest_products` を実行せよ」という fail closed で止まる。
+  - 全体リセット後の ingest 実行順序は **`ingest_products` → `ingest_urtect` / `ingest_alarmcom`** の順を必ず守ること。`ingest_urtect` / `ingest_alarmcom` はどちらも起動時に vegapunk の Product ノード一覧を取得し、0 件なら「製品マスタが空。先に `ingest_products` を実行せよ」という fail closed で止まる。`ingest_urtect`（Google Sites）と `ingest_alarmcom`（answers.alarm.com）の間に順序依存は無い（両方 products.json 投入後ならどちらを先に走らせてもよい）。
+  - **`backfill-concept-keys`（Issue #8 Phase B2-0/B2-1）は schema 更新後・2-hop 拡張の読み取り経路有効化前に必ず実行すること。** `ManualSection.concept_keys`（`MENTIONS_CONCEPT` 辺の読み取り最適化射影）を書く CLI で、`ingest_alarmcom` の差分 ingest は既存 section を再翻訳しないため単独では埋まらない（未変更記事は `existing_hash == hash` で skip される）。`--probe-only`（書き込みなし・B2-0 の fan-in 実測）/ `--verify`（辺と属性の乖離検出）/ `--probe-one <section_key>`（`UpsertNodes` の意味論を実測し即復旧）/ 既定（全件書き込み・冪等）の 4 モードは相互排他。詳細は `docs/superpowers/specs/2026-08-02-concept-expansion-design.md`。
+    - **`backfill-concept-keys` を `ingest_alarmcom` / `ingest_urtect` と同時に走らせないこと（`merge-schema` の「同一 schema で同時 1 本」と同じ粒度の制約）。** backfill は全 ManualSection の属性を読み切ってから書き戻す（読み取り段階で section 数と同じ本数の traverse を逐次発行するため、本番規模では読みと書きの間に数十分〜数時間の差が生じる）。この間に ingest が同じ section を更新すると、**backfill が新しい本文を古い本文で上書きする**。全属性を明示再送する設計上、`UpsertNodes` が部分マージでも全置換でも起きる。実行前に `gcloud run jobs executions list` で ingest job が走っていないことを確認する。
+    - 既定モードが途中で失敗した場合、エラーメッセージに `--start-after <section_key>` の形で再開点が出る。その値をそのまま `--args` に足して再実行する（冪等なので最初からやり直しても壊れないが、全 section の traverse を再度払うことになる）。
+  - **第 2 のマニュアルソース `ingest_alarmcom`（Issue #8）**: answers.alarm.com（MindTouch KB）を `?mt-language=JA` の機械翻訳で ingest する。クロール対象は sitemap.xml と製品マスタ（Product ノード）駆動で絞る。各製品の型番/別名が「ファミリーハブ URL」に現れる記事ファミリーだけを取り込み、1 製品でもハブ未マッチなら fail closed で止まる（`products.json` の aliases に URL 上の表記を足して再投入する）。robots.txt の Crawl-delay=5 秒を守るため全リクエストを 5 秒以上空けて逐次実行し、**実行時間は対象ファミリー数（≒英日 2 リクエスト × 記事数 × 5 秒）に比例する**。Cloud Run job は本件スコープ外（未新設）。
+- **`merge-schema`（Issue #8 Phase B1）**: vegapunk の `Merge` RPC（Leiden コミュニティ検出 + CommunitySummary + Node2Vec）を schema `urtect` に対して実行し、**前後の `GetStats` と global/hybrid 検索の返却物を JSON で出す**。
+- Merge は **schema 全体の同期再計算で、同一 schema では同時 1 本しか走らない**。実行中に再実行すると `FAILED_PRECONDITION` で弾かれる。
+- job の `--task-timeout` は CLI の `--timeout-secs`（既定 6h = 21600 秒）より長く取ること。**ちょうど同じ値にすると、CLI の per-request timeout と task-timeout が同着し、JSON summary が出力される前に task が kill される。** 実際の job は 7h（25200 秒）で作成済み。短いと Merge の途中で task が殺され、サーバ側だけ処理が続く状態になる。
+- ingest とは独立した job にしてある。`ingest_alarmcom` は実測約 6 時間かかるため、その末尾に Merge を積むと Merge だけの再実行ができない。
 - env（fail-closed 境界で2群に分けて扱うこと）:
-  - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs:54` で起動時 fail closed）
-  - **未設定でも起動する**: `VEGAPUNK_ENDPOINT`（`config.cloudrun.toml:13` の値にフォールバック。env があれば `config.rs:218` が上書き）、`VEGAPUNK_BEARER_TOKEN`
+  - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs` の `AnthropicClient::from_config` で起動時 fail closed）
+  - **未設定でも起動する**: `VEGAPUNK_ENDPOINT`（`config.cloudrun.toml` の `vegapunk_endpoint` キーの値にフォールバック。env があれば `server/src/config.rs` の `AppConfig::load` が上書き）、`VEGAPUNK_BEARER_TOKEN`
   - **そもそも env が無い**: OAuth の署名鍵。起動時に CSPRNG で生成してメモリに置く（`server/src/oauth/signing.rs` の `SigningKey::generate`）。Secret Manager にも置かない。
 - Secret Manager injection で注入するのは **`VEGAPUNK_BEARER_TOKEN` / `CS_SUPPORT_LLM_API_KEY` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET` の 3 つのみ**（真に秘密の値）。`CS_SUPPORT_PUBLIC_DOMAIN` は公開ホスト名、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は公開識別子であり、平文 env で構わない。非機密値まで Secret Manager に入れると「どれが本当の秘密か」の判断基準が失われる。
 - **再デプロイ・再起動で利用者はログアウトしない。** アクセストークンとリフレッシュトークンは Google が発行した値をそのまま中継しているため、こちらのプロセス状態に依存しない。再起動で失われるのは進行中のログインフロー（最長 600 秒）と DCR 登録だけで、後者は claude.ai の再登録で自動的に回復する。
 - **一括失効手段は無い。** 旧構成では署名鍵の差し替えが全トークンの一括失効になっていたが、自前トークンを廃止した現在その手段は存在しない。失効は Google 側（アカウントのアクセス権限管理）で行う。
 - `[llm] enabled = true` のため、**顧客問い合わせ本文が Anthropic API へ送信される**。運用上の注意点として認識しておくこと。
   `VEGAPUNK_BEARER_TOKEN` 未設定時は起動自体は成功するが、vegapunk 呼び出し（`search_manual` 等）だけが
-  失敗する（`main.rs:192-202`。空文字がそのまま使われるため fail-closed にならない点に注意）。
+  失敗する（`server/src/main.rs` の `read_bearer_token`。空文字がそのまま使われるため fail-closed にならない点に注意）。
 
 ビルド & デプロイ:
 
@@ -408,9 +416,13 @@ gcloud run services update cs-support-mcp --project sivira-cs-support --region a
 gcloud run jobs update ingest-rules --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
 
 gcloud run jobs update ingest-urtect --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
+
+gcloud run jobs update merge-schema --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
+
+gcloud run jobs update backfill-concept-keys --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
 ```
 
-`<tag>` は service と両 job で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。
+`<tag>` は service と全 job（`ingest-rules` / `ingest-urtect` / `merge-schema` / `backfill-concept-keys`）で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。`backfill-concept-keys` job は初回のみ `merge-schema` と同じ VPC connector / service account / Secret Manager injection で `gcloud run jobs create` が必要（未作成の場合、上記 `jobs update` は失敗する）。
 
 ### 認証（OAuth 2.1 フェデレーション、実測済み）
 

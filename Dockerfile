@@ -14,7 +14,11 @@ RUN cargo build --release --locked \
     --bin verify_demo \
     --bin ingest_rules \
     --bin ingest_urtect \
-    --bin ingest_products
+    --bin ingest_products \
+    --bin ingest_alarmcom \
+    --bin verify_alarmcom \
+    --bin merge_schema \
+    --bin backfill_concept_keys
 
 FROM debian:bookworm-slim
 
@@ -25,6 +29,10 @@ COPY --from=builder /app/server/target/release/verify_demo /usr/local/bin/verify
 COPY --from=builder /app/server/target/release/ingest_rules /usr/local/bin/ingest_rules
 COPY --from=builder /app/server/target/release/ingest_urtect /usr/local/bin/ingest_urtect
 COPY --from=builder /app/server/target/release/ingest_products /usr/local/bin/ingest_products
+COPY --from=builder /app/server/target/release/ingest_alarmcom /usr/local/bin/ingest_alarmcom
+COPY --from=builder /app/server/target/release/verify_alarmcom /usr/local/bin/verify_alarmcom
+COPY --from=builder /app/server/target/release/merge_schema /usr/local/bin/merge_schema
+COPY --from=builder /app/server/target/release/backfill_concept_keys /usr/local/bin/backfill_concept_keys
 COPY server/config.gce.toml ./config.gce.toml
 COPY server/config.cloudrun.toml ./config.cloudrun.toml
 COPY server/data ./data

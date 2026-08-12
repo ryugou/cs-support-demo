@@ -829,7 +829,7 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
   - **リクエスト経路の Bearer 検証はネットワーク非依存の署名検証**に変わった（`server/src/oauth/middleware.rs`）。Google tokeninfo 照会（`GoogleTokenVerifier`）は `/oauth/callback` での identity 確定（aud 完全一致・`email_verified == "true"`・安定した `sub` の必須化）にのみ使う。
   - **この変更は AuthN の配管のみで、AuthZ は一切変わっていない**。下記の「無条件 supervisor」はそのまま残っている。
 - **actor 突合のホワイトリストは廃止済み**（`server/src/harness/authn.rs`）。config `[[actors]]` による email ホワイトリスト、およびその後継として一時導入された `[default_actor]` フォールバック（commit aa9e3d8）も同じ理由で revert 済み（commit e90ef59）。config と DB の二重の正本を避けるため、config 側にホワイトリスト相当を足す実装は再度行わない。
-- **`Authenticator::lookup_by_identity` は突合を一切行わず、任意の検証済み email を無条件に `Role::Supervisor` かつ config 全 project の `allowed_schemas` で `Actor` に解決する**（`server/src/harness/authn.rs:87-104`）。supervisor は `add_known_resolution` 等の権限ゲート（`server/src/harness/mod.rs:315`）を無条件に通過する。
+- **`Authenticator::lookup_by_identity` は突合を一切行わず、任意の検証済み email を無条件に `Role::Supervisor` かつ config 全 project の `allowed_schemas` で `Actor` に解決する**（`server/src/harness/authn.rs`）。supervisor は `add_known_resolution` 等の権限ゲート（`Harness::admit_known_resolution`、`server/src/harness/mod.rs`）を無条件に通過する。
 - **Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済み**。テストユーザ登録による制限は外れているため、認証到達可能な母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。下記の「無条件 supervisor」と組み合わせて読むこと ―― 片方だけではリスクの規模を誤る。
 - **actor 突合表の DB 移行は未実装**。現状の歯止めは「Google 認証を通過したか」のみであり、実質的なアクセス制御は無い ―― 言い換えると、現状は Google アカウントで認証さえ通れば誰でも supervisor 権限の全操作（`add_known_resolution` を含む）が可能であり、実質的な認可（誰が何をできるか）は「Google 認証を通過したか」以上には絞られていない。`Authenticator::lookup_by_identity`（同ファイル doc comment に「DB 実装時の差し替え seam」と明記）を DB 参照に差し替えるまで、本番運用でのアクセス制御としては不十分と扱うこと。
 
