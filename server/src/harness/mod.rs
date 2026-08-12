@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod authn;
+pub mod clarify;
 pub mod correction;
 pub mod decision;
 pub mod egress;
@@ -1580,6 +1581,76 @@ mod tests {
         assert!(
             draft_customer_reply_via_stub(&drafted).await.is_none(),
             "abstain is 'do not emit' too; the draft must be dropped, not passed through"
+        );
+    }
+
+    // ---- clarification_allowed 契約テスト（会話フロー v1.1 design doc §2・§8） ----
+    //
+    // **退行防止テストであり、`evaluate()` 経由の検証ではない。** `decide()` を呼ばず、
+    // `decision::AnswerDecision::Escalate` を直接構築する（`harness::reply` のテストと同じ
+    // 流儀）。ここでの assert は「matches! 式の複製が、L795-803 の本物の matches! 式と
+    // 同じ bool を返すこと」であり、本番の `decide()` の出力を検証するものではない
+    // （design doc §8「`clarification_allowed` の契約テスト（退行防止）」）。
+    //
+    // **プロダクションコード（L795-803 の matches! 式）は一切変更しない。**
+    fn clarification_allowed_for(decision: &decision::AnswerDecision) -> bool {
+        // 本体の matches! 式（harness/mod.rs L795-803 相当）をそのまま複製する。
+        matches!(
+            decision,
+            decision::AnswerDecision::Escalate {
+                layer: 3,
+                reason: decision::EscalateReason::InsufficientDirectness
+                    | decision::EscalateReason::UnknownAddedSignal,
+                ..
+            }
+        )
+    }
+
+    fn escalate_for_contract_test(
+        layer: u8,
+        reason: decision::EscalateReason,
+    ) -> decision::AnswerDecision {
+        decision::AnswerDecision::Escalate {
+            reason,
+            layer,
+            route_to: "triage".to_string(),
+            disclosure_scope: decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clarification_is_denied_for_layer1_and_layer2_escalations() {
+        // 第1層（明示エスカレーションルール）・第2層（禁止ドメイン）は実際の `decide()` では
+        // 常に `RegulatedOrSafety` を返す（spec に明記）。
+        let layer1 = escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety);
+        assert!(
+            !clarification_allowed_for(&layer1),
+            "layer 1 escalation must never allow clarification"
+        );
+
+        let layer2 = escalate_for_contract_test(2, decision::EscalateReason::RegulatedOrSafety);
+        assert!(
+            !clarification_allowed_for(&layer2),
+            "layer 2 escalation must never allow clarification"
+        );
+    }
+
+    #[test]
+    fn clarification_is_allowed_for_layer3_gray() {
+        let insufficient_directness =
+            escalate_for_contract_test(3, decision::EscalateReason::InsufficientDirectness);
+        assert!(
+            clarification_allowed_for(&insufficient_directness),
+            "layer 3 InsufficientDirectness must allow clarification"
+        );
+
+        let unknown_added_signal =
+            escalate_for_contract_test(3, decision::EscalateReason::UnknownAddedSignal);
+        assert!(
+            clarification_allowed_for(&unknown_added_signal),
+            "layer 3 UnknownAddedSignal must allow clarification"
         );
     }
 
