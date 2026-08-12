@@ -313,6 +313,15 @@ pub fn decide_reply_action(
     }
 }
 
+/// 「初回か継続か」をサーバがコードで判定する純関数（会話フロー v1.1 design doc §3）。
+///
+/// 判定は決定論（`history` が非空、または `case_id` が渡された場合は継続）。文面の出し分けは
+/// `clarify.rs` / `escalation_reply.rs` 側が `is_continuation: bool` を受け取って行うだけで、
+/// 判定ロジックそのものはこの関数以外に持たせない。
+fn is_continuation(history: &[ReplyHistoryTurn], case_id: Option<&str>) -> bool {
+    !history.is_empty() || case_id.is_some()
+}
+
 /// `AnswerDecision::Escalate.missing` を `clarify::build_clarify_prompt` の第2引数
 /// （不足情報）向けの人間可読テキストへ変換する。このテキストは LLM への入力にのみ使い、
 /// 顧客へは出さない（design doc §3: 検索ヒットの title・本文は入力に含めない制約とは別枠。
@@ -571,6 +580,9 @@ async fn reply_handler(
                 Ok(conv) => conv,
                 Err(err) => return conv_state_load_failed(&err, &request_id, &outcome.case_id),
             };
+            // 「初回か継続か」の判定は決定論（コード）。文面の出し分けは `clarify.rs` /
+            // `escalation_reply.rs` 側に `is_continuation` として渡すだけ（design doc §3）。
+            let is_continuation = is_continuation(&history, req.case_id.as_deref());
 
             match decide_reply_action(&outcome, &conv, &state.config.api) {
                 ReplyAction::Answer(text) => (
@@ -605,6 +617,7 @@ async fn reply_handler(
                                 state.harness.reply_draft_max_tokens,
                                 &req.message,
                                 &missing_text,
+                                is_continuation,
                             )
                             .await
                         }
@@ -636,6 +649,7 @@ async fn reply_handler(
                                 &state.harness.ng,
                                 state.harness.reply_draft_max_tokens,
                                 &req.message,
+                                is_continuation,
                             )
                             .await
                         }
@@ -1157,6 +1171,27 @@ mod tests {
         let outcome = base_outcome(rule_match_escalate_decision(), false);
         let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
         assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    // ---- is_continuation（会話フロー v1.1 design doc §3: 初回/継続の決定論判定） ----
+
+    #[test]
+    fn is_continuation_true_when_history_is_non_empty() {
+        let history = vec![ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: "前回の発話".to_string(),
+        }];
+        assert!(is_continuation(&history, None));
+    }
+
+    #[test]
+    fn is_continuation_true_when_history_is_empty_but_case_id_is_present() {
+        assert!(is_continuation(&[], Some("case-12345678-abcd")));
+    }
+
+    #[test]
+    fn is_continuation_false_when_history_is_empty_and_case_id_is_absent() {
+        assert!(!is_continuation(&[], None));
     }
 
     // ---- missing_to_text ----
