@@ -113,6 +113,65 @@ pub struct RelatedCase {
     pub last_decision: String,
 }
 
+/// support_case ノードに永続化する会話状態（会話フロー v1.1 design doc §6）。
+/// すべて加算属性・後方互換（欠落は既定値）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseConvState {
+    /// 聞き返し回数。エスカレーション応答送信時に 0 へリセットする（design doc §3）。
+    pub clarify_turns: u32,
+    /// 次の顧客発話を希望時間帯の返信として解釈するか（design doc §5）。
+    pub awaiting_time_pref: bool,
+    /// `awaiting_time_pref` 中に `is_time_preference = false` と分類された連続回数
+    /// （2 回連続で自動解除、design doc §5）。
+    pub time_pref_false_count: u32,
+    /// 担当者への申し送り用の希望時間帯（時間外希望は付記を含む）。
+    pub preferred_contact_time: Option<String>,
+}
+
+/// support_case の属性 map から [`CaseConvState`] を復元する純関数。
+///
+/// 欠落・parse 失敗は既定値（0 / false / None）に倒す。数値の parse 失敗を warn しないのは、
+/// `knowledge.rs` の `approval_count` / `rejection_count` 読み取りと同じ規律に合わせるため
+/// （読み取り側で毎回 warn すると、既存 case（この 4 属性を持たない）を読むたびに warn が出る）。
+fn conv_state_from_attrs(attrs: &std::collections::HashMap<String, String>) -> CaseConvState {
+    let get = |key: &str| attrs.get(key).map(String::as_str).unwrap_or("");
+    CaseConvState {
+        clarify_turns: get("clarify_turns").parse().unwrap_or(0),
+        awaiting_time_pref: get("awaiting_time_pref") == "true",
+        time_pref_false_count: get("time_pref_false_count").parse().unwrap_or(0),
+        preferred_contact_time: attrs
+            .get("preferred_contact_time")
+            .filter(|s| !s.is_empty())
+            .cloned(),
+    }
+}
+
+/// [`CaseConvState`] を support_case の属性 map へ書き戻す全属性を組み立てる純関数。
+///
+/// read-merge-write: 既存属性（`question` / `actor` 等、この 4 キー以外)を土台に、
+/// 会話状態の 4 キーだけを重ねる（`merge_outcome_attributes` と同じ形。vegapunk の
+/// `UpsertNodes` は全置換のため、部分送信すると既存属性が消える）。
+fn merge_conv_state_attributes(
+    existing: &std::collections::HashMap<String, String>,
+    state: &CaseConvState,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = existing.clone();
+    merged.insert("clarify_turns".to_string(), state.clarify_turns.to_string());
+    merged.insert(
+        "awaiting_time_pref".to_string(),
+        state.awaiting_time_pref.to_string(),
+    );
+    merged.insert(
+        "time_pref_false_count".to_string(),
+        state.time_pref_false_count.to_string(),
+    );
+    merged.insert(
+        "preferred_contact_time".to_string(),
+        state.preferred_contact_time.clone().unwrap_or_default(),
+    );
+    merged
+}
+
 /// outcome 確定時に answer_attempt へ書き戻す全属性を組み立てる純関数。
 ///
 /// read-merge-write: 既存属性（draft / case_id / known_resolution_id / 起票者の
@@ -253,6 +312,47 @@ impl Harness {
     /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
     pub fn store(&self) -> Result<&knowledge::KnowledgeStore> {
         self.knowledge()
+    }
+
+    /// support_case の会話状態（会話フロー v1.1）を読む。case 未存在は全既定値として扱う
+    /// （エラーにしない。新規会話・古い case（この 4 属性を持たない）の両方が該当する）。
+    pub async fn load_conv_state(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+    ) -> Result<CaseConvState> {
+        let attrs = self
+            .knowledge()?
+            .load_case(&ctx.schema, case_id)
+            .await?
+            .unwrap_or_default();
+        Ok(conv_state_from_attrs(&attrs))
+    }
+
+    /// support_case の会話状態を保存する。read-merge-write で既存属性（`question` 等）を保ち、
+    /// 会話状態 4 属性だけを上書きしたうえで全属性を明示再送する（vegapunk 0.2.0 の
+    /// `UpsertNodes` は全置換のため、部分送信は既存属性を消す。`backfill_concept_keys` と
+    /// 同じ流儀）。
+    pub async fn save_conv_state(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+        state: &CaseConvState,
+    ) -> Result<()> {
+        let knowledge = self.knowledge()?;
+        let existing = knowledge
+            .load_case(&ctx.schema, case_id)
+            .await?
+            .unwrap_or_default();
+        let merged = merge_conv_state_attributes(&existing, state);
+        knowledge
+            .record(
+                &ctx.schema,
+                "support_case",
+                case_id,
+                merged.into_iter().collect(),
+            )
+            .await
     }
 
     /// 監査イベントの共通入口。ctx 由来の provenance フィールドをここで一元的に埋める。
@@ -1481,5 +1581,139 @@ mod tests {
             draft_customer_reply_via_stub(&drafted).await.is_none(),
             "abstain is 'do not emit' too; the draft must be dropped, not passed through"
         );
+    }
+
+    // ---- CaseConvState（会話フロー v1.1 design doc §6） ----
+
+    #[test]
+    fn conv_state_from_attrs_defaults_when_attributes_are_missing() {
+        // 古い case（この 4 属性を持たない）を読んでもエラーにせず既定値に倒す（後方互換）。
+        let attrs = std::collections::HashMap::new();
+        let state = conv_state_from_attrs(&attrs);
+        assert_eq!(
+            state,
+            CaseConvState {
+                clarify_turns: 0,
+                awaiting_time_pref: false,
+                time_pref_false_count: 0,
+                preferred_contact_time: None,
+            }
+        );
+    }
+
+    #[test]
+    fn conv_state_from_attrs_parses_present_values() {
+        let attrs: std::collections::HashMap<String, String> = [
+            ("clarify_turns".to_string(), "2".to_string()),
+            ("awaiting_time_pref".to_string(), "true".to_string()),
+            ("time_pref_false_count".to_string(), "1".to_string()),
+            (
+                "preferred_contact_time".to_string(),
+                "平日午後（対応時間外の希望）".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let state = conv_state_from_attrs(&attrs);
+        assert_eq!(state.clarify_turns, 2);
+        assert!(state.awaiting_time_pref);
+        assert_eq!(state.time_pref_false_count, 1);
+        assert_eq!(
+            state.preferred_contact_time.as_deref(),
+            Some("平日午後（対応時間外の希望）")
+        );
+    }
+
+    #[test]
+    fn conv_state_from_attrs_treats_empty_preferred_contact_time_as_none() {
+        let attrs: std::collections::HashMap<String, String> =
+            [("preferred_contact_time".to_string(), "".to_string())]
+                .into_iter()
+                .collect();
+        let state = conv_state_from_attrs(&attrs);
+        assert_eq!(state.preferred_contact_time, None);
+    }
+
+    #[test]
+    fn merge_conv_state_attributes_preserves_unrelated_existing_keys() {
+        // read-merge-write: 会話状態と無関係な既存属性（question / last_decision 等）は消えない。
+        let existing: std::collections::HashMap<String, String> = [
+            ("question".to_string(), "元の質問".to_string()),
+            ("last_decision".to_string(), "escalate".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let state = CaseConvState {
+            clarify_turns: 1,
+            awaiting_time_pref: true,
+            time_pref_false_count: 0,
+            preferred_contact_time: None,
+        };
+        let merged = merge_conv_state_attributes(&existing, &state);
+        assert_eq!(merged.get("question").map(String::as_str), Some("元の質問"));
+        assert_eq!(
+            merged.get("last_decision").map(String::as_str),
+            Some("escalate")
+        );
+        assert_eq!(merged.get("clarify_turns").map(String::as_str), Some("1"));
+        assert_eq!(
+            merged.get("awaiting_time_pref").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            merged.get("time_pref_false_count").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            merged.get("preferred_contact_time").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn merge_conv_state_attributes_overwrites_previous_conv_state_values() {
+        let existing: std::collections::HashMap<String, String> = [
+            ("clarify_turns".to_string(), "3".to_string()),
+            ("awaiting_time_pref".to_string(), "true".to_string()),
+            ("time_pref_false_count".to_string(), "1".to_string()),
+            ("preferred_contact_time".to_string(), "旧い希望".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // エスカレーション応答送信時のリセット相当（design doc §3）。
+        let state = CaseConvState {
+            clarify_turns: 0,
+            awaiting_time_pref: true,
+            time_pref_false_count: 0,
+            preferred_contact_time: None,
+        };
+        let merged = merge_conv_state_attributes(&existing, &state);
+        assert_eq!(merged.get("clarify_turns").map(String::as_str), Some("0"));
+        assert_eq!(
+            merged.get("preferred_contact_time").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn conv_state_round_trips_through_merge_and_parse() {
+        for state in [
+            CaseConvState {
+                clarify_turns: 0,
+                awaiting_time_pref: false,
+                time_pref_false_count: 0,
+                preferred_contact_time: None,
+            },
+            CaseConvState {
+                clarify_turns: 3,
+                awaiting_time_pref: true,
+                time_pref_false_count: 2,
+                preferred_contact_time: Some("平日夕方（対応時間外の希望）".to_string()),
+            },
+        ] {
+            let merged = merge_conv_state_attributes(&std::collections::HashMap::new(), &state);
+            let round_tripped = conv_state_from_attrs(&merged);
+            assert_eq!(round_tripped, state);
+        }
     }
 }
