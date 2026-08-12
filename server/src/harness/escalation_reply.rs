@@ -10,13 +10,38 @@ use crate::harness::prompt_input::{
     CONTINUATION_OPENER_RULE,
 };
 
-/// 受け止め文の生成失敗・生成上限による途中切断・egress gate 却下時の定型文
-/// （design doc §4 の文字列そのまま）。
+/// 受け止め文の生成失敗・生成上限による途中切断・egress gate 却下時の定型文（初回、
+/// `is_continuation = false`。design doc §4 の文字列そのまま）。継続時は
+/// [`FALLBACK_ACK_TEXT_CONTINUATION`] を使う（選択は [`fallback_ack`] に集約されている）。
 ///
 /// `config::default_fallback_reply_text()` と同一文字列だが、Task 4 の要件どおり本モジュール
 /// 内に独立した定数として持つ（用途が異なるため共有化しない）。
 pub const FALLBACK_ACK_TEXT: &str =
     "お問い合わせありがとうございます。担当者が確認のうえ、あらためてご連絡いたします。";
+
+/// 継続会話（`is_continuation = true`）での受け止め文フォールバック定型文
+/// （design doc §4: 感謝オープナーを含めない）。
+pub const FALLBACK_ACK_TEXT_CONTINUATION: &str = "担当者が確認のうえ、あらためてご連絡いたします。";
+
+/// 会話段階から受け止め文フォールバックの定型文を選ぶ単一の選択ポイント。
+///
+/// 戻り値は `(定型文, 定数名)`。定数名は warn ログでどちらへ倒れたかを識別するために使う
+/// （[`draft_ack_text`] の生成失敗・egress gate 却下ログと同じ形）。
+///
+/// `draft_ack_text`（LLM 生成が有効な経路）と `api.rs` の `reply_drafter` 未設定経路（LLM 生成
+/// 自体を行わない kill switch 経路）の両方から呼ばれる。選択ロジックをここ 1 箇所に集約する
+/// ことで、両経路が常に同じ会話段階判定に従う（レビュー指摘: 複製すると経路ごとに判定がずれ、
+/// 継続会話でも感謝オープナー付きの文が出る退行を起こしうる）。
+pub fn fallback_ack(is_continuation: bool) -> (&'static str, &'static str) {
+    if is_continuation {
+        (
+            FALLBACK_ACK_TEXT_CONTINUATION,
+            "FALLBACK_ACK_TEXT_CONTINUATION",
+        )
+    } else {
+        (FALLBACK_ACK_TEXT, "FALLBACK_ACK_TEXT")
+    }
+}
 
 /// `case_id` から顧客向け表示用の受付番号を作る。`"case-"` prefix を剥がした先頭 8 文字。
 /// 一意ではなく衝突しうる（design doc §4: 数万件規模で約 1%）。
@@ -88,7 +113,9 @@ pub fn build_ack_prompt(question: &str, is_continuation: bool) -> (String, Strin
 }
 
 /// 受け止め文を 1 案生成する。生成失敗・生成上限による途中切断・egress gate 却下のいずれでも
-/// [`FALLBACK_ACK_TEXT`] へ倒す（`harness::clarify::draft_clarify_question` と同じ型）。
+/// フォールバック定型文へ倒す（`harness::clarify::draft_clarify_question` と同じ型）。倒す先は
+/// `is_continuation` によって変わる: 初回は [`FALLBACK_ACK_TEXT`]、継続は
+/// [`FALLBACK_ACK_TEXT_CONTINUATION`]（design doc §4）。選択は [`fallback_ack`] に委譲する。
 pub async fn draft_ack_text(
     drafter: &crate::llm::AnthropicClient,
     ng: &NgDictionary,
@@ -96,6 +123,7 @@ pub async fn draft_ack_text(
     question: &str,
     is_continuation: bool,
 ) -> String {
+    let (fallback_text, fallback_name) = fallback_ack(is_continuation);
     let (system, user) = build_ack_prompt(question, is_continuation);
     let draft = match drafter
         .draft_reply(&system, &user, max_tokens, "escalation_ack")
@@ -105,9 +133,10 @@ pub async fn draft_ack_text(
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "escalation ack generation failed; falling back to FALLBACK_ACK_TEXT"
+                fallback = fallback_name,
+                "escalation ack generation failed; falling back"
             );
-            return FALLBACK_ACK_TEXT.to_string();
+            return fallback_text.to_string();
         }
     };
     let ctx = EmitContext {
@@ -117,8 +146,8 @@ pub async fn draft_ack_text(
         draft,
         &ctx,
         ng,
-        FALLBACK_ACK_TEXT,
-        "FALLBACK_ACK_TEXT",
+        fallback_text,
+        fallback_name,
         "escalation_ack",
         "the question",
     )
@@ -226,17 +255,72 @@ mod tests {
 
     #[tokio::test]
     async fn blocked_ack_draft_falls_back() {
-        let (out, _log) =
-            draft_ack_text_via_stub("この方法で絶対に治りますのでご安心ください。", "end_turn")
-                .await;
+        let (out, _log) = draft_ack_text_via_stub(
+            "この方法で絶対に治りますのでご安心ください。",
+            "end_turn",
+            false,
+        )
+        .await;
         assert_eq!(out, FALLBACK_ACK_TEXT);
     }
 
     #[tokio::test]
     async fn abstain_ack_draft_falls_back() {
-        let (out, _log) =
-            draft_ack_text_via_stub("継続すると効果がありますと言われています。", "end_turn").await;
+        let (out, _log) = draft_ack_text_via_stub(
+            "継続すると効果がありますと言われています。",
+            "end_turn",
+            false,
+        )
+        .await;
         assert_eq!(out, FALLBACK_ACK_TEXT);
+    }
+
+    /// design doc §4: 継続会話でフォールバックする場合は感謝オープナーを含まない
+    /// `FALLBACK_ACK_TEXT_CONTINUATION` を返す（egress gate 却下経路で検証）。
+    #[tokio::test]
+    async fn continuation_ack_draft_falls_back_to_the_continuation_text() {
+        let (out, _log) = draft_ack_text_via_stub(
+            "この方法で絶対に治りますのでご安心ください。",
+            "end_turn",
+            true,
+        )
+        .await;
+        assert_eq!(out, FALLBACK_ACK_TEXT_CONTINUATION);
+    }
+
+    /// design doc §4 の「感謝オープナーを含めない」要求そのものを固定する。
+    /// `FALLBACK_ACK_TEXT_CONTINUATION` の中身を感謝オープナー付きに書き換えても
+    /// `continuation_ack_draft_falls_back_to_the_continuation_text`（定数一致のみを見る）は
+    /// 緑のままになりうるため、文言そのものの性質を別途検証する。
+    #[test]
+    fn continuation_fallback_text_omits_the_thanks_opener_while_the_initial_one_keeps_it() {
+        assert!(
+            !FALLBACK_ACK_TEXT_CONTINUATION.contains("ありがとうございます"),
+            "継続時の受け止め文フォールバックは感謝オープナーを含めない設計（design doc §4）"
+        );
+        assert!(
+            FALLBACK_ACK_TEXT.contains("ありがとうございます"),
+            "対照: 初回の受け止め文フォールバックは感謝オープナーを含む"
+        );
+    }
+
+    /// `fallback_ack` は `api.rs` の `reply_drafter` 未設定経路（`[harness]
+    /// customer_reply_draft_enabled = false` の kill switch）が使う選択ポイントそのもの。
+    /// ここで正しい定数が返ることを固定し、`draft_ack_text` 内の選択ロジックと api.rs 側が
+    /// 同じ関数を経由して一致することを担保する。
+    #[test]
+    fn fallback_ack_selects_by_conversation_stage() {
+        assert_eq!(
+            fallback_ack(false),
+            (FALLBACK_ACK_TEXT, "FALLBACK_ACK_TEXT")
+        );
+        assert_eq!(
+            fallback_ack(true),
+            (
+                FALLBACK_ACK_TEXT_CONTINUATION,
+                "FALLBACK_ACK_TEXT_CONTINUATION"
+            )
+        );
     }
 
     #[test]
@@ -252,6 +336,7 @@ mod tests {
     async fn draft_ack_text_via_stub(
         draft_text: &str,
         stop_reason: &str,
+        is_continuation: bool,
     ) -> (String, crate::llm::test_support::RequestLog) {
         let body = serde_json::json!({
             "stop_reason": stop_reason,
@@ -273,7 +358,14 @@ mod tests {
         .expect("llm client must build from the stub config")
         .expect("enabled = true with a readable key file must yield a client");
 
-        let out = draft_ack_text(&drafter, &ng(), 700, "エラーが出て困っています", false).await;
+        let out = draft_ack_text(
+            &drafter,
+            &ng(),
+            700,
+            "エラーが出て困っています",
+            is_continuation,
+        )
+        .await;
         (out, log)
     }
 
@@ -291,6 +383,7 @@ mod tests {
         let (out, log) = draft_ack_text_via_stub(
             "ご質問いただいている件、担当者が確認のうえご連絡いたします。",
             "max_tokens",
+            false,
         )
         .await;
         assert_eq!(out, FALLBACK_ACK_TEXT);
@@ -310,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn non_truncated_draft_passes_through_the_egress_gate() {
         const CLEAN: &str = "ご質問いただいている件、担当者が確認のうえご連絡いたします。";
-        let (out, _log) = draft_ack_text_via_stub(CLEAN, "end_turn").await;
+        let (out, _log) = draft_ack_text_via_stub(CLEAN, "end_turn", false).await;
         assert_eq!(out, CLEAN);
     }
 

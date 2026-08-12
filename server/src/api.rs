@@ -653,7 +653,9 @@ async fn reply_handler(
                             )
                             .await
                         }
-                        None => escalation_reply::FALLBACK_ACK_TEXT.to_string(),
+                        None => escalation_reply::fallback_ack(is_continuation)
+                            .0
+                            .to_string(),
                     };
                     let out_of_hours_now = !hours::is_within_business_hours(
                         &state.config.api.business_hours,
