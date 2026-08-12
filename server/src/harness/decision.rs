@@ -554,6 +554,159 @@ mod tests {
         assert!(matches!(d2, AnswerDecision::Allowed { .. }));
     }
 
+    // --- 実データ回帰: human_handoff_request のサイレント never-match 検知（PR #17 review W3）---
+    //
+    // "human_handoff_request" という signal 名は
+    // data/urtect/signal-lexicon.json / data/signal-lexicon.json / data/urtect/rules.json の
+    // 3 箇所に手書きで重複している。どこか 1 箇所で typo が起きると
+    // `rule.condition.is_subset(question)` が永久に false になり、取次依頼が第1層で
+    // エスカレーションされず素通りする（黙って第3層評価に流れる）。ここでは実際に配布される
+    // JSON ファイルをロードし、lexicon → rules → decide() の一気通貫でこの不整合を検知する。
+
+    fn bundled_lexicon_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/urtect/signal-lexicon.json")
+    }
+
+    fn bundled_rules_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/urtect/rules.json")
+    }
+
+    #[test]
+    fn bundled_lexicon_extracts_human_handoff_request_for_known_surface_forms() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        for utterance in [
+            "担当者につないでください",
+            "担当者に繋いでください",           // W2: 漢字表記「繋いで」
+            "オペレーターに繋いでもらえますか", // W2: 漢字表記「繋いで」
+            "人に代わってください",             // W2: 「人に代わって」
+            "サポートにつないでほしい",         // W2: 「サポートにつないで」
+        ] {
+            assert!(
+                lex.normalize(utterance)
+                    .contains(&Signal::new("human_handoff_request")),
+                "expected human_handoff_request signal for utterance: {utterance}"
+            );
+        }
+    }
+
+    // --- 実データ回帰: human_handoff_request の代理問い合わせ誤爆検知（PR #17 review Critical）---
+    //
+    // surface_forms は resolve::normalize_key 後の単純部分一致で照合される。かつて
+    // 「人に代わって」を surface_form に持っていたため、「本人に代わって」のような代理問い合わせの
+    // 発話にも部分一致してしまい、human_handoff_request（rules.json の human-handoff、第1層
+    // mandatory エスカレーション）が誤って立っていた。human_handoff_request は第1層に落ちると
+    // clarification_allowed() が false になり、聞き返しも回答も一切行わずエスカレーションで
+    // 確定するため、正当な代理問い合わせが全件人手に回る Critical だった。ここでは実際に配布される
+    // JSON をロードし、非マッチ（代理問い合わせ）とマッチ（依頼形）の両方を実データで固定する。
+    #[test]
+    fn bundled_lexicon_does_not_flag_human_handoff_for_proxy_inquiry_phrases() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+
+        for utterance in [
+            "本人に代わって問い合わせています。カメラがオフラインです",
+            "代理人に代わって連絡しています",
+            "設置は業者の人に代わってやってもらいました",
+            "母に代わって問い合わせています",
+        ] {
+            assert!(
+                !lex.normalize(utterance)
+                    .contains(&Signal::new("human_handoff_request")),
+                "expected human_handoff_request to NOT fire for proxy inquiry utterance: {utterance}"
+            );
+        }
+
+        // W2 の後退防止: 依頼形（人に代わって + ください/ほしい 等）は引き続き立つこと
+        for utterance in ["人に代わってください", "人に代わってほしいです"] {
+            assert!(
+                lex.normalize(utterance)
+                    .contains(&Signal::new("human_handoff_request")),
+                "expected human_handoff_request signal for utterance: {utterance}"
+            );
+        }
+    }
+
+    /// ingest_rules.rs の RuleInput と同形（rule_id/condition/owner/route/binding）の
+    /// テスト専用パース struct。CLI 側の構造体をテストから直接 import できないため複製する。
+    #[derive(Debug, serde::Deserialize)]
+    struct BundledRuleInput {
+        rule_id: String,
+        condition: Vec<String>,
+        owner: Option<String>,
+        route: String,
+        binding: String,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct BundledRulesFile {
+        escalation_rules: Vec<BundledRuleInput>,
+    }
+
+    fn load_bundled_escalation_rules() -> Vec<EscalationRule> {
+        let body =
+            std::fs::read_to_string(bundled_rules_path()).expect("read bundled urtect rules.json");
+        let parsed: BundledRulesFile =
+            serde_json::from_str(&body).expect("parse bundled urtect rules.json");
+        parsed
+            .escalation_rules
+            .into_iter()
+            .map(|r| EscalationRule {
+                id: r.rule_id,
+                condition: r.condition.into_iter().map(Signal::new).collect(),
+                route: r.route,
+                owner: r.owner,
+                binding: match r.binding.as_str() {
+                    "mandatory" => Binding::Mandatory,
+                    "advisory" => Binding::Advisory,
+                    other => panic!("unknown binding in bundled urtect rules.json: {other}"),
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bundled_rules_contain_human_handoff_rule_and_layer1_matches_it() {
+        let rules = load_bundled_escalation_rules();
+        let expected = signals(&["human_handoff_request"]);
+        let rule = rules.iter().find(|r| r.condition == expected).expect(
+            "data/urtect/rules.json must define an escalation rule \
+                 with condition == [\"human_handoff_request\"]",
+        );
+        let matched = match_layer1(&rules, &expected);
+        assert_eq!(matched.map(|r| r.id.as_str()), Some(rule.id.as_str()));
+    }
+
+    #[test]
+    fn bundled_human_handoff_rule_escalates_at_layer1_even_with_high_manual_score() {
+        // 第1層が第3層より優先されることを実データで確認する（layer 短絡契約の回帰防止）。
+        // best_manual_score=0.99 は単独なら Allowed になる水準だが、human_handoff_request は
+        // 必ず第1層で捕捉され、回答生成（第3層）へ到達してはならない。
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["human_handoff_request"]);
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            Some(0.99),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate {
+                layer, route_to, ..
+            } => {
+                assert_eq!(layer, 1);
+                assert_eq!(route_to, "support_desk");
+            }
+            other => panic!("expected layer1 escalate for human_handoff_request, got {other:?}"),
+        }
+    }
+
     #[test]
     fn decide_is_deterministic() {
         let resolutions = vec![kr("kr1", &["discoloration"])];

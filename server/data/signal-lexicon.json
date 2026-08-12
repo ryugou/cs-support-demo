@@ -12,6 +12,7 @@
     { "signal": "continue_use_question", "class": "context", "surface_forms": ["使い続けて", "続けて大丈夫", "食べてもいい", "飲んでもいい"], "description": "継続使用可否の相談" },
     { "signal": "expiry_question", "class": "context", "surface_forms": ["賞味期限", "消費期限", "保存方法", "開封後"], "description": "期限・保存の相談" },
     { "signal": "refund_request", "class": "context", "surface_forms": ["返金", "返品", "交換して"], "description": "返金・返品の要望" },
+    { "signal": "human_handoff_request", "class": "context", "surface_forms": ["担当者につないで", "担当者に代わって", "人間に代わって", "オペレーターにつないで", "オペレーターに代わって", "有人対応", "人と話したい", "担当者と話したい", "担当者にお願いします", "担当者に繋いで", "オペレーターに繋いで", "人に代わってください", "人に代わってほしい", "人に代わって欲しい", "人に代わってもらえ", "人に代わっていただ", "サポートにつないで"], "description": "担当者への取次・有人対応を明示的に希望する発話" },
     { "signal": "unclassified_risk", "class": "hazard", "surface_forms": [], "llm_only": true, "description": "既存のどの signal にも分類できないが、安全・契約・法務・製品破損などの懸念を含む発話（疑わしい場合に立てる）" }
   ]
 }

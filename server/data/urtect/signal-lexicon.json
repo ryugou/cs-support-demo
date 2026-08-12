@@ -40,6 +40,7 @@
     { "signal": "security_guarantee", "class": "hazard", "surface_forms": ["安全ですか", "防犯として十分", "これで安心", "セキュリティは大丈夫"], "description": "セキュリティ・防犯性能の保証を求める発話（保証表明は不可、support_desk への mandatory エスカレーション対象）" },
     { "signal": "legal_privacy_question", "class": "hazard", "surface_forms": ["警察に提出", "第三者に提供", "プライバシー", "録画を証拠", "肖像権", "法的に"], "description": "警察提出・第三者提供・肖像権など録画データの法務性を伴う取り扱い相談（support_desk への mandatory エスカレーション対象）" },
     { "signal": "physical_damage_smell_heat", "class": "hazard", "surface_forms": ["焦げ臭い", "こげくさい", "変な匂い", "異臭", "熱い", "熱を持つ", "煙", "発煙", "溶けて", "パチパチ音"], "description": "焦げ臭い・発熱・発煙など物理的な破損・火災リスクを示す事象（hardware 部門への mandatory エスカレーション対象）" },
+    { "signal": "human_handoff_request", "class": "context", "surface_forms": ["担当者につないで", "担当者に代わって", "人間に代わって", "オペレーターにつないで", "オペレーターに代わって", "有人対応", "人と話したい", "担当者と話したい", "担当者にお願いします", "担当者に繋いで", "オペレーターに繋いで", "人に代わってください", "人に代わってほしい", "人に代わって欲しい", "人に代わってもらえ", "人に代わっていただ", "サポートにつないで"], "description": "担当者への取次・有人対応を明示的に希望する発話" },
     { "signal": "unclassified_risk", "class": "hazard", "surface_forms": [], "llm_only": true, "description": "既存のどの signal にも分類できないが、安全・契約・法務・製品破損などの懸念を含む発話（疑わしい場合に立てる）" }
   ]
 }
