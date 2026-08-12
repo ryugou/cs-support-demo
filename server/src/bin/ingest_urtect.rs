@@ -132,6 +132,48 @@ fn detect_product_models(body: &str) -> Vec<String> {
         .collect()
 }
 
+/// vector entry の metadata を組み立てる純関数。
+///
+/// vegapunk `UpsertVectors` の `VectorEntry.metadata` は自由なメタデータ領域ではなく、
+/// 固定列へのキー名マッピングである（2026-07-18 backend チーム回答で確定）。認識される
+/// キーは `node_id` / `text` / `source_type` / `timestamp_ms` の 4 つのみで、それ以外の
+/// キーは backend 側で保存されない。
+///
+/// 契約: `node_id` は呼び出し側の entry `id`（graph node_id）と同一文字列でなければならない。
+/// `GetVectors` / `Search(local)` の schema スコープは `node_id` 列への
+/// `starts_with("{schema}:gen{N}:")` で効くため、ここがずれると当該 entry は
+/// 全読み出し経路から不可視になる（過去の投入分が見えなかった原因そのもの）。
+fn vector_metadata(
+    node_id: &str,
+    text: &str,
+    source_type: &str,
+    timestamp_ms: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("node_id".to_string(), node_id.to_string()),
+        ("text".to_string(), text.to_string()),
+        ("source_type".to_string(), source_type.to_string()),
+        ("timestamp_ms".to_string(), timestamp_ms.to_string()),
+    ]
+}
+
+/// vector entry 1 件 `(id, vector, metadata)` を組み立てる。
+///
+/// entry の `id`（graph node_id）と `metadata` 内の `node_id` は同一文字列でなければ
+/// ならない契約（`vector_metadata` のコメント参照）。呼び出し側が `id` を 2 回書いて
+/// 別値が入り込む余地をなくすため、ここで `id` を 1 回だけ受け取り内部で
+/// `vector_metadata(&id, ...)` に渡してから entry を返す。
+fn vector_entry(
+    id: String,
+    vector: Vec<f32>,
+    text: &str,
+    source_type: &str,
+    timestamp_ms: &str,
+) -> (String, Vec<f32>, Vec<(String, String)>) {
+    let metadata = vector_metadata(&id, text, source_type, timestamp_ms);
+    (id, vector, metadata)
+}
+
 /// nav リンク 1 件（同一ホスト・manual 配下のみ列挙。列挙順を保つ Vec）。
 struct NavEntry {
     url: String,
@@ -301,6 +343,13 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<String> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    // vector metadata の timestamp_ms は run 開始時に 1 回だけ取得する。entry ごとに now を
+    // 取ると同一 run 内で値がばらつき、決定性が失われる（2026-07-18 backend 契約）。
+    let ingest_timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before unix epoch; cannot compute vector metadata timestamp_ms")?
+        .as_millis()
+        .to_string();
     let token = read_token(&args)?;
 
     // 汎用テンプレの name をテナント schema 名に差し替える（vegapunk は name 一致を要求）。
@@ -694,56 +743,78 @@ async fn main() -> Result<()> {
         let mut entries: Vec<(String, Vec<f32>, Vec<(String, String)>)> =
             Vec::with_capacity(section_bodies.len() + product_inputs.len());
 
-        // section_bodies はここ以降使わないため move で消費する（body は section 本文の
-        // 全文で ingest 中最大級の String。clone を避ける）。slug は zip 用に残す。
+        // section_bodies はここ以降使わないため move で消費する。body は section 本文の
+        // 全文で ingest 中最大級の String だが、embed 後も vector metadata の `text`
+        // （embedding 元テキストそのもの）として必要なため、ここだけ 1 回 clone して残す
+        // （section_items 側は embed_all に move する）。slug も zip 用に残す。
         let mut section_slugs: Vec<String> = Vec::with_capacity(section_bodies.len());
+        let mut section_texts: Vec<String> = Vec::with_capacity(section_bodies.len());
         let section_items: Vec<(String, String)> = section_bodies
             .into_iter()
             .map(|(slug, body)| {
                 let label = format!("section {slug}");
                 section_slugs.push(slug);
+                section_texts.push(body.clone());
                 (label, body)
             })
             .collect();
         let section_vectors = embed_all(&client, section_items, EMBED_CONCURRENCY).await?;
-        for (slug, vector) in section_slugs.iter().zip(section_vectors) {
+        for ((slug, text), vector) in section_slugs
+            .iter()
+            .zip(section_texts.iter())
+            .zip(section_vectors)
+        {
             let id = cs_support_mcp::manual::schema_ids::manual_node_id(
                 &args.schema,
                 cs_support_mcp::manual::schema_ids::KIND_SECTION,
                 slug,
             );
-            entries.push((
+            // metadata は固定列マッピングで認識キーは node_id/text/source_type/timestamp_ms
+            // のみ（2026-07-18 backend 契約）。旧キー node_type/section_key/doc_key は
+            // backend に保存されない dead weight だったため削除した。id と
+            // metadata.node_id の一致は vector_entry ヘルパが構造的に保証する。
+            entries.push(vector_entry(
                 id,
                 vector,
-                vec![
-                    ("node_type".to_string(), "ManualSection".to_string()),
-                    ("section_key".to_string(), slug.clone()),
-                    ("doc_key".to_string(), DOC_KEY.to_string()),
-                ],
+                text,
+                cs_support_mcp::manual::schema_ids::KIND_SECTION,
+                &ingest_timestamp_ms,
             ));
         }
 
+        // text は embed 入力と metadata の両方で同じ値を使う契約（vector metadata の `text` は
+        // 埋め込み元テキストそのもの）。sections と同様、1 回だけ計算して両者に渡し、
+        // 片側だけ組み立て式を変更して契約が乖離する余地を無くす。
+        let mut product_texts: Vec<String> = Vec::with_capacity(product_inputs.len());
         let product_items: Vec<(String, String)> = product_inputs
             .iter()
             .map(|input| {
                 let text = format!("{} {}", input.name, input.aliases.join(" "));
+                product_texts.push(text.clone());
                 (format!("product {}", input.model), text)
             })
             .collect();
         let product_vectors = embed_all(&client, product_items, EMBED_CONCURRENCY).await?;
-        for (input, vector) in product_inputs.iter().zip(product_vectors) {
+        for ((input, text), vector) in product_inputs
+            .iter()
+            .zip(product_texts.iter())
+            .zip(product_vectors)
+        {
             let id = cs_support_mcp::manual::schema_ids::manual_node_id(
                 &args.schema,
                 cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
                 &input.model,
             );
-            entries.push((
+            // metadata は固定列マッピングで認識キーは node_id/text/source_type/timestamp_ms
+            // のみ（2026-07-18 backend 契約）。旧キー node_type/product_key は backend に
+            // 保存されない dead weight だったため削除した。id と metadata.node_id の一致は
+            // vector_entry ヘルパが構造的に保証する。
+            entries.push(vector_entry(
                 id,
                 vector,
-                vec![
-                    ("node_type".to_string(), "Product".to_string()),
-                    ("product_key".to_string(), input.model.clone()),
-                ],
+                text,
+                cs_support_mcp::manual::schema_ids::KIND_PRODUCT,
+                &ingest_timestamp_ms,
             ));
         }
         let entries_len = entries.len();
@@ -882,5 +953,85 @@ mod tests {
             models,
             vec!["ADC-V724".to_string(), "ADC-V724X".to_string()]
         );
+    }
+
+    #[test]
+    fn vector_metadata_node_id_matches_given_id() {
+        // node_id は id（graph node_id）と三者一致する契約（2026-07-18 backend 契約）。
+        // ここがずれると schema スコープの starts_with フィルタから外れ、全読み出し経路から
+        // 不可視になる（今回の修正対象そのもの）。
+        let metadata = vector_metadata(
+            "urtect:gen1:ManualSection:sec-1",
+            "本文",
+            "ManualSection",
+            "1737200000000",
+        );
+        let node_id = metadata
+            .iter()
+            .find(|(k, _)| k == "node_id")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(node_id, Some("urtect:gen1:ManualSection:sec-1"));
+    }
+
+    #[test]
+    fn vector_metadata_has_exactly_four_recognized_keys() {
+        // backend は固定列マッピングで、認識キー以外は保存されない。旧キー
+        // (node_type/section_key/doc_key) を混ぜても無視されるだけの dead weight になるため、
+        // 4 キーちょうどであることをテストで固定する。
+        // 値も key/value を取り違えていないことを見るため、4 引数それぞれ異なるリテラルにする。
+        let metadata = vector_metadata(
+            "urtect:gen1:ManualSection:sec-1",
+            "抜き差ししてください",
+            "ManualSection",
+            "1737200000000",
+        );
+        let mut keys: Vec<&str> = metadata.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["node_id", "source_type", "text", "timestamp_ms"]);
+
+        let get = |key: &str| {
+            metadata
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        // text は embed 元テキストそのもの、source_type は呼び出し側が渡した kind 文字列と
+        // 一致する契約。キー名だけでなく値も引数と食い違っていないことを固定する。
+        assert_eq!(get("text"), Some("抜き差ししてください"));
+        assert_eq!(get("source_type"), Some("ManualSection"));
+    }
+
+    #[test]
+    fn vector_entry_id_matches_metadata_node_id() {
+        // entry の id と metadata.node_id が別値になる余地をコンパイル構造で消すための
+        // ヘルパ。返る (id, _, metadata) の id と metadata 内 node_id が同一値であることを固定する。
+        let (id, vector, metadata) = vector_entry(
+            "urtect:gen1:ManualSection:sec-1".to_string(),
+            vec![0.1, 0.2],
+            "本文",
+            "ManualSection",
+            "1737200000000",
+        );
+        let node_id = metadata
+            .iter()
+            .find(|(k, _)| k == "node_id")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(id, "urtect:gen1:ManualSection:sec-1");
+        assert_eq!(node_id, Some(id.as_str()));
+        assert_eq!(vector, vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn vector_metadata_timestamp_is_all_digits() {
+        // timestamp_ms は時刻フィルタ用の数値文字列という契約。空文字や非数字が混ざると
+        // backend 側のフィルタが機能しない。
+        let metadata = vector_metadata("id", "text", "ManualSection", "1737200000000");
+        let timestamp = metadata
+            .iter()
+            .find(|(k, _)| k == "timestamp_ms")
+            .map(|(_, v)| v.as_str())
+            .expect("timestamp_ms key present");
+        assert!(!timestamp.is_empty());
+        assert!(timestamp.chars().all(|c| c.is_ascii_digit()));
     }
 }

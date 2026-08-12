@@ -5,20 +5,6 @@ vegapunk_endpoint = "http://127.0.0.1:16840"
 project_id = "sivira-cs-demo"
 schema = "sivira-cs-demo"
 
-[auth]
-# jwt_secret_file = "/path/to/jwt-secret"   # env CS_SUPPORT_JWT_SECRET_FILE で上書き
-default_actor = "op-001"                     # dev 専用フォールバック（JWT 未設定時のみ）
-
-[[actors]]
-sub = "op-001"
-role = "operator"
-allowed_schemas = ["sivira-cs-demo"]
-
-[[actors]]
-sub = "sup-001"
-role = "supervisor"
-allowed_schemas = ["sivira-cs-demo"]
-
 [harness]
 audit_log_path = "data/audit/audit.jsonl"
 search_improvement_queue_path = "data/audit/search-improvement-queue.jsonl"

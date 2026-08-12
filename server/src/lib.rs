@@ -1,10 +1,12 @@
 pub mod config;
 pub mod harness;
+pub mod health;
 pub mod ingest;
 pub mod llm;
 pub mod manual;
 pub mod mcp;
 pub mod model;
+pub mod oauth;
 pub mod project;
 pub mod proto;
 pub mod resolve;

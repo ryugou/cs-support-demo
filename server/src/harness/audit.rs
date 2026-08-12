@@ -12,7 +12,11 @@ use std::sync::Mutex;
 pub struct AuditDraft {
     pub request_id: String,
     pub schema: String,
+    /// 監査主体の主識別子（`google-sub:{sub}`）。email 変更に影響されない安定 ID。
     pub actor: String,
+    /// 認証時点の email（F4 で追加した加算フィールド）。`actor` を人間が読める形に
+    /// 落とすための「当時の値」であり、同一性判定には使わない。
+    pub actor_email: String,
     pub used_scope: AccessScope,
     pub retrieved_node_ids: Vec<String>,
     pub decision: String,
@@ -34,6 +38,10 @@ struct AuditEvent<'a> {
     /// PunkRecord generation。Step 1 では node_id に gen prefix が含まれるため None。
     generation: Option<i64>,
     actor: &'a str,
+    /// F4: 認証時点の email。加算フィールドであり、既存行にこのキーは無いが
+    /// `verify_chain` は行ごとに実在するキーだけを再ハッシュするため後方互換
+    /// （`extraction_mode` 追加時と同じ性質）。
+    actor_email: &'a str,
     used_scope: &'a AccessScope,
     retrieved_node_ids: &'a [String],
     decision: &'a str,
@@ -99,6 +107,7 @@ impl WormAuditLog {
             "schema": draft.schema,
             "generation": serde_json::Value::Null,
             "actor": draft.actor,
+            "actor_email": draft.actor_email,
             "used_scope": draft.used_scope,
             "retrieved_node_ids": draft.retrieved_node_ids,
             "decision": draft.decision,
@@ -119,6 +128,7 @@ impl WormAuditLog {
             schema: &draft.schema,
             generation: None,
             actor: &draft.actor,
+            actor_email: &draft.actor_email,
             used_scope: &draft.used_scope,
             retrieved_node_ids: &draft.retrieved_node_ids,
             decision: &draft.decision,
@@ -133,6 +143,16 @@ impl WormAuditLog {
         writeln!(file, "{line}")
             .with_context(|| format!("append audit log {}", self.path.display()))?;
         file.flush().context("flush audit log")?;
+        // Cloud Run では /data を GCS FUSE (gcsfuse) でマウントする運用を想定する。
+        // gcsfuse は close/fsync のタイミングで GCS へのアップロードを確定させるため、
+        // flush だけではプロセス kill・インスタンス強制終了時にイベントが GCS 側に
+        // 届いている保証がない。1 イベントごとに sync_all（fsync 相当）してから
+        // event_id を返すことで、「append が成功した」= 「耐久化された」を一致させる
+        // （I5: WORM の provenance はイベント単位で耐久していなければ監査の意味がない）。
+        // 失敗を握りつぶすと「監査ログに残ったはず」という誤った前提で運用してしまうため、
+        // ここも他の I/O と同様に Err を呼び出し元へ伝播する（fail closed）。
+        file.sync_all()
+            .with_context(|| format!("fsync audit log {}", self.path.display()))?;
         *prev_hash = hash;
         Ok(event_id)
     }
@@ -201,7 +221,8 @@ mod tests {
         AuditDraft {
             request_id: request_id.to_string(),
             schema: "sivira-cs-demo".to_string(),
-            actor: "op-001".to_string(),
+            actor: "google-sub:101572111487015263315".to_string(),
+            actor_email: "op@sivira.co".to_string(),
             used_scope: scope(),
             retrieved_node_ids: vec!["sivira-cs-demo#gen1/section:doc-1#storage".to_string()],
             decision: decision.to_string(),
@@ -240,6 +261,7 @@ mod tests {
                 "governing_norm_ids",
                 "graph_provenance_linked",
                 "extraction_mode",
+                "actor_email",
                 "prev_hash",
                 "hash",
             ] {
@@ -248,6 +270,98 @@ mod tests {
         }
         // hash chain: 2 行目の prev_hash は 1 行目の hash
         assert_eq!(lines[1]["prev_hash"], lines[0]["hash"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F4: 監査主体は安定した principal ID（`google-sub:{sub}`）で記録し、
+    /// email は「当時の値」として別フィールド `actor_email` に残す。
+    #[test]
+    fn append_records_stable_actor_id_and_point_in_time_email_separately() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let log = WormAuditLog::open(&path).expect("open worm log");
+        log.append(draft("req-1", "allowed")).expect("append");
+
+        let body = std::fs::read_to_string(&path).expect("read log");
+        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(line["actor"], "google-sub:101572111487015263315");
+        assert_eq!(line["actor_email"], "op@sivira.co");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 旧形式エントリ（`actor` が `google:{email}`、`actor_email` キーそのものが無い）を
+    /// 含むログを手で組み立てる。`actor_email` 追加前に書かれた本番エントリの再現。
+    fn write_legacy_entry(path: &Path) -> String {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let payload = serde_json::json!({
+            "event_id": "legacy-event-1",
+            "timestamp": "2026-07-01T00:00:00+00:00",
+            "request_id": "req-legacy",
+            "schema": "sivira-cs-demo",
+            "generation": serde_json::Value::Null,
+            "actor": "google:alice@sivira.co",
+            "used_scope": scope(),
+            "retrieved_node_ids": Vec::<String>::new(),
+            "decision": "allowed",
+            "route": serde_json::Value::Null,
+            "governing_norm_ids": Vec::<String>::new(),
+            "graph_provenance_linked": false,
+            "extraction_mode": "not_applicable",
+        });
+        let payload_text = serde_json::to_string(&payload).unwrap();
+        let prev = genesis_hash();
+        let mut hasher = Sha256::new();
+        hasher.update(prev.as_bytes());
+        hasher.update(payload_text.as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        let mut map = payload.as_object().unwrap().clone();
+        map.insert("prev_hash".to_string(), serde_json::json!(prev));
+        map.insert("hash".to_string(), serde_json::json!(hash));
+        let line = serde_json::to_string(&serde_json::Value::Object(map)).unwrap();
+        std::fs::write(path, format!("{line}\n")).unwrap();
+        hash
+    }
+
+    /// F4 後方互換: `actor_email` の追加は加算フィールドであり、既存エントリを壊さない。
+    /// `verify_chain` は行ごとに実在するキーだけを再ハッシュするため、
+    /// 旧エントリ（`actor_email` 無し）を含むログも整合性検証を通り、チェーンが継続する。
+    #[test]
+    fn legacy_entries_without_actor_email_still_verify_and_chain_continues() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let legacy_hash = write_legacy_entry(&path);
+
+        // 旧エントリを含むログを開けること（fail closed 検証を通過する）
+        let log = WormAuditLog::open(&path).expect("legacy log must still open");
+        log.append(draft("req-new", "allowed")).expect("append");
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // 旧エントリはそのまま読める
+        assert_eq!(lines[0]["actor"], "google:alice@sivira.co");
+        assert!(lines[0].get("actor_email").is_none());
+        // 新エントリはチェーンを継続する
+        assert_eq!(lines[1]["prev_hash"].as_str().unwrap(), legacy_hash);
+        // 形式は prefix で判別できる（旧 = google:{email} / 新 = google-sub:{sub}）
+        assert!(!lines[0]["actor"]
+            .as_str()
+            .unwrap()
+            .starts_with("google-sub:"));
+        assert!(lines[1]["actor"]
+            .as_str()
+            .unwrap()
+            .starts_with("google-sub:"));
+        // 旧エントリの email は actor 文字列から、新エントリは actor_email から辿れる
+        // （＝ cutover をまたいだ同一人物の追跡経路が残っている）
+        assert!(lines[0]["actor"].as_str().unwrap().contains('@'));
+        assert_eq!(lines[1]["actor_email"], "op@sivira.co");
+
+        // 再オープンしても整合性検証を通る
+        drop(log);
+        WormAuditLog::open(&path).expect("mixed-format log must reopen");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1,0 +1,17 @@
+# Docker build context から除外するもの。
+# 目的は 2 つ: (1) ビルドコンテキスト転送・レイヤキャッシュの無駄を削る、
+# (2) secret / 監査ログ・ローカル私有物をイメージに焼き込まない事故を防ぐ。
+#
+# .gitignore と目的が異なるため意図的に別管理にしている
+# （.gitignore は「コミットしない」、こちらは「イメージに入れない」）。
+
+.git
+server/target
+server/certs
+.env*
+!.env.example
+**/audit.jsonl
+# server/data/audit は runtime 生成物（WORM・検索改善キュー）のため丸ごと除外
+server/data/audit/
+docs
+.superpowers

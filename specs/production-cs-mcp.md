@@ -470,7 +470,7 @@ PunkRecord 側の Step 1 実装方針は別紙『PunkRecord Step 1 前方互換�
 
 ## 未決事項
 
-- 認証方式: bearer token / JWT / session token / OIDC のどれを採用するか。
+- ~~認証方式: bearer token / JWT / session token / OIDC のどれを採用するか。~~ → 解決（2026-07-21）: Google OAuth 2.1（IdP = Google）。詳細は S1-11 追記および「AuthN 現状」節を参照。
 - actor / tenant / role / entitlement の保存場所。
 - AccessPolicy を PunkRecord に置くか、別の policy store に置くか。Cedar を入れる場合の policy 配置。
 - PunkRecord の record model と vegapunk graph schema の境界。
@@ -500,7 +500,7 @@ PunkRecord 側の Step 1 実装方針は別紙『PunkRecord Step 1 前方互換�
 - 会話で結論が変わったら、同じターンで本書を更新する。
 - 古い会話履歴より本書を優先する。
 - 本書と `CLAUDE.md` が矛盾する場合は、Production CS MCP に関しては本書を優先する。
-- ただし、言語、Python 禁止、Rust 優先、vegapunk API を推測しない、ローカル vegapunk を起動しない、GCE deploy wrapper 必須などの運用制約は `CLAUDE.md` に従う。
+- ただし、言語、Python 禁止、Rust 優先、vegapunk API を推測しない、ローカル vegapunk を起動しない、Cloud Run デプロイ手順（`CLAUDE.md` の「Cloud Run デプロイ手順」節に従う）などの運用制約は `CLAUDE.md` に従う。
 
 ---
 
@@ -788,7 +788,7 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
    - LLM が未設定（`config.llm.enabled = false`）のときは lexicon 単独（`ExtractionMode::LexiconOnly`）。LLM 呼び出しが失敗した場合は lexicon 単独の結果にフォールバックする（`ExtractionMode::LexiconFallback`。判定は必ず何らかの signal 集合で走らせ、LLM 不達を理由に判定不能にはしない）。LLM 分類に成功した場合は `ExtractionMode::Hybrid`。
    - 決定論 lexicon は安全床・オフライン動作・API キー不要の dev 経路として残す。既知の限界（辞書外表現の取りこぼし）は、(a) 第2層照合が signal だけでなく raw text パターンにも当たること、(b) LLM 抽出が語彙内の追加 signal を拾うこと、(c) Step 1 の利用者が担当者でありグレーは必ずエスカレーションに倒れること、の 3 点で吸収する。
    - どの経路で抽出したか（`extraction_mode`: `lexicon_only` / `hybrid` / `lexicon_fallback`）は WORM 監査（`AuditDraft.extraction_mode`、加算フィールド）に記録し、`evaluate_answerability` の応答にも同値を返す（監査可能性・運用時のフォールバック頻度の可視化）。
-2. **MCP の actor 認証は JWT HS256 + config actor 表とする。**
+2. **MCP の actor 認証は JWT HS256 + config actor 表とする。**（**2026-07-21 更新: 本方式は撤去済み。下記「AuthN 現状」参照。**）
    - `Authorization: Bearer <JWT>` を HS256 共有鍵（env / file から注入。設定ファイルに平文を置かない）で検証し、`Claims { sub, role, exp, iss }` を得る。
    - `Claims.sub` → config の actor 表（role / allowed_schemas）で AccessScope を自明写像する（サーバ導出・I1）。
    - JWT secret 未設定時は config の `default_actor` に明示ログ付きでフォールバックする（ローカル開発専用。GCE では secret 必須）。
@@ -801,6 +801,14 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
    - 昇格条件（approval_required → auto_answer_audited）: 承認回数 ≥ N ∧ 承認者多様性 ≥ M ∧ 却下率 ≤ r。降格条件: 却下数 ≥ K で approval_required へ戻す。判定は決定論の純関数 `regrade`。
    - N / M / r / K の具体値は S1-9 のとおり未決のため config（`[harness.grading]`）で注入し、初期値は N=3, M=2, r=0.2, K=2 の仮置きとする。**業務確認で確定させること。**
    - Step 1 の利用者は担当者のため、`auto_answer_audited` でも応答セマンティクスは変わらない（担当者に直接応答）。grade は Step 2 の「顧客直に即答してよいか」の判定材料として蓄積する。
+
+### AuthN 現状（2026-07-21 更新、実測済み）
+
+- **AuthN = Google OAuth 2.1**。IdP は Google（`accounts.google.com`）、`cs-support-mcp` は OAuth リソースサーバとして動作する。無トークンアクセスは `401` + `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource/{project_id}/mcp"` を返し、`GET /.well-known/oauth-protected-resource/{project_id}/mcp` が `200` でリソースメタデータ（`authorization_servers: ["https://accounts.google.com"]`）を返す。`/.well-known/oauth-authorization-server` は 404 が正常（認可サーバが Google 自身のため、このリソースサーバ側にメタデータを持たない）。
+- **actor 突合のホワイトリストは廃止済み**（`server/src/harness/authn.rs`）。config `[[actors]]` による email ホワイトリスト、およびその後継として一時導入された `[default_actor]` フォールバック（commit aa9e3d8）も同じ理由で revert 済み（commit e90ef59）。config と DB の二重の正本を避けるため、config 側にホワイトリスト相当を足す実装は再度行わない。
+- **`Authenticator::lookup_by_identity` は突合を一切行わず、任意の検証済み email を無条件に `Role::Supervisor` かつ config 全 project の `allowed_schemas` で `Actor` に解決する**（`server/src/harness/authn.rs:87-104`）。supervisor は `add_known_resolution` 等の権限ゲート（`server/src/harness/mod.rs:315`）を無条件に通過する。
+- **Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済み**。テストユーザ登録による制限は外れているため、認証到達可能な母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。下記の「無条件 supervisor」と組み合わせて読むこと ―― 片方だけではリスクの規模を誤る。
+- **actor 突合表の DB 移行は未実装**。現状の歯止めは「Google 認証を通過したか」のみであり、実質的なアクセス制御は無い ―― 言い換えると、現状は Google アカウントで認証さえ通れば誰でも supervisor 権限の全操作（`add_known_resolution` を含む）が可能であり、実質的な認可（誰が何をできるか）は「Google 認証を通過したか」以上には絞られていない。`Authenticator::lookup_by_identity`（同ファイル doc comment に「DB 実装時の差し替え seam」と明記）を DB 参照に差し替えるまで、本番運用でのアクセス制御としては不十分と扱うこと。
 
 ### 実装状況（2026-07-04）
 
@@ -819,9 +827,17 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
   - ロードマップ遵守事項: マルチターン累積再判定（変色→+カビで unknown_added_signal 自動エスカレーション）、grade 昇格（resolved×3・承認者 2 名→auto_answer_audited）・降格（wrong_answer×2→demoted）、GMR 進化（例外ルール「変色+カビ→廃棄」追加で具体ルール優先）
 - 残: signal 語彙 / NG 辞書 / grading しきい値の業務レビューによる確定。UpsertNodes は read-merge-write 済みで merge/置換いずれのセマンティクスでも整合。
 
+### ベクトル経路（意味検索）の解決と実測（2026-07-18）
+
+- **A6 ブロッカー解消**: 「UpsertVectors が成功応答を返すのに Search/GetVectors から不可視」の原因は vegapunk 側の未文書化契約 — `VectorEntry.metadata` は固定列マッピングで、認識キーは `node_id` / `text` / `source_type` / `timestamp_ms` の 4 つのみ。**schema スコープは `node_id` 列への `starts_with("{schema}:gen{N}:")` で効くため `metadata.node_id`（= `id` と同一値）が必須**。ingest 側を契約準拠に修正（`vector_entry` ヘルパで `id == metadata.node_id` を構造強制）。
+- 受け入れ実測（urtect 再構築後）: `GetVectors({schema:"urtect"})` に 72 vectors（ManualSection 69 + Product 3）が node_id 付きで列挙 / `Search(mode:"local")` が投入 ManualSection id を score 付きで返却。merge 等の後処理は不要（local は即時。global/コミュニティ系のみ merge 待ち）。
+- 実機挙動: 意味的言い換え「カメラの映像がぼやけて鮮明ではない」→ allowed 0.75（top=画質の設定。LLM 抽出 + 検索の意味経路が語彙重なりゼロの言い換えを回答に導く）。C 群（NAS/他社カメラ/浴室）は escalate 維持。
+- **キャリブレーション留意（要監視）**: backend の vector score はスケール圧縮が強い（完全一致クエリでも ~0.65、無関連でも ~0.53-0.55）。`max(text, vector)` 合成により C 群スコアが 0.53-0.55 まで上昇し、しきい値 0.6 とのマージンが薄い。現状は vector 単独で判定を覆せない安全な構成だが、コーパス拡大・backend モデル変更時は C 群相当の質問で再測定すること。必要になった場合の対策は vector score への上限係数（config 化）を予定。
+- ingest 全体 63 秒（69 ページ crawl + 並行 embed 同時 4 + upsert 込み。並行化の実測確認済み）。
+
 ### 本番運用時の課題（デモでは保留）
 
-- **JWT 認証の本番化（B6）**: デモ運用ではローカルは `[auth] default_actor` フォールバック、GCE も同様に緩めてよい。本番では `CS_SUPPORT_JWT_SECRET_FILE` を既存 stack の Secret Manager injection で渡し、`config.gce.toml` から `default_actor` を外して JWT 必須にする。actor 表（sub → role / allowed_schemas）の払い出し・失効運用も本番で確定する。
+- **actor 突合表の DB 化（B6、旧: JWT 認証の本番化）**: AuthN は Google OAuth 2.1 に移行済み（上記「AuthN 現状」参照）。残る課題は認可側で、`Authenticator::lookup_by_identity` が突合なしに任意の検証済み email を supervisor へ無条件解決する現状を、DB ベースの actor 表（sub/email → role / allowed_schemas）に差し替えること。払い出し・失効運用も本番で確定する。
 - **デモ商材と signal 語彙のドメイン整合**: 現行サンプルマニュアルは `SVR-HB100`（スマートホームハブ＝電子機器）だが、signal 語彙初版は化粧品・健康食品向け。納品対象の商材を確定し、マニュアルと語彙のドメインを揃える（電子機器なら安全語彙を発熱・発火・感電系に作り直す）。
 
 ---

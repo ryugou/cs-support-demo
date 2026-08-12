@@ -18,6 +18,7 @@ nodes:
       approver_set: { type: string }
       origin: { type: string }
       created_by: { type: string }
+      created_by_email: { type: string }
       verified_at: { type: string }
       error_axis: { type: string }
       root_cause: { type: string }
@@ -56,6 +57,7 @@ nodes:
       case_id: { type: string, required: true }
       request_id: { type: string }
       actor: { type: string }
+      actor_email: { type: string }
       question: { type: string }
       product_key: { type: string }
       created_at: { type: string }
@@ -68,6 +70,7 @@ nodes:
       case_id: { type: string }
       request_id: { type: string }
       actor: { type: string }
+      actor_email: { type: string }
       draft: { type: string }
       decision: { type: string }
       evaluation_request_id: { type: string }
@@ -75,6 +78,9 @@ nodes:
       egress_verdict: { type: string }
       outcome: { type: string }
       outcome_actor: { type: string }
+      # 承認者の認証時点 email。安定 ID だけだと、隣接する起票者の actor_email が
+      # 承認者のものと誤読される。同一人物判定には使わない（当時の値）。
+      outcome_actor_email: { type: string }
       outcome_note: { type: string }
       audit_event_id: { type: string }
       created_at: { type: string }
@@ -90,6 +96,7 @@ nodes:
       attempt_id: { type: string }
       request_id: { type: string }
       actor: { type: string }
+      actor_email: { type: string }
       feedback_source: { type: string }
       corrected_answer: { type: string }
       routing: { type: string }
@@ -100,6 +107,7 @@ nodes:
       case_id: { type: string }
       request_id: { type: string }
       actor: { type: string }
+      actor_email: { type: string }
       layer: { type: int }
       reason: { type: string }
       route_to: { type: string }

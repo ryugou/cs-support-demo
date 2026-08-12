@@ -8,19 +8,10 @@ project_id = "urtect"
 schema = "urtect"
 manual_schema = "manual_v1"
 
-[auth]
-# jwt_secret_file = "/path/to/jwt-secret"   # env CS_SUPPORT_JWT_SECRET_FILE で上書き
-default_actor = "sup-001"                    # dev 専用フォールバック（JWT 未設定時のみ）
-
-[[actors]]
-sub = "op-001"
-role = "operator"
-allowed_schemas = ["urtect"]
-
-[[actors]]
-sub = "sup-001"
-role = "supervisor"
-allowed_schemas = ["urtect"]
+# email ホワイトリスト（[[actors]]）は廃止した。アクセス制御は将来 DB ベースで
+# 実装する方針であり、config と DB の二重の正本を避けるため、当面は
+# ホワイトリストなしで運用する（検証済み Google email はすべて受け入れる。
+# 詳細は server/src/harness/authn.rs の Authenticator doc comment を参照）。
 
 [harness]
 audit_log_path = "data/urtect/audit.jsonl"

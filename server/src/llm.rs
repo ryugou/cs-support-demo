@@ -134,7 +134,8 @@ impl AnthropicClient {
 
 /// env `CS_SUPPORT_LLM_API_KEY` → `api_key_file` の順に鍵を解決する。
 /// どちらも無ければ `Ok(None)`（呼び出し側で fail closed の Err に変換する）。
-/// harness/mod.rs の jwt_secret_file 解決と同じ「trim して空は拒否」方針を踏襲する。
+/// ファイル読み込みは `config::read_secret_file` に委譲し、「trim して空は拒否」方針を
+/// 他の secret ファイル（vegapunk bearer token 等）と共通化している。
 fn resolve_api_key(cfg: &LlmConfig) -> Result<Option<String>> {
     if let Ok(from_env) = env::var(API_KEY_ENV) {
         let trimmed = from_env.trim();

@@ -42,6 +42,7 @@ mod tests {
     fn actor(schemas: &[&str]) -> Actor {
         Actor {
             sub: "op-001".to_string(),
+            email: "op@sivira.co".to_string(),
             role: Role::Operator,
             allowed_schemas: schemas.iter().map(ToString::to_string).collect(),
         }

@@ -63,6 +63,7 @@ nodes:
       approver_set: { type: string }
       origin: { type: string }
       created_by: { type: string }
+      created_by_email: { type: string }
       verified_at: { type: string }
       # CIS 互換の予約フィールド（Step 1 は空、将来 CIRG が書く。別紙 §3.2）
       error_axis: { type: string }
@@ -98,6 +99,7 @@ nodes:
       case_id: { type: string, required: true }
       request_id: { type: string }
       actor: { type: string }
+      actor_email: { type: string }
       question: { type: string }
       product_key: { type: string }
       created_at: { type: string }
@@ -111,6 +113,7 @@ nodes:
       case_id: { type: string }
       request_id: { type: string }
       actor: { type: string }
+      actor_email: { type: string }
       draft: { type: string }
       decision: { type: string }   # 予約（未使用）。削除は非加算になるため残置
       evaluation_request_id: { type: string }
@@ -121,6 +124,9 @@ nodes:
       outcome_note: { type: string }
       # outcome を確定した actor（承認者多様性の導出元）
       outcome_actor: { type: string }
+      # 承認者の認証時点 email。安定 ID だけだと、隣接する起票者の actor_email が
+      # 承認者のものと誤読される。同一人物判定には使わない（当時の値）。
+      outcome_actor_email: { type: string }
       created_at: { type: string }
   answer_evidence:
     attributes:
@@ -134,6 +140,7 @@ nodes:
       attempt_id: { type: string }
       request_id: { type: string }
       actor: { type: string }
+      actor_email: { type: string }
       feedback_source: { type: string }
       corrected_answer: { type: string }
       routing: { type: string }
@@ -144,6 +151,7 @@ nodes:
       case_id: { type: string }
       request_id: { type: string }
       actor: { type: string }
+      actor_email: { type: string }
       layer: { type: int }
       reason: { type: string }
       route_to: { type: string }
