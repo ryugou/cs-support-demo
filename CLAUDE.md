@@ -384,15 +384,15 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 - image: `asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>`（`<tag>` は git short SHA を使う運用）
 - public URL: `https://cs-support-mcp-235108918288.asia-northeast1.run.app`
 - MCP endpoint: `https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/mcp`
-- Cloud Run jobs（service と同一イメージ）: `ingest-rules`, `ingest-urtect`, `merge-schema`, `backfill-concept-keys`
-- **`server/data/urtect/rules.json` / `server/data/urtect/signal-lexicon.json` はどちらも image 内ファイルが正本**（service と `ingest-rules` job は同一イメージ。Product ノードとは扱いが異なる点に注意）。main マージ時は CI（`auto-ingest` job、`.github/workflows/deploy.yml`）が `server/data/**` の変更を検知し、ビルド → デプロイ → `ingest-rules` 実行までを自動で行う。手動で反映する場合は、まずイメージを再ビルドして service と `ingest-rules` job の両方を更新し（上記ビルド & デプロイ手順）、そのうえで `rules.json` の変更分だけ `gcloud run jobs execute ingest-rules --project sivira-cs-support --region asia-northeast1 --wait` を実行する。**`signal-lexicon.json` は vegapunk へ投入する対象ではなく、サービスが起動時にイメージ内ファイルから読むだけなので `ingest-rules` では一切反映されない**（反映漏れは signal が本番で永久に立たないサイレント never-match になる。`ingest_rules.rs` は `--rules-file` のみを受け取り lexicon ファイルには一切触れない）。
+- Cloud Run jobs（service と同一イメージ）: `ingest-products`, `ingest-rules`, `ingest-urtect`, `ingest-alarmcom`, `merge-schema`, `verify-alarmcom`, `backfill-concept-keys`
+- **`server/data/urtect/rules.json` / `server/data/urtect/signal-lexicon.json` はどちらも image 内ファイルが正本**（service と `ingest-rules` job は同一イメージ。Product ノードとは扱いが異なる点に注意）。main マージ時は CI（`auto-ingest` job、`.github/workflows/deploy.yml`）が `server/data/**` の変更を検知し、ビルド → デプロイ → `ingest-rules` 実行までを自動で行う。CI 以外の経路で image を反映しない。`server/data/**` を変更していないのに `rules.json` の再投入だけが必要なとき（＝`auto-ingest` の paths filter が発火しないとき）に限り、`gcloud run jobs execute ingest-rules --project sivira-cs-support --region asia-northeast1 --wait` を単発で実行してよい（`jobs execute` は image を更新しないため、手動デプロイ禁止の対象外）。**`signal-lexicon.json` は vegapunk へ投入する対象ではなく、サービスが起動時にイメージ内ファイルから読むだけなので `ingest-rules` では一切反映されない**（反映漏れは signal が本番で永久に立たないサイレント never-match になる。`ingest_rules.rs` は `--rules-file` のみを受け取り lexicon ファイルには一切触れない）。
 - **製品マスタの正本は vegapunk の Product ノード**（Issue #6: `KNOWN_MODELS` 定数は廃止済み）。`server/data/urtect/products.json` はコードではなく、`ingest_products` CLI に渡す seed 投入の入力記録である。
   - 製品を追加する手順: `products.json` に `{ "model", "name", "aliases" }` を追記 → `ingest_products` を実行する。**サービスの再ビルド・再デプロイは不要**（Product ノードは vegapunk 側にしか存在しないため）。
   - 全体リセット後の ingest 実行順序は **`ingest_products` → `ingest_urtect` / `ingest_alarmcom`** の順を必ず守ること。`ingest_urtect` / `ingest_alarmcom` はどちらも起動時に vegapunk の Product ノード一覧を取得し、0 件なら「製品マスタが空。先に `ingest_products` を実行せよ」という fail closed で止まる。`ingest_urtect`（Google Sites）と `ingest_alarmcom`（answers.alarm.com）の間に順序依存は無い（両方 products.json 投入後ならどちらを先に走らせてもよい）。
   - **`backfill-concept-keys`（Issue #8 Phase B2-0/B2-1）は schema 更新後・2-hop 拡張の読み取り経路有効化前に必ず実行すること。** `ManualSection.concept_keys`（`MENTIONS_CONCEPT` 辺の読み取り最適化射影）を書く CLI で、`ingest_alarmcom` の差分 ingest は既存 section を再翻訳しないため単独では埋まらない（未変更記事は `existing_hash == hash` で skip される）。`--probe-only`（書き込みなし・B2-0 の fan-in 実測）/ `--verify`（辺と属性の乖離検出）/ `--probe-one <section_key>`（`UpsertNodes` の意味論を実測し即復旧）/ 既定（全件書き込み・冪等）の 4 モードは相互排他。詳細は `docs/superpowers/specs/2026-08-02-concept-expansion-design.md`。
     - **`backfill-concept-keys` を `ingest_alarmcom` / `ingest_urtect` と同時に走らせないこと（`merge-schema` の「同一 schema で同時 1 本」と同じ粒度の制約）。** backfill は全 ManualSection の属性を読み切ってから書き戻す（読み取り段階で section 数と同じ本数の traverse を逐次発行するため、本番規模では読みと書きの間に数十分〜数時間の差が生じる）。この間に ingest が同じ section を更新すると、**backfill が新しい本文を古い本文で上書きする**。全属性を明示再送する設計上、`UpsertNodes` が部分マージでも全置換でも起きる。実行前に `gcloud run jobs executions list` で ingest job が走っていないことを確認する。
     - 既定モードが途中で失敗した場合、エラーメッセージに `--start-after <section_key>` の形で再開点が出る。その値をそのまま `--args` に足して再実行する（冪等なので最初からやり直しても壊れないが、全 section の traverse を再度払うことになる）。
-  - **第 2 のマニュアルソース `ingest_alarmcom`（Issue #8）**: answers.alarm.com（MindTouch KB）を `?mt-language=JA` の機械翻訳で ingest する。クロール対象は sitemap.xml と製品マスタ（Product ノード）駆動で絞る。各製品の型番/別名が「ファミリーハブ URL」に現れる記事ファミリーだけを取り込み、1 製品でもハブ未マッチなら fail closed で止まる（`products.json` の aliases に URL 上の表記を足して再投入する）。robots.txt の Crawl-delay=5 秒を守るため全リクエストを 5 秒以上空けて逐次実行し、**実行時間は対象ファミリー数（≒英日 2 リクエスト × 記事数 × 5 秒）に比例する**。Cloud Run job は本件スコープ外（未新設）。
+  - **第 2 のマニュアルソース `ingest_alarmcom`（Issue #8）**: answers.alarm.com（MindTouch KB）を `?mt-language=JA` の機械翻訳で ingest する。クロール対象は sitemap.xml と製品マスタ（Product ノード）駆動で絞る。各製品の型番/別名が「ファミリーハブ URL」に現れる記事ファミリーだけを取り込み、1 製品でもハブ未マッチなら fail closed で止まる（`products.json` の aliases に URL 上の表記を足して再投入する）。robots.txt の Crawl-delay=5 秒を守るため全リクエストを 5 秒以上空けて逐次実行し、**実行時間は対象ファミリー数（≒英日 2 リクエスト × 記事数 × 5 秒）に比例する**。Cloud Run job `ingest-alarmcom` は CI の image 更新対象に含まれる（`.github/workflows/deploy.yml` の `RUN_JOBS`）。**job が未作成のまま main にマージすると `Update Cloud Run job images` ステップが `NOT_FOUND` で失敗し、デプロイ経路全体（service 更新を含む）が止まる。**
 - **`merge-schema`（Issue #8 Phase B1）**: vegapunk の `Merge` RPC（Leiden コミュニティ検出 + CommunitySummary + Node2Vec）を schema `urtect` に対して実行し、**前後の `GetStats` と global/hybrid 検索の返却物を JSON で出す**。
 - Merge は **schema 全体の同期再計算で、同一 schema では同時 1 本しか走らない**。実行中に再実行すると `FAILED_PRECONDITION` で弾かれる。
 - job の `--task-timeout` は CLI の `--timeout-secs`（既定 6h = 21600 秒）より長く取ること。**ちょうど同じ値にすると、CLI の per-request timeout と task-timeout が同着し、JSON summary が出力される前に task が kill される。** 実際の job は 7h（25200 秒）で作成済み。短いと Merge の途中で task が殺され、サーバ側だけ処理が続く状態になる。
@@ -417,21 +417,18 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 
 ビルド & デプロイ:
 
+デプロイは main マージ → CI（`.github/workflows/deploy.yml` の `build-deploy` job）のみで行う。**イメージ tag を更新する目的の手動デプロイ**（`--image` を伴う `gcloud run services update` / `gcloud run jobs update`、および `gcloud builds submit` による手動ビルド・デプロイ）は禁止する。secret 注入・鍵ローテート（`--update-secrets`）、`gcloud run jobs create`、`gcloud run jobs execute` は禁止対象外である。
+
+CI の `build-deploy` job が、`cs-support-mcp` / `cs-support-line` の両 service と、`ingest-products` / `ingest-rules` / `ingest-urtect` / `ingest-alarmcom` / `merge-schema` / `verify-alarmcom` / `backfill-concept-keys` の全 7 job を、同一 tag（コミット SHA、`steps.image.outputs.tag`）へ更新する。全対象が同一 workflow run 内の同一 tag を参照するため、**成功した run の後は** tag が揃う（手動での tag 統一運用は不要）。ただし更新ループの**途中失敗時は部分更新のまま止まる**（先に成功した対象は新 tag、残りは旧 tag。ロールバックはされず、run が赤くなる）。この状態は原因修正後に同 run を re-run するか次のマージで収束させる。jobs → services の順で更新するため、途中失敗時に本番 service が新 tag・jobs が旧 tag という組み合わせにはならない。
+
+`backfill-concept-keys` job は初回のみ `merge-schema` と同じ VPC connector / service account / Secret Manager injection で `gcloud run jobs create` が必要（未作成の場合、CI の `Update Cloud Run job images` ステップが失敗する）。
+
+**CI の更新対象（`.github/workflows/deploy.yml` の `RUN_SERVICES` / `RUN_JOBS`）は、全て事前に Cloud Run 上に作成済みであること。** 1 つでも未作成だと `Update Cloud Run job images` が `NOT_FOUND` で失敗し、その後の service 更新に到達しないためデプロイ経路全体が止まる。対象を増やすときは、先に `gcloud run jobs create` / `gcloud run services create` で実体を作ってから `RUN_JOBS` / `RUN_SERVICES` に追加する。既存の確認は次で行う（1 行で実行すること）:
+
 ```sh
-gcloud builds submit --project sivira-cs-support --region asia-northeast1 --tag asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag> .
-
-gcloud run services update cs-support-mcp --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
-
-gcloud run jobs update ingest-rules --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
-
-gcloud run jobs update ingest-urtect --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
-
-gcloud run jobs update merge-schema --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
-
-gcloud run jobs update backfill-concept-keys --project sivira-cs-support --region asia-northeast1 --image asia-northeast1-docker.pkg.dev/sivira-cs-support/cs-support/cs-support-mcp:<tag>
+gcloud run jobs list --project sivira-cs-support --region asia-northeast1 --format='value(metadata.name)'
+gcloud run services list --project sivira-cs-support --region asia-northeast1 --format='value(metadata.name)'
 ```
-
-`<tag>` は service と全 job（`ingest-rules` / `ingest-urtect` / `merge-schema` / `backfill-concept-keys`）で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。`backfill-concept-keys` job は初回のみ `merge-schema` と同じ VPC connector / service account / Secret Manager injection で `gcloud run jobs create` が必要（未作成の場合、上記 `jobs update` は失敗する）。
 
 #### OAuth 署名鍵（初回のみ）
 
