@@ -1,15 +1,20 @@
 pub mod audit;
 pub mod authn;
+pub mod clarify;
 pub mod correction;
 pub mod decision;
 pub mod egress;
+pub mod escalation_reply;
 pub mod extraction;
 pub mod grading;
+pub mod hours;
 pub mod knowledge;
+pub(crate) mod prompt_input;
 pub mod reply;
 pub mod rules;
 pub mod scope;
 pub mod signal;
+pub mod time_pref;
 
 use crate::config::AppConfig;
 use crate::mcp::ToolService;
@@ -112,6 +117,98 @@ pub struct RelatedCase {
     pub last_decision: String,
 }
 
+/// support_case ノードに永続化する会話状態（会話フロー v1.1 design doc §6）。
+/// すべて加算属性・後方互換（欠落は既定値）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseConvState {
+    /// 聞き返し回数。エスカレーション応答送信時に 0 へリセットする（design doc §3）。
+    pub clarify_turns: u32,
+    /// 次の顧客発話を希望時間帯の返信として解釈するか（design doc §5）。
+    pub awaiting_time_pref: bool,
+    /// `awaiting_time_pref` 中に `is_time_preference = false` と分類された連続回数
+    /// （2 回連続で自動解除、design doc §5）。
+    pub time_pref_false_count: u32,
+    /// 担当者への申し送り用の希望時間帯（時間外希望は付記を含む）。
+    pub preferred_contact_time: Option<String>,
+    /// `awaiting_time_pref` 中に希望時間帯の抽出インフラが失敗（LLM 呼び出しエラー・
+    /// 応答 parse 失敗）した連続回数。`time_pref_false_count`（真の分類結果が false だった
+    /// 回数）とは別枠で数える。3 回に達したら `awaiting_time_pref = false` かつ
+    /// `time_pref_false_count = 0` へ自動解除し、自身も 0 へリセットする（design doc §5）。
+    /// この判定自体は `Harness` ではなくオーケストレーション層（`api.rs`）の責務で、
+    /// ここは読み書きの器のみを持つ。
+    pub time_pref_extraction_error_count: u32,
+}
+
+/// support_case の属性 map から [`CaseConvState`] を復元する純関数。
+///
+/// 欠落・parse 失敗は既定値（0 / false / None）に倒す。数値の parse 失敗を warn しないのは、
+/// `knowledge.rs` の `approval_count` / `rejection_count` 読み取りと同じ規律に合わせるため
+/// （読み取り側で毎回 warn すると、既存 case（この 4 属性を持たない）を読むたびに warn が出る）。
+fn conv_state_from_attrs(attrs: &std::collections::HashMap<String, String>) -> CaseConvState {
+    let get = |key: &str| attrs.get(key).map(String::as_str).unwrap_or("");
+    CaseConvState {
+        clarify_turns: get("clarify_turns").parse().unwrap_or(0),
+        awaiting_time_pref: get("awaiting_time_pref") == "true",
+        time_pref_false_count: get("time_pref_false_count").parse().unwrap_or(0),
+        preferred_contact_time: attrs
+            .get("preferred_contact_time")
+            .filter(|s| !s.is_empty())
+            .cloned(),
+        time_pref_extraction_error_count: get("time_pref_extraction_error_count")
+            .parse()
+            .unwrap_or(0),
+    }
+}
+
+/// [`CaseConvState`] を support_case の属性 map へ書き戻す全属性を組み立てる純関数。
+///
+/// read-merge-write: 既存属性（`question` / `actor` 等、この 4 キー以外)を土台に、
+/// 会話状態の 4 キーだけを重ねる（`merge_outcome_attributes` と同じ形。vegapunk の
+/// `UpsertNodes` は全置換のため、部分送信すると既存属性が消える）。
+fn merge_conv_state_attributes(
+    existing: &std::collections::HashMap<String, String>,
+    state: &CaseConvState,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = existing.clone();
+    merged.insert("clarify_turns".to_string(), state.clarify_turns.to_string());
+    merged.insert(
+        "awaiting_time_pref".to_string(),
+        state.awaiting_time_pref.to_string(),
+    );
+    merged.insert(
+        "time_pref_false_count".to_string(),
+        state.time_pref_false_count.to_string(),
+    );
+    merged.insert(
+        "preferred_contact_time".to_string(),
+        state.preferred_contact_time.clone().unwrap_or_default(),
+    );
+    merged.insert(
+        "time_pref_extraction_error_count".to_string(),
+        state.time_pref_extraction_error_count.to_string(),
+    );
+    merged
+}
+
+/// [`Harness::save_conv_state`] が使う判定を独立させた純関数（テスト容易性のため、
+/// 実際の `KnowledgeStore::load_case` 呼び出しから切り離してある）。
+///
+/// `existing` は `load_case` の結果そのもの。`None`（case 未存在）を許してしまうと、会話状態
+/// 4 属性だけを持つ `case_id` 属性なしの support_case ノードを書くことになり、以後
+/// `load_case` / `load_cases` のどちらからも二度と見えなくなる（Warning 2 の回帰防止）。
+fn require_existing_case_attrs(
+    existing: Option<std::collections::HashMap<String, String>>,
+    case_id: &str,
+    schema: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    existing.ok_or_else(|| {
+        anyhow!(
+            "save_conv_state: case {case_id} not found in schema {schema}; the caller must \
+             create the case (Harness::evaluate) before saving conversation state"
+        )
+    })
+}
+
 /// outcome 確定時に answer_attempt へ書き戻す全属性を組み立てる純関数。
 ///
 /// read-merge-write: 既存属性（draft / case_id / known_resolution_id / 起票者の
@@ -139,6 +236,24 @@ fn merge_outcome_attributes(
         note.unwrap_or_default().to_string(),
     );
     merged
+}
+
+/// 聞き返し可否（決定論）: 第3層グレーのみ。第1・2層は問答無用でルーティング
+/// （会話フロー v1.1 design doc §2）。
+///
+/// **この関数が契約そのもの。** `evaluate()` はこの関数を呼ぶだけで、判定式をインラインに
+/// 複製しない。テスト（本ファイル `mod tests`）もこの関数を呼ぶこと。式をテスト側に複製すると、
+/// ここを書き換えて `matches!` の条件を変えてもテストが検出できなくなる（Critical 1 の回帰）。
+fn clarification_allowed(decision: &decision::AnswerDecision) -> bool {
+    matches!(
+        decision,
+        decision::AnswerDecision::Escalate {
+            layer: 3,
+            reason: decision::EscalateReason::InsufficientDirectness
+                | decision::EscalateReason::UnknownAddedSignal,
+            ..
+        }
+    )
 }
 
 /// `Harness::evaluate()` に渡された case_id が既存 case として解決できなかった場合の挙動。
@@ -252,6 +367,66 @@ impl Harness {
     /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
     pub fn store(&self) -> Result<&knowledge::KnowledgeStore> {
         self.knowledge()
+    }
+
+    /// support_case の会話状態（会話フロー v1.1）を読む。case 未存在は全既定値として扱う
+    /// （エラーにしない。新規会話・古い case（この 4 属性を持たない）の両方が該当する）。
+    pub async fn load_conv_state(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+    ) -> Result<CaseConvState> {
+        let attrs = self
+            .knowledge()?
+            .load_case(&ctx.schema, case_id)
+            .await?
+            .unwrap_or_default();
+        Ok(conv_state_from_attrs(&attrs))
+    }
+
+    /// support_case の会話状態を保存する。read-merge-write で既存属性（`question` 等）を保ち、
+    /// 会話状態 4 属性だけを上書きしたうえで全属性を明示再送する（vegapunk 0.2.0 の
+    /// `UpsertNodes` は全置換のため、部分送信は既存属性を消す。`backfill_concept_keys` と
+    /// 同じ流儀）。
+    ///
+    /// **契約: 呼び出し側は case が既に存在する状態でだけ呼ぶこと。** `evaluate()` は冒頭で
+    /// case 属性を読み、末尾で全属性を再送する（新規 case ならその時点で `record` 済み）。この
+    /// 順序を守らずに case 未作成のタイミングで本メソッドを呼ぶと、[`require_existing_case_attrs`]
+    /// が `Err` にする（Warning 2 の回帰防止）。
+    ///
+    /// **契約（lost update）: 本メソッドは `evaluate()` と並行に、または `evaluate()` の実行中に
+    /// 呼んではならない。必ず `evaluate()` が完了した後に呼ぶこと。** `evaluate()` は関数冒頭で
+    /// 読んだ case 属性のスナップショットを保持したまま vegapunk 検索・LLM 抽出を挟み、最後に
+    /// **全属性を再送**する（read-merge-write の「read」が古いまま「write」される）。
+    /// `evaluate()` の実行中に本メソッドが割り込むと、本メソッドが書いた会話状態 4 属性を、
+    /// 後から確定する `evaluate()` の書き込みが古いスナップショットで上書きし、会話状態が
+    /// 消える（逆順・非重複なら問題ない）。呼び出し側（Part B のオーケストレーション）はこの
+    /// 順序を守ること。
+    /// 黙って `unwrap_or_default()` していた旧実装は、case が無いと会話状態 4 属性だけを持つ
+    /// `case_id` 属性なしの support_case ノードを書いていた。このノードは `case_id eq` で
+    /// 検索する `knowledge::load_case` にも、`attrs.get("case_id")?` で filter_map する
+    /// `load_cases` にも二度と見えなくなり、会話状態が保存されたつもりで毎ターン既定値へ戻る
+    /// （聞き返しの 3 ターン上限が機能しなくなる）。加えて schema 上 `case_id` は
+    /// required（`schema/cs-support.yml`）であり、無属性ノードはスキーマ違反でもある。
+    /// **なので握りつぶさず fail closed する。**
+    pub async fn save_conv_state(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+        state: &CaseConvState,
+    ) -> Result<()> {
+        let knowledge = self.knowledge()?;
+        let existing = knowledge.load_case(&ctx.schema, case_id).await?;
+        let existing = require_existing_case_attrs(existing, case_id, &ctx.schema)?;
+        let merged = merge_conv_state_attributes(&existing, state);
+        knowledge
+            .record(
+                &ctx.schema,
+                "support_case",
+                case_id,
+                merged.into_iter().collect(),
+            )
+            .await
     }
 
     /// 監査イベントの共通入口。ctx 由来の provenance フィールドをここで一元的に埋める。
@@ -543,6 +718,7 @@ impl Harness {
         case_id: Option<&str>,
         tools: &ToolService,
         history: &[reply::ReplyHistoryTurn],
+        is_continuation: bool,
         unknown_case_id_policy: UnknownCaseIdPolicy,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
@@ -791,16 +967,9 @@ impl Harness {
             thresholds: &self.thresholds,
             default_route: &self.default_route,
         });
-        // 聞き返し可否（決定論）: 第3層グレーのみ。第1・2層は問答無用でルーティング。
-        let clarification_allowed = matches!(
-            &decision_result,
-            decision::AnswerDecision::Escalate {
-                layer: 3,
-                reason: decision::EscalateReason::InsufficientDirectness
-                    | decision::EscalateReason::UnknownAddedSignal,
-                ..
-            }
-        );
+        // 聞き返し可否（決定論）: 第3層グレーのみ。判定条件そのものは clarification_allowed()
+        // （本ファイル冒頭のモジュールレベル関数）が契約として持つ。ここでは呼ぶだけにする。
+        let clarification_allowed = clarification_allowed(&decision_result);
         // [記録] 判定結果を case に永続化する（record_answer_attempt の lineage 検証の根拠。
         // client の自己申告でなくサーバ側の記録と突合するため）。KR 由来の回答なら
         // その kr_id もサーバ記録として残す（outcome 記録が client 申告に依存しないため）。
@@ -916,6 +1085,7 @@ impl Harness {
                 &section_hits,
                 &resolutions,
                 history,
+                is_continuation,
             )
             .await;
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
@@ -941,6 +1111,9 @@ impl Harness {
     ///
     /// 材料の選別（Escalate ではマニュアル本文を一切渡さない）は `reply::build_reply_brief`
     /// が担う。ここはその結果を送るだけで、安全判断をこの関数に持ち込まない。
+    ///
+    /// `is_continuation` は `evaluate()` から素通しされる会話段階フラグ（判定はサーバ側が
+    /// コードで行う。`reply::build_reply_system_prompt` の doc を参照）。
     async fn draft_customer_reply(
         &self,
         question: &str,
@@ -948,6 +1121,7 @@ impl Harness {
         hits: &[SectionHit],
         resolutions: &[rules::KnownResolution],
         history: &[reply::ReplyHistoryTurn],
+        is_continuation: bool,
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
@@ -964,10 +1138,15 @@ impl Harness {
             _ => None,
         };
         let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
-        let system = reply::build_reply_system_prompt(&brief);
+        let system = reply::build_reply_system_prompt(&brief, is_continuation);
         let user = reply::build_reply_user_message(question, &brief, history);
         let draft = match drafter
-            .draft_reply(&system, &user, self.reply_draft_max_tokens)
+            .draft_reply(
+                &system,
+                &user,
+                self.reply_draft_max_tokens,
+                "customer_reply",
+            )
             .await
         {
             Ok(draft) => draft,
@@ -1355,19 +1534,31 @@ mod tests {
         }
     }
 
-    /// stub LLM に `draft_text` をそのまま返させ、`draft_customer_reply` の結果を返す。
+    /// stub LLM に `draft_text` をそのまま返させ、`draft_customer_reply` の結果と、stub が
+    /// 実際に受け取った生リクエスト（`RequestLog`）を返す。
+    ///
+    /// `is_continuation` は `draft_customer_reply` へそのまま渡す。呼び出し側が `evaluate()` →
+    /// `draft_customer_reply()` → `build_reply_system_prompt()` の素通し配線を検証できるよう、
+    /// stub 到達済みの生リクエスト（system prompt を含む）を返す
+    /// （`clarify.rs::draft_clarify_question_via_stub` と同じパターン）。
     ///
     /// `AnthropicClient` のフィールドは `llm.rs` で private なので `from_config` 経由で組む。
     /// API キーは env `CS_SUPPORT_LLM_API_KEY` が優先されるが、未設定の環境でも構築できるよう
     /// 一時ファイルを置く（stub は鍵を検証しない。ここで必要なのは「鍵が解決できて client が
     /// 構築されること」だけ）。env を書き換えないのは、並行テストと競合させないため。
-    async fn draft_customer_reply_via_stub(draft_text: &str) -> Option<crate::llm::ReplyDraft> {
+    async fn draft_customer_reply_via_stub(
+        draft_text: &str,
+        is_continuation: bool,
+    ) -> (
+        Option<crate::llm::ReplyDraft>,
+        crate::llm::test_support::RequestLog,
+    ) {
         let body = serde_json::json!({
             "stop_reason": "end_turn",
             "content": [{"type": "text", "text": draft_text}],
         })
         .to_string();
-        let (endpoint, _log) = crate::llm::test_support::spawn_messages_stub(body).await;
+        let (endpoint, log) = crate::llm::test_support::spawn_messages_stub(body).await;
 
         let dir = std::env::temp_dir().join(format!("harness-reply-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -1404,9 +1595,17 @@ mod tests {
             score: 0.9,
             source_url: None,
         }];
-        harness
-            .draft_customer_reply("カメラが反応しません", &decision, &hits, &[], &[])
-            .await
+        let draft = harness
+            .draft_customer_reply(
+                "カメラが反応しません",
+                &decision,
+                &hits,
+                &[],
+                &[],
+                is_continuation,
+            )
+            .await;
+        (draft, log)
     }
 
     /// 「NG 表現を含まない下書きなら通る」ことは、**下記 2 件の偽陽性を潰すために必須**。
@@ -1425,9 +1624,8 @@ mod tests {
             ),
             "precondition: pick a draft text that the current NG dictionary passes"
         );
-        let draft = draft_customer_reply_via_stub(CLEAN)
-            .await
-            .expect("a draft with no NG term must survive the gate");
+        let (draft, _log) = draft_customer_reply_via_stub(CLEAN, false).await;
+        let draft = draft.expect("a draft with no NG term must survive the gate");
         // 生成結果がそのまま返ること。null でないだけでなく**本文が一致する**ことを見るのは、
         // 下書きが実際に stub から流れてきた証拠にするため。
         assert_eq!(draft.text, CLEAN);
@@ -1451,8 +1649,9 @@ mod tests {
             ),
             "precondition: the term taken from the dictionary must actually block"
         );
+        let (draft, _log) = draft_customer_reply_via_stub(&drafted, false).await;
         assert!(
-            draft_customer_reply_via_stub(&drafted).await.is_none(),
+            draft.is_none(),
             "draft_customer_reply must run the generated draft through egress_gate and drop a \
              blocked one (customer_reply_draft = null)"
         );
@@ -1476,9 +1675,481 @@ mod tests {
             ),
             "precondition: the term taken from the dictionary must actually abstain"
         );
+        let (draft, _log) = draft_customer_reply_via_stub(&drafted, false).await;
         assert!(
-            draft_customer_reply_via_stub(&drafted).await.is_none(),
+            draft.is_none(),
             "abstain is 'do not emit' too; the draft must be dropped, not passed through"
         );
+    }
+
+    /// design doc §3 配線テスト: `is_continuation` が `evaluate()` → `draft_customer_reply()` →
+    /// `build_reply_system_prompt()` まで素通しされていることを確認する。純関数の単体テスト
+    /// （`reply.rs` の `system_prompt_adds_continuation_opener_rule_when_a_continuation` 等）
+    /// だけでは、呼び出し側（`draft_customer_reply`）がフラグを握り潰しても（例: 固定値
+    /// `false` を渡す退行）全テストが緑のままになる。stub に実際に届いた生リクエストを見て
+    /// 配線そのものを確認する。
+    #[tokio::test]
+    async fn draft_customer_reply_forwards_is_continuation_true_to_the_system_prompt() {
+        let (_draft, log) = draft_customer_reply_via_stub("本文です。", true).await;
+        let requests = log.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "stub に実際にリクエストが届いていること（配線を主張する前提）"
+        );
+        assert!(
+            requests[0].contains("定型オープナー"),
+            "is_continuation = true のとき CONTINUATION_OPENER_RULE 由来の制約が \
+             system prompt（stub への生リクエスト）に含まれていること"
+        );
+    }
+
+    /// 対照テスト（false-positive 防止）: `is_continuation = false` のときは含まれないこと。
+    /// これが無いと「常に CONTINUATION_OPENER_RULE を含める」実装でも上のテストだけでは緑になる。
+    #[tokio::test]
+    async fn draft_customer_reply_omits_continuation_rule_when_not_a_continuation() {
+        let (_draft, log) = draft_customer_reply_via_stub("本文です。", false).await;
+        let requests = log.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "stub に実際にリクエストが届いていること（配線を主張する前提）"
+        );
+        assert!(!requests[0].contains("定型オープナー"));
+    }
+
+    // ---- clarification_allowed 契約テスト（会話フロー v1.1 design doc §2・§8） ----
+    //
+    // Critical 1 の修正: 以前はここに本体 `matches!` 式の複製ヘルパーがあり、本体を書き換えても
+    // テストが追随して緑になり続ける（退行を検出できない）状態だった。いまは本体の
+    // `clarification_allowed()`（本ファイル冒頭のモジュールレベル関数）をそのまま呼ぶ。
+
+    fn escalate_for_contract_test(
+        layer: u8,
+        reason: decision::EscalateReason,
+    ) -> decision::AnswerDecision {
+        decision::AnswerDecision::Escalate {
+            reason,
+            layer,
+            route_to: "triage".to_string(),
+            disclosure_scope: decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clarification_is_denied_for_layer1_and_layer2_escalations() {
+        // 第1層（明示エスカレーションルール）・第2層（禁止ドメイン）は実際の `decide()` では
+        // 常に `RegulatedOrSafety` を返す（spec に明記）。第3層の reason 網羅としての価値が
+        // あるため、手組み Escalate に対する本テストは残す（`decide()` 経由の版は下に別途置く）。
+        let layer1 = escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety);
+        assert!(
+            !clarification_allowed(&layer1),
+            "layer 1 escalation must never allow clarification"
+        );
+
+        let layer2 = escalate_for_contract_test(2, decision::EscalateReason::RegulatedOrSafety);
+        assert!(
+            !clarification_allowed(&layer2),
+            "layer 2 escalation must never allow clarification"
+        );
+    }
+
+    #[test]
+    fn clarification_is_allowed_for_layer3_gray() {
+        let insufficient_directness =
+            escalate_for_contract_test(3, decision::EscalateReason::InsufficientDirectness);
+        assert!(
+            clarification_allowed(&insufficient_directness),
+            "layer 3 InsufficientDirectness must allow clarification"
+        );
+
+        let unknown_added_signal =
+            escalate_for_contract_test(3, decision::EscalateReason::UnknownAddedSignal);
+        assert!(
+            clarification_allowed(&unknown_added_signal),
+            "layer 3 UnknownAddedSignal must allow clarification"
+        );
+    }
+
+    // ---- clarification_allowed 契約テスト: decide() の実出力を通す版（Critical 1） ----
+    //
+    // 上の 2 テストは手組みの `Escalate` に対する reason 網羅であり、`decide()` 自体の配線
+    // （第1・2層が本当に layer 1/2 の Escalate を返すか、第3層グレーが本当に
+    // InsufficientDirectness/UnknownAddedSignal を返すか）までは見ていない。ここでは
+    // `decision::decide()` を実際に通した出力に対して `clarification_allowed()` を検証する
+    // （plan Task 3 Step 1 が要求する退行防止テスト）。入力の組み立ては `decision.rs` の
+    // `mod tests` にある layer1/layer2/layer3 系テストの入力例を踏襲する。
+
+    fn contract_test_signals(values: &[&str]) -> signal::SignalSet {
+        values.iter().map(|v| signal::Signal::new(*v)).collect()
+    }
+
+    fn contract_test_thresholds() -> decision::Thresholds {
+        decision::Thresholds {
+            low: 0.6,
+            mid: 0.8,
+            high: 0.95,
+        }
+    }
+
+    fn contract_test_calm_stakes() -> decision::StakesInput {
+        decision::StakesInput {
+            mandatory_domain_near: false,
+            ng_near_hit: false,
+            hazard_signal_count: 0,
+        }
+    }
+
+    fn contract_test_kr(id: &str, set: &[&str]) -> rules::KnownResolution {
+        rules::KnownResolution {
+            id: id.to_string(),
+            signal_set: contract_test_signals(set),
+            applicability: "全ロット".to_string(),
+            answer: "answer".to_string(),
+            source_authority: rules::SourceAuthority::Authoritative,
+            root_cause: rules::RootCause::KnowledgeError,
+            grade: rules::Grade::ApprovalRequired,
+            approval_count: 0,
+            rejection_count: 0,
+            approver_set: Vec::new(),
+            origin: "test".to_string(),
+            binding: rules::Binding::Advisory,
+            registration_trigger: "single_ruling".to_string(),
+            knowledge_class: "commercial".to_string(),
+            outcome_ref: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn decide_layer1_escalation_denies_clarification() {
+        // decision.rs::layer1_short_circuits_everything と同じ入力形。
+        let rules = vec![rules::EscalationRule {
+            id: "r1".to_string(),
+            condition: contract_test_signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: rules::Binding::Mandatory,
+        }];
+        let resolutions = vec![contract_test_kr("kr1", &["post_ingestion_symptom"])];
+        let q = contract_test_signals(&["post_ingestion_symptom"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &rules,
+            domains: &[],
+            resolutions: &resolutions,
+            best_manual_score: Some(1.0),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d, decision::AnswerDecision::Escalate { layer: 1, .. }),
+            "precondition: decide() must actually take the layer 1 branch, got {d:?}"
+        );
+        assert!(
+            !clarification_allowed(&d),
+            "layer 1 escalation from decide() must never allow clarification"
+        );
+    }
+
+    #[test]
+    fn decide_layer2_escalation_denies_clarification() {
+        // decision.rs::layer2_blocks_before_layer3 と同じ入力形。
+        let domains = vec![rules::ProhibitedDomain {
+            id: "d1".to_string(),
+            domain_signals: contract_test_signals(&["skin_irritation"]),
+            text_patterns: Vec::new(),
+            route: "derm_liaison".to_string(),
+            binding: rules::Binding::Mandatory,
+        }];
+        let resolutions = vec![contract_test_kr("kr1", &["skin_irritation"])];
+        let q = contract_test_signals(&["skin_irritation"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &[],
+            domains: &domains,
+            resolutions: &resolutions,
+            best_manual_score: Some(1.0),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d, decision::AnswerDecision::Escalate { layer: 2, .. }),
+            "precondition: decide() must actually take the layer 2 branch, got {d:?}"
+        );
+        assert!(
+            !clarification_allowed(&d),
+            "layer 2 escalation from decide() must never allow clarification"
+        );
+    }
+
+    #[test]
+    fn decide_layer3_insufficient_directness_allows_clarification() {
+        // decision.rs::high_stakes_raises_threshold_and_escalates と同系の入力
+        // （signal 無し・best_manual_score がしきい値未満）。
+        let q = signal::SignalSet::new();
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &[],
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(
+                d,
+                decision::AnswerDecision::Escalate {
+                    layer: 3,
+                    reason: decision::EscalateReason::InsufficientDirectness,
+                    ..
+                }
+            ),
+            "precondition: decide() must actually return layer 3 InsufficientDirectness, got {d:?}"
+        );
+        assert!(
+            clarification_allowed(&d),
+            "layer 3 InsufficientDirectness from decide() must allow clarification"
+        );
+    }
+
+    #[test]
+    fn decide_layer3_unknown_added_signal_allows_clarification() {
+        // decision.rs::layer3_added_signal_escalates_with_unknown_added_signal と同じ入力形
+        // （KR の signal_set の部分集合に一致するが、未知の追加 signal が残る）。
+        let resolutions = vec![contract_test_kr("kr1", &["discoloration"])];
+        let q = contract_test_signals(&["discoloration", "mold"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &[],
+            domains: &[],
+            resolutions: &resolutions,
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(
+                d,
+                decision::AnswerDecision::Escalate {
+                    layer: 3,
+                    reason: decision::EscalateReason::UnknownAddedSignal,
+                    ..
+                }
+            ),
+            "precondition: decide() must actually return layer 3 UnknownAddedSignal, got {d:?}"
+        );
+        assert!(
+            clarification_allowed(&d),
+            "layer 3 UnknownAddedSignal from decide() must allow clarification"
+        );
+    }
+
+    // ---- CaseConvState（会話フロー v1.1 design doc §6） ----
+
+    #[test]
+    fn conv_state_from_attrs_defaults_when_attributes_are_missing() {
+        // 古い case（この 4 属性を持たない）を読んでもエラーにせず既定値に倒す（後方互換）。
+        let attrs = std::collections::HashMap::new();
+        let state = conv_state_from_attrs(&attrs);
+        assert_eq!(
+            state,
+            CaseConvState {
+                clarify_turns: 0,
+                awaiting_time_pref: false,
+                time_pref_false_count: 0,
+                preferred_contact_time: None,
+                time_pref_extraction_error_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn conv_state_from_attrs_parses_present_values() {
+        let attrs: std::collections::HashMap<String, String> = [
+            ("clarify_turns".to_string(), "2".to_string()),
+            ("awaiting_time_pref".to_string(), "true".to_string()),
+            ("time_pref_false_count".to_string(), "1".to_string()),
+            (
+                "preferred_contact_time".to_string(),
+                "平日午後（対応時間外の希望）".to_string(),
+            ),
+            (
+                "time_pref_extraction_error_count".to_string(),
+                "2".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let state = conv_state_from_attrs(&attrs);
+        assert_eq!(state.clarify_turns, 2);
+        assert!(state.awaiting_time_pref);
+        assert_eq!(state.time_pref_false_count, 1);
+        assert_eq!(
+            state.preferred_contact_time.as_deref(),
+            Some("平日午後（対応時間外の希望）")
+        );
+        assert_eq!(state.time_pref_extraction_error_count, 2);
+    }
+
+    #[test]
+    fn conv_state_from_attrs_defaults_time_pref_extraction_error_count_when_missing() {
+        // 古い case・time_pref_extraction_error_count 追加前の case のどちらもこのキーを
+        // 持たない。欠落は 0 に倒す（他の 3 属性と同じ後方互換の規律）。
+        let attrs: std::collections::HashMap<String, String> =
+            [("clarify_turns".to_string(), "1".to_string())]
+                .into_iter()
+                .collect();
+        let state = conv_state_from_attrs(&attrs);
+        assert_eq!(state.time_pref_extraction_error_count, 0);
+    }
+
+    #[test]
+    fn conv_state_from_attrs_treats_empty_preferred_contact_time_as_none() {
+        let attrs: std::collections::HashMap<String, String> =
+            [("preferred_contact_time".to_string(), "".to_string())]
+                .into_iter()
+                .collect();
+        let state = conv_state_from_attrs(&attrs);
+        assert_eq!(state.preferred_contact_time, None);
+    }
+
+    #[test]
+    fn merge_conv_state_attributes_preserves_unrelated_existing_keys() {
+        // read-merge-write: 会話状態と無関係な既存属性（question / last_decision 等）は消えない。
+        let existing: std::collections::HashMap<String, String> = [
+            ("question".to_string(), "元の質問".to_string()),
+            ("last_decision".to_string(), "escalate".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let state = CaseConvState {
+            clarify_turns: 1,
+            awaiting_time_pref: true,
+            time_pref_false_count: 0,
+            preferred_contact_time: None,
+            time_pref_extraction_error_count: 2,
+        };
+        let merged = merge_conv_state_attributes(&existing, &state);
+        assert_eq!(merged.get("question").map(String::as_str), Some("元の質問"));
+        assert_eq!(
+            merged.get("last_decision").map(String::as_str),
+            Some("escalate")
+        );
+        assert_eq!(merged.get("clarify_turns").map(String::as_str), Some("1"));
+        assert_eq!(
+            merged.get("awaiting_time_pref").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            merged.get("time_pref_false_count").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            merged.get("preferred_contact_time").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            merged
+                .get("time_pref_extraction_error_count")
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn merge_conv_state_attributes_overwrites_previous_conv_state_values() {
+        let existing: std::collections::HashMap<String, String> = [
+            ("clarify_turns".to_string(), "3".to_string()),
+            ("awaiting_time_pref".to_string(), "true".to_string()),
+            ("time_pref_false_count".to_string(), "1".to_string()),
+            ("preferred_contact_time".to_string(), "旧い希望".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // エスカレーション応答送信時のリセット相当（design doc §3）。
+        let state = CaseConvState {
+            clarify_turns: 0,
+            awaiting_time_pref: true,
+            time_pref_false_count: 0,
+            preferred_contact_time: None,
+            time_pref_extraction_error_count: 0,
+        };
+        let merged = merge_conv_state_attributes(&existing, &state);
+        assert_eq!(merged.get("clarify_turns").map(String::as_str), Some("0"));
+        assert_eq!(
+            merged.get("preferred_contact_time").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            merged
+                .get("time_pref_extraction_error_count")
+                .map(String::as_str),
+            Some("0"),
+            "自動解除時は time_pref_false_count と同じく 0 へリセットされる"
+        );
+    }
+
+    #[test]
+    fn conv_state_round_trips_through_merge_and_parse() {
+        for state in [
+            CaseConvState {
+                clarify_turns: 0,
+                awaiting_time_pref: false,
+                time_pref_false_count: 0,
+                preferred_contact_time: None,
+                time_pref_extraction_error_count: 0,
+            },
+            CaseConvState {
+                clarify_turns: 3,
+                awaiting_time_pref: true,
+                time_pref_false_count: 2,
+                preferred_contact_time: Some("平日夕方（対応時間外の希望）".to_string()),
+                time_pref_extraction_error_count: 1,
+            },
+        ] {
+            let merged = merge_conv_state_attributes(&std::collections::HashMap::new(), &state);
+            let round_tripped = conv_state_from_attrs(&merged);
+            assert_eq!(round_tripped, state);
+        }
+    }
+
+    // ---- require_existing_case_attrs（Warning 2 の回帰防止） ----
+
+    #[test]
+    fn require_existing_case_attrs_passes_through_when_case_exists() {
+        let attrs: std::collections::HashMap<String, String> =
+            [("question".to_string(), "元の質問".to_string())]
+                .into_iter()
+                .collect();
+        let result = require_existing_case_attrs(Some(attrs.clone()), "case-1", "urtect");
+        assert_eq!(result.unwrap(), attrs);
+    }
+
+    #[test]
+    fn require_existing_case_attrs_errors_instead_of_defaulting_when_case_is_missing() {
+        // 修正前は `unwrap_or_default()` で空の HashMap に倒し、`case_id` 属性なしの
+        // support_case ノードを書いていた（Warning 2）。そのノードは `load_case` /
+        // `load_cases` のどちらからも二度と見えなくなる。いまは黙って倒さず Err にする。
+        let result = require_existing_case_attrs(None, "case-missing", "urtect");
+        let err = result.expect_err("missing case must be an error, not a silent default");
+        let message = err.to_string();
+        // 運用者が次に何を見ればよいか分かる情報: どの case か・どの schema か。
+        assert!(message.contains("case-missing"), "{message}");
+        assert!(message.contains("urtect"), "{message}");
     }
 }

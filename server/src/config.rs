@@ -52,6 +52,10 @@ pub struct AppConfig {
 pub struct ApiConfig {
     pub enabled: bool,
     pub fallback_reply_text: String,
+    /// 聞き返し（ヒアリングループ）の上限ターン数（会話フロー v1.1 design doc §2）。
+    pub clarify_max_turns: u32,
+    /// 営業時間案内・希望時間帯の重なり判定に使う設定（design doc §6）。
+    pub business_hours: BusinessHoursConfig,
 }
 
 impl Default for ApiConfig {
@@ -59,12 +63,39 @@ impl Default for ApiConfig {
         Self {
             enabled: false,
             fallback_reply_text: default_fallback_reply_text(),
+            clarify_max_turns: 3,
+            business_hours: BusinessHoursConfig::default(),
         }
     }
 }
 
 fn default_fallback_reply_text() -> String {
     "お問い合わせありがとうございます。担当者が確認のうえ、あらためてご連絡いたします。".to_string()
+}
+
+/// 営業時間の設定（会話フロー v1.1 design doc §6）。祝日は考慮しない（v1.1 スコープ外）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BusinessHoursConfig {
+    /// `"mon-fri"` または `"everyday"`。
+    pub days: String,
+    /// "HH:MM"（例: "10:00"）。
+    pub start: String,
+    /// "HH:MM"（例: "18:00"）。
+    pub end: String,
+    /// IANA タイムゾーン名（例: "Asia/Tokyo"）。
+    pub tz: String,
+}
+
+impl Default for BusinessHoursConfig {
+    fn default() -> Self {
+        Self {
+            days: "mon-fri".to_string(),
+            start: "10:00".to_string(),
+            end: "18:00".to_string(),
+            tz: "Asia/Tokyo".to_string(),
+        }
+    }
 }
 
 /// Anthropic Messages API による signal 抽出エージェントの設定。
@@ -417,6 +448,11 @@ schema = "s"
             cfg.api.fallback_reply_text,
             "お問い合わせありがとうございます。担当者が確認のうえ、あらためてご連絡いたします。"
         );
+        assert_eq!(cfg.api.clarify_max_turns, 3);
+        assert_eq!(cfg.api.business_hours.days, "mon-fri");
+        assert_eq!(cfg.api.business_hours.start, "10:00");
+        assert_eq!(cfg.api.business_hours.end, "18:00");
+        assert_eq!(cfg.api.business_hours.tz, "Asia/Tokyo");
     }
 
     #[test]
@@ -430,10 +466,21 @@ schema = "s"
 [api]
 enabled = true
 fallback_reply_text = "テスト用フォールバック"
+clarify_max_turns = 5
+[api.business_hours]
+days = "everyday"
+start = "09:00"
+end = "21:00"
+tz = "UTC"
 "#;
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert!(cfg.api.enabled);
         assert_eq!(cfg.api.fallback_reply_text, "テスト用フォールバック");
+        assert_eq!(cfg.api.clarify_max_turns, 5);
+        assert_eq!(cfg.api.business_hours.days, "everyday");
+        assert_eq!(cfg.api.business_hours.start, "09:00");
+        assert_eq!(cfg.api.business_hours.end, "21:00");
+        assert_eq!(cfg.api.business_hours.tz, "UTC");
     }
 
     #[test]

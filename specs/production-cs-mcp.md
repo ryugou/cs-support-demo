@@ -378,6 +378,10 @@ GMR が前提にする「同じ入力なら同じ答えでよい」は CS では
 
 将来 client 側（チャットボットのバックエンド）が文面生成を担うようになったら、この下書きは不要になる。**その時点で kill switch を false に倒せば、本 spec の本来の構成に戻る。**
 
+### 追記: 会話フロー v1.1（聞き返し・営業時間・希望時間帯、Issue #17）
+
+`/api/reply` 経路に限り、応答決定を「即答 / 聞き返し（最大3ターン）/ 文脈化エスカレーション」の3値へ拡張し、営業時間案内と希望時間帯の受付を追加した。本節が述べる「第1層・第2層は問答無用でルーティング、第3層のみグレー」という判定思想はそのまま前提とし、聞き返しは第3層グレー（`InsufficientDirectness` / `UnknownAddedSignal`）に限定して許可する。詳細（決定表・プロンプト制約・営業時間判定・case への状態追加）は `docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md` を正本とする。MCP tool（`evaluate_answerability`）の入出力・挙動は変更しない。
+
 ### decision の構造（修正版）
 
 ```text

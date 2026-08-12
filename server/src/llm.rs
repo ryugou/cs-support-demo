@@ -156,6 +156,7 @@ impl AnthropicClient {
         system_prompt: &str,
         user_message: &str,
         max_tokens: u32,
+        route: &str,
     ) -> Result<ReplyDraft> {
         let payload = serde_json::json!({
             "model": self.model,
@@ -228,10 +229,12 @@ impl AnthropicClient {
         // `customer_reply_draft_max_tokens` を上げるか、抜粋量を見直す合図。
         if truncated {
             tracing::warn!(
+                route,
                 draft_chars = drafted.chars().count(),
-                "customer reply draft hit max_tokens and is cut off; it is returned as-is with \
-                 truncated=true but must not be sent to a customer without editing. Raise \
-                 harness.customer_reply_draft_max_tokens or reduce the excerpt volume"
+                "draft hit max_tokens and is cut off; returned to the caller with truncated=true. \
+                 Whether to use it is the caller's decision — some routes fall back to a canned reply \
+                 on truncation, others surface it for human editing. Raise \
+                 harness.customer_reply_draft_max_tokens or reduce the excerpt volume if this recurs"
             );
         }
         Ok(ReplyDraft {
@@ -319,7 +322,10 @@ pub fn parse_signal_response(text: &str) -> Result<Vec<String>> {
 }
 
 /// 先頭の ```json / ``` フェンスと末尾の ``` を取り除く（無ければ何もしない）。
-fn strip_markdown_fence(text: &str) -> &str {
+///
+/// `pub(crate)`: `harness::time_pref::parse_time_pref_response` も同じ「```json フェンスを
+/// 許容してから serde_json::from_str」というパターンを再利用する（re-implement しない）。
+pub(crate) fn strip_markdown_fence(text: &str) -> &str {
     let trimmed = text.trim();
     let without_prefix = trimmed
         .strip_prefix("```json")
@@ -455,7 +461,7 @@ mod tests {
         )
         .await;
         let draft = stub_client(endpoint)
-            .draft_reply("sys", "user", 700)
+            .draft_reply("sys", "user", 700, "test_route")
             .await
             .expect("stub returns a usable draft");
         assert_eq!(draft.text, "途中まで書いた下書き");
@@ -473,7 +479,7 @@ mod tests {
         )
         .await;
         let draft = stub_client(endpoint)
-            .draft_reply("sys", "user", 700)
+            .draft_reply("sys", "user", 700, "test_route")
             .await
             .unwrap();
         assert!(!draft.truncated);
@@ -488,7 +494,7 @@ mod tests {
             spawn_messages_stub(r#"{"content":[{"type":"text","text":"下書き"}]}"#.to_string())
                 .await;
         let draft = stub_client(endpoint)
-            .draft_reply("sys", "user", 700)
+            .draft_reply("sys", "user", 700, "test_route")
             .await
             .unwrap();
         assert!(!draft.truncated);
@@ -511,7 +517,7 @@ mod tests {
         .await;
         // stub_client の self.max_tokens は 300。引数には 700 を渡す。
         stub_client(endpoint)
-            .draft_reply("SYSTEM-MARKER", "USER-MARKER", 700)
+            .draft_reply("SYSTEM-MARKER", "USER-MARKER", 700, "test_route")
             .await
             .unwrap();
         let raw = log.lock().unwrap().first().cloned().expect("one request");

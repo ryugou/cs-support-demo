@@ -10,9 +10,9 @@
 //! main.rs 側で登録しない（design doc §3）。
 
 use crate::config::AppConfig;
-use crate::harness::decision::AnswerDecision;
+use crate::harness::decision::{self, AnswerDecision};
 use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
-use crate::harness::Harness;
+use crate::harness::{clarify, escalation_reply, hours, time_pref, Harness};
 use crate::mcp::ToolService;
 use crate::oauth::VerifiedIdentity;
 use axum::extract::rejection::JsonRejection;
@@ -218,34 +218,130 @@ pub struct ApiState {
     pub api_key: String,
 }
 
-/// `evaluate` の結果から顧客向け最終応答文を決める純関数（design doc §4 の決定表）。
+/// `/api/reply` が返す応答の種別（会話フロー v1.1 design doc §2 の決定表）。
 ///
-/// - `Allowed` かつ下書きあり かつ **非 truncated** → 下書きをそのまま使う（`is_fallback = false`）
-/// - `Allowed` かつ下書きあり かつ **truncated** → フォールバック文（下記参照）
-/// - `Allowed` かつ下書き `None`（LLM 失敗・egress 却下） → フォールバック文
-/// - `Escalate`（rule_match 相当の reason も含め全 reason） → フォールバック文。
-///   下書きが存在していても **無視する**（judge が escalate と決めた以上、その判定を
-///   下書きの中身で覆してはならない。下書きは判定を知らずに生成されているため、
-///   escalate 判定時にたまたま非空の下書きが残っていても顧客へは出さない）
+/// 時間帯受付（design doc §5）は `evaluate()` に到達する前にハンドラ側で解決済みのため、
+/// この enum の関心事ではない（4値目の `TimePrefIntake` 相当は存在しない。理由は
+/// `reply_handler` の doc コメント参照）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyAction {
+    /// `customer_reply_draft` をそのまま顧客へ返す。
+    Answer(String),
+    /// 聞き返し（ヒアリングループ）を送る。
+    Clarify,
+    /// 文脈化されたエスカレーション応答を送る。
+    EscalationReply,
+}
+
+/// `awaiting_time_pref` 中の希望時間帯抽出インフラ失敗（LLM 呼び出しエラー・parse 失敗・
+/// `reply_drafter` 未設定）を許容する連続回数。3 回連続で `awaiting_time_pref` を自動解除する
+/// （design doc §5）。
+const TIME_PREF_EXTRACTION_ERROR_LIMIT: u32 = 3;
+
+/// 希望時間帯抽出のインフラ失敗（LLM 呼び出しエラー・parse 失敗・reply_drafter 未設定）を
+/// 1 回分記録する純関数。design doc §5: 3 回連続で `awaiting_time_pref` を自動解除する
+/// （`time_pref_false_count` の 2 回連続解除とは別カウンタ）。
 ///
-/// truncated な下書きを捨てる理由（`llm.rs` の `ReplyDraft` doc コメント参照）:
+/// `CaseConvState::time_pref_extraction_error_count` の doc コメント（`harness/mod.rs`）が
+/// 明記するとおり、この判定は `Harness` ではなくオーケストレーション層（`api.rs`）の責務。
+fn note_time_pref_extraction_failure(conv: &mut crate::harness::CaseConvState) {
+    conv.time_pref_extraction_error_count += 1;
+    if conv.time_pref_extraction_error_count >= TIME_PREF_EXTRACTION_ERROR_LIMIT {
+        conv.awaiting_time_pref = false;
+        conv.time_pref_false_count = 0;
+        conv.time_pref_extraction_error_count = 0;
+    }
+}
+
+/// 新しいエスカレーション応答（design doc §4）を送るときに希望時間帯の伺いを立てる純関数。
+///
+/// design doc §5: 「新しいエスカレーション応答（第 4 節）を送るときは
+/// `awaiting_time_pref = true` を上書きセットし、`time_pref_false_count` を 0 に戻す」。
+/// `clarify_turns` は聞き返しループとは別の会話段階へ移るため 0 に戻す。
+///
+/// **`time_pref_extraction_error_count` はここでは変更しない。** design doc §5 が
+/// このカウンタのリセット条件として列挙しているのは「分類が成功した場合」
+/// （`note_time_pref_extraction_failure` は関知しない）と「3 回到達で自動解除する瞬間」
+/// （`note_time_pref_extraction_failure` 内で完結）の 2 つだけで、新しいエスカレーション応答の
+/// 送信はそのどちらでもない。ここでリセットすると、`awaiting_time_pref = true` の間に抽出
+/// インフラが継続的に失敗しているケースで「失敗 → EscalationReply → 0 に巻き戻る」を繰り返し、
+/// 3 回連続到達による自動解除が永久に到達不能になる（他の 3 箇所と揃えて書き忘れに見えても、
+/// 意図的に外している）。
+fn arm_time_pref_solicitation(conv: &mut crate::harness::CaseConvState) {
+    conv.awaiting_time_pref = true;
+    conv.time_pref_false_count = 0;
+    conv.clarify_turns = 0;
+}
+
+/// `evaluate` の結果と会話状態から応答の種別を決める純関数（design doc §2 の決定表そのもの）。
+///
+/// - `Allowed` かつ下書きあり かつ **非 truncated** → `Answer`
+/// - `Escalate` かつ `clarification_allowed` かつ `conv.clarify_turns < cfg.clarify_max_turns`
+///   → `Clarify`
+/// - それ以外すべて（`Escalate` の残り全部 / `Allowed` で下書き無しか truncated） →
+///   `EscalationReply`
+///
+/// truncated な下書きを `Answer` に使わない理由（`llm.rs` の `ReplyDraft` doc コメント参照）:
 /// 生成上限で途中切断された下書きは、**切れ目がたまたま「。」の直後に落ちると完成文に
 /// 見える**。日本語のビジネス文は結び・注意書きが末尾に来るため、見た目は完成しているのに
 /// 末尾の安全上の但し書きだけが落ちた下書きが成立しうる。MCP 経路（`rmcp_server.rs`）は
 /// 人間の CS 担当が下書きを検分してから送るため `truncated=true` を返して警告するだけで
 /// 足りるが、`/api/reply` は**人間の検分が一切入らない自動送信経路**であり、同じ扱いにはできない。
 ///
-/// `is_fallback` は呼び出し側が warn ログを出すかどうかの判定に使う（design doc §4 末尾）。
-pub fn reply_text_for<'a>(
-    decision: &AnswerDecision,
-    draft: Option<&'a str>,
-    draft_truncated: bool,
-    fallback: &'a str,
-) -> (&'a str, bool) {
-    match (decision, draft) {
-        (AnswerDecision::Allowed { .. }, Some(text)) if !draft_truncated => (text, false),
-        _ => (fallback, true),
+/// `Escalate` のとき下書きが存在していても無視する（judge が escalate と決めた以上、その判定を
+/// 下書きの中身で覆してはならない。下書きは判定を知らずに生成されているため、escalate 判定時に
+/// たまたま非空の下書きが残っていても顧客へは出さない）。
+pub fn decide_reply_action(
+    outcome: &crate::harness::EvaluationOutcome,
+    conv: &crate::harness::CaseConvState,
+    cfg: &crate::config::ApiConfig,
+) -> ReplyAction {
+    match &outcome.decision {
+        AnswerDecision::Allowed { .. } => match &outcome.customer_reply_draft {
+            Some(draft) if !outcome.customer_reply_draft_truncated => {
+                ReplyAction::Answer(draft.clone())
+            }
+            _ => ReplyAction::EscalationReply,
+        },
+        AnswerDecision::Escalate { .. } => {
+            if outcome.clarification_allowed && conv.clarify_turns < cfg.clarify_max_turns {
+                ReplyAction::Clarify
+            } else {
+                ReplyAction::EscalationReply
+            }
+        }
     }
+}
+
+/// 「初回か継続か」をサーバがコードで判定する純関数（会話フロー v1.1 design doc §3）。
+///
+/// 判定は決定論（`history` が非空、または `case_id` が渡された場合は継続）。文面の出し分けは
+/// `clarify.rs` / `escalation_reply.rs` / `reply.rs`（顧客向け回答下書き）側が
+/// `is_continuation: bool` を受け取って行うだけで、判定ロジックそのものはこの関数以外に
+/// 持たせない。
+fn is_continuation(history: &[ReplyHistoryTurn], case_id: Option<&str>) -> bool {
+    !history.is_empty() || case_id.is_some()
+}
+
+/// `AnswerDecision::Escalate.missing` を `clarify::build_clarify_prompt` の第2引数
+/// （不足情報）向けの人間可読テキストへ変換する。このテキストは LLM への入力にのみ使い、
+/// 顧客へは出さない（design doc §3: 検索ヒットの title・本文は入力に含めない制約とは別枠。
+/// missing は内部スコアの数値であり、egress gate（顧客向け出力の NG 表現検出）はプロンプト
+/// 入力までは見ないため、この関数はあくまで LLM 入力向けの体裁を整えるだけで、漏洩を防ぐ
+/// 仕組みではない）。
+fn missing_to_text(missing: &[decision::EvidenceRequirement]) -> String {
+    if missing.is_empty() {
+        return "情報が不足しており、現在の内容では回答の根拠が十分ではありません。".to_string();
+    }
+    missing
+        .iter()
+        .map(|m| match m {
+            decision::EvidenceRequirement::DirectManualCoverage { required, best } => format!(
+                "マニュアルとの一致度が必要水準に届いていません（必要: {required:.2} 以上、現在: {best:.2}）"
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `Harness::evaluate` が返す `anyhow::Error` を HTTP ステータスへ分類する純関数
@@ -293,16 +389,51 @@ fn error_response(status: StatusCode, error: &str, message: impl Into<String>) -
         .into_response()
 }
 
-/// `POST /{project_id}/api/reply`（design doc §2〜§4）。
+/// `evaluate()` 呼び出し前に conv state を 500 なしで読めなかった場合の共通処理。
+fn conv_state_load_failed(err: &anyhow::Error, request_id: &str, case_id: &str) -> Response {
+    tracing::error!(
+        error = ?err,
+        request_id = %request_id,
+        case_id = %case_id,
+        "answer api: load_conv_state failed"
+    );
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "failed to load conversation state; see server logs",
+    )
+}
+
+/// conv state の保存に失敗した場合の共通処理。
+fn conv_state_save_failed(err: &anyhow::Error, request_id: &str, case_id: &str) -> Response {
+    tracing::error!(
+        error = ?err,
+        request_id = %request_id,
+        case_id = %case_id,
+        "answer api: save_conv_state failed"
+    );
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "failed to save conversation state; see server logs",
+    )
+}
+
+/// `POST /{project_id}/api/reply`（design doc §2〜§4。会話フロー v1.1 design doc §2・§5）。
 ///
 /// 処理順:
 /// 1. 認証（`authorize`）→ 401
 /// 2. `project_id` を `state.config.projects` から解決 → 無ければ 404
 /// 3. body を `ReplyRequest` としてデシリアライズ・`validate` → どちらの失敗も 400
-/// 4. `history` を変換し `harness.begin` → `harness.evaluate`
-/// 5. `evaluate` の `Err` はエラー分類関数で 503 / 500（500 は必ず `tracing::error!`）
-/// 6. `Ok(outcome)` は決定表の純関数で `reply_text` を決め、フォールバックなら
-///    `tracing::warn!` を出して 200 を返す
+/// 4. `history` を変換し `harness.begin`
+/// 5. `req.case_id` があり、その会話が `awaiting_time_pref = true` なら、次の発話を
+///    希望時間帯の返信として先に解釈する（会話フロー v1.1 design doc §5）。この段階の
+///    state 変更はすべて `evaluate()` を呼ぶ**前**に保存を完了させる（`save_conv_state` の
+///    lost-update 契約。`harness::mod::Harness::save_conv_state` の doc コメント参照）。
+///    時間帯返信として確定した場合はここで応答を返し、`evaluate()` を呼ばない。
+/// 6. `harness.evaluate`。`Err` はエラー分類関数で 503 / 500（500 は必ず `tracing::error!`）
+/// 7. `Ok(outcome)` は最新の conv state を取り直し、`decide_reply_action`（design doc §2 の
+///    決定表）で `Answer` / `Clarify` / `EscalationReply` を決めて 200 を返す
 async fn reply_handler(
     State(state): State<ApiState>,
     Path(project_id): Path<String>,
@@ -378,6 +509,64 @@ async fn reply_handler(
     };
 
     let request_id = ctx.request_id.clone();
+
+    // ステップ 5: 希望時間帯の受付（会話フロー v1.1 design doc §5）。
+    // `evaluate()` を呼ぶ前にすべての state 変更・保存を完了させる。
+    if let Some(case_id) = req.case_id.as_deref() {
+        let mut conv = match state.harness.load_conv_state(&ctx, case_id).await {
+            Ok(conv) => conv,
+            Err(err) => return conv_state_load_failed(&err, &request_id, case_id),
+        };
+
+        if conv.awaiting_time_pref {
+            // `reply_drafter` が `None`（`[llm] enabled = false`）のときは時間帯抽出そのものが
+            // 実行不能。抽出インフラ失敗と同じ経路（連続回数で自動解除）へ合流させる
+            // （design doc §5）。
+            let extraction = match state.harness.reply_drafter.as_ref() {
+                Some(drafter) => time_pref::extract_time_preference(drafter, &req.message).await,
+                None => Err(time_pref::TimePrefExtractionError),
+            };
+
+            match extraction {
+                Ok(extraction) => {
+                    conv.time_pref_extraction_error_count = 0;
+                    let action = time_pref::handle_time_pref(
+                        &extraction,
+                        &mut conv,
+                        &state.config.api.business_hours,
+                    );
+                    if let Err(err) = state.harness.save_conv_state(&ctx, case_id, &conv).await {
+                        return conv_state_save_failed(&err, &request_id, case_id);
+                    }
+                    if let time_pref::TimePrefAction::Reply(text) = action {
+                        return (
+                            StatusCode::OK,
+                            Json(ReplyResponse {
+                                reply_text: text,
+                                case_id: case_id.to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                    // TimePrefAction::PassToEvaluate: 下の evaluate() へ続行。
+                }
+                Err(_) => {
+                    note_time_pref_extraction_failure(&mut conv);
+                    if let Err(err) = state.harness.save_conv_state(&ctx, case_id, &conv).await {
+                        return conv_state_save_failed(&err, &request_id, case_id);
+                    }
+                    // 通常の evaluate フローへ続行。
+                }
+            }
+        }
+    }
+
+    // 「初回か継続か」の判定は決定論（コード）。文面の出し分けは `clarify.rs` /
+    // `escalation_reply.rs` / `reply.rs`（回答下書き）側に `is_continuation` として渡すだけ
+    // （design doc §3）。`evaluate()` の内部で回答下書き生成（`draft_customer_reply`）まで
+    // 完結するため、`evaluate()` を呼ぶ前に計算しておく必要がある。
+    let is_continuation = is_continuation(&history, req.case_id.as_deref());
+
     match state
         .harness
         .evaluate(
@@ -387,6 +576,7 @@ async fn reply_handler(
             req.case_id.as_deref(),
             &state.tools,
             &history,
+            is_continuation,
             // /api/reply は design doc §2 の契約: 未知 case_id はエラーにせず新規 case
             // として処理する（クライアント保存漏れ・再起動由来の未知 id は通常運用）。
             crate::harness::UnknownCaseIdPolicy::StartNew,
@@ -394,32 +584,114 @@ async fn reply_handler(
         .await
     {
         Ok(outcome) => {
-            let (reply_text, is_fallback) = reply_text_for(
-                &outcome.decision,
-                outcome.customer_reply_draft.as_deref(),
-                outcome.customer_reply_draft_truncated,
-                &state.config.api.fallback_reply_text,
-            );
-            if is_fallback {
-                // `draft_truncated` を分けて出すのは、運用者がここから次のアクションを
-                // 判断できるようにするため: truncated=true なら
-                // `harness.customer_reply_draft_max_tokens` を上げる余地があるが、
-                // false（Escalate や下書き生成失敗）はそれでは直らない。
-                tracing::warn!(
-                    request_id = %request_id,
-                    decision = ?outcome.decision,
-                    draft_truncated = outcome.customer_reply_draft_truncated,
-                    "answer api fell back to fixed reply"
-                );
+            let mut conv = match state.harness.load_conv_state(&ctx, &outcome.case_id).await {
+                Ok(conv) => conv,
+                Err(err) => return conv_state_load_failed(&err, &request_id, &outcome.case_id),
+            };
+
+            match decide_reply_action(&outcome, &conv, &state.config.api) {
+                ReplyAction::Answer(text) => (
+                    StatusCode::OK,
+                    Json(ReplyResponse {
+                        reply_text: text,
+                        case_id: outcome.case_id,
+                    }),
+                )
+                    .into_response(),
+                ReplyAction::Clarify => {
+                    let missing: &[decision::EvidenceRequirement] = match &outcome.decision {
+                        AnswerDecision::Escalate { missing, .. } => missing,
+                        other => {
+                            tracing::error!(
+                                request_id = %request_id,
+                                decision = ?other,
+                                "decide_reply_action returned Clarify for a non-Escalate decision; \
+                                 this is a bug in decide_reply_action's decision-table logic. \
+                                 Falling back to an empty missing list so the clarify prompt still \
+                                 degrades gracefully instead of panicking"
+                            );
+                            &[]
+                        }
+                    };
+                    let missing_text = missing_to_text(missing);
+                    let reply_text = match state.harness.reply_drafter.as_ref() {
+                        Some(drafter) => {
+                            clarify::draft_clarify_question(
+                                drafter,
+                                &state.harness.ng,
+                                state.harness.reply_draft_max_tokens,
+                                &req.message,
+                                &missing_text,
+                                is_continuation,
+                            )
+                            .await
+                        }
+                        None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
+                    };
+
+                    conv.clarify_turns += 1;
+                    if let Err(err) = state
+                        .harness
+                        .save_conv_state(&ctx, &outcome.case_id, &conv)
+                        .await
+                    {
+                        return conv_state_save_failed(&err, &request_id, &outcome.case_id);
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(ReplyResponse {
+                            reply_text,
+                            case_id: outcome.case_id,
+                        }),
+                    )
+                        .into_response()
+                }
+                ReplyAction::EscalationReply => {
+                    let ack_text = match state.harness.reply_drafter.as_ref() {
+                        Some(drafter) => {
+                            escalation_reply::draft_ack_text(
+                                drafter,
+                                &state.harness.ng,
+                                state.harness.reply_draft_max_tokens,
+                                &req.message,
+                                is_continuation,
+                            )
+                            .await
+                        }
+                        None => escalation_reply::fallback_ack(is_continuation)
+                            .0
+                            .to_string(),
+                    };
+                    let out_of_hours_now = !hours::is_within_business_hours(
+                        &state.config.api.business_hours,
+                        chrono::Utc::now(),
+                    );
+                    let hours_label = hours::business_hours_label(&state.config.api.business_hours);
+                    let block = escalation_reply::build_deterministic_block(
+                        &outcome.case_id,
+                        &hours_label,
+                        out_of_hours_now,
+                    );
+                    let reply_text = escalation_reply::assemble_escalation_reply(&ack_text, &block);
+
+                    arm_time_pref_solicitation(&mut conv);
+                    if let Err(err) = state
+                        .harness
+                        .save_conv_state(&ctx, &outcome.case_id, &conv)
+                        .await
+                    {
+                        return conv_state_save_failed(&err, &request_id, &outcome.case_id);
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(ReplyResponse {
+                            reply_text,
+                            case_id: outcome.case_id,
+                        }),
+                    )
+                        .into_response()
+                }
             }
-            (
-                StatusCode::OK,
-                Json(ReplyResponse {
-                    reply_text: reply_text.to_string(),
-                    case_id: outcome.case_id,
-                }),
-            )
-                .into_response()
         }
         Err(err) => {
             let (status, code) = classify_evaluate_error(&err);
@@ -690,7 +962,7 @@ mod tests {
         assert!(!authorize(&headers, ""));
     }
 
-    // ---- reply_text_for（design doc §4 の決定表） ----
+    // ---- decide_reply_action（会話フロー v1.1 design doc §2 の決定表） ----
 
     fn allowed_decision() -> AnswerDecision {
         AnswerDecision::Allowed {
@@ -702,72 +974,250 @@ mod tests {
         }
     }
 
-    fn escalate_decision() -> AnswerDecision {
+    /// 第3層グレー相当（`InsufficientDirectness`）の escalate。
+    fn gray_escalate_decision() -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::InsufficientDirectness,
+            layer: 3,
+            route_to: "triage".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::NoInternalDetails,
+            audit_required: true,
+            missing: vec![decision::EvidenceRequirement::DirectManualCoverage {
+                required: 0.8,
+                best: 0.5,
+            }],
+        }
+    }
+
+    /// 第1層（明示エスカレーションルール、rule_match）相当の escalate。
+    fn rule_match_escalate_decision() -> AnswerDecision {
         AnswerDecision::Escalate {
             reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
             layer: 1,
             route_to: "triage".to_string(),
-            disclosure_scope: crate::harness::decision::DisclosureScope::NoInternalDetails,
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: vec![],
         }
     }
 
+    fn base_outcome(
+        decision: AnswerDecision,
+        clarification_allowed: bool,
+    ) -> crate::harness::EvaluationOutcome {
+        crate::harness::EvaluationOutcome {
+            decision,
+            signals: crate::harness::signal::SignalSet::new(),
+            accumulated_signals: crate::harness::signal::SignalSet::new(),
+            case_id: "case-12345678-abcd".to_string(),
+            clarification_allowed,
+            hits: Vec::new(),
+            audit_event_id: "audit-1".to_string(),
+            related_cases: Vec::new(),
+            extraction_mode: crate::harness::extraction::ExtractionMode::LexiconOnly,
+            customer_reply_draft: None,
+            customer_reply_draft_truncated: false,
+        }
+    }
+
+    fn default_conv_state() -> crate::harness::CaseConvState {
+        crate::harness::CaseConvState {
+            clarify_turns: 0,
+            awaiting_time_pref: false,
+            time_pref_false_count: 0,
+            preferred_contact_time: None,
+            time_pref_extraction_error_count: 0,
+        }
+    }
+
+    fn default_api_config() -> crate::config::ApiConfig {
+        crate::config::ApiConfig {
+            enabled: true,
+            clarify_max_turns: 3,
+            ..Default::default()
+        }
+    }
+
+    // --- note_time_pref_extraction_failure ---
+
     #[test]
-    fn reply_text_for_allowed_with_draft_uses_the_draft_verbatim() {
-        let (text, is_fallback) = reply_text_for(
-            &allowed_decision(),
-            Some("下書き本文"),
-            false,
-            "フォールバック文",
-        );
-        assert_eq!(text, "下書き本文");
-        assert!(!is_fallback);
+    fn note_time_pref_extraction_failure_first_time_keeps_awaiting_and_increments_count() {
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true;
+
+        note_time_pref_extraction_failure(&mut conv);
+
+        assert_eq!(conv.time_pref_extraction_error_count, 1);
+        assert!(conv.awaiting_time_pref, "1回目では自動解除しない");
     }
 
     #[test]
-    fn reply_text_for_allowed_without_draft_falls_back() {
-        let (text, is_fallback) =
-            reply_text_for(&allowed_decision(), None, false, "フォールバック文");
-        assert_eq!(text, "フォールバック文");
-        assert!(is_fallback);
+    fn note_time_pref_extraction_failure_second_time_keeps_awaiting_and_increments_count() {
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true;
+        conv.time_pref_extraction_error_count = 1;
+
+        note_time_pref_extraction_failure(&mut conv);
+
+        assert_eq!(conv.time_pref_extraction_error_count, 2);
+        assert!(conv.awaiting_time_pref, "2回目では自動解除しない");
+    }
+
+    #[test]
+    fn note_time_pref_extraction_failure_third_time_clears_all_three_counters() {
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true;
+        conv.time_pref_extraction_error_count = 2;
+        conv.time_pref_false_count = 1; // 解除と同時にリセットされることを確認するため非ゼロにしておく
+
+        note_time_pref_extraction_failure(&mut conv);
+
+        assert!(!conv.awaiting_time_pref, "3回連続で自動解除する");
+        assert_eq!(conv.time_pref_false_count, 0);
+        assert_eq!(conv.time_pref_extraction_error_count, 0);
+    }
+
+    // --- arm_time_pref_solicitation ---
+
+    #[test]
+    fn arm_time_pref_solicitation_sets_awaiting_and_resets_false_and_clarify_counters() {
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = false;
+        conv.time_pref_false_count = 2;
+        conv.clarify_turns = 3;
+
+        arm_time_pref_solicitation(&mut conv);
+
+        assert!(
+            conv.awaiting_time_pref,
+            "新しいエスカレーション応答は希望時間帯を尋ねる"
+        );
+        assert_eq!(conv.time_pref_false_count, 0);
+        assert_eq!(conv.clarify_turns, 0);
+    }
+
+    /// design doc §5 はリセット対象を「分類成功時」と「3 回到達時」の 2 つに限定しており、
+    /// 新しいエスカレーション応答の送信はそのどちらでもない。ここで
+    /// `time_pref_extraction_error_count` を 0 に戻すと、抽出インフラが継続的に失敗している
+    /// 状況で毎ターン `EscalationReply` に倒れるたびカウンタが 0 に巻き戻り、3 回連続到達に
+    /// よる自動解除（`note_time_pref_extraction_failure`）が永久に到達不能になる。
+    #[test]
+    fn arm_time_pref_solicitation_does_not_touch_extraction_error_count() {
+        let mut conv = default_conv_state();
+        conv.time_pref_extraction_error_count = 2;
+
+        arm_time_pref_solicitation(&mut conv);
+
+        assert_eq!(
+            conv.time_pref_extraction_error_count, 2,
+            "3回連続の自動解除を到達可能に保つため、ここではリセットしない"
+        );
+    }
+
+    #[test]
+    fn decide_reply_action_answers_when_allowed_with_a_non_truncated_draft() {
+        let mut outcome = base_outcome(allowed_decision(), false);
+        outcome.customer_reply_draft = Some("下書き本文".to_string());
+        outcome.customer_reply_draft_truncated = false;
+        let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
+        assert_eq!(action, ReplyAction::Answer("下書き本文".to_string()));
     }
 
     /// truncated な下書きは「見た目は完成しているが安全上の但し書きだけが落ちている」
     /// 可能性があり、`/api/reply` には人間の検分が入らないため、非空の下書きでも
-    /// フォールバックへ倒さなければならない（llm.rs の `ReplyDraft` doc コメント参照）。
+    /// `EscalationReply` へ倒さなければならない（llm.rs の `ReplyDraft` doc コメント参照）。
     #[test]
-    fn reply_text_for_allowed_with_truncated_draft_falls_back() {
-        let (text, is_fallback) = reply_text_for(
-            &allowed_decision(),
-            Some("途中で切れた下書き本文..."),
-            true,
-            "フォールバック文",
-        );
-        assert_eq!(text, "フォールバック文");
-        assert!(is_fallback);
+    fn decide_reply_action_escalates_when_allowed_but_draft_is_truncated() {
+        let mut outcome = base_outcome(allowed_decision(), false);
+        outcome.customer_reply_draft = Some("途中で切れた下書き本文...".to_string());
+        outcome.customer_reply_draft_truncated = true;
+        let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
     }
 
     #[test]
-    fn reply_text_for_escalate_falls_back_even_without_a_draft() {
-        let (text, is_fallback) =
-            reply_text_for(&escalate_decision(), None, false, "フォールバック文");
-        assert_eq!(text, "フォールバック文");
-        assert!(is_fallback);
+    fn decide_reply_action_escalates_when_allowed_without_a_draft() {
+        let outcome = base_outcome(allowed_decision(), false);
+        let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
     }
 
-    /// escalate 判定のとき、たまたま非空の下書きが残っていても顧客へは出さない
-    /// （下書きは判定を知らずに生成されるため、escalate という判定そのものを覆してはならない）。
     #[test]
-    fn reply_text_for_escalate_ignores_a_present_draft() {
-        let (text, is_fallback) = reply_text_for(
-            &escalate_decision(),
-            Some("危険な下書き"),
-            false,
-            "フォールバック文",
-        );
-        assert_eq!(text, "フォールバック文");
-        assert!(is_fallback);
+    fn decide_reply_action_clarifies_when_gray_escalate_with_turns_remaining() {
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 2; // < clarify_max_turns(3)
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::Clarify);
+    }
+
+    #[test]
+    fn decide_reply_action_escalates_when_clarify_turns_are_exhausted() {
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3; // == clarify_max_turns(3): 枯渇
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    #[test]
+    fn decide_reply_action_escalates_when_clarification_is_not_allowed() {
+        // 第1・2層起因の escalate は clarification_allowed = false（決定論）。
+        let outcome = base_outcome(gray_escalate_decision(), false);
+        let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    /// `decide_reply_action` 自身は `layer` を見ない（`clarification_allowed` の値だけで
+    /// 分岐する）。rule_match（第1層）相当の escalate で `clarification_allowed = false` が
+    /// 渡ったとき、turns 消費とは無関係にエスカレーションへ倒れることを固定する。
+    /// 「第1層では `clarification_allowed` が常に false になる」こと自体は、この関数ではなく
+    /// 呼び出し元（`harness/mod.rs` の `clarification_allowed()` 契約テスト）が保証している。
+    #[test]
+    fn decide_reply_action_escalates_for_rule_match_even_with_turns_remaining() {
+        let outcome = base_outcome(rule_match_escalate_decision(), false);
+        let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    // ---- is_continuation（会話フロー v1.1 design doc §3: 初回/継続の決定論判定） ----
+
+    #[test]
+    fn is_continuation_true_when_history_is_non_empty() {
+        let history = vec![ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: "前回の発話".to_string(),
+        }];
+        assert!(is_continuation(&history, None));
+    }
+
+    #[test]
+    fn is_continuation_true_when_history_is_empty_but_case_id_is_present() {
+        assert!(is_continuation(&[], Some("case-12345678-abcd")));
+    }
+
+    #[test]
+    fn is_continuation_false_when_history_is_empty_and_case_id_is_absent() {
+        assert!(!is_continuation(&[], None));
+    }
+
+    // ---- missing_to_text ----
+
+    #[test]
+    fn missing_to_text_renders_coverage_requirement() {
+        let missing = vec![decision::EvidenceRequirement::DirectManualCoverage {
+            required: 0.8,
+            best: 0.5,
+        }];
+        let text = missing_to_text(&missing);
+        assert!(text.contains("0.80"));
+        assert!(text.contains("0.50"));
+    }
+
+    #[test]
+    fn missing_to_text_has_a_fallback_for_empty_missing() {
+        let text = missing_to_text(&[]);
+        assert!(!text.is_empty());
     }
 
     // ---- classify_evaluate_error（design doc §2 のエラー表: 503 / 500） ----

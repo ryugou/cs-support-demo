@@ -63,12 +63,22 @@ async fn main() -> Result<()> {
     // `fallback_reply_text` が空文字のまま起動すると、escalate / rule_match / 下書き失敗の
     // すべてで `reply_text: ""` が返る。呼び出し元（LINE アダプタ等)は空メッセージ送信に
     // 失敗し、顧客に何も返せないまま気づけない。起動時に弾く。
+    // v1.1（Task 6, `api.rs` の会話フローオーケストレーション導入）でこの config は
+    // `/api/reply` の応答経路からは外れた（各分岐が `escalation_reply.rs` / `clarify.rs` の
+    // 定型文フォールバックを個別に持つ）。互換のためフィールドとこの起動時チェックは残置する。
     if config.api.enabled && config.api.fallback_reply_text.trim().is_empty() {
         anyhow::bail!(
             "[api] enabled = true but [api] fallback_reply_text is empty (or whitespace only); \
              set a non-empty fallback reply text, or set [api] enabled = false to disable \
              the /api/reply route"
         );
+    }
+    // 会話フロー v1.1: `business_hours` の tz/start/end は営業時間判定（hours.rs）と
+    // エスカレーション応答の営業時間表記の両方で使われる。設定ミスがあると hours.rs は
+    // fail-closed で「常に営業時間外」に倒すため、機能はするが誤案内が出続ける事故になる。
+    // 起動時点で検知して落とす。
+    if config.api.enabled {
+        validate_business_hours_config(&config.api.business_hours)?;
     }
     let bearer_token = read_bearer_token(&args)?;
     let vegapunk = VegapunkClient::connect_lazy_with_limits(
@@ -371,6 +381,49 @@ fn require_nonempty_env(name: &str, value: Option<String>, guidance: &str) -> Re
         .with_context(|| format!("{name} is required and must not be empty; {guidance}"))
 }
 
+/// `[api] business_hours`（会話フロー v1.1 design doc §6）を起動時に検証する純関数。
+///
+/// `hours.rs` は tz/start/end の parse 失敗を実行時に fail-closed で「営業時間外」に
+/// 倒すため、設定ミスがあっても機能自体は止まらない。その代わり、運用者が気づかないまま
+/// 「常に営業時間外」の誤案内（`escalation_reply.rs` の決定的ブロック）が出続ける事故になる。
+/// `days` は tz/start/end と壊れ方が異なる点に注意: `hours::days_overlap` は未知値を
+/// fail-closed（重ならない）にする一方、`hours::business_hours_label` は未知の `days` を
+/// 黙って「平日」表示に倒す。つまり `days` の設定ミスを検証対象から外すと、「常に対応時間外」
+/// の案内がもっともらしいラベル付きで出続けるという、tz/start/end とは別経路の事故が起きる。
+/// `[api] enabled = true` のときだけ起動時点で検知して落とす（`CS_SUPPORT_LLM_API_KEY` /
+/// `fallback_reply_text` と同じ「有効時のみ fail closed」の方針）。
+fn validate_business_hours_config(cfg: &cs_support_mcp::config::BusinessHoursConfig) -> Result<()> {
+    if !matches!(cfg.days.as_str(), "mon-fri" | "everyday") {
+        anyhow::bail!(
+            "[api.business_hours] days \"{}\" is neither \"mon-fri\" nor \"everyday\"; fix the \
+             config value, or set [api] enabled = false to disable the /api/reply route",
+            cfg.days
+        );
+    }
+    cfg.tz.parse::<chrono_tz::Tz>().map_err(|_| {
+        anyhow::anyhow!(
+            "[api.business_hours] tz \"{}\" is not a valid IANA timezone name; fix the config \
+             value, or set [api] enabled = false to disable the /api/reply route",
+            cfg.tz
+        )
+    })?;
+    chrono::NaiveTime::parse_from_str(&cfg.start, "%H:%M").map_err(|_| {
+        anyhow::anyhow!(
+            "[api.business_hours] start \"{}\" is not \"HH:MM\"; fix the config value, or set \
+             [api] enabled = false to disable the /api/reply route",
+            cfg.start
+        )
+    })?;
+    chrono::NaiveTime::parse_from_str(&cfg.end, "%H:%M").map_err(|_| {
+        anyhow::anyhow!(
+            "[api.business_hours] end \"{}\" is not \"HH:MM\"; fix the config value, or set \
+             [api] enabled = false to disable the /api/reply route",
+            cfg.end
+        )
+    })?;
+    Ok(())
+}
+
 /// OAuth 署名鍵を解決する純関数（env 値を引数で受けるのでテストできる）。
 ///
 /// - 値がある → `SigningKey::from_secret`。**短すぎる材料は起動時に弾く**（fail closed）。
@@ -528,6 +581,61 @@ mod tests {
             err.to_string(),
             "CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID is required and must not be empty; \
              set it to the Google OAuth Client ID from Google Cloud Console before starting the server"
+        );
+    }
+
+    // ---- validate_business_hours_config（会話フロー v1.1 design doc §6） ----
+
+    fn valid_business_hours() -> cs_support_mcp::config::BusinessHoursConfig {
+        cs_support_mcp::config::BusinessHoursConfig::default()
+    }
+
+    #[test]
+    fn validate_business_hours_config_accepts_the_default_config() {
+        assert!(validate_business_hours_config(&valid_business_hours()).is_ok());
+    }
+
+    #[test]
+    fn validate_business_hours_config_rejects_invalid_days() {
+        let mut cfg = valid_business_hours();
+        cfg.days = "weekends-only".to_string();
+        let err = validate_business_hours_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("days"),
+            "error must name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_business_hours_config_rejects_invalid_tz() {
+        let mut cfg = valid_business_hours();
+        cfg.tz = "Not/A/Timezone".to_string();
+        let err = validate_business_hours_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("tz"),
+            "error must name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_business_hours_config_rejects_invalid_start() {
+        let mut cfg = valid_business_hours();
+        cfg.start = "not-a-time".to_string();
+        let err = validate_business_hours_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("start"),
+            "error must name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_business_hours_config_rejects_invalid_end() {
+        let mut cfg = valid_business_hours();
+        cfg.end = "25:99".to_string();
+        let err = validate_business_hours_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("end"),
+            "error must name the offending field: {err}"
         );
     }
 }

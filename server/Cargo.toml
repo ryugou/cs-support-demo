@@ -21,6 +21,7 @@ base64 = "0.22"
 # `getrandom` は nonce を OS CSPRNG から引くために必要。
 chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10.4"
 clap = { version = "4", features = ["derive", "env"] }
 # 署名ブロブの HMAC-SHA256。`verify_slice` の定数時間比較を使うために、
 # sha2 だけで手組みせずこのクレートを使う（`==` 比較は署名の先頭一致長が
