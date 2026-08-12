@@ -316,8 +316,9 @@ pub fn decide_reply_action(
 /// 「初回か継続か」をサーバがコードで判定する純関数（会話フロー v1.1 design doc §3）。
 ///
 /// 判定は決定論（`history` が非空、または `case_id` が渡された場合は継続）。文面の出し分けは
-/// `clarify.rs` / `escalation_reply.rs` 側が `is_continuation: bool` を受け取って行うだけで、
-/// 判定ロジックそのものはこの関数以外に持たせない。
+/// `clarify.rs` / `escalation_reply.rs` / `reply.rs`（顧客向け回答下書き）側が
+/// `is_continuation: bool` を受け取って行うだけで、判定ロジックそのものはこの関数以外に
+/// 持たせない。
 fn is_continuation(history: &[ReplyHistoryTurn], case_id: Option<&str>) -> bool {
     !history.is_empty() || case_id.is_some()
 }
@@ -560,6 +561,12 @@ async fn reply_handler(
         }
     }
 
+    // 「初回か継続か」の判定は決定論（コード）。文面の出し分けは `clarify.rs` /
+    // `escalation_reply.rs` / `reply.rs`（回答下書き）側に `is_continuation` として渡すだけ
+    // （design doc §3）。`evaluate()` の内部で回答下書き生成（`draft_customer_reply`）まで
+    // 完結するため、`evaluate()` を呼ぶ前に計算しておく必要がある。
+    let is_continuation = is_continuation(&history, req.case_id.as_deref());
+
     match state
         .harness
         .evaluate(
@@ -569,6 +576,7 @@ async fn reply_handler(
             req.case_id.as_deref(),
             &state.tools,
             &history,
+            is_continuation,
             // /api/reply は design doc §2 の契約: 未知 case_id はエラーにせず新規 case
             // として処理する（クライアント保存漏れ・再起動由来の未知 id は通常運用）。
             crate::harness::UnknownCaseIdPolicy::StartNew,
@@ -580,9 +588,6 @@ async fn reply_handler(
                 Ok(conv) => conv,
                 Err(err) => return conv_state_load_failed(&err, &request_id, &outcome.case_id),
             };
-            // 「初回か継続か」の判定は決定論（コード）。文面の出し分けは `clarify.rs` /
-            // `escalation_reply.rs` 側に `is_continuation` として渡すだけ（design doc §3）。
-            let is_continuation = is_continuation(&history, req.case_id.as_deref());
 
             match decide_reply_action(&outcome, &conv, &state.config.api) {
                 ReplyAction::Answer(text) => (

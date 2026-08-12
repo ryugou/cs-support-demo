@@ -20,10 +20,11 @@ use crate::harness::egress::{self, EgressVerdict, EmitContext, NgDictionary};
 /// 他方の doc が腐るため。**
 pub(crate) const MAX_QUESTION_CHARS: usize = 2000;
 
-/// 会話継続時（`is_continuation == true`）に聞き返し・受け止め文プロンプトへ追加する
-/// system prompt 用の 1 行（会話フロー v1.1 design doc §3）。`clarify.rs` /
-/// `escalation_reply.rs` 両方が使う。以前この種の文字列が2モジュールへ複製され drift した
-/// 経緯（本モジュール冒頭のdoc参照）を繰り返さないためここに集約する。
+/// 会話継続時（`is_continuation == true`）に聞き返し・受け止め文・回答下書きプロンプトへ
+/// 追加する system prompt 用の 1 行（会話フロー v1.1 design doc §3）。`clarify.rs` /
+/// `escalation_reply.rs` / `reply.rs`（顧客向け回答下書き）の 3 モジュールが使う。以前この
+/// 種の文字列が複数モジュールへ複製され drift した経緯（本モジュール冒頭のdoc参照）を
+/// 繰り返さないためここに集約する。
 pub(crate) const CONTINUATION_OPENER_RULE: &str =
     "- 継続中の会話です。挨拶・感謝・謝罪の定型オープナー（「いつもご利用いただき〜」\
      「ご不便をおかけして〜」等）は書かず、直前のやり取りを受けて本題から書き始める。\n";

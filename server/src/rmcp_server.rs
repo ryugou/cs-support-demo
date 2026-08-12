@@ -636,6 +636,13 @@ impl CsSupportRmcpServer {
                 // MCP 経路は会話履歴を持たない（呼び出し側は case_id による signal 累積で
                 // マルチターンを扱う）。応答生成 API（/api/reply）だけが履歴を渡す。
                 &[],
+                // MCP 経路は会話フロー v1.1 design doc の適用範囲外（§1: 適用は /api/reply
+                // 経路のみ）。`case_id` は複数ターンで Some になりうるが、`api.rs::is_continuation`
+                // のヒューリスティック（history 非空 or case_id が Some）をここに流用すると、
+                // MCP の 2 ターン目以降を誤って「継続」扱いにしてしまう（history は常に空な
+                // ので case_id だけで継続判定することになる）。design doc の意図（MCP は常に
+                // 初回扱い）に反するため、常にリテラル false を渡す。
+                false,
                 // 未知 case_id は Err のまま維持する（従来どおり）。/api/reply 限定の
                 // fallback（design doc §2）を MCP 経路まで広げると、CS 担当の入力ミスが
                 // 黙って新規 case へ合流し、会話層の累積 signal が失われたまま気づけなくなる。

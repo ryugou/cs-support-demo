@@ -718,6 +718,7 @@ impl Harness {
         case_id: Option<&str>,
         tools: &ToolService,
         history: &[reply::ReplyHistoryTurn],
+        is_continuation: bool,
         unknown_case_id_policy: UnknownCaseIdPolicy,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
@@ -1084,6 +1085,7 @@ impl Harness {
                 &section_hits,
                 &resolutions,
                 history,
+                is_continuation,
             )
             .await;
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
@@ -1109,6 +1111,9 @@ impl Harness {
     ///
     /// 材料の選別（Escalate ではマニュアル本文を一切渡さない）は `reply::build_reply_brief`
     /// が担う。ここはその結果を送るだけで、安全判断をこの関数に持ち込まない。
+    ///
+    /// `is_continuation` は `evaluate()` から素通しされる会話段階フラグ（判定はサーバ側が
+    /// コードで行う。`reply::build_reply_system_prompt` の doc を参照）。
     async fn draft_customer_reply(
         &self,
         question: &str,
@@ -1116,6 +1121,7 @@ impl Harness {
         hits: &[SectionHit],
         resolutions: &[rules::KnownResolution],
         history: &[reply::ReplyHistoryTurn],
+        is_continuation: bool,
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
@@ -1132,7 +1138,7 @@ impl Harness {
             _ => None,
         };
         let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
-        let system = reply::build_reply_system_prompt(&brief);
+        let system = reply::build_reply_system_prompt(&brief, is_continuation);
         let user = reply::build_reply_user_message(question, &brief, history);
         let draft = match drafter
             .draft_reply(
@@ -1528,19 +1534,31 @@ mod tests {
         }
     }
 
-    /// stub LLM に `draft_text` をそのまま返させ、`draft_customer_reply` の結果を返す。
+    /// stub LLM に `draft_text` をそのまま返させ、`draft_customer_reply` の結果と、stub が
+    /// 実際に受け取った生リクエスト（`RequestLog`）を返す。
+    ///
+    /// `is_continuation` は `draft_customer_reply` へそのまま渡す。呼び出し側が `evaluate()` →
+    /// `draft_customer_reply()` → `build_reply_system_prompt()` の素通し配線を検証できるよう、
+    /// stub 到達済みの生リクエスト（system prompt を含む）を返す
+    /// （`clarify.rs::draft_clarify_question_via_stub` と同じパターン）。
     ///
     /// `AnthropicClient` のフィールドは `llm.rs` で private なので `from_config` 経由で組む。
     /// API キーは env `CS_SUPPORT_LLM_API_KEY` が優先されるが、未設定の環境でも構築できるよう
     /// 一時ファイルを置く（stub は鍵を検証しない。ここで必要なのは「鍵が解決できて client が
     /// 構築されること」だけ）。env を書き換えないのは、並行テストと競合させないため。
-    async fn draft_customer_reply_via_stub(draft_text: &str) -> Option<crate::llm::ReplyDraft> {
+    async fn draft_customer_reply_via_stub(
+        draft_text: &str,
+        is_continuation: bool,
+    ) -> (
+        Option<crate::llm::ReplyDraft>,
+        crate::llm::test_support::RequestLog,
+    ) {
         let body = serde_json::json!({
             "stop_reason": "end_turn",
             "content": [{"type": "text", "text": draft_text}],
         })
         .to_string();
-        let (endpoint, _log) = crate::llm::test_support::spawn_messages_stub(body).await;
+        let (endpoint, log) = crate::llm::test_support::spawn_messages_stub(body).await;
 
         let dir = std::env::temp_dir().join(format!("harness-reply-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -1577,9 +1595,17 @@ mod tests {
             score: 0.9,
             source_url: None,
         }];
-        harness
-            .draft_customer_reply("カメラが反応しません", &decision, &hits, &[], &[])
-            .await
+        let draft = harness
+            .draft_customer_reply(
+                "カメラが反応しません",
+                &decision,
+                &hits,
+                &[],
+                &[],
+                is_continuation,
+            )
+            .await;
+        (draft, log)
     }
 
     /// 「NG 表現を含まない下書きなら通る」ことは、**下記 2 件の偽陽性を潰すために必須**。
@@ -1598,9 +1624,8 @@ mod tests {
             ),
             "precondition: pick a draft text that the current NG dictionary passes"
         );
-        let draft = draft_customer_reply_via_stub(CLEAN)
-            .await
-            .expect("a draft with no NG term must survive the gate");
+        let (draft, _log) = draft_customer_reply_via_stub(CLEAN, false).await;
+        let draft = draft.expect("a draft with no NG term must survive the gate");
         // 生成結果がそのまま返ること。null でないだけでなく**本文が一致する**ことを見るのは、
         // 下書きが実際に stub から流れてきた証拠にするため。
         assert_eq!(draft.text, CLEAN);
@@ -1624,8 +1649,9 @@ mod tests {
             ),
             "precondition: the term taken from the dictionary must actually block"
         );
+        let (draft, _log) = draft_customer_reply_via_stub(&drafted, false).await;
         assert!(
-            draft_customer_reply_via_stub(&drafted).await.is_none(),
+            draft.is_none(),
             "draft_customer_reply must run the generated draft through egress_gate and drop a \
              blocked one (customer_reply_draft = null)"
         );
@@ -1649,10 +1675,47 @@ mod tests {
             ),
             "precondition: the term taken from the dictionary must actually abstain"
         );
+        let (draft, _log) = draft_customer_reply_via_stub(&drafted, false).await;
         assert!(
-            draft_customer_reply_via_stub(&drafted).await.is_none(),
+            draft.is_none(),
             "abstain is 'do not emit' too; the draft must be dropped, not passed through"
         );
+    }
+
+    /// design doc §3 配線テスト: `is_continuation` が `evaluate()` → `draft_customer_reply()` →
+    /// `build_reply_system_prompt()` まで素通しされていることを確認する。純関数の単体テスト
+    /// （`reply.rs` の `system_prompt_adds_continuation_opener_rule_when_a_continuation` 等）
+    /// だけでは、呼び出し側（`draft_customer_reply`）がフラグを握り潰しても（例: 固定値
+    /// `false` を渡す退行）全テストが緑のままになる。stub に実際に届いた生リクエストを見て
+    /// 配線そのものを確認する。
+    #[tokio::test]
+    async fn draft_customer_reply_forwards_is_continuation_true_to_the_system_prompt() {
+        let (_draft, log) = draft_customer_reply_via_stub("本文です。", true).await;
+        let requests = log.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "stub に実際にリクエストが届いていること（配線を主張する前提）"
+        );
+        assert!(
+            requests[0].contains("定型オープナー"),
+            "is_continuation = true のとき CONTINUATION_OPENER_RULE 由来の制約が \
+             system prompt（stub への生リクエスト）に含まれていること"
+        );
+    }
+
+    /// 対照テスト（false-positive 防止）: `is_continuation = false` のときは含まれないこと。
+    /// これが無いと「常に CONTINUATION_OPENER_RULE を含める」実装でも上のテストだけでは緑になる。
+    #[tokio::test]
+    async fn draft_customer_reply_omits_continuation_rule_when_not_a_continuation() {
+        let (_draft, log) = draft_customer_reply_via_stub("本文です。", false).await;
+        let requests = log.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "stub に実際にリクエストが届いていること（配線を主張する前提）"
+        );
+        assert!(!requests[0].contains("定型オープナー"));
     }
 
     // ---- clarification_allowed 契約テスト（会話フロー v1.1 design doc §2・§8） ----
