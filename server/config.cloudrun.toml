@@ -45,6 +45,16 @@ policy = "escalate_unless_answerable"
 default_escalation_route = "support_desk"
 # 意味検索（ベクトル経路）: urtect は embeddings ingest 済みのため有効化
 vector_route_enabled = true
+# manual 検索スコア v2（TF / 長さ正規化 / 型番 run 除外 / 密度 tiebreak）。
+# design: docs/superpowers/specs/2026-08-05-manual-scoring-tf-lengthnorm-design.md
+# 4 つの変更をまとめて切る kill switch。デモで劣化が見えたらこの 1 行を false にして再デプロイする。
+manual_scoring_v2_enabled = true
+# デモ用: evaluate_answerability が顧客向け返信文の「下書き」を返す。
+# 有効化すると評価 1 回につき Anthropic 呼び出しが 1 回増え、問い合わせ本文と
+# （Allowed 時のみ）マニュアル抜粋が Anthropic へ送信される。切り戻しはこの行を
+# false にして再デプロイするだけ。文面の正本は client 側という結論は不変
+# （specs/production-cs-mcp.md「message_policy の扱い」を参照）。
+customer_reply_draft_enabled = true
 
 [harness.thresholds]
 low = 0.6

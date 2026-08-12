@@ -156,6 +156,29 @@ pub struct HarnessConfig {
     /// embeddings を ingest 済みのテナントでのみ有効化する（urtect design §2.3）。
     #[serde(default)]
     pub vector_route_enabled: bool,
+    /// manual 検索スコアの v2（TF / 長さ正規化 / 型番 run 除外 / 密度 tiebreak）を有効にするか。
+    ///
+    /// **既定 false。** design `docs/superpowers/specs/2026-08-05-manual-scoring-tf-lengthnorm-design.md`
+    /// の 4 つの変更を**まとめて**切り替える kill switch（個別フラグにすると組み合わせが
+    /// 16 通りになり、デモ中の切り分けが実行不能になる）。false のとき従来と完全に同一の
+    /// **スコアと順位**になる。デモで劣化が見えたらこの 1 行を false に戻して再デプロイする。
+    #[serde(default)]
+    pub manual_scoring_v2_enabled: bool,
+    /// `evaluate_answerability` が顧客向け返信文の**下書き**を返すか（デモ用）。
+    ///
+    /// **既定 false。** 有効化すると評価 1 回につき Anthropic API 呼び出しが 1 回増え、
+    /// 顧客問い合わせ本文と（Allowed 時のみ）マニュアル抜粋が Anthropic へ送信される。
+    /// 文面の正本は client 側という spec の結論は変わらない（`harness::reply` の doc を参照）。
+    #[serde(default)]
+    pub customer_reply_draft_enabled: bool,
+    /// 返信文下書きの `max_tokens`。signal 抽出用（`[llm] max_tokens`、既定 300）とは別枠。
+    /// 返信文は数百字必要で、抽出用の上限では途中で切れる。
+    #[serde(default = "default_reply_draft_max_tokens")]
+    pub customer_reply_draft_max_tokens: u32,
+}
+
+fn default_reply_draft_max_tokens() -> u32 {
+    700
 }
 
 fn default_audit_log_path() -> String {
@@ -187,8 +210,11 @@ impl Default for HarnessConfig {
             policy: default_policy(),
             thresholds: ThresholdsConfig::default(),
             grading: GradingConfig::default(),
+            customer_reply_draft_enabled: false,
+            customer_reply_draft_max_tokens: default_reply_draft_max_tokens(),
             default_escalation_route: default_escalation_route(),
             vector_route_enabled: false,
+            manual_scoring_v2_enabled: false,
         }
     }
 }
@@ -289,6 +315,10 @@ schema = "s"
         assert!(!cfg.llm.enabled);
         assert_eq!(cfg.llm.model, "claude-haiku-4-5-20251001");
         assert!(!cfg.harness.vector_route_enabled);
+        assert!(
+            !cfg.harness.manual_scoring_v2_enabled,
+            "manual scoring v2 must stay opt-in (kill switch defaults to off)"
+        );
     }
 
     #[test]
@@ -304,11 +334,13 @@ enabled = true
 api_key_file = "/tmp/key"
 [harness]
 vector_route_enabled = true
+manual_scoring_v2_enabled = true
 "#;
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert!(cfg.llm.enabled);
         assert_eq!(cfg.llm.api_key_file.as_deref(), Some("/tmp/key"));
         assert!(cfg.harness.vector_route_enabled);
+        assert!(cfg.harness.manual_scoring_v2_enabled);
     }
 
     #[test]

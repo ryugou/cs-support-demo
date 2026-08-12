@@ -19,6 +19,12 @@ use unicode_normalization::UnicodeNormalization;
 /// 「get_section の traversal は最大 2 hop に制限する」に合わせる。
 const MAX_ANCESTOR_HOPS: usize = 2;
 
+/// BM25 の TF 飽和パラメータ。design（`2026-08-05-manual-scoring-tf-lengthnorm-design.md`）の
+/// 「`k1` / `b` は調整しない」に従い標準値を使う。実測できるようになるまでチューニングしない。
+const BM25_K1: f32 = 1.2;
+/// BM25 の長さ正規化パラメータ（同 design。標準値）。
+const BM25_B: f32 = 0.75;
+
 /// `NodeResult` を read tool が返す JSON ビュー（node_id / node_type / attributes）に整形する。
 /// 旧 snapshot 経路の `node_json` と同一形状を保つ（クライアント契約を変えない）。
 fn node_result_json(n: &crate::proto::graphrag::NodeResult) -> serde_json::Value {
@@ -152,24 +158,81 @@ pub(crate) fn run_bigrams(runs: &[String]) -> Vec<String> {
 ///
 /// 既知の限界（コードコメント）: 漢字 run の bigram 断片一致は無関係語への誤マッチを
 /// 許す場合がある。business 語彙チューニング/ベクトル検索フェーズで扱う。
-fn run_matches(run: &str, text_nfkc: &str) -> bool {
-    if text_nfkc.contains(run) {
-        return true;
+///
+/// 戻り値は**出現回数**（0 は不一致）。直接一致は非重複の出現回数を数える。
+/// bigram 救済で一致した漢字 run は「元の run が何回出たか」を定義できないため
+/// `1`（非ゼロ最小）に固定する ── 救済は元々「取りこぼしを防ぐ」ための弱い一致なので、
+/// TF でも最弱に置くのが一貫している（design「bigram 救済で一致した漢字 run の tf」）。
+fn run_term_frequency(run: &str, text_nfkc: &str) -> usize {
+    // 空 run は `str::matches` が文字数+1 個の空マッチを返し tf が本文長に化けるため弾く。
+    // content_runs は空 run を作らないので、これは呼び出し側の破れに対する防御。
+    if run.is_empty() {
+        return 0;
+    }
+    let direct = text_nfkc.matches(run).count();
+    if direct > 0 {
+        return direct;
     }
     // bigram 救済は漢字 run 限定
     if !run.chars().all(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)) {
-        return false;
+        return 0;
     }
     let single = [run.to_string()];
     let bigrams = run_bigrams(&single);
     if bigrams.len() < 2 {
-        return false;
+        return 0;
     }
     let hit = bigrams
         .iter()
         .filter(|b| text_nfkc.contains(b.as_str()))
         .count();
-    (hit as f32 / bigrams.len() as f32) >= 0.5
+    if (hit as f32 / bigrams.len() as f32) >= 0.5 {
+        1
+    } else {
+        0
+    }
+}
+
+/// run が正規化済みテキストにマッチするか（`run_term_frequency` の bool 射影）。
+/// マッチ判定の定義を 1 箇所に保つため、独自の判定は持たない。
+fn run_matches(run: &str, text_nfkc: &str) -> bool {
+    run_term_frequency(run, text_nfkc) > 0
+}
+
+/// v2 の長さ正規化に必要な 1 節分の長さ情報。単位は NFKC 正規化後の文字数。
+#[derive(Debug, Clone, Copy)]
+struct DocLength {
+    chars: usize,
+    /// 採点対象コーパスの平均文字数。0 は「平均が取れない」を意味する（下記の縮退を参照）。
+    avg_chars: f32,
+}
+
+/// v2 の run 重み。BM25 の TF 飽和項に長さ正規化を掛け、min クランプで 0..=1 に収める。
+///
+/// ```text
+/// raw = tf × (k1 + 1) / ( tf + k1 × (1 - b + b × len/avg_len) )
+/// w   = min(1.0, raw)
+/// ```
+///
+/// 分子の `(k1 + 1)` と min クランプが要点。`tf = 1` かつ `len = avg_len` でちょうど 1.0 に
+/// なり、v1（bool 一致 = 1.0）の満点条件が上限として保存される。素朴な `tf/(tf+1)` だと
+/// 「平均長の記事で 1 回言及」が 0.5 になり、短く簡潔な記事が閾値 0.6 を割って escalate へ
+/// 倒れる（design「分子の `(k1 + 1)` と min クランプが要点」）。
+fn saturating_run_weight(tf: usize, length: DocLength) -> f32 {
+    if tf == 0 {
+        return 0.0;
+    }
+    // avg_len = 0（空コーパス、または全節が空本文）ではゼロ除算になる。NaN を返すと
+    // score が全順序を失い、閾値比較も無言で false になるため、長さ正規化を掛けない
+    // （= 平均長扱い）方向へ縮退させる。v1 と同じ満点条件に戻るだけで、順位は壊れない。
+    let length_ratio = if length.avg_chars > 0.0 {
+        length.chars as f32 / length.avg_chars
+    } else {
+        1.0
+    };
+    let tf = tf as f32;
+    let denominator = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * length_ratio);
+    (tf * (BM25_K1 + 1.0) / denominator).min(1.0)
 }
 
 /// 質問の内容語ラン（重複除去済み）を返す。run が 1 つも取れない質問は None。
@@ -202,8 +265,18 @@ pub(crate) fn run_document_frequency(corpus_bodies_nfkc: &[String], runs: &[Stri
 
 /// run 単位 IDF 重み付きカバレッジスコア。
 /// idf(run) = ln(1 + N / (1 + df(run)))
-/// score = Σ_{matched runs} idf(run) / Σ_{all runs} idf(run)
-fn idf_weighted_score(runs: &[String], dfs: &[usize], corpus_len: usize, body_nfkc: &str) -> f32 {
+/// score = Σ_{runs} idf(run) × w(run, doc) / Σ_{runs} idf(run)
+///
+/// `length_norm` が `None`（v1）のとき w は bool 一致（0 または 1）で、従来と完全に同一。
+/// `Some`（v2）のときは TF + 長さ正規化の飽和重み（`saturating_run_weight`）を使う。
+/// どちらでも w ≤ 1 なので score は 0..=1 に収まり、回答可能性の閾値の枠組みを壊さない。
+fn idf_weighted_score(
+    runs: &[String],
+    dfs: &[usize],
+    corpus_len: usize,
+    body_nfkc: &str,
+    length_norm: Option<DocLength>,
+) -> f32 {
     debug_assert_eq!(runs.len(), dfs.len());
     let n = corpus_len as f32;
     let mut matched_weight = 0.0_f32;
@@ -211,14 +284,58 @@ fn idf_weighted_score(runs: &[String], dfs: &[usize], corpus_len: usize, body_nf
     for (run, df) in runs.iter().zip(dfs.iter()) {
         let idf = (1.0 + n / (1.0 + *df as f32)).ln();
         total_weight += idf;
-        if run_matches(run, body_nfkc) {
-            matched_weight += idf;
-        }
+        let weight = match length_norm {
+            Some(length) => saturating_run_weight(run_term_frequency(run, body_nfkc), length),
+            None if run_matches(run, body_nfkc) => 1.0,
+            None => 0.0,
+        };
+        matched_weight += idf * weight;
     }
     if total_weight <= 0.0 {
         return 0.0;
     }
     matched_weight / total_weight
+}
+
+/// 内容語 run が 1 つも残らない質問（全ひらがな、あるいは型番だけ）のスコア。
+/// 現行の legacy 経路（`crate::mcp::section_score`）を各節に適用する。
+fn legacy_fallback_scores(question: &str, query_norm: &str, section_bodies: &[String]) -> Vec<f32> {
+    section_bodies
+        .iter()
+        .map(|b| crate::mcp::section_score(query_norm, question, b))
+        .collect()
+}
+
+/// manual スコアの構成。`v2_enabled` は design（2026-08-05）の TF / 長さ正規化 / 型番 run 除外を
+/// **まとめて**切り替える kill switch（`[harness] manual_scoring_v2_enabled`、既定 false）。
+/// 個別フラグにすると組み合わせが 8 通りになり、デモ中の切り分けが実行不能になるため分けない。
+/// `false` のときは v1 と完全に同一のスコアを返す。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ManualScoring {
+    pub v2_enabled: bool,
+    /// 質問 run から落とす型番 run（Product ノードの `model` / `aliases` を `content_runs` で
+    /// 分解したもの）。`v2_enabled = false` のときは参照しない。
+    pub model_runs: HashSet<String>,
+}
+
+/// snapshot の Product ノードから型番 run 集合を作る。
+///
+/// `model` と `aliases` を、質問側と**同じ `content_runs`** で分解する（`ADC-V724` →
+/// `{adc, v724}`）。分解方法を揃えることが要点で、揃えないと除外が効かない。
+/// `aliases` は ingest 側が `,` 連結で 1 属性に詰めている（`manual::ingest_model::
+/// build_product_node`）が、`,` は `content_runs` の run 区切りなので前処理は要らない。
+pub(crate) fn model_runs_from_snapshot(snapshot: &GetGraphSnapshotResponse) -> HashSet<String> {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == KIND_PRODUCT)
+        .flat_map(|n| {
+            ["model", "aliases"]
+                .into_iter()
+                .filter_map(|key| n.attributes.get(key))
+        })
+        .flat_map(|raw| content_runs(raw))
+        .collect()
 }
 
 /// manual 直接性スコアの本体: 質問と節本文の集合を受け取り、各節のスコアを返す。
@@ -234,24 +351,125 @@ fn idf_weighted_score(runs: &[String], dfs: &[usize], corpus_len: usize, body_nf
 /// スコア: fast path（完全部分文字列 1.0 / 正規化部分文字列 0.95）→
 /// run 単位 IDF 重み付きカバレッジ。run が取れない質問（全ひらがな等）は
 /// legacy の section_score にフォールバックする。
-pub(crate) fn score_against_corpus(question: &str, section_bodies: &[String]) -> Vec<f32> {
-    let query_norm = normalize_key(question);
-    let Some(runs) = unique_content_runs(question) else {
-        // run が 1 つも取れない質問（全ひらがな等）は legacy フォールバックを各節に適用する。
-        return section_bodies
-            .iter()
-            .map(|b| crate::mcp::section_score(&query_norm, question, b))
-            .collect();
+/// **スコアだけを見るテスト用。** production 経路は
+/// [`score_against_corpus_ranked`] を使う（同点時の並び替えに密度が要るため）。
+/// スコア自体は同じものを返すので、閾値・カバレッジの検証はこちらで足りる。
+#[cfg(test)]
+pub(crate) fn score_against_corpus(
+    question: &str,
+    section_bodies: &[String],
+    scoring: &ManualScoring,
+) -> Vec<f32> {
+    score_against_corpus_ranked(question, section_bodies, scoring)
+        .into_iter()
+        .map(|s| s.score)
+        .collect()
+}
+
+/// 1 節の採点結果。
+///
+/// **`score` と `density` は役割が違う。混ぜてはならない。**
+///
+/// - `score`: 回答可能性の閾値（low 0.6 / mid 0.8 / high 0.95）と**絶対値で比較**される。
+///   ここに補助信号を足すと閾値の意味が変わり、実測なしに較正し直せなくなる
+/// - `density`: **同点時の並び順にだけ**使う。順位にしか効かないので、**「答えないはずの
+///   ものを答える」方向の事故を構造的に起こせない**（`score` が閾値を跨がないため）
+///
+/// density が要る理由: 満点条件が `tf ≥ (1 - b + b × len/avg_len)` なので、**平均より
+/// 長い記事でも数回言及すれば満点に届く**。実測では正解記事（`パスワード` 50 回 / 2,152 字）と
+/// 無関係な記事（同 2 回 / 5,175 字）が**ともに 1.0** になった。カバレッジは「クエリ語を
+/// 覆っているか」しか見ないので、この 2 つを区別できない。区別できるのは**密度**である
+/// （2.65% 対 0.48%、実測で 5 倍以上の開き）。
+///
+/// 二段構えの意図: **カバレッジで回答可否を決め、密度で並べる。**
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SectionScore {
+    pub score: f32,
+    /// クエリ run の出現回数合計 ÷ 本文文字数。v1（kill switch off）では常に 0.0 で、
+    /// 並び順に一切影響しない。
+    pub density: f32,
+}
+
+/// [`score_against_corpus`] に、同点時の並び替え用の密度を足した版。
+fn score_against_corpus_ranked(
+    question: &str,
+    section_bodies: &[String],
+    scoring: &ManualScoring,
+) -> Vec<SectionScore> {
+    // 密度を持たない（= 並び順に効かない）採点結果へ畳む補助。
+    let flat = |scores: Vec<f32>| -> Vec<SectionScore> {
+        scores
+            .into_iter()
+            .map(|score| SectionScore {
+                score,
+                density: 0.0,
+            })
+            .collect()
     };
+    let query_norm = normalize_key(question);
+    let Some(mut runs) = unique_content_runs(question) else {
+        // run が 1 つも取れない質問（全ひらがな等）は legacy フォールバックを各節に適用する。
+        return flat(legacy_fallback_scores(
+            question,
+            &query_norm,
+            section_bodies,
+        ));
+    };
+    if scoring.v2_enabled {
+        // 型番 run を落とす。alarm.com の記事は設計上あえて製品非依存で書かれており、
+        // 正解記事に型番が 1 度も出てこない。型番 run を残すと分母だけが膨らみ、
+        // 型番を書いて質問するほど汎用的な正解記事の順位が下がる（design 原因 1）。
+        runs.retain(|run| !scoring.model_runs.contains(run));
+        if runs.is_empty() {
+            // 質問が型番だけ（例:「ADC-V724」）。run が取れない質問と同じ扱いへ倒す。
+            return flat(legacy_fallback_scores(
+                question,
+                &query_norm,
+                section_bodies,
+            ));
+        }
+    }
     let corpus_nfkc: Vec<String> = section_bodies.iter().map(|b| nfkc_lowercase(b)).collect();
     // DF は質問 1 回につき 1 度だけ計算する（節ごとに再計算しない）。
     let dfs = run_document_frequency(&corpus_nfkc, &runs);
+    // 長さ正規化の材料。v1 では空のままにして `doc_chars.get(i)` を None に落とし、
+    // 従来の bool 一致に戻す（分岐を採点ループ側に二重化しない）。
+    let doc_chars: Vec<usize> = if scoring.v2_enabled {
+        corpus_nfkc.iter().map(|b| b.chars().count()).collect()
+    } else {
+        Vec::new()
+    };
+    let avg_chars = if doc_chars.is_empty() {
+        0.0
+    } else {
+        doc_chars.iter().sum::<usize>() as f32 / doc_chars.len() as f32
+    };
     section_bodies
         .iter()
         .zip(corpus_nfkc.iter())
-        .map(|(body, body_nfkc)| {
-            substring_fast_path(question, &query_norm, body)
-                .unwrap_or_else(|| idf_weighted_score(&runs, &dfs, corpus_nfkc.len(), body_nfkc))
+        .enumerate()
+        .map(|(i, (body, body_nfkc))| {
+            // doc_chars が空（= v1）なら length_norm は None になり、従来の bool 一致になる。
+            let length_norm = doc_chars.get(i).map(|chars| DocLength {
+                chars: *chars,
+                avg_chars,
+            });
+            let score = substring_fast_path(question, &query_norm, body).unwrap_or_else(|| {
+                idf_weighted_score(&runs, &dfs, corpus_nfkc.len(), body_nfkc, length_norm)
+            });
+            // 密度は v2 のときだけ立てる。v1 では 0.0 のままなので tiebreak が no-op になり、
+            // 並び順も従来と完全に一致する（kill switch の「完全に同一」を順位側でも守る）。
+            let density = match doc_chars.get(i) {
+                Some(0) | None => 0.0,
+                Some(chars) => {
+                    let occurrences: usize = runs
+                        .iter()
+                        .map(|run| run_term_frequency(run, body_nfkc))
+                        .sum();
+                    occurrences as f32 / *chars as f32
+                }
+            };
+            SectionScore { score, density }
         })
         .collect()
 }
@@ -443,11 +661,23 @@ pub struct ManualStore {
     /// 材料 corpus の共有ローダ。`search` は `graph_snapshot(5000)` の全件依存をやめ、
     /// ここ経由の TTL キャッシュ付き manual_corpus（ページングで上限なし）を使う。
     corpus: Arc<crate::corpus::CorpusLoader>,
+    /// manual スコア v2（TF / 長さ正規化 / 型番 run 除外）の kill switch。
+    /// `[harness] manual_scoring_v2_enabled`（既定 false）。テナント設定であって
+    /// リクエストごとの引数ではないため、呼び出し引数ではなくここに持つ。
+    scoring_v2_enabled: bool,
 }
 
 impl ManualStore {
-    pub fn new(client: Arc<VegapunkClient>, corpus: Arc<crate::corpus::CorpusLoader>) -> Self {
-        Self { client, corpus }
+    pub fn new(
+        client: Arc<VegapunkClient>,
+        corpus: Arc<crate::corpus::CorpusLoader>,
+        scoring_v2_enabled: bool,
+    ) -> Self {
+        Self {
+            client,
+            corpus,
+            scoring_v2_enabled,
+        }
     }
 
     /// signal 絞り込み(A) と body 全文(B) の max スコアで ManualSection を返す。
@@ -577,7 +807,18 @@ impl ManualStore {
             .iter()
             .map(|n| n.attributes.get("body").cloned().unwrap_or_default())
             .collect();
-        let corpus_scores = score_against_corpus(question, &bodies);
+        // 型番 run は本文テキストマッチに使わない（構造 = DESCRIBES 辺 / product_key で扱う）。
+        // 除外集合は snapshot の Product ノードから毎回組み立てる（製品マスタの正本は
+        // vegapunk 側にあり、サーバ側に定数化された型番一覧を持たない方針のため）。
+        let scoring = ManualScoring {
+            v2_enabled: self.scoring_v2_enabled,
+            model_runs: if self.scoring_v2_enabled {
+                model_runs_from_snapshot(snapshot)
+            } else {
+                HashSet::new()
+            },
+        };
+        let corpus_scores = score_against_corpus_ranked(question, &bodies, &scoring);
         let query_norm = normalize_key(question);
         let attr = |n: &crate::proto::graphrag::GraphNode, key: &str| -> String {
             n.attributes.get(key).cloned().unwrap_or_default()
@@ -587,7 +828,7 @@ impl ManualStore {
         // 引くだけなので、snapshot に無い id や product_key フィルタで除外された節の
         // vector スコアは自然に無視される（別集合として union する必要がない）。
         let vector_map = fold_max_scores(vector_hits);
-        let mut hits: Vec<ManualHit> = manual_sections
+        let mut hits: Vec<(f32, ManualHit)> = manual_sections
             .into_iter()
             .zip(corpus_scores)
             .zip(bodies)
@@ -597,7 +838,7 @@ impl ManualStore {
                 // 正規化部分文字列 → 0.95。それ以外は body のみに対する IDF corpus スコアを使う。
                 let text = format!("{title}\n{body}");
                 let text_score =
-                    substring_fast_path(question, &query_norm, &text).unwrap_or(corpus_score);
+                    substring_fast_path(question, &query_norm, &text).unwrap_or(corpus_score.score);
                 let vector_score = vector_map.get(n.node_id.as_str()).copied().unwrap_or(0.0);
                 // 最終スコアは max(text, vector)。backend の vector score は 0-1 程度のスケールを
                 // 前提とし、ここではリスケールしない（較正は実測ベースで Task 11 に回す）。
@@ -619,6 +860,7 @@ impl ManualStore {
                 (
                     in_signal,
                     score,
+                    corpus_score.density,
                     ManualHit {
                         section_key: attr(n, "section_key"),
                         title,
@@ -631,19 +873,35 @@ impl ManualStore {
                 )
             })
             // 候補: signal 絞り込みに入る or (text/vector いずれかの) スコアが立つ（0 超）ものを残す
-            .filter(|(in_signal, score, _)| *in_signal || *score > 0.0)
-            .map(|(_, _, h)| h)
+            .filter(|(in_signal, score, _, _)| *in_signal || *score > 0.0)
+            .map(|(_, _, density, h)| (density, h))
             .collect();
-        // score 降順 + 同点は section_key 昇順の決定論 tiebreak。
-        // （sort_by 自体は stable sort だが、同点時の順序が snapshot のノード順=backend の
-        // 返却順に依存してしまう。top_k 打ち切り・best_manual_sections・WORM 記録が
-        // 実行ごとに揺れないよう、入力順に依存しない全順序で並べる。）
-        hits.sort_by(|a, b| {
+        // score 降順 → クエリ語密度 降順 → section_key 昇順 の決定論 tiebreak。
+        //
+        // **密度は同点のときにしか効かない。** score は閾値と絶対値で比較されるので触らず、
+        // 「どちらが先か」だけを決める。したがって回答可否の判定は一切変わらない
+        // （＝この tiebreak で「答えないはずのものを答える」方向へ倒れることは起こらない）。
+        //
+        // 密度を挟む理由: 満点条件が `tf ≥ (1 - b + b × len/avg_len)` なので、平均より長い
+        // 記事でも数回言及すれば満点に届く。実測（alarm.com 5 記事）では正解記事と無関係な
+        // 固定 IP 記事がともに 1.0 で並び、カバレッジだけでは順位が決まらなかった。
+        //
+        // section_key 昇順は最終 tiebreak として必ず残す。密度は浮動小数で同着しうるし、
+        // v1 では全節 0.0 で並ぶため、これが無いと順序が snapshot のノード順（backend の
+        // 返却順）に依存してしまう。top_k 打ち切り・best_manual_sections・WORM 記録が
+        // 実行ごとに揺れないよう、入力順に依存しない全順序で並べる。
+        hits.sort_by(|(a_density, a), (b_density, b)| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b_density
+                        .partial_cmp(a_density)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| a.section_key.cmp(&b.section_key))
         });
+        let mut hits: Vec<ManualHit> = hits.into_iter().map(|(_, h)| h).collect();
         hits.truncate(top_k.max(1));
         Ok(hits)
     }
@@ -1017,8 +1275,488 @@ mod tests {
     use crate::harness::signal::Signal;
 
     /// 単一節コーパスでスコアを取るテストヘルパ（production 経路と同じ score_against_corpus を使う）。
+    /// v1（kill switch off）のスコアを見る。v2 は実データ 5 記事のテスト群で固定する。
     fn score_one(question: &str, body: &str) -> f32 {
-        score_against_corpus(question, &[body.to_string()])[0]
+        score_against_corpus(question, &[body.to_string()], &ManualScoring::default())[0]
+    }
+
+    // ---- 実データ回帰: 本番実測の 5 記事 ----
+    //
+    // 出典: 本番 `evaluate_answerability` レスポンス（質問は `PASSWORD_QUESTION`）の
+    // `hits[].body_ja` を **verbatim** で保存したもの。本文の長さそのものが長さ正規化の
+    // 判定材料なので、要約・短縮・整形をしてはならない。
+    const BODY_STATIC_IP: &str = include_str!("testdata/alarmcom_static_ip.txt");
+    const BODY_BANDWIDTH: &str = include_str!("testdata/alarmcom_bandwidth.txt");
+    const BODY_RESET_PASSWORD: &str =
+        include_str!("testdata/alarmcom_change_or_reset_password.txt");
+    const BODY_UNABLE_TO_LOG_IN: &str = include_str!("testdata/alarmcom_unable_to_log_in.txt");
+    const BODY_PARTNER_HUB: &str = include_str!("testdata/alarmcom_partner_hub.txt");
+
+    /// 本番で誤った順位が観測された実際の質問。
+    const PASSWORD_QUESTION: &str = "ADC-V724 を使っていますが、パスワードを忘れてしまいました";
+
+    /// 正解記事のラベル（この質問に答えているのはこの 1 件）。
+    const ANSWER_ARTICLE: &str = "③パスワードの変更またはリセット";
+
+    /// 回答可能性の low 閾値（`[harness.thresholds] low`）。正解記事はこれを超える必要がある。
+    const ANSWERABILITY_LOW_THRESHOLD: f32 = 0.6;
+
+    /// 5 記事コーパス（本番レスポンスの hits 順 = 現行スコアの降順）。
+    /// ラベルはアサーション失敗時に「どの記事か」を読めるようにするためだけに使う。
+    fn alarmcom_articles() -> Vec<(&'static str, String)> {
+        vec![
+            ("①固定IP", BODY_STATIC_IP.to_string()),
+            ("②帯域幅", BODY_BANDWIDTH.to_string()),
+            (ANSWER_ARTICLE, BODY_RESET_PASSWORD.to_string()),
+            ("④ログインできない", BODY_UNABLE_TO_LOG_IN.to_string()),
+            ("⑤パートナー様向け(ハブ)", BODY_PARTNER_HUB.to_string()),
+        ]
+    }
+
+    // 5 記事の section_key。**正解記事が昇順で最後に来るよう意図的に振ってある。**
+    //
+    // 最終 tiebreak は section_key 昇順なので、密度 tiebreak が効いていなければ
+    // 正解記事は同点集団の**最下位**に沈む。この向きに振っておかないと、
+    // 「密度で 1 位になった」のか「同点のまま section_key の巡り合わせで 1 位になった」
+    // のかをテストが区別できない（順位テストが実質何も検証していない状態になる）。
+    const KEY_STATIC_IP: &str = "a-static-ip";
+    const KEY_BANDWIDTH: &str = "b-bandwidth";
+    const KEY_UNABLE_TO_LOG_IN: &str = "c-unable-to-log-in";
+    const KEY_PARTNER_HUB: &str = "d-partner-hub";
+    const ANSWER_SECTION_KEY: &str = "z-change-or-reset-password";
+    /// 正解より上に来てはいけない記事の section_key（`MUST_RANK_BELOW` と同じ 3 件）。
+    const MUST_RANK_BELOW_KEYS: [&str; 3] = [KEY_STATIC_IP, KEY_BANDWIDTH, KEY_PARTNER_HUB];
+
+    /// 実データ 5 記事を `search_with_snapshot`（= production の検索経路）へ通し、
+    /// **返却順**の section_key を返す。
+    ///
+    /// スコア関数を直接叩くのではなく production の sort を通すのは、順位を決めているのが
+    /// `search_with_snapshot` の tiebreak だからである。テスト側で並べ替えを再実装すると、
+    /// 本番の sort を書き換えてもテストが緑のままになる。
+    async fn rank_alarmcom_through_search(v2_enabled: bool) -> Vec<String> {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphNode as PN};
+        use std::collections::HashMap;
+        let schema = "urtect";
+        let section = |section_key: &str, title: &str, body: &str| -> PN {
+            let attrs: HashMap<String, String> = [
+                ("section_key".to_string(), section_key.to_string()),
+                ("title".to_string(), title.to_string()),
+                ("body".to_string(), body.to_string()),
+                ("source_url".to_string(), String::new()),
+                ("breadcrumb".to_string(), String::new()),
+            ]
+            .into_iter()
+            .collect();
+            PN {
+                node_id: manual_node_id(schema, "ManualSection", section_key),
+                node_type: "ManualSection".to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: attrs,
+            }
+        };
+        // 型番除外は Product ノード由来なので、製品マスタも同じ snapshot に入れる
+        // （本番と同じ `model_runs_from_snapshot` の経路を通す）。
+        let mut nodes = urtect_product_snapshot().nodes;
+        nodes.extend([
+            section(KEY_STATIC_IP, "固定IPの設定", BODY_STATIC_IP),
+            section(KEY_BANDWIDTH, "帯域幅要件", BODY_BANDWIDTH),
+            section(
+                KEY_UNABLE_TO_LOG_IN,
+                "ログインできない",
+                BODY_UNABLE_TO_LOG_IN,
+            ),
+            section(KEY_PARTNER_HUB, "パートナー様向け", BODY_PARTNER_HUB),
+            section(
+                ANSWER_SECTION_KEY,
+                "パスワードの変更またはリセット",
+                BODY_RESET_PASSWORD,
+            ),
+        ]);
+        let snapshot = GetGraphSnapshotResponse {
+            nodes,
+            edges: Vec::new(),
+            truncated: false,
+            total_node_count: 0,
+        };
+        let client = Arc::new(
+            crate::vegapunk::VegapunkClient::connect_lazy("http://127.0.0.1:1", "test")
+                .expect("connect_lazy"),
+        );
+        let corpus = Arc::new(crate::corpus::CorpusLoader::new(client.clone()));
+        ManualStore::new(client, corpus, v2_enabled)
+            .search_with_snapshot(
+                schema,
+                PASSWORD_QUESTION,
+                &SignalSet::new(),
+                None,
+                5,
+                &snapshot,
+                &[],
+            )
+            .expect("search_with_snapshot")
+            .into_iter()
+            .map(|h| h.section_key)
+            .collect()
+    }
+
+    /// 実データ 5 記事を採点し、(ラベル, score) を記事順で返す。
+    fn score_alarmcom_articles(scoring: &ManualScoring) -> Vec<(&'static str, f32)> {
+        let articles = alarmcom_articles();
+        let bodies: Vec<String> = articles.iter().map(|(_, body)| body.clone()).collect();
+        let scores = score_against_corpus(PASSWORD_QUESTION, &bodies, scoring);
+        articles
+            .iter()
+            .map(|(label, _)| *label)
+            .zip(scores)
+            .collect()
+    }
+
+    fn score_of(scored: &[(&'static str, f32)], label: &str) -> f32 {
+        scored
+            .iter()
+            .find(|(l, _)| *l == label)
+            .unwrap_or_else(|| panic!("article {label} missing from {scored:?}"))
+            .1
+    }
+
+    /// `server/data/urtect/products.json` と同じ 3 機種を持つ snapshot。
+    /// 型番除外集合は本番と同じ `model_runs_from_snapshot` 経由で作る
+    /// （テスト専用の別経路を作ると、分解方法のズレという本件の要点を検証できない）。
+    fn urtect_product_snapshot() -> GetGraphSnapshotResponse {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphNode as PN};
+        let schema = "urtect";
+        let product = |model: &str, aliases: &str| -> PN {
+            PN {
+                node_id: manual_node_id(schema, KIND_PRODUCT, model),
+                node_type: KIND_PRODUCT.to_string(),
+                display_text: String::new(),
+                degree: 0,
+                community: None,
+                attributes: [
+                    ("product_key".to_string(), model.to_string()),
+                    ("name".to_string(), model.to_string()),
+                    ("model".to_string(), model.to_string()),
+                    ("aliases".to_string(), aliases.to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            }
+        };
+        GetGraphSnapshotResponse {
+            nodes: vec![
+                product("ADC-V724", ""),
+                product("ADC-V724X", ""),
+                product("ADC-VC727P", ""),
+            ],
+            edges: Vec::new(),
+            truncated: false,
+            total_node_count: 0,
+        }
+    }
+
+    /// 本番と同じ構成の v2 スコアリング（kill switch on + snapshot 由来の型番除外集合）。
+    fn scoring_v2() -> ManualScoring {
+        ManualScoring {
+            v2_enabled: true,
+            model_runs: model_runs_from_snapshot(&urtect_product_snapshot()),
+        }
+    }
+
+    #[test]
+    fn model_runs_from_snapshot_splits_models_the_same_way_questions_are_split() {
+        // 質問側の content_runs と同じ分解でなければ除外が効かない（"ADC-V724" という
+        // 1 語のままでは、質問由来の run "adc" / "v724" のどちらとも照合できない）。
+        let runs = model_runs_from_snapshot(&urtect_product_snapshot());
+        for expected in ["adc", "v724", "v724x", "vc727p"] {
+            assert!(runs.contains(expected), "expected {expected} in {runs:?}");
+        }
+        // 質問「ADC-V724 を…」から出る型番 run が確かに除外対象に入っていること。
+        let question_runs = content_runs(PASSWORD_QUESTION);
+        assert!(question_runs.contains(&"adc".to_string()));
+        assert!(question_runs.contains(&"v724".to_string()));
+    }
+
+    #[test]
+    fn model_runs_from_snapshot_splits_comma_joined_aliases() {
+        // ingest 側は aliases を "," 連結で 1 属性に詰める
+        // （manual::ingest_model::build_product_node）。"," は content_runs の run 区切り。
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphNode as PN};
+        let node = PN {
+            node_id: manual_node_id("urtect", KIND_PRODUCT, "ADC-V724"),
+            node_type: KIND_PRODUCT.to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: [
+                ("model".to_string(), "ADC-V724".to_string()),
+                ("aliases".to_string(), "V724 Pro,VC727P".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let snap = GetGraphSnapshotResponse {
+            nodes: vec![node],
+            edges: Vec::new(),
+            truncated: false,
+            total_node_count: 0,
+        };
+        let runs = model_runs_from_snapshot(&snap);
+        for expected in ["adc", "v724", "pro", "vc727p"] {
+            assert!(runs.contains(expected), "expected {expected} in {runs:?}");
+        }
+    }
+
+    #[test]
+    fn run_term_frequency_counts_occurrences_and_caps_bigram_rescue_at_one() {
+        // 直接一致は非重複の出現回数
+        assert_eq!(
+            run_term_frequency("パスワード", "パスワードとパスワード"),
+            2
+        );
+        assert_eq!(run_term_frequency("パスワード", "本文にはありません"), 0);
+        // bigram 救済（漢字 run 限定）は出現回数を定義できないので非ゼロ最小の 1 に固定する
+        assert_eq!(
+            run_term_frequency("設定方法", "設定を開き、方法を選択します。設定と方法。"),
+            1
+        );
+        // カタカナ run は断片救済しない（既存の回帰: バックアップ誤マッチ）
+        assert_eq!(
+            run_term_frequency("バックアップ", "アプリをチェックしてアップデートします。"),
+            0
+        );
+        // 空 run は本文長に化けさせない（防御）
+        assert_eq!(run_term_frequency("", "何かの本文"), 0);
+    }
+
+    #[test]
+    fn saturating_run_weight_clamps_to_one_and_keeps_the_v1_full_credit_condition() {
+        // tf=1 かつ len==avg_len でちょうど 1.0 ── v1（bool 一致 = 1.0）の満点条件が
+        // 上限として保存される。これが回答可能性の 3 閾値を取り直さずに済む根拠。
+        let at_average = saturating_run_weight(
+            1,
+            DocLength {
+                chars: 1000,
+                avg_chars: 1000.0,
+            },
+        );
+        assert!(
+            (at_average - 1.0).abs() < 1e-6,
+            "tf=1 at average length must be exactly 1.0, got {at_average}"
+        );
+        // raw > 1 になる入力（多数回言及 × 平均より短い本文）でも 1.0 を超えない
+        let raw_above_one = saturating_run_weight(
+            50,
+            DocLength {
+                chars: 100,
+                avg_chars: 1000.0,
+            },
+        );
+        assert_eq!(
+            raw_above_one, 1.0,
+            "min clamp must cap the weight at 1.0 (score は 0..=1 を保つ契約)"
+        );
+        // 平均より長い記事の薄い言及だけが 1.0 未満に落ちる（本改修の実体）
+        let long_and_thin = saturating_run_weight(
+            1,
+            DocLength {
+                chars: 5000,
+                avg_chars: 1000.0,
+            },
+        );
+        assert!(
+            long_and_thin > 0.0 && long_and_thin < 1.0,
+            "a single mention in a long document must be discounted, got {long_and_thin}"
+        );
+        // 不一致は 0
+        assert_eq!(
+            saturating_run_weight(
+                0,
+                DocLength {
+                    chars: 100,
+                    avg_chars: 1000.0
+                }
+            ),
+            0.0
+        );
+        // avg_len=0（空コーパス / 全節が空本文）でゼロ除算 → NaN にならない
+        let degenerate = saturating_run_weight(
+            1,
+            DocLength {
+                chars: 0,
+                avg_chars: 0.0,
+            },
+        );
+        assert!(
+            degenerate.is_finite() && (0.0..=1.0).contains(&degenerate),
+            "avg_len=0 must degrade, not produce NaN; got {degenerate}"
+        );
+    }
+
+    #[test]
+    fn scoring_v1_reproduces_the_production_misranking() {
+        // kill switch off の回帰担保。本番実測どおり ②帯域幅 > ①固定IP > ③正解 になり、
+        // かつ ③④⑤ が完全同点（本番で観測された 0.6028153896331787 の 3 件同着）になる。
+        // この同点が判定の非決定性の出どころなので、v1 の性質としてここに固定しておく。
+        let scored = score_alarmcom_articles(&ManualScoring::default());
+        let answer = score_of(&scored, ANSWER_ARTICLE);
+        assert!(
+            score_of(&scored, "②帯域幅") > score_of(&scored, "①固定IP"),
+            "v1 ranking changed: {scored:?}"
+        );
+        assert!(
+            score_of(&scored, "①固定IP") > answer,
+            "v1 must still rank the irrelevant static-IP article above the answer: {scored:?}"
+        );
+        assert_eq!(
+            answer,
+            score_of(&scored, "④ログインできない"),
+            "v1 ties the answer with the login article: {scored:?}"
+        );
+        assert_eq!(
+            answer,
+            score_of(&scored, "⑤パートナー様向け(ハブ)"),
+            "v1 ties the answer with the hub page: {scored:?}"
+        );
+    }
+
+    // connect_lazy が Tokio ランタイム下での呼び出しを要求するため #[tokio::test]。
+    #[tokio::test]
+    async fn scoring_v2_ranks_the_password_reset_article_first() {
+        let ranked = rank_alarmcom_through_search(true).await;
+        assert_eq!(
+            ranked.first().map(String::as_str),
+            Some(ANSWER_SECTION_KEY),
+            "the answering article must rank first: {ranked:?}"
+        );
+    }
+
+    /// **カバレッジスコアだけでは順位が決まらないことを固定する。**
+    ///
+    /// 型番除外 + TF + 長さ正規化を入れても、①③④⑤ は**すべて 1.0 で同点**になる
+    /// （満点条件が `tf ≥ 長さ係数` なので、5,175 字の記事でも `パスワード` 2 回で届く）。
+    /// 落ちるのは `忘` を 1 度も含まない ②帯域幅 だけである。
+    ///
+    /// このテストが無いと、「同点は残っているが section_key の巡り合わせで正解が上に来た」
+    /// 状態を「直った」と誤認する。順位を決めているのが密度であることを、スコアの同点と
+    /// セットで固定する。
+    #[tokio::test]
+    async fn scoring_v2_still_ties_on_coverage_so_density_is_what_orders_them() {
+        let scored = score_alarmcom_articles(&scoring_v2());
+        let answer = score_of(&scored, ANSWER_ARTICLE);
+        assert!(
+            (answer - score_of(&scored, "①固定IP")).abs() < 1e-6,
+            "coverage is expected to tie here; if this changed, the density tiebreak may no \
+             longer be what fixes the ranking: {scored:?}"
+        );
+        // 順位は production の検索経路で決まる。
+        let ranked = rank_alarmcom_through_search(true).await;
+        let position = |key: &str| {
+            ranked
+                .iter()
+                .position(|k| k == key)
+                .unwrap_or_else(|| panic!("{key} missing from {ranked:?}"))
+        };
+        for key in MUST_RANK_BELOW_KEYS {
+            assert!(
+                position(ANSWER_SECTION_KEY) < position(key),
+                "answer must outrank {key}: {ranked:?}"
+            );
+        }
+        // 返信文の材料は上位 3 件（`harness::reply` の MAX_EXCERPTS）。無関係な 2 記事が
+        // そこへ入らないことが、下書き汚染を止める実質的な条件である。
+        let material: Vec<&str> = ranked.iter().take(3).map(String::as_str).collect();
+        for key in [KEY_STATIC_IP, KEY_BANDWIDTH] {
+            assert!(
+                !material.contains(&key),
+                "{key} is irrelevant and must not become reply material: {material:?}"
+            );
+        }
+    }
+
+    /// kill switch off では、密度 tiebreak も含めて従来どおりの並びになる。
+    ///
+    /// section_key は正解記事が最後に来るよう意図的に振ってあるので、v1 では
+    /// **同点 → section_key 昇順**で正解が最下位に沈む。これは本番で観測された
+    /// 「③④⑤ が同点で並ぶ」状態そのものであり、v2 の効果を測る基準線になる。
+    #[tokio::test]
+    async fn scoring_v1_leaves_the_answer_buried_by_the_section_key_tiebreak() {
+        let ranked = rank_alarmcom_through_search(false).await;
+        assert_eq!(
+            ranked.last().map(String::as_str),
+            Some(ANSWER_SECTION_KEY),
+            "v1 must reproduce the buried answer (this is the baseline v2 has to beat): {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn scoring_v2_keeps_the_answer_above_the_answerability_threshold() {
+        let scored = score_alarmcom_articles(&scoring_v2());
+        let answer = score_of(&scored, ANSWER_ARTICLE);
+        assert!(
+            answer > ANSWERABILITY_LOW_THRESHOLD,
+            "answer must stay answerable (> {ANSWERABILITY_LOW_THRESHOLD}), got {answer}: {scored:?}"
+        );
+    }
+
+    #[test]
+    fn scoring_v2_keeps_every_score_within_zero_and_one() {
+        // 閾値（0.6 / 0.8 / 0.95）と絶対値で比較される契約なので、上限 1.0 を割らせない。
+        let scored = score_alarmcom_articles(&scoring_v2());
+        for (label, score) in &scored {
+            assert!(
+                score.is_finite() && (0.0..=1.0).contains(score),
+                "{label} score out of range: {score} ({scored:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn scoring_v2_leaves_average_or_shorter_documents_unchanged() {
+        // design の主張「平均長以下の記事は、1 回の言及でも現行どおり満点を得る」を固定する。
+        // 単一節コーパスは len == avg_len なので、tf >= 1 の run は min クランプで 1.0 に
+        // 張り付き、v1（bool 一致）と完全に同値になる ── これが「閾値を取り直さずに済む」
+        // 根拠であり、既存の score_one 系テストが v2 でも壊れない理由でもある。
+        let cases = [
+            ("録画ルールの設定方法", "録画ルールの設定方法を説明します。設定画面から録画ルールを選択してください。"),
+            ("SDカードの推奨メーカーはどこか", "SDカードを一度抜き差ししてください。カードの向きを確認し、カチッと音がするまで挿入します。"),
+            ("カメラを浴室に設置できるか", "設置までのステップを説明します。壁面への取り付けは付属のブラケットを使用します。"),
+        ];
+        for (question, body) in cases {
+            let bodies = [body.to_string()];
+            let v1 = score_against_corpus(question, &bodies, &ManualScoring::default());
+            let v2 = score_against_corpus(question, &bodies, &scoring_v2());
+            assert_eq!(
+                v1, v2,
+                "v2 must not move scores for average-or-shorter documents (question={question})"
+            );
+        }
+    }
+
+    #[test]
+    fn model_number_only_question_falls_back_to_legacy_scoring() {
+        // 「ADC-V724」だけの質問は型番除外で run が空になる。既存の「run が取れない質問」と
+        // 同じ legacy フォールバック（crate::mcp::section_score）へ落ちることを、legacy を
+        // 直接呼んだ結果との一致で固定する。
+        let question = "ADC-V724";
+        let bodies: Vec<String> = alarmcom_articles()
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect();
+        let got = score_against_corpus(question, &bodies, &scoring_v2());
+        let query_norm = normalize_key(question);
+        let want: Vec<f32> = bodies
+            .iter()
+            .map(|b| crate::mcp::section_score(&query_norm, question, b))
+            .collect();
+        assert_eq!(got, want, "model-only question must use the legacy path");
+        // 非空虚性: legacy 経路が 1 件でも非ゼロを返すコーパスで検証している
+        // （全 0 なら「型番除外で run が消えたから 0」と区別できない）。
+        assert!(
+            want.iter().any(|s| *s > 0.0),
+            "fixture must exercise a non-trivial legacy score: {want:?}"
+        );
     }
 
     #[test]
@@ -1218,6 +1956,7 @@ mod tests {
         let hits = score_against_corpus(
             "iPhoneで使っていますが、カメラを浴室に設置できますか",
             &sections,
+            &ManualScoring::default(),
         );
         // どの節も 0.6 未満（浴室の欠落が支配する）
         assert!(
@@ -1233,7 +1972,11 @@ mod tests {
             "カメラの設置 壁面への設置は付属ブラケットでカメラを固定します。".to_string(),
             "録画ルールの設定 録画ルールを設定します。".to_string(),
         ];
-        let hits = score_against_corpus("カメラを壁面に設置できますか", &sections);
+        let hits = score_against_corpus(
+            "カメラを壁面に設置できますか",
+            &sections,
+            &ManualScoring::default(),
+        );
         // 設置節は全 run（カメラ・壁面・設置）を含むので高スコア
         assert!(
             hits.iter().any(|s| *s > 0.6),
@@ -1248,7 +1991,8 @@ mod tests {
                 .expect("connect_lazy"),
         );
         let corpus = Arc::new(crate::corpus::CorpusLoader::new(client.clone()));
-        ManualStore::new(client, corpus)
+        // search_with_snapshot 系の既存テストは v1（kill switch off）の挙動を見る。
+        ManualStore::new(client, corpus, false)
     }
 
     // connect_lazy は tonic の内部リアクタが Tokio ランタイム下での呼び出しを要求するため、

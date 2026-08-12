@@ -6,6 +6,7 @@ pub mod egress;
 pub mod extraction;
 pub mod grading;
 pub mod knowledge;
+pub mod reply;
 pub mod rules;
 pub mod scope;
 pub mod signal;
@@ -54,6 +55,12 @@ pub struct Harness {
     /// 意味検索（ベクトル経路）を manual retrieval に合成するか
     /// （config.harness.vector_route_enabled、urtect design §2.3）。
     pub vector_route_enabled: bool,
+    /// 顧客向け返信文の**下書き**生成に使う LLM（デモ用）。
+    /// `harness.customer_reply_draft_enabled = false`（既定）なら `None` で、
+    /// `evaluate` は下書きを作らない。詳細は `harness::reply` の doc を参照。
+    pub reply_drafter: Option<crate::llm::AnthropicClient>,
+    /// 返信文下書きの `max_tokens`（config.harness.customer_reply_draft_max_tokens）。
+    pub reply_draft_max_tokens: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +91,17 @@ pub struct EvaluationOutcome {
     pub related_cases: Vec<RelatedCase>,
     /// 今ターンの signal 抽出がどの経路を通ったか（S1-11 改訂・WORM 監査にも記録済み）。
     pub extraction_mode: extraction::ExtractionMode,
+    /// 顧客向け返信文の**下書き**（デモ用シミュレーション出力）。
+    ///
+    /// `harness.customer_reply_draft_enabled = false`（既定）、LLM 未設定、生成失敗のいずれでも
+    /// `None`。**権威ある回答ではない**（文面の正本は client 側という spec の結論は不変）。
+    pub customer_reply_draft: Option<String>,
+    /// 上記の下書きが `max_tokens` で**途中で切れている**か。
+    ///
+    /// 切れ目がたまたま「。」の直後に落ちると下書きは完成文に見えるため、これを client へ
+    /// 伝えないと、**末尾の注意書きだけが落ちた案内**がそのまま顧客へ送られうる。
+    /// 下書きが無いとき（`customer_reply_draft` が `None`）は常に `false`。
+    pub customer_reply_draft_truncated: bool,
 }
 
 /// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
@@ -144,6 +162,28 @@ impl Harness {
         // `from_config` が Err を返し、ここで起動が fail closed する。
         let anthropic_client = crate::llm::AnthropicClient::from_config(&config.llm)
             .context("configure llm signal extraction client")?;
+        // 返信文下書き（デモ用）は同じクライアントを使い回す。`customer_reply_draft_enabled`
+        // が true でも `[llm] enabled = false` なら client が無いので、下書きは黙って出ない
+        // （signal 抽出が lexicon 単独へフォールバックするのと同じ degrade。起動は止めない）。
+        let reply_drafter = if config.harness.customer_reply_draft_enabled {
+            // max_tokens = 0 は API エラーになるだけで、毎回 warn + null という分かりにくい
+            // 壊れ方をする。設定ミスは起動時に気づける形で弾く。
+            anyhow::ensure!(
+                config.harness.customer_reply_draft_max_tokens > 0,
+                "harness.customer_reply_draft_max_tokens must be greater than 0 when \
+                 customer_reply_draft_enabled = true (got 0; every draft would fail at the API \
+                 and silently return null)"
+            );
+            if anthropic_client.is_none() {
+                tracing::warn!(
+                    "harness.customer_reply_draft_enabled = true ですが [llm] enabled = false の\
+                     ため下書きは生成されません（customer_reply_draft は常に null になります）"
+                );
+            }
+            anthropic_client.clone()
+        } else {
+            None
+        };
         let llm_classifier: Option<Arc<dyn extraction::ClassifyLlm>> =
             anthropic_client.map(|client| {
                 Arc::new(extraction::AnthropicSignalClassifier::new(
@@ -176,10 +216,13 @@ impl Harness {
             manual: Some(crate::manual::retrieval::ManualStore::new(
                 client.clone(),
                 corpus.clone(),
+                config.harness.manual_scoring_v2_enabled,
             )),
             corpus: Some(corpus),
             default_route: config.harness.default_escalation_route.clone(),
             vector_route_enabled: config.harness.vector_route_enabled,
+            reply_drafter,
+            reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
         })
     }
 
@@ -807,6 +850,15 @@ impl Harness {
                 Some(extraction_mode),
             )
             .await?;
+        // [デモ] 顧客向け返信文の下書き。**判定が確定した後**に、その判定の制約下でだけ作る。
+        // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
+        // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
+        let reply_draft = self
+            .draft_customer_reply(question, &decision_result, &section_hits, &resolutions)
+            .await;
+        let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
+        let customer_reply_draft = reply_draft.map(|d| d.text);
+
         Ok(EvaluationOutcome {
             decision: decision_result,
             signals,
@@ -817,7 +869,90 @@ impl Harness {
             audit_event_id,
             related_cases,
             extraction_mode,
+            customer_reply_draft,
+            customer_reply_draft_truncated,
         })
+    }
+
+    /// 顧客向け返信文の下書きを 1 案作る（デモ用）。無効化時・LLM 未設定時・生成失敗時は
+    /// `None` を返し、**評価そのものは成功させる**。
+    ///
+    /// 材料の選別（Escalate ではマニュアル本文を一切渡さない）は `reply::build_reply_brief`
+    /// が担う。ここはその結果を送るだけで、安全判断をこの関数に持ち込まない。
+    async fn draft_customer_reply(
+        &self,
+        question: &str,
+        decision: &decision::AnswerDecision,
+        hits: &[SectionHit],
+        resolutions: &[rules::KnownResolution],
+    ) -> Option<crate::llm::ReplyDraft> {
+        let drafter = self.reply_drafter.as_ref()?;
+        // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
+        // 引いて渡す（引けなければ材料ゼロのまま = でっち上げない。reply.rs の doc を参照）。
+        let kr_answer = match decision {
+            decision::AnswerDecision::Allowed {
+                source: decision::AnswerSource::KnownResolution,
+                known_resolution_id: Some(kr_id),
+                ..
+            } => resolutions
+                .iter()
+                .find(|kr| &kr.id == kr_id)
+                .map(|kr| kr.answer.as_str()),
+            _ => None,
+        };
+        let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
+        let system = reply::build_reply_system_prompt(&brief);
+        let user = reply::build_reply_user_message(question, &brief);
+        let draft = match drafter
+            .draft_reply(&system, &user, self.reply_draft_max_tokens)
+            .await
+        {
+            Ok(draft) => draft,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    kind = ?brief.kind,
+                    "customer reply draft generation failed; returning the evaluation without a \
+                     draft (customer_reply_draft = null). The decision itself is unaffected"
+                );
+                return None;
+            }
+        };
+
+        // [S1-4] 出口ゲート。spec「egress 位置の固定」は AI 生成 draft も人間製 outbound も
+        // 同一の egress_gate を通すと定めている（人間製も信頼しない）。**サーバ生成の下書きは
+        // その筆頭**であり、ここを迂回すると新経路だけ NG 表現・暗示効能の統制が外れる。
+        // block / abstain は黙って null にせず、必ず理由付きで warn する（規約: 握りつぶし禁止）。
+        // チャネルは Step 1 の固定値 operator（S1-4 / 遵守事項 4。rmcp_server の
+        // operator_emit_context と同じ）。Step 1 の判定は channel 非依存。
+        let ctx = egress::EmitContext {
+            channel: egress::EmitChannel::Operator,
+        };
+        let verdict = egress::egress_gate(&draft.text, &ctx, &self.ng);
+        match verdict {
+            egress::EgressVerdict::Pass => Some(draft),
+            ref blocked => {
+                // 一致した NG 語は**サーバ自身の辞書由来**（顧客データではない）ので、ログへ
+                // 出して安全であり原因特定が一気に速くなる。下書き本文そのものは出さない
+                // （NG 表現をログへ転記しない）。文字数だけ添えて切り分けの材料にする。
+                let term = match blocked {
+                    egress::EgressVerdict::Block { term }
+                    | egress::EgressVerdict::Abstain { term } => term.as_str(),
+                    egress::EgressVerdict::Pass => "",
+                };
+                tracing::warn!(
+                    verdict = blocked.label(),
+                    term,
+                    draft_chars = draft.text.chars().count(),
+                    kind = ?brief.kind,
+                    "customer reply draft was blocked by the egress gate; returning \
+                     customer_reply_draft = null. The decision itself is unaffected. Inspect the \
+                     manual excerpts or the known_resolution behind this decision — the draft \
+                     contained a term the NG dictionary rejects"
+                );
+                None
+            }
+        }
     }
 
     /// record_answer_attempt の入口強制（S1-1 の短絡順序を emit 側でも閉じる）:
@@ -976,6 +1111,9 @@ mod tests {
             corpus: None,
             default_route: "triage".to_string(),
             vector_route_enabled: false,
+            // 返信文下書きはデモ用で既定 off。テストは判定そのものを見るため常に無効。
+            reply_drafter: None,
+            reply_draft_max_tokens: 700,
         }
     }
 
@@ -1124,5 +1262,160 @@ mod tests {
                 crate::config::ManualSchemaKind::LegacySection,
             )
             .is_err());
+    }
+
+    // ---- 下書き生成と出口ゲートの**配線**（spec S1-4「egress 位置の固定」）----
+    //
+    // 以下 3 件は `draft_customer_reply` が生成結果を実際に `egress_gate` へ通していることを、
+    // stub LLM に下書きを喋らせて検証する。**ゲート単体の判定テストではない**
+    // （それは `egress.rs` の tests と `reply.rs` の
+    // `egress_gate_blocks_and_abstains_on_ng_terms` が持つ）。
+    //
+    // ここを間接的な検証（ゲート単体の呼び出し）で済ませると、`draft_customer_reply` から
+    // `egress_gate` の呼び出しを外しても**全テストが緑のまま NG 表現の統制だけが外れる**。
+
+    /// 本番（Cloud Run）が読むのと同じ NG 辞書。**推測の NG 語をテストに書かない**ため、
+    /// 実データを読み、そこから語を取る（`server/config.cloudrun.toml` の
+    /// `ng_dictionary_path = "data/urtect/ng-dictionary.json"`）。
+    /// パスは cwd 非依存にする（`cargo test` の起動位置に依存させない）。
+    fn production_ng_dictionary() -> egress::NgDictionary {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/urtect/ng-dictionary.json"
+        ));
+        egress::NgDictionary::from_path(path).expect("production ng dictionary must load and parse")
+    }
+
+    fn operator_emit_context() -> egress::EmitContext {
+        egress::EmitContext {
+            channel: egress::EmitChannel::Operator,
+        }
+    }
+
+    /// stub LLM に `draft_text` をそのまま返させ、`draft_customer_reply` の結果を返す。
+    ///
+    /// `AnthropicClient` のフィールドは `llm.rs` で private なので `from_config` 経由で組む。
+    /// API キーは env `CS_SUPPORT_LLM_API_KEY` が優先されるが、未設定の環境でも構築できるよう
+    /// 一時ファイルを置く（stub は鍵を検証しない。ここで必要なのは「鍵が解決できて client が
+    /// 構築されること」だけ）。env を書き換えないのは、並行テストと競合させないため。
+    async fn draft_customer_reply_via_stub(draft_text: &str) -> Option<crate::llm::ReplyDraft> {
+        let body = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": draft_text}],
+        })
+        .to_string();
+        let (endpoint, _log) = crate::llm::test_support::spawn_messages_stub(body).await;
+
+        let dir = std::env::temp_dir().join(format!("harness-reply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let key_path = dir.join("llm-api-key");
+        std::fs::write(&key_path, "test-key\n").expect("write api key file");
+        let drafter = crate::llm::AnthropicClient::from_config(&crate::config::LlmConfig {
+            enabled: true,
+            endpoint,
+            api_key_file: Some(key_path.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .expect("llm client must build from the stub config")
+        .expect("enabled = true with a readable key file must yield a client");
+
+        let harness = Harness {
+            reply_drafter: Some(drafter),
+            ng: production_ng_dictionary(),
+            ..harness_for_test()
+        };
+        let decision = decision::AnswerDecision::Allowed {
+            source: decision::AnswerSource::Manual,
+            evidence_section_keys: vec!["sec-a".to_string()],
+            known_resolution_id: None,
+            stakes: decision::Stakes::Low,
+            threshold: 0.6,
+        };
+        let hits = vec![SectionHit {
+            section_key: "sec-a".to_string(),
+            title_ja: "タイトル".to_string(),
+            body_ja: Some("マニュアル本文".to_string()),
+            body_en: None,
+            translation_status: None,
+            breadcrumb: Vec::new(),
+            score: 0.9,
+            source_url: None,
+        }];
+        harness
+            .draft_customer_reply("カメラが反応しません", &decision, &hits, &[])
+            .await
+    }
+
+    /// 「NG 表現を含まない下書きなら通る」ことは、**下記 2 件の偽陽性を潰すために必須**。
+    /// これが無いと、`reply_drafter` を無効化しただけ（＝そもそも生成されない）でも
+    /// 「ゲートが効いた」ように見えて 2 件とも緑になる。
+    #[tokio::test]
+    async fn a_clean_generated_draft_is_returned_as_is() {
+        const CLEAN: &str =
+            "お問い合わせありがとうございます。担当部署より改めてご連絡いたします。";
+        // 前提の明示: この文面は NG 辞書に触れていない（辞書が育って触れた場合は
+        // ここが落ち、テスト本体の失敗と区別できる）。
+        assert!(
+            matches!(
+                egress::egress_gate(CLEAN, &operator_emit_context(), &production_ng_dictionary()),
+                egress::EgressVerdict::Pass
+            ),
+            "precondition: pick a draft text that the current NG dictionary passes"
+        );
+        let draft = draft_customer_reply_via_stub(CLEAN)
+            .await
+            .expect("a draft with no NG term must survive the gate");
+        // 生成結果がそのまま返ること。null でないだけでなく**本文が一致する**ことを見るのは、
+        // 下書きが実際に stub から流れてきた証拠にするため。
+        assert_eq!(draft.text, CLEAN);
+        assert!(!draft.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_generated_draft_with_a_blocked_ng_term_is_dropped() {
+        let ng = production_ng_dictionary();
+        let term = ng
+            .block_terms
+            .first()
+            .expect("the production NG dictionary must have at least one block term")
+            .clone();
+        let drafted =
+            format!("お問い合わせありがとうございます。本製品は「{term}」とご案内しております。");
+        assert!(
+            matches!(
+                egress::egress_gate(&drafted, &operator_emit_context(), &ng),
+                egress::EgressVerdict::Block { .. }
+            ),
+            "precondition: the term taken from the dictionary must actually block"
+        );
+        assert!(
+            draft_customer_reply_via_stub(&drafted).await.is_none(),
+            "draft_customer_reply must run the generated draft through egress_gate and drop a \
+             blocked one (customer_reply_draft = null)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generated_draft_with_an_abstain_ng_term_is_dropped() {
+        // block だけを特別扱いする実装（abstain を素通し）を許さない。
+        let ng = production_ng_dictionary();
+        let term = ng
+            .abstain_terms
+            .first()
+            .expect("the production NG dictionary must have at least one abstain term")
+            .clone();
+        let drafted =
+            format!("お問い合わせありがとうございます。本製品は「{term}」とご案内しております。");
+        assert!(
+            matches!(
+                egress::egress_gate(&drafted, &operator_emit_context(), &ng),
+                egress::EgressVerdict::Abstain { .. }
+            ),
+            "precondition: the term taken from the dictionary must actually abstain"
+        );
+        assert!(
+            draft_customer_reply_via_stub(&drafted).await.is_none(),
+            "abstain is 'do not emit' too; the draft must be dropped, not passed through"
+        );
     }
 }

@@ -88,6 +88,40 @@ pub struct EvaluateAnswerabilityResponse {
     /// 今ターンの signal 抽出モード（S1-11 改訂）: `lexicon_only` / `hybrid` /
     /// `lexicon_fallback`。WORM 監査にも同値を記録している。
     pub extraction_mode: String,
+    /// 顧客へ送る返信文の**下書き**（デモ用。無効化時・生成失敗時・出口ゲートで弾かれた
+    /// ときは null）。
+    ///
+    /// **これは検証前の下書きであって、承認された回答ではない。送信前に必ず担当者が内容を
+    /// 確認すること。**
+    ///
+    /// `decision.decision` が escalate のとき、サーバは**内部マニュアル本文を生成に
+    /// 渡していない**（内部資料の漏洩は構造的に防いでいる）。ただし**文面に解決方法が
+    /// 現れないことは保証しない** — モデルの事前知識や、顧客が問い合わせ本文に書いた
+    /// 手順が混じりうる。escalate の下書きは「取り次ぐ旨」として扱い、内容を鵜呑みに
+    /// しないこと。
+    ///
+    /// **escalate のとき `hits` から手順を補ってはならない。** サーバが意図的に渡さな
+    /// かった本文で下書きを補完することは、回答してはいけないと判定した場面で答える
+    /// ことに等しく、判定そのものを無効化する。
+    ///
+    /// 開示範囲の正本は `decision.disclosure_scope` であり、この文面ではない。
+    pub customer_reply_draft: Option<String>,
+    /// `customer_reply_draft` が生成上限で**途中で切れている**か。
+    ///
+    /// **true のときは、そのまま顧客へ送ってはならない。** 理由は 2 つある。
+    ///
+    /// 1. **出口ゲートの統制が構造的に迂回されうる。** `egress_gate` は NG 語の部分文字列
+    ///    一致で判定するため、切断が「絶対に治ります」を「絶対に治りま」で切ると**ゲートは
+    ///    Pass する**。主張は読者に伝わるのに、統制だけが外れた状態になる
+    /// 2. **末尾の注意書きが落ちうる。** 切れ目がたまたま句点の直後だと文面は完成して
+    ///    見えるが、日本語のビジネス文は結び・注意書き（「電源を切ってから作業してください」
+    ///    等）が末尾に来るため、**安全上の但し書きだけが欠けた案内**になっている可能性がある
+    ///
+    /// 補い方は `decision.decision` で変わる。**allowed のときに限り** `hits` の原文と
+    /// 突き合わせて補うこと。**escalate のときは補わない** — 上記
+    /// `customer_reply_draft` の注記のとおり、判定そのものを無効化するため。
+    /// 切れた下書きは破棄し、取り次ぐ旨だけを書く。
+    pub customer_reply_draft_truncated: bool,
 }
 
 /// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
@@ -573,7 +607,17 @@ impl CsSupportRmcpServer {
 
     #[tool(
         name = "evaluate_answerability",
-        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。"
+        // **この description に書くのは「client が振る舞いを変えるべきこと」だけにする。**
+        // 理由・背景は返却型の field description（`EvaluateAnswerabilityResponse`）へ置く。
+        //
+        // tool description はモデルへ確実に届く唯一の経路なので、放っておくと
+        // 説明が全部ここへ集まって、判断を変える指示が背景説明に埋没する。
+        // 逆に field description は届くか不明なので、**振る舞いを変える指示を
+        // そちらだけに置いてはならない**（この非対称を逆向きに踏んだのが W-10）。
+        //
+        // 分節のラベル（【…】）は、呼び出し方の要件（case_id）と返却物の処理を
+        // モデルが取り違えないために置いている。
+        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。【返却された customer_reply_draft の扱い】customer_reply_draft は検証前の下書きであり、承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れているため、そのまま顧客へ送らないこと。decision.decision が allowed の場合に限り、hits と突き合わせて補完してよい。decision.decision が escalate の場合は、解決方法・手順を一切補わず、取り次ぐ旨に留めること（判定を無効化するため）。"
     )]
     async fn evaluate_answerability(
         &self,
@@ -615,6 +659,8 @@ impl CsSupportRmcpServer {
                 .map(RelatedCaseJson::from)
                 .collect(),
             extraction_mode: outcome.extraction_mode.as_str().to_string(),
+            customer_reply_draft: outcome.customer_reply_draft,
+            customer_reply_draft_truncated: outcome.customer_reply_draft_truncated,
         }))
     }
 

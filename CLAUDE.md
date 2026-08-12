@@ -212,8 +212,9 @@ cs-support-mcp/
 - **トークンは自前発行しない。** 一時期は自前のアクセス/リフレッシュトークンを署名付きで発行していたが、デモに対して寿命・失効・鍵管理を自前で抱える設計が過剰と判断され撤回した。現行の `/oauth/token` は **Google が発行した access_token / refresh_token / expires_in をそのままクライアントへ返し**、`grant_type=refresh_token` は受け取った refresh_token を **Google の token endpoint へ中継する**だけである。AS の外殻（DCR / authorize / callback / token）は claude.ai の DCR のために残している。
 - **confused deputy 対策は redirect_uri の許可リスト。** `/oauth/register`（DCR）は無認証のため、redirect_uri を無制限に受け付けると第三者が任意ホストの redirect_uri を登録でき、`callback` がその第三者へ認可コードを配送してしまう。`is_acceptable_redirect_uri`（`server/src/oauth/authserver.rs`）が https を `claude.ai` へのホスト完全一致（サフィックス一致ではない）に、http を loopback のみに絞ることでこの経路を閉じている。一時期はこれを自前の同意画面（`/oauth/consent`）で塞いでいたが、許可リスト導入により経路自体が消えたため撤去済み。**2 段目のリダイレクト（この AS → 動的登録クライアント）は Google 側の redirect_uri 設定では一切守られない**点に注意（1 段目の `https://<host>/oauth/callback` 登録とは別物）。詳細: `docs/superpowers/specs/2026-07-22-restrict-redirect-uri-design.md`。
 - **失効は Google 側で行う。** このサーバは失効台帳を持たないため、個別のトークン失効手段が無い。利用者単位の失効は Google アカウントのアクセス権限管理から行う。
-- 署名が必要なのは client_id / state / 認可コードだけ（改竄されると redirect_uri の書き換えや認可コード偽造が成立するため）。**署名鍵は起動時に CSPRNG で生成してメモリに保持する**（`SigningKey::generate`）。env にも Secret Manager にも鍵は無い。
-- **再起動時の影響**: 進行中のログインフロー（state / 認可コード、最長 600 秒）と DCR 登録は無効になる。DCR は claude.ai が再登録すれば自動的に回復する。**アクセストークンとリフレッシュトークンは Google 発行なので、再起動しても利用者はログアウトしない。**
+- 署名が必要なのは client_id / state / 認可コードだけ（改竄されると redirect_uri の書き換えや認可コード偽造が成立するため）。**署名鍵は `CS_SUPPORT_OAUTH_SIGNING_KEY`（Secret Manager 注入）から読む。** 未設定だと起動時に CSPRNG で生成して warn するが、その状態では**再起動・コールドスタートのたびに利用者の接続が切れる**（下記）。
+- **再起動時の影響**: **署名鍵が同一なら、進行中のログインフロー（state / 認可コード、最長 600 秒）も DCR 登録も再起動をまたいで有効**。アクセストークンとリフレッシュトークンは Google 発行なのでそもそもプロセス状態に依存しない。
+  - **鍵が変わると（＝未注入時は毎回）両方が無効になり、`grant_type=refresh_token` が `unverifiable_client_id` → `invalid_grant` で落ちて全利用者が再ログインになる。** 「DCR は claude.ai が再登録すれば自動回復する」はリフレッシュ経路には当てはまらない（claude.ai はリフレッシュ前に登録をやり直さず、`invalid_grant` を受け取るだけ）。**これが 2026-08 まで実際に起きていた不具合である。**
 - リクエスト経路の Bearer 検証は `GoogleTokenVerifier`（tokeninfo 照会）。`aud` の完全一致・`email_verified`・安定した `sub` の取得・TTL キャッシュを行う。Google に到達できない場合は **503** を返す（401 に倒すと Google 障害が全利用者の強制ログアウトに化けるため）。
 - **警告**: 現状、Google アカウントで認証さえ通れば誰でも supervisor として `add_known_resolution` を含む全操作を実行できる（`server/src/harness/authn.rs` の `lookup_by_identity` が突合を行わず無条件に supervisor 解決するため）。actor 突合表の DB 実装が入るまで、アクセス制御としては不十分と扱うこと。詳細は `specs/production-cs-mcp.md` の「AuthN 現状」節を参照。
 - **警告（上記の規模）**: Google OAuth 同意画面は 2026-07-21 に External（本番公開）へ切替済みで、テストユーザによる制限は無い。したがって上記「誰でも」の母集団は sivira.co 内部ではなく **全世界の任意の Google アカウント**である。OAuth クライアントが Internal（組織限定）だと仮定しないこと。
@@ -329,7 +330,7 @@ ssh vegapunk 'ruby -ryaml -e "c=YAML.load_file(File.expand_path(%q[~/.config/veg
 OAuth クライアントの値を設定する（本番と同一のものを使ってよい。client_id は公開識別子だが
 **client_secret は真の秘密**なので、コマンド例に直書きせず各自の値に置き換えること）。
 
-OAuth 署名鍵の env は無い。起動時に CSPRNG で生成される。
+OAuth 署名鍵（`CS_SUPPORT_OAUTH_SIGNING_KEY`）はローカルでは未設定でよい。起動時に CSPRNG で生成され、その旨が warn に出る。ローカルは Google の callback（`https://127.0.0.1:3443/oauth/callback` が Google 未登録）が通らずログインフロー自体を完走できないため、鍵が再起動で変わっても支障が無い。**本番では必ず注入すること**（未注入だとデプロイ・コールドスタートのたびに接続が切れる。Cloud Run 節を参照）。
 
 ただし `https://127.0.0.1:3443/oauth/callback` は Google 側に未登録のため、ブラウザ経由の
 OAuth ログインフローそのものはローカルで完結しない。ローカルでの疎通確認は、Bearer 無し
@@ -398,13 +399,20 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
 - env（fail-closed 境界で2群に分けて扱うこと）:
   - **未設定だと起動に失敗する**: `CS_SUPPORT_PUBLIC_DOMAIN`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET`、`CS_SUPPORT_LLM_API_KEY`（`config.cloudrun.toml` が `[llm] enabled = true` のため。鍵を解決できないと `server/src/llm.rs` の `AnthropicClient::from_config` で起動時 fail closed）
   - **未設定でも起動する**: `VEGAPUNK_ENDPOINT`（`config.cloudrun.toml` の `vegapunk_endpoint` キーの値にフォールバック。env があれば `server/src/config.rs` の `AppConfig::load` が上書き）、`VEGAPUNK_BEARER_TOKEN`
-  - **そもそも env が無い**: OAuth の署名鍵。起動時に CSPRNG で生成してメモリに置く（`server/src/oauth/signing.rs` の `SigningKey::generate`）。Secret Manager にも置かない。
-- Secret Manager injection で注入するのは **`VEGAPUNK_BEARER_TOKEN` / `CS_SUPPORT_LLM_API_KEY` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET` の 3 つのみ**（真に秘密の値）。`CS_SUPPORT_PUBLIC_DOMAIN` は公開ホスト名、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は公開識別子であり、平文 env で構わない。非機密値まで Secret Manager に入れると「どれが本当の秘密か」の判断基準が失われる。
-- **再デプロイ・再起動で利用者はログアウトしない。** アクセストークンとリフレッシュトークンは Google が発行した値をそのまま中継しているため、こちらのプロセス状態に依存しない。再起動で失われるのは進行中のログインフロー（最長 600 秒）と DCR 登録だけで、後者は claude.ai の再登録で自動的に回復する。
-- **一括失効手段は無い。** 旧構成では署名鍵の差し替えが全トークンの一括失効になっていたが、自前トークンを廃止した現在その手段は存在しない。失効は Google 側（アカウントのアクセス権限管理）で行う。
+  - **未設定でも起動するが、設定しないと接続が切れ続ける**: `CS_SUPPORT_OAUTH_SIGNING_KEY`（OAuth 署名鍵）。未設定なら起動時に CSPRNG で生成し warn する（`server/src/main.rs` の `resolve_signing_key`）。**設定されているが 32 バイト未満の場合は起動時 fail closed**（設定したつもりで脆い鍵を使い続けないため）。
+- Secret Manager injection で注入するのは **`VEGAPUNK_BEARER_TOKEN` / `CS_SUPPORT_LLM_API_KEY` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET` / `CS_SUPPORT_OAUTH_SIGNING_KEY` の 4 つのみ**（真に秘密の値）。`CS_SUPPORT_PUBLIC_DOMAIN` は公開ホスト名、`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` は公開識別子であり、平文 env で構わない。非機密値まで Secret Manager に入れると「どれが本当の秘密か」の判断基準が失われる。
+- **署名鍵を設定していれば、再デプロイ・再起動で利用者はログアウトしない。** アクセストークン／リフレッシュトークンは Google 発行の値をそのまま中継しているのでプロセス状態に依存せず、DCR 登録と進行中のログインフローは署名鍵さえ同じなら再起動をまたいで有効。
+  - **警告（2026-08 まで実際に起きていた不具合）**: 署名鍵をプロセスごとに生成していた頃は、**デプロイのたび・アイドル明けのコールドスタートのたびに接続が切れていた**。`/oauth/token` の `grant_type=refresh_token` は毎回 `client_id`（署名鍵で封緘した DCR 登録ブロブ）を検証しており、鍵が変わると `unverifiable_client_id` → `invalid_grant` を返す。OAuth クライアントは `invalid_grant` を受けると仕様どおり refresh_token を破棄するため、Google のトークンが有効でも再ログインになる。`minScale` 未設定でゼロスケールするので、**放置しておくだけで切れる**。「Google 発行だから再起動に強い」という以前の説明はこの経路を見落としていた。
+- **一括失効は署名鍵のローテーションで行う。** Secret Manager の `CS_SUPPORT_OAUTH_SIGNING_KEY` を差し替えて再デプロイすると、全 DCR 登録と進行中のログインフローが無効になり、全クライアントが再接続を要求される。個別利用者の失効は従来どおり Google 側（アカウントのアクセス権限管理）で行う。
 - `[llm] enabled = true` のため、**顧客問い合わせ本文が Anthropic API へ送信される**。運用上の注意点として認識しておくこと。
+  さらに `[harness] customer_reply_draft_enabled = true`（デモ用の返信文下書き）のときは、**evaluate 1 回につき Anthropic 呼び出しが 1 回増え、Allowed 時はマニュアル抜粋（最大 2,500 字 × 3 件）または known_resolution の回答本文も送信される**（質問本文 2,000 字と合わせて、**抜粋が上限まで埋まった場合の最大で** 1 下書きあたり概ね 8〜11k トークン。短い記事ではこれを大きく下回る）。切り戻しは `server/config.cloudrun.toml` のこの行を `false` にして再デプロイするだけ。下書きは `egress_gate` を通っており、NG 表現が出た場合は `customer_reply_draft` が `null` になる（理由は warn ログに出る）。
   `VEGAPUNK_BEARER_TOKEN` 未設定時は起動自体は成功するが、vegapunk 呼び出し（`search_manual` 等）だけが
   失敗する（`server/src/main.rs` の `read_bearer_token`。空文字がそのまま使われるため fail-closed にならない点に注意）。
+- **`[harness] manual_scoring_v2_enabled = true`（manual 検索スコア v2）**: 型番 run 除外 / TF / 長さ正規化 / 密度 tiebreak の **4 つをまとめて**切り替える kill switch（既定 false、Cloud Run 構成でのみ true）。**切り戻しは `server/config.cloudrun.toml` のこの行を `false` にして再デプロイするだけ**で、スコアも順位も従来へ完全に戻る。
+  - 入れた理由: 型番を書いて質問すると、**製品非依存で書かれた正解記事が構造的に減点され**、型番をたまたま含む無関係な長文が上位に来ていた（本番実測。詳細と実測値は `docs/superpowers/specs/2026-08-05-manual-scoring-tf-lengthnorm-design.md`）。順位は `evaluate_answerability` の返信文下書きが使う材料（上位 3 件）を決めるため、**順位汚染はそのまま下書きの品質に出る**。
+  - **corpus 全体の recall は未測定**（vegapunk 不介入のため）。保証しているのは実データ 5 記事に対する順位と、スコアが 0〜1 に収まることだけ。vegapunk 復旧後に `verify_alarmcom` で before/after を測り、閾値の妥当性を再確認すること。
+  - **既知の限界**: カテゴリのハブページ（`/Partner` 等の目次的な記事）は語彙統計では正解記事と区別できず、上位に残りうる。誤った手順は持ち込まないが、材料の 1 枠を消費する。
+- **抜粋の切り詰めは warn に出る**（`server/src/harness/reply.rs` の `truncate_material`）。実データでは記事 5 件中 2 件が `MAX_EXCERPT_CHARS = 2,500` を超え（5,175 字 / 5,477 字）、**半分近くが落ちる**。下書きが「資料に記載がありません」と答えたら、まずこの warn（`route` / `material_id` / `original_chars`）を確認すること。
 
 ビルド & デプロイ:
 
@@ -423,6 +431,51 @@ gcloud run jobs update backfill-concept-keys --project sivira-cs-support --regio
 ```
 
 `<tag>` は service と全 job（`ingest-rules` / `ingest-urtect` / `merge-schema` / `backfill-concept-keys`）で必ず同じ値を使うこと（tag をずらすと service と job の実装がずれる）。`backfill-concept-keys` job は初回のみ `merge-schema` と同じ VPC connector / service account / Secret Manager injection で `gcloud run jobs create` が必要（未作成の場合、上記 `jobs update` は失敗する）。
+
+#### OAuth 署名鍵（初回のみ）
+
+`CS_SUPPORT_OAUTH_SIGNING_KEY` が未注入だと、デプロイ・コールドスタートのたびに利用者の接続が切れる（上記「警告」を参照）。secret を 1 度だけ作り、service に注入する。
+
+**鍵材料は必ず `openssl rand -base64 32` の出力を使うこと。** 実装の長さ検査（32 バイト）は長さしか見ておらず、覚えやすい 32 文字も通る。鍵が推測されると redirect_uri 許可リストの迂回と、認可コードの復号（＝利用者の Google トークン取得）が両方成立する（下記「blast radius」）。
+
+```sh
+openssl rand -base64 32 | gcloud secrets create cs-support-oauth-signing-key --project sivira-cs-support --data-file=-
+
+# **IAM 付与を忘れないこと。** ランタイム SA がこの secret を読めないと revision の起動に
+# 失敗し、デプロイごとサービスが落ちる（新 secret を足すときの定番の踏み外し）。
+# <runtime-sa> は既存 3 secret と同じ SA。次のコマンドで確認する（1 行で実行すること）:
+#   gcloud run services describe cs-support-mcp --project sivira-cs-support --region asia-northeast1 --format='value(spec.template.spec.serviceAccountName)'
+gcloud secrets add-iam-policy-binding cs-support-oauth-signing-key --project sivira-cs-support --member serviceAccount:<runtime-sa> --role roles/secretmanager.secretAccessor
+
+# バージョンは :latest ではなく番号で固定する（理由は下記ローテート手順）。
+gcloud run services update cs-support-mcp --project sivira-cs-support --region asia-northeast1 --update-secrets CS_SUPPORT_OAUTH_SIGNING_KEY=cs-support-oauth-signing-key:1
+```
+
+注入後の 1 回だけは全クライアントが再接続を要求される（鍵が変わるため）。以降は切れない。
+
+**デプロイ後に必ず確認すること**（これをやらないと「直った」と言えない）:
+
+1. ログに `CS_SUPPORT_OAUTH_SIGNING_KEY is not set` の warn が**出ていない**こと。出ていたら注入が効いておらず何も直っていない
+2. ログに `google did not return a refresh_token` の warn が**出ていない**こと。出ていたら原因は別で、この修正では解決しない
+3. **コールドスタートを 1 回はさんで（15 分以上アイドル → 再アクセス）接続が維持されること。** これが受け入れ基準そのもの
+
+鍵をローテートする（＝全 DCR 登録と進行中ログインフローを一括無効化する）場合:
+
+```sh
+openssl rand -base64 32 | gcloud secrets versions add cs-support-oauth-signing-key --project sivira-cs-support --data-file=-
+
+# **バージョンを番号で指定する。** `:latest` のままだと service spec が変化せず
+# `gcloud run services update` が no-op になり、新 revision が作られない。Cloud Run が
+# `:latest` を解決するのはインスタンス起動時なので、鍵が実際に切り替わるのは「たまたま
+# 次にコールドスタートしたとき」になり、失効したつもりで失効していない状態が生まれる。
+gcloud run services update cs-support-mcp --project sivira-cs-support --region asia-northeast1 --update-secrets CS_SUPPORT_OAUTH_SIGNING_KEY=cs-support-oauth-signing-key:<new-version>
+```
+
+**この secret の blast radius（受容したリスクとして記録）**: `authorize` は署名済み `Blob::Client` 内の `redirect_uris` へのメンバシップ照合しか行わず、`is_acceptable_redirect_uri`（claude.ai へのホスト完全一致）を再適用しない。したがって**この鍵を読める者は任意の redirect_uri を持つ client_id を自分で鋳造でき、許可リストを完全に迂回できる**。`/oauth/callback` が封緘済み認可コードを攻撃者ホストへ配送し、同じ鍵から派生した AEAD 鍵で復号すれば、ログインした利用者の Google access_token / refresh_token が手に入る。
+
+- 鍵をプロセスメモリのみに置いていた頃は、奪取に稼働中コンテナへの侵入が必要だった。**永続化により、Secret Manager・Cloud Run の env 設定・`gcloud secrets create` を叩いた端末のシェル履歴に残る長寿命の値になった**
+- したがって `roles/secretmanager.secretAccessor` は**この secret 単体に対してランタイム SA のみ**へ付与する（プロジェクト全体付与にしない）
+- 恒久対処は `authorize` とリダイレクト直前で `is_acceptable_redirect_uri` を**再適用**すること。鍵漏洩だけでは confused deputy が成立しなくなる（別途対応）
 
 ### 認証（OAuth 2.1 フェデレーション、実測済み）
 
