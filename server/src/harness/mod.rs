@@ -9,6 +9,7 @@ pub mod extraction;
 pub mod grading;
 pub mod hours;
 pub mod knowledge;
+pub(crate) mod prompt_input;
 pub mod reply;
 pub mod rules;
 pub mod scope;
@@ -174,6 +175,25 @@ fn merge_conv_state_attributes(
     merged
 }
 
+/// [`Harness::save_conv_state`] が使う判定を独立させた純関数（テスト容易性のため、
+/// 実際の `KnowledgeStore::load_case` 呼び出しから切り離してある）。
+///
+/// `existing` は `load_case` の結果そのもの。`None`（case 未存在）を許してしまうと、会話状態
+/// 4 属性だけを持つ `case_id` 属性なしの support_case ノードを書くことになり、以後
+/// `load_case` / `load_cases` のどちらからも二度と見えなくなる（Warning 2 の回帰防止）。
+fn require_existing_case_attrs(
+    existing: Option<std::collections::HashMap<String, String>>,
+    case_id: &str,
+    schema: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    existing.ok_or_else(|| {
+        anyhow!(
+            "save_conv_state: case {case_id} not found in schema {schema}; the caller must \
+             create the case (Harness::evaluate) before saving conversation state"
+        )
+    })
+}
+
 /// outcome 確定時に answer_attempt へ書き戻す全属性を組み立てる純関数。
 ///
 /// read-merge-write: 既存属性（draft / case_id / known_resolution_id / 起票者の
@@ -201,6 +221,24 @@ fn merge_outcome_attributes(
         note.unwrap_or_default().to_string(),
     );
     merged
+}
+
+/// 聞き返し可否（決定論）: 第3層グレーのみ。第1・2層は問答無用でルーティング
+/// （会話フロー v1.1 design doc §2）。
+///
+/// **この関数が契約そのもの。** `evaluate()` はこの関数を呼ぶだけで、判定式をインラインに
+/// 複製しない。テスト（本ファイル `mod tests`）もこの関数を呼ぶこと。式をテスト側に複製すると、
+/// ここを書き換えて `matches!` の条件を変えてもテストが検出できなくなる（Critical 1 の回帰）。
+fn clarification_allowed(decision: &decision::AnswerDecision) -> bool {
+    matches!(
+        decision,
+        decision::AnswerDecision::Escalate {
+            layer: 3,
+            reason: decision::EscalateReason::InsufficientDirectness
+                | decision::EscalateReason::UnknownAddedSignal,
+            ..
+        }
+    )
 }
 
 /// `Harness::evaluate()` に渡された case_id が既存 case として解決できなかった場合の挙動。
@@ -335,6 +373,27 @@ impl Harness {
     /// 会話状態 4 属性だけを上書きしたうえで全属性を明示再送する（vegapunk 0.2.0 の
     /// `UpsertNodes` は全置換のため、部分送信は既存属性を消す。`backfill_concept_keys` と
     /// 同じ流儀）。
+    ///
+    /// **契約: 呼び出し側は case が既に存在する状態でだけ呼ぶこと。** `evaluate()` は冒頭で
+    /// case 属性を読み、末尾で全属性を再送する（新規 case ならその時点で `record` 済み）。この
+    /// 順序を守らずに case 未作成のタイミングで本メソッドを呼ぶと、[`require_existing_case_attrs`]
+    /// が `Err` にする（Warning 2 の回帰防止）。
+    ///
+    /// **契約（lost update）: 本メソッドは `evaluate()` と並行に、または `evaluate()` の実行中に
+    /// 呼んではならない。必ず `evaluate()` が完了した後に呼ぶこと。** `evaluate()` は関数冒頭で
+    /// 読んだ case 属性のスナップショットを保持したまま vegapunk 検索・LLM 抽出を挟み、最後に
+    /// **全属性を再送**する（read-merge-write の「read」が古いまま「write」される）。
+    /// `evaluate()` の実行中に本メソッドが割り込むと、本メソッドが書いた会話状態 4 属性を、
+    /// 後から確定する `evaluate()` の書き込みが古いスナップショットで上書きし、会話状態が
+    /// 消える（逆順・非重複なら問題ない）。呼び出し側（Part B のオーケストレーション）はこの
+    /// 順序を守ること。
+    /// 黙って `unwrap_or_default()` していた旧実装は、case が無いと会話状態 4 属性だけを持つ
+    /// `case_id` 属性なしの support_case ノードを書いていた。このノードは `case_id eq` で
+    /// 検索する `knowledge::load_case` にも、`attrs.get("case_id")?` で filter_map する
+    /// `load_cases` にも二度と見えなくなり、会話状態が保存されたつもりで毎ターン既定値へ戻る
+    /// （聞き返しの 3 ターン上限が機能しなくなる）。加えて schema 上 `case_id` は
+    /// required（`schema/cs-support.yml`）であり、無属性ノードはスキーマ違反でもある。
+    /// **なので握りつぶさず fail closed する。**
     pub async fn save_conv_state(
         &self,
         ctx: &RequestContext,
@@ -342,10 +401,8 @@ impl Harness {
         state: &CaseConvState,
     ) -> Result<()> {
         let knowledge = self.knowledge()?;
-        let existing = knowledge
-            .load_case(&ctx.schema, case_id)
-            .await?
-            .unwrap_or_default();
+        let existing = knowledge.load_case(&ctx.schema, case_id).await?;
+        let existing = require_existing_case_attrs(existing, case_id, &ctx.schema)?;
         let merged = merge_conv_state_attributes(&existing, state);
         knowledge
             .record(
@@ -894,16 +951,9 @@ impl Harness {
             thresholds: &self.thresholds,
             default_route: &self.default_route,
         });
-        // 聞き返し可否（決定論）: 第3層グレーのみ。第1・2層は問答無用でルーティング。
-        let clarification_allowed = matches!(
-            &decision_result,
-            decision::AnswerDecision::Escalate {
-                layer: 3,
-                reason: decision::EscalateReason::InsufficientDirectness
-                    | decision::EscalateReason::UnknownAddedSignal,
-                ..
-            }
-        );
+        // 聞き返し可否（決定論）: 第3層グレーのみ。判定条件そのものは clarification_allowed()
+        // （本ファイル冒頭のモジュールレベル関数）が契約として持つ。ここでは呼ぶだけにする。
+        let clarification_allowed = clarification_allowed(&decision_result);
         // [記録] 判定結果を case に永続化する（record_answer_attempt の lineage 検証の根拠。
         // client の自己申告でなくサーバ側の記録と突合するため）。KR 由来の回答なら
         // その kr_id もサーバ記録として残す（outcome 記録が client 申告に依存しないため）。
@@ -1587,25 +1637,9 @@ mod tests {
 
     // ---- clarification_allowed 契約テスト（会話フロー v1.1 design doc §2・§8） ----
     //
-    // **退行防止テストであり、`evaluate()` 経由の検証ではない。** `decide()` を呼ばず、
-    // `decision::AnswerDecision::Escalate` を直接構築する（`harness::reply` のテストと同じ
-    // 流儀）。ここでの assert は「matches! 式の複製が、L795-803 の本物の matches! 式と
-    // 同じ bool を返すこと」であり、本番の `decide()` の出力を検証するものではない
-    // （design doc §8「`clarification_allowed` の契約テスト（退行防止）」）。
-    //
-    // **プロダクションコード（L795-803 の matches! 式）は一切変更しない。**
-    fn clarification_allowed_for(decision: &decision::AnswerDecision) -> bool {
-        // 本体の matches! 式（harness/mod.rs L795-803 相当）をそのまま複製する。
-        matches!(
-            decision,
-            decision::AnswerDecision::Escalate {
-                layer: 3,
-                reason: decision::EscalateReason::InsufficientDirectness
-                    | decision::EscalateReason::UnknownAddedSignal,
-                ..
-            }
-        )
-    }
+    // Critical 1 の修正: 以前はここに本体 `matches!` 式の複製ヘルパーがあり、本体を書き換えても
+    // テストが追随して緑になり続ける（退行を検出できない）状態だった。いまは本体の
+    // `clarification_allowed()`（本ファイル冒頭のモジュールレベル関数）をそのまま呼ぶ。
 
     fn escalate_for_contract_test(
         layer: u8,
@@ -1624,16 +1658,17 @@ mod tests {
     #[test]
     fn clarification_is_denied_for_layer1_and_layer2_escalations() {
         // 第1層（明示エスカレーションルール）・第2層（禁止ドメイン）は実際の `decide()` では
-        // 常に `RegulatedOrSafety` を返す（spec に明記）。
+        // 常に `RegulatedOrSafety` を返す（spec に明記）。第3層の reason 網羅としての価値が
+        // あるため、手組み Escalate に対する本テストは残す（`decide()` 経由の版は下に別途置く）。
         let layer1 = escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety);
         assert!(
-            !clarification_allowed_for(&layer1),
+            !clarification_allowed(&layer1),
             "layer 1 escalation must never allow clarification"
         );
 
         let layer2 = escalate_for_contract_test(2, decision::EscalateReason::RegulatedOrSafety);
         assert!(
-            !clarification_allowed_for(&layer2),
+            !clarification_allowed(&layer2),
             "layer 2 escalation must never allow clarification"
         );
     }
@@ -1643,15 +1678,201 @@ mod tests {
         let insufficient_directness =
             escalate_for_contract_test(3, decision::EscalateReason::InsufficientDirectness);
         assert!(
-            clarification_allowed_for(&insufficient_directness),
+            clarification_allowed(&insufficient_directness),
             "layer 3 InsufficientDirectness must allow clarification"
         );
 
         let unknown_added_signal =
             escalate_for_contract_test(3, decision::EscalateReason::UnknownAddedSignal);
         assert!(
-            clarification_allowed_for(&unknown_added_signal),
+            clarification_allowed(&unknown_added_signal),
             "layer 3 UnknownAddedSignal must allow clarification"
+        );
+    }
+
+    // ---- clarification_allowed 契約テスト: decide() の実出力を通す版（Critical 1） ----
+    //
+    // 上の 2 テストは手組みの `Escalate` に対する reason 網羅であり、`decide()` 自体の配線
+    // （第1・2層が本当に layer 1/2 の Escalate を返すか、第3層グレーが本当に
+    // InsufficientDirectness/UnknownAddedSignal を返すか）までは見ていない。ここでは
+    // `decision::decide()` を実際に通した出力に対して `clarification_allowed()` を検証する
+    // （plan Task 3 Step 1 が要求する退行防止テスト）。入力の組み立ては `decision.rs` の
+    // `mod tests` にある layer1/layer2/layer3 系テストの入力例を踏襲する。
+
+    fn contract_test_signals(values: &[&str]) -> signal::SignalSet {
+        values.iter().map(|v| signal::Signal::new(*v)).collect()
+    }
+
+    fn contract_test_thresholds() -> decision::Thresholds {
+        decision::Thresholds {
+            low: 0.6,
+            mid: 0.8,
+            high: 0.95,
+        }
+    }
+
+    fn contract_test_calm_stakes() -> decision::StakesInput {
+        decision::StakesInput {
+            mandatory_domain_near: false,
+            ng_near_hit: false,
+            hazard_signal_count: 0,
+        }
+    }
+
+    fn contract_test_kr(id: &str, set: &[&str]) -> rules::KnownResolution {
+        rules::KnownResolution {
+            id: id.to_string(),
+            signal_set: contract_test_signals(set),
+            applicability: "全ロット".to_string(),
+            answer: "answer".to_string(),
+            source_authority: rules::SourceAuthority::Authoritative,
+            root_cause: rules::RootCause::KnowledgeError,
+            grade: rules::Grade::ApprovalRequired,
+            approval_count: 0,
+            rejection_count: 0,
+            approver_set: Vec::new(),
+            origin: "test".to_string(),
+            binding: rules::Binding::Advisory,
+            registration_trigger: "single_ruling".to_string(),
+            knowledge_class: "commercial".to_string(),
+            outcome_ref: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn decide_layer1_escalation_denies_clarification() {
+        // decision.rs::layer1_short_circuits_everything と同じ入力形。
+        let rules = vec![rules::EscalationRule {
+            id: "r1".to_string(),
+            condition: contract_test_signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: rules::Binding::Mandatory,
+        }];
+        let resolutions = vec![contract_test_kr("kr1", &["post_ingestion_symptom"])];
+        let q = contract_test_signals(&["post_ingestion_symptom"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &rules,
+            domains: &[],
+            resolutions: &resolutions,
+            best_manual_score: Some(1.0),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d, decision::AnswerDecision::Escalate { layer: 1, .. }),
+            "precondition: decide() must actually take the layer 1 branch, got {d:?}"
+        );
+        assert!(
+            !clarification_allowed(&d),
+            "layer 1 escalation from decide() must never allow clarification"
+        );
+    }
+
+    #[test]
+    fn decide_layer2_escalation_denies_clarification() {
+        // decision.rs::layer2_blocks_before_layer3 と同じ入力形。
+        let domains = vec![rules::ProhibitedDomain {
+            id: "d1".to_string(),
+            domain_signals: contract_test_signals(&["skin_irritation"]),
+            text_patterns: Vec::new(),
+            route: "derm_liaison".to_string(),
+            binding: rules::Binding::Mandatory,
+        }];
+        let resolutions = vec![contract_test_kr("kr1", &["skin_irritation"])];
+        let q = contract_test_signals(&["skin_irritation"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &[],
+            domains: &domains,
+            resolutions: &resolutions,
+            best_manual_score: Some(1.0),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d, decision::AnswerDecision::Escalate { layer: 2, .. }),
+            "precondition: decide() must actually take the layer 2 branch, got {d:?}"
+        );
+        assert!(
+            !clarification_allowed(&d),
+            "layer 2 escalation from decide() must never allow clarification"
+        );
+    }
+
+    #[test]
+    fn decide_layer3_insufficient_directness_allows_clarification() {
+        // decision.rs::high_stakes_raises_threshold_and_escalates と同系の入力
+        // （signal 無し・best_manual_score がしきい値未満）。
+        let q = signal::SignalSet::new();
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &[],
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(
+                d,
+                decision::AnswerDecision::Escalate {
+                    layer: 3,
+                    reason: decision::EscalateReason::InsufficientDirectness,
+                    ..
+                }
+            ),
+            "precondition: decide() must actually return layer 3 InsufficientDirectness, got {d:?}"
+        );
+        assert!(
+            clarification_allowed(&d),
+            "layer 3 InsufficientDirectness from decide() must allow clarification"
+        );
+    }
+
+    #[test]
+    fn decide_layer3_unknown_added_signal_allows_clarification() {
+        // decision.rs::layer3_added_signal_escalates_with_unknown_added_signal と同じ入力形
+        // （KR の signal_set の部分集合に一致するが、未知の追加 signal が残る）。
+        let resolutions = vec![contract_test_kr("kr1", &["discoloration"])];
+        let q = contract_test_signals(&["discoloration", "mold"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &[],
+            domains: &[],
+            resolutions: &resolutions,
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(
+                d,
+                decision::AnswerDecision::Escalate {
+                    layer: 3,
+                    reason: decision::EscalateReason::UnknownAddedSignal,
+                    ..
+                }
+            ),
+            "precondition: decide() must actually return layer 3 UnknownAddedSignal, got {d:?}"
+        );
+        assert!(
+            clarification_allowed(&d),
+            "layer 3 UnknownAddedSignal from decide() must allow clarification"
         );
     }
 
@@ -1787,5 +2008,30 @@ mod tests {
             let round_tripped = conv_state_from_attrs(&merged);
             assert_eq!(round_tripped, state);
         }
+    }
+
+    // ---- require_existing_case_attrs（Warning 2 の回帰防止） ----
+
+    #[test]
+    fn require_existing_case_attrs_passes_through_when_case_exists() {
+        let attrs: std::collections::HashMap<String, String> =
+            [("question".to_string(), "元の質問".to_string())]
+                .into_iter()
+                .collect();
+        let result = require_existing_case_attrs(Some(attrs.clone()), "case-1", "urtect");
+        assert_eq!(result.unwrap(), attrs);
+    }
+
+    #[test]
+    fn require_existing_case_attrs_errors_instead_of_defaulting_when_case_is_missing() {
+        // 修正前は `unwrap_or_default()` で空の HashMap に倒し、`case_id` 属性なしの
+        // support_case ノードを書いていた（Warning 2）。そのノードは `load_case` /
+        // `load_cases` のどちらからも二度と見えなくなる。いまは黙って倒さず Err にする。
+        let result = require_existing_case_attrs(None, "case-missing", "urtect");
+        let err = result.expect_err("missing case must be an error, not a silent default");
+        let message = err.to_string();
+        // 運用者が次に何を見ればよいか分かる情報: どの case か・どの schema か。
+        assert!(message.contains("case-missing"), "{message}");
+        assert!(message.contains("urtect"), "{message}");
     }
 }

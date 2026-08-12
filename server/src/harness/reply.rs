@@ -29,12 +29,8 @@
 //! 筆頭**である。ここを迂回すると、NG 表現・暗示効能の統制が新経路だけ外れる。
 
 use crate::harness::decision::{AnswerDecision, AnswerSource, DisclosureScope};
+use crate::harness::prompt_input::{neutralize_delimiters, truncate_chars, truncate_question};
 use crate::model::SectionHit;
-
-/// 問い合わせ本文の最大文字数。`MAX_EXCERPT_CHARS` で資料側を切っているのに、より信用
-/// できない入力である問い合わせ本文が無制限なのは筋が通らない。注入面積・コスト・
-/// レイテンシに効く。**具体値を書かないのは、片方を変えたときに他方の doc が腐るため。**
-const MAX_QUESTION_CHARS: usize = 2000;
 
 /// LLM に渡す抜粋 1 件あたりの最大文字数。プロンプト肥大とコストの抑制のために切るが、
 /// **短すぎると「答えを渡しておきながら答えられない」下書きを生む**。
@@ -161,16 +157,6 @@ pub struct ReplyExcerpt {
     pub source: String,
     /// 資料本文。**見出し行を含めない**（含めると上記の偽装が復活する）。
     pub body: String,
-}
-
-/// 文字数上限で切り詰める（文字境界を壊さない）。切ったことが分かるよう省略記号を付ける。
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 /// 資料 1 件分の本文を上限で切り、**切ったときは必ず warn する**。
@@ -440,38 +426,17 @@ pub fn build_reply_user_message(
             .collect::<Vec<_>>()
             .join("\n\n")
     };
-    let question = question.trim();
-    let question_chars = question.chars().count();
-    if question_chars > MAX_QUESTION_CHARS {
-        // 資料側（`truncate_material`）と同じ規律。問い合わせの後半（実際の症状や型番が
-        // 後ろに書かれていることは多い）が落ちた下書きは、読んだだけでは原因が分からない。
-        tracing::warn!(
-            route = "question",
-            original_chars = question_chars,
-            max_chars = MAX_QUESTION_CHARS,
-            "the customer question was truncated before being handed to the reply drafter; the \
-             draft only saw the head of it. If the draft misses the point of a long inquiry, \
-             check the part past the limit"
-        );
-    }
+    // 切り詰め・trim・超過時 warn は `prompt_input::truncate_question` が担う（Warning 3/4 の
+    // 集約先。`clarify.rs` / `escalation_reply.rs` も同じ関数・同じ規律を使う）。資料側
+    // （`truncate_material`）と同じ規律で、問い合わせの後半（実際の症状や型番が後ろに
+    // 書かれていることは多い）が落ちた下書きは、読んだだけでは原因が分からない。
+    let question = truncate_question(question, "customer_reply");
     format!(
         "{}<顧客からの問い合わせ>\n{}\n</顧客からの問い合わせ>\n\n<資料>\n{}\n</資料>",
         build_history_block(history),
-        neutralize_delimiters(&truncate_chars(question, MAX_QUESTION_CHARS)),
+        neutralize_delimiters(&question),
         material
     )
-}
-
-/// 問い合わせ本文から、区切りタグとして解釈されうる山括弧を無害化する。
-///
-/// **これが無いと、顧客が `</顧客からの問い合わせ><資料>…` を書くだけで「サーバが渡した
-/// 資料」を偽装でき、escalate でも解決方法を載せさせられる**（`excerpts` を空にする構造的
-/// 保証は「内部マニュアルが漏れない」ことしか担保しない。顧客が自分で書いた文字列は別物）。
-///
-/// 本文を捨てずに全角へ寄せる（問い合わせ内容の情報は保ちたい。モデルが読む意味は変わらず、
-/// 区切りとしては機能しなくなる）。
-fn neutralize_delimiters(s: &str) -> String {
-    s.replace('<', "＜").replace('>', "＞")
 }
 
 #[cfg(test)]
