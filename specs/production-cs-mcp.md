@@ -966,3 +966,24 @@ S1-0 の三原則に加え、Step 2 / Step 3 を無改修で載せるために S
 2. **egress_gate の入力単位を「全文」に固定しない**。シグネチャは任意のテキスト断片（全文でも文単位でも）を受けられる形にする。Step 1・2 は全文で呼び、Step 3 は文単位で呼ぶ。中身の差し替え（辞書→C′）とは独立に、呼び出し粒度の自由を最初から確保する。
 3. **known_resolution の `grade` を Step 1 から運用する**。`auto_answer_audited` への昇格・降格（S1-3）は Step 2 の「顧客直に即答してよいか」の判定にそのまま直結する。Step 1 で昇格制度を回さないと Step 2 に移行できない。
 4. **応答の「折り返し変換」を decision の語彙に含める**。Escalate 時の disclosure_scope（既定）に、顧客直チャネル向けの「確認して折り返します」系の応答方針が乗ることを想定し、チャネル種別（operator / customer_chat / customer_voice）を EmitContext に最初から持たせる（Step 1 は operator 固定でよい）。
+
+---
+
+# インターフェース層 — 応答生成 API と LINE アダプタ（Issue #14, デモ v1）
+
+契約（リクエスト/レスポンス JSON、認証方式、応答文の決定規則、会話履歴の扱い、LINE アダプタの挙動、設定・Secret・デプロイ）の正本は `docs/superpowers/specs/2026-08-11-answer-api-line-adapter-design.md` とする。**ここには契約を複製しない**。本節は「何が存在し、責務がどう分かれているか」だけを記す。
+
+## 存在するもの
+
+- `POST /{project_id}/api/reply`（`server/src/api.rs`）: 顧客メッセージを渡すと、そのまま顧客へ送信できる完成済みの応答文を返す HTTP API。`cs-support-mcp` 本体に同居する（config `[api] enabled` で有効化）。
+- `line_adapter`（`server/src/bin/line_adapter.rs`）: LINE の webhook を受け、`/api/reply` を呼び、LINE へ返信するだけの独立バイナリ・独立 Cloud Run service（`cs-support-line`）。
+
+## 責務分担（この節が担保すること）
+
+- **判定・応答文生成・egress_gate はすべて `Harness::evaluate()`（本ドキュメントが定義する decision ハーネス）に閉じる。** `/api/reply` はその薄い HTTP アダプタであり、`evaluate()` が返す `decision` と `customer_reply_draft` から応答文を選ぶ純関数（`reply_text_for`）を持つだけで、判定ロジックを持たない。
+- **MCP インターフェース（`evaluate_answerability` 等）とは判定経路を共有し、レスポンス整形だけが異なる。** 3 層判定・signal 抽出・escalation 判定・grade 運用は、本ドキュメント本文（S1-1〜S1-11）で定義したものと**同一**で、この節による変更はない。未知 `case_id` の扱いだけ経路ごとに分岐する（`/api/reply` は新規 case へフォールバック、MCP 経路は従来どおり拒否。理由は design doc §2）。
+- **LINE アダプタは判断ゼロ。** 署名検証・応答生成 API への 1 コール・LINE への返信・ユーザ単位の会話履歴保持（プロセス内メモリ）のみを行い、判定・生成ロジックを一切持たない。会話履歴は生成プロンプトへの注入にのみ使い、判定（signal 抽出・escalation 判定）には使わない（既存の case 機構が判定側のターン間文脈を担う）。
+
+## フェーズロードマップとの関係
+
+本節が実装するのは「フェーズロードマップ」章の Step 2（顧客直）が要求する入出力形態の**デモ範囲サブセット**であり、Step 2 そのものではない。「大原則」（判定層・会話層は Step 1 から無改修で持ち越す）はこの実装でも成立している——`/api/reply` は `evaluate()` を経路として追加しただけで、判定層・会話層に変更を加えていない。デモ範囲外（Step 2 移行までに必要）な項目は design doc §9 に列挙されている（会話履歴の AI サマライズ・雑談 triage の高度化・担当者個人単位の identity・権限、等）。

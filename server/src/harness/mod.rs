@@ -141,6 +141,17 @@ fn merge_outcome_attributes(
     merged
 }
 
+/// `Harness::evaluate()` に渡された case_id が既存 case として解決できなかった場合の挙動。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownCaseIdPolicy {
+    /// MCP 経路(`evaluate_answerability`)の従来挙動。未知 case_id を `Err` にする。
+    /// CS 担当の case_id 打ち間違いを黙って新規 case へ合流させず、即エラーで気づけるようにする。
+    Reject,
+    /// `/api/reply` 契約限定(design doc §2)。未知 case_id をエラーにせず新規 case として
+    /// 処理する。クライアント保持の case_id がサーバ再起動・保存漏れで失効するのは通常運用。
+    StartNew,
+}
+
 impl Harness {
     pub fn build(
         config: &AppConfig,
@@ -523,6 +534,7 @@ impl Harness {
     /// 会話層（S1-0 / 遵守事項 1）: case_id 単位の累積 signal 集合をサーバ側で維持し、
     /// **毎ターン累積集合で再判定**する。条件が増えたら（変色 → 変色+カビ）再判定が
     /// 自動的にエスカレーションへ倒れる。会話履歴の言質は判定入力にしない。
+    #[allow(clippy::too_many_arguments)]
     pub async fn evaluate(
         &self,
         ctx: &RequestContext,
@@ -530,6 +542,8 @@ impl Harness {
         product_key: Option<&str>,
         case_id: Option<&str>,
         tools: &ToolService,
+        history: &[reply::ReplyHistoryTurn],
+        unknown_case_id_policy: UnknownCaseIdPolicy,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
@@ -577,15 +591,48 @@ impl Harness {
         let signals = extraction_outcome.signals;
         let extraction_mode = extraction_outcome.mode;
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
-        // 既存 case_id は存在を検証する（未知の id への orphan edge 追加を防ぐ）。
+        // 既存 case_id は存在を確認する。存在すれば復元する。存在しない（未知の id）場合の
+        // 扱いは `unknown_case_id_policy` で経路ごとに分ける:
+        // - `/api/reply`（`UnknownCaseIdPolicy::StartNew`）: design doc §2「未知の case_id は
+        //   エラーにせず新規 case として処理し、warn ログを出す」。クライアント側（LINE
+        //   アダプタ等）が保持する case_id をそのまま渡すため、サーバ再起動やクライアント側の
+        //   保存漏れで未知 id が届くのは異常系ではなく通常運用として扱う。この fallback は
+        //   `/api/reply` の契約としてのみ定義されている（design doc §2）。
+        // - MCP `evaluate_answerability`（`UnknownCaseIdPolicy::Reject`）: 従来どおり Err。
+        //   CS 担当が case_id を打ち間違えた場合に黙って新規 case へ合流すると、会話層の
+        //   累積 signal（エスカレーション判定の根拠）が失われたまま気づけなくなるため、
+        //   即エラーで気づける従来の厳格な挙動を維持する。
         // case の全属性を手元に保持し、後段の判定記録は read-merge-write で全属性を再送する
         // （UpsertNodes が全属性置換セマンティクスでも既存属性を失わない）。
-        let (case_id, prior_signals, mut case_attrs) = match case_id {
-            Some(id) => {
-                let attrs = knowledge
-                    .load_case(&ctx.schema, id)
-                    .await?
-                    .ok_or_else(|| anyhow!("unknown case_id: {id}"))?;
+        let existing_case = match case_id {
+            Some(id) => knowledge.load_case(&ctx.schema, id).await?,
+            None => None,
+        };
+        if let Some(id) = case_id {
+            if existing_case.is_none() {
+                if matches!(unknown_case_id_policy, UnknownCaseIdPolicy::Reject) {
+                    return Err(anyhow!("unknown case_id: {id}"));
+                }
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    schema = %ctx.schema,
+                    requested_case_id = id,
+                    "case_id not found; starting a new case under the /api/reply contract (UnknownCaseIdPolicy::StartNew)"
+                );
+            }
+        }
+        // existing_case が None かつ case_id が Some だった場合のみ「未知 case_id → 新規 case」の
+        // フォールバックが発生している(case_id が最初から None の通常の新規会話とは区別する)。
+        let previous_case_id: Option<&str> = if existing_case.is_none() {
+            case_id
+        } else {
+            None
+        };
+        let (case_id, prior_signals, mut case_attrs) = match existing_case {
+            Some(attrs) => {
+                // 直前の `match case_id { Some(id) => ... }` で `existing_case` を得ているため、
+                // ここに来る時点で `case_id` は必ず `Some`。
+                let id = case_id.expect("existing_case is Some only when case_id was Some");
                 (
                     id.to_string(),
                     knowledge::case_signals_from_snapshot(&ctx.schema, id, &live_snapshot),
@@ -618,6 +665,15 @@ impl Harness {
                         attrs.clone().into_iter().collect(),
                     )
                     .await?;
+                if let Some(prev) = previous_case_id {
+                    tracing::warn!(
+                        request_id = %ctx.request_id,
+                        schema = %ctx.schema,
+                        previous_case_id = prev,
+                        case_id = %new_id,
+                        "unknown case_id folded into new case (UnknownCaseIdPolicy::StartNew)"
+                    );
+                }
                 (new_id, signal::SignalSet::new(), attrs)
             }
         };
@@ -854,7 +910,13 @@ impl Harness {
         // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
         // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
         let reply_draft = self
-            .draft_customer_reply(question, &decision_result, &section_hits, &resolutions)
+            .draft_customer_reply(
+                question,
+                &decision_result,
+                &section_hits,
+                &resolutions,
+                history,
+            )
             .await;
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
         let customer_reply_draft = reply_draft.map(|d| d.text);
@@ -885,6 +947,7 @@ impl Harness {
         decision: &decision::AnswerDecision,
         hits: &[SectionHit],
         resolutions: &[rules::KnownResolution],
+        history: &[reply::ReplyHistoryTurn],
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
@@ -902,7 +965,7 @@ impl Harness {
         };
         let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
         let system = reply::build_reply_system_prompt(&brief);
-        let user = reply::build_reply_user_message(question, &brief);
+        let user = reply::build_reply_user_message(question, &brief, history);
         let draft = match drafter
             .draft_reply(&system, &user, self.reply_draft_max_tokens)
             .await
@@ -1342,7 +1405,7 @@ mod tests {
             source_url: None,
         }];
         harness
-            .draft_customer_reply("カメラが反応しません", &decision, &hits, &[])
+            .draft_customer_reply("カメラが反応しません", &decision, &hits, &[], &[])
             .await
     }
 

@@ -18,7 +18,8 @@ RUN cargo build --release --locked \
     --bin ingest_alarmcom \
     --bin verify_alarmcom \
     --bin merge_schema \
-    --bin backfill_concept_keys
+    --bin backfill_concept_keys \
+    --bin line_adapter
 
 FROM debian:bookworm-slim
 
@@ -33,6 +34,7 @@ COPY --from=builder /app/server/target/release/ingest_alarmcom /usr/local/bin/in
 COPY --from=builder /app/server/target/release/verify_alarmcom /usr/local/bin/verify_alarmcom
 COPY --from=builder /app/server/target/release/merge_schema /usr/local/bin/merge_schema
 COPY --from=builder /app/server/target/release/backfill_concept_keys /usr/local/bin/backfill_concept_keys
+COPY --from=builder /app/server/target/release/line_adapter /usr/local/bin/line_adapter
 COPY server/config.gce.toml ./config.gce.toml
 COPY server/config.cloudrun.toml ./config.cloudrun.toml
 COPY server/data ./data

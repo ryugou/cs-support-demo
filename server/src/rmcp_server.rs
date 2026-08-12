@@ -633,6 +633,13 @@ impl CsSupportRmcpServer {
                 req.product_key.as_deref(),
                 req.case_id.as_deref(),
                 &self.tools,
+                // MCP 経路は会話履歴を持たない（呼び出し側は case_id による signal 累積で
+                // マルチターンを扱う）。応答生成 API（/api/reply）だけが履歴を渡す。
+                &[],
+                // 未知 case_id は Err のまま維持する（従来どおり）。/api/reply 限定の
+                // fallback（design doc §2）を MCP 経路まで広げると、CS 担当の入力ミスが
+                // 黙って新規 case へ合流し、会話層の累積 signal が失われたまま気づけなくなる。
+                crate::harness::UnknownCaseIdPolicy::Reject,
             )
             .await
             .map_err(to_error)?;
