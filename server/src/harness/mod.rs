@@ -4,6 +4,7 @@ pub mod clarify;
 pub mod correction;
 pub mod decision;
 pub mod egress;
+pub mod escalation_reply;
 pub mod extraction;
 pub mod grading;
 pub mod hours;
