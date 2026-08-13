@@ -36,6 +36,10 @@ env:
   GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
   RUN_REGION: ${{ vars.RUN_REGION }}
   GAR_IMAGE: ${{ vars.GAR_IMAGE }}
+  # CI が同一イメージ tag へ更新する対象。ここが唯一の正本で、CLAUDE.md の記述は
+  # この 2 行に追従させる。リソースを増やしたらここに足す。
+  RUN_SERVICES: "cs-support-mcp cs-support-line"
+  RUN_JOBS: "ingest-products ingest-rules ingest-urtect ingest-alarmcom merge-schema verify-alarmcom backfill-concept-keys"
 
 jobs:
   build-deploy:
@@ -97,31 +101,48 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Deploy Cloud Run service
+      - name: Update Cloud Run job images
+        # 対象は ingest-products / ingest-rules / ingest-urtect / ingest-alarmcom /
+        # merge-schema / verify-alarmcom / backfill-concept-keys の 7 job。
+        # いずれも cs-support-mcp と同一イメージを別バイナリ・別引数で起動する
+        # （バイナリ選択は各 job のエントリポイント定義側の責務で、ここでは image tag
+        # のみを更新する）。ループ内で `gcloud` が非 0 終了すると `run:` ステップの
+        # 既定シェル（bash `-e` 相当）でそのままステップが失敗するため、途中の job で
+        # 失敗した場合に後続を握りつぶして成功扱いにすることはない。
+        # ここを service 更新より先に実行する理由（fail closed）:
+        # job 更新は Cloud Run のリビジョンを作らず本番トラフィックに影響しないが、
+        # service 更新は本番の live トラフィックを新イメージへ切り替える。
+        # 対象リソースのいずれかが未作成・権限不足などで失敗したとき、job を先に
+        # 更新しておけば本番 service は旧イメージのまま止まる。逆順だと、service
+        # だけ新イメージに切り替わり job が旧イメージのまま取り残される
+        # 部分デプロイが発生する。
+        run: |
+          for job in ${RUN_JOBS}; do
+            echo "updating job: ${job}"
+            gcloud run jobs update "${job}" \
+              --project "${{ env.GCP_PROJECT_ID }}" \
+              --region "${{ env.RUN_REGION }}" \
+              --image "${{ steps.image.outputs.tag }}"
+          done
+
+      - name: Deploy Cloud Run services
         # サービス定義（VPC / secrets / メモリ等）は Task 3 の初回作成で固定済みのため、
         # CI からは image のみ更新する。`gcloud run deploy` は未指定フラグに CLI 既定値を
         # 適用しうる（既定値は gcloud のバージョンで変わる）ため、image 以外に触れない
         # `gcloud run services update` を使う。ここを `deploy` に戻すと、CLI 更新のたびに
         # サービス定義が静かに書き換わる経路が復活する。
+        # 対象は cs-support-mcp（本体）と cs-support-line（LINE アダプタ、同一イメージを
+        # 別コマンドで起動）の 2 service。ループ内で `gcloud` が非 0 終了すると
+        # `run:` ステップの既定動作（bash `-e` 相当）でそのままステップが失敗するため、
+        # 途中の service で失敗した場合に後続を握りつぶして成功扱いにすることはない。
         run: |
-          gcloud run services update cs-support-mcp \
-            --project "${{ env.GCP_PROJECT_ID }}" \
-            --region "${{ env.RUN_REGION }}" \
-            --image "${{ steps.image.outputs.tag }}"
-
-      - name: Update ingest-rules job image
-        run: |
-          gcloud run jobs update ingest-rules \
-            --project "${{ env.GCP_PROJECT_ID }}" \
-            --region "${{ env.RUN_REGION }}" \
-            --image "${{ steps.image.outputs.tag }}"
-
-      - name: Update ingest-urtect job image
-        run: |
-          gcloud run jobs update ingest-urtect \
-            --project "${{ env.GCP_PROJECT_ID }}" \
-            --region "${{ env.RUN_REGION }}" \
-            --image "${{ steps.image.outputs.tag }}"
+          for service in ${RUN_SERVICES}; do
+            echo "updating service: ${service}"
+            gcloud run services update "${service}" \
+              --project "${{ env.GCP_PROJECT_ID }}" \
+              --region "${{ env.RUN_REGION }}" \
+              --image "${{ steps.image.outputs.tag }}"
+          done
 
   auto-ingest:
     # 既知の制約: この job は build-deploy（service デプロイ）の "後" に走る。
