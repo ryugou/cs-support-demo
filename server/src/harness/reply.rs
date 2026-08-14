@@ -58,7 +58,11 @@ const MAX_EXCERPTS: usize = 3;
 
 /// 生成プロンプトに注入する会話履歴の最大ターン数（design doc §5）。
 /// 判定（signal 抽出・escalation 判定）には使わない。生成のみ。
-const MAX_HISTORY_TURNS: usize = 6;
+///
+/// `pub(crate)`: `harness::api::select_customer_history_for_known_facts` が把握済み事項リストの
+/// customer 発話件数をこれと揃えるために再利用する（Warning 1 修正。窓の「件数」だけ共有し、
+/// 予算計算そのものは共有しない。詳細は `api.rs` の doc コメントを参照）。
+pub(crate) const MAX_HISTORY_TURNS: usize = 6;
 
 /// 生成プロンプトに注入する会話履歴の合計文字数上限（design doc §5）。
 /// 超過分は古い側から捨てる。
