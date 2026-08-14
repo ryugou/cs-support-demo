@@ -29,6 +29,13 @@ pub(crate) const CONTINUATION_OPENER_RULE: &str =
     "- 継続中の会話です。挨拶・感謝・謝罪の定型オープナー（「いつもご利用いただき〜」\
      「ご不便をおかけして〜」等）は書かず、直前のやり取りを受けて本題から書き始める。\n";
 
+/// 会話終了を示唆する定型文言の説明句（会話フロー v1.1 design doc §3 の (2) および
+/// 「クローザーの扱い」）。`clarify.rs`（聞き返し、常時禁止）と `reply.rs`
+/// （回答下書き Answer 分岐、常時禁止 + 継続を誘う一文への差し替え指示）が、
+/// それぞれの文脈の文へこの語句を埋め込む。
+pub(crate) const CLOSER_BAN_PHRASE: &str =
+    "感謝・締め・「何かあればお申し付けください」等、会話の終了を示唆する文言";
+
 /// 文字数上限で切り詰める（文字境界を壊さない）。切ったことが分かるよう省略記号を付ける。
 pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

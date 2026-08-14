@@ -114,11 +114,13 @@ env（`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `CS_ANSWER_API_URL` 
 
 1. `X-Line-Signature` を channel secret の HMAC-SHA256（base64）で定数時間比較する。不一致は 400
 2. イベントを順に処理する。`message` かつ `text` 以外のメッセージは `CS_LINE_NONTEXT_TEXT` を返信、`message` 以外のイベントは無視
-3. テキストイベント: セッションストアから該当 user の履歴・case_id を取り、API を 1 回コール（タイムアウト 50 秒）
+3. テキストイベント: まず**同一ユーザーのセッションロックを取得**し、その直後に LINE の chat loading API（`POST https://api.line.me/v2/bot/chat/loading/start`、`chatId` = source.userId、`loadingSeconds` = 60）を呼んで処理中アニメーションを表示する（ロック取得後に呼ぶ理由は下記の直列化の項を参照。ロック取得前に呼ぶと、同一ユーザーの並行イベントの処理順が chat loading API の応答速度で決まってしまい、会話履歴・signal 累積・case_id 確定の順序が入れ替わりうる）。**この呼び出しの失敗は warn ログのみで処理を継続する**（表示は体験改善であり必須機能ではない）。続けてロック済みセッションから該当 user の履歴・case_id を取り、API を 1 回コール（タイムアウト 50 秒）
 4. API が 200 を返した時点で、`case_id` と顧客発話（customer ターン）を直ちにセッションへ保存する。サーバ側では 200 の時点で case が確定し signal が追記済みのため、以降の発話を同じ case に必ず合流させる（LINE 返信の成否でこの保存を左右させると、返信失敗時に次の発話が新規 case となり蓄積 signal が判定から脱落する）。その後 `reply_text` を Reply API で返信し、**返信成功時のみ** assistant ターンを履歴へ追記する（顧客が受信していない発話を履歴に残さない）。API が非 200・タイムアウトの場合は `CS_LINE_FALLBACK_TEXT` を返信し、セッションは変更しない
 5. 全イベント処理後に 200 を返す
 
-イベントは 1 リクエスト内・同一ユーザーとも逐次処理する（並行処理しない）。そのため 1 イベントあたりのタイムアウトは最大で約 100 秒（応答生成 API 呼び出し 50 秒 + LINE Reply API 呼び出し分）まで累積しうる。この累積は v1 の Accepted Risk として受容し、デプロイ後の E2E（第 8 節）で実測した往復時間をもとに妥当性を再評価する。
+イベントは 1 リクエスト内・同一ユーザーとも逐次処理する（並行処理しない）。そのため 1 イベントあたりのタイムアウトは最大で約 103 秒（chat loading API 呼び出し、per-request timeout 3 秒・失敗/タイムアウトしても継続 + 応答生成 API 呼び出し 50 秒 + LINE Reply API 呼び出し分）まで累積しうる。chat loading API は「失敗しても warn ログのみで継続する」設計（手順3）のため、ここに `state.http` の既定 timeout（50 秒）をそのまま使うと LINE reply token の実効予算（実測往復 10〜15 秒、第 8 節）を食い潰しうる。これを避けるため chat loading API 呼び出しだけ短い per-request timeout（3 秒、`server/src/bin/line_adapter.rs` の `DEFAULT_LINE_LOADING_TIMEOUT`）を明示的に掛けている。この累積は v1 の Accepted Risk として受容し、デプロイ後の E2E（第 8 節）で実測した往復時間をもとに妥当性を再評価する。
+
+なおこの約 103 秒は 1 イベント単体の上限であり、**同一ユーザーの先行イベントのロック解放待ちは含まない**（`SessionStore::lock_session` はロック取得時点からイベント処理全体を直列化するため、後続イベントの実待ち時間は同一ユーザーのキュー長に比例して増える）。これも v1 の Accepted Risk として受容し、第 8 節の E2E で同一ユーザー連続発話時の reply token 失効と webhook 再送の有無を実測して再評価する。
 
 セッションストア（プロセス内メモリ）:
 
