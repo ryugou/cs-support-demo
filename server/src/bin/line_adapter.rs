@@ -5,9 +5,11 @@
 //! （`cs_support_mcp::api`）側で完結しており、このバイナリは
 //!
 //! 1. `X-Line-Signature` を検証する
-//! 2. テキストメッセージだけを応答生成 API へ 1 回渡す
-//! 3. 返ってきた `reply_text` を LINE へ返信する
-//! 4. ユーザ単位の会話履歴・case_id をプロセス内メモリに保持する
+//! 2. テキストイベントの処理中、chat loading API で処理中アニメーションを表示する
+//!    （失敗しても warn ログのみで継続する。表示は体験改善であり必須機能ではない）
+//! 3. テキストメッセージだけを応答生成 API へ 1 回渡す
+//! 4. 返ってきた `reply_text` を LINE へ返信する
+//! 5. ユーザ単位の会話履歴・case_id をプロセス内メモリに保持する
 //!
 //! だけを行う。応答生成 API と HTTP JSON でやり取りする独立サービス（別 Cloud Run
 //! service, design doc §7）なので、リクエスト/レスポンスの型は `cs_support_mcp::api` の
@@ -199,10 +201,13 @@ impl SessionStore {
             .map(|(key, _)| key)
     }
 
-    /// 該当ユーザーの一連の処理（get→応答生成 API 呼び出し→(200 なら) case_id + customer
-    /// ターン保存→LINE 返信→(成功時のみ) assistant ターン追記）を直列化するロックを取得する。
-    /// 返り値の `OwnedMutexGuard` を保持し続けている間、同一ユーザーの他の呼び出しはこの
-    /// `await` で待たされる。
+    /// 該当ユーザーの一連の処理（chat loading API 呼び出し→get→応答生成 API 呼び出し→(200
+    /// なら) case_id + customer ターン保存→LINE 返信→(成功時のみ) assistant ターン追記）を
+    /// ロック取得時点からイベント処理全体を通して直列化するロックを取得する（Stage 2 codex
+    /// レビュー round 2 Suggestion 4: chat loading API 呼び出しをロック取得後に呼ぶよう
+    /// `handle_event` を変更した際、この一覧が旧契約（chat loading API を含まない）のまま
+    /// 取り残されていたのを更新）。返り値の `OwnedMutexGuard` を保持し続けている間、同一
+    /// ユーザーの他の呼び出しはこの `await` で待たされる。
     ///
     /// TTL を超過していた場合はここでセッションを空にリセットする（design doc §6:
     /// 「アクセス時 + 定期スイープ」の「アクセス時」側。以前は該当エントリをマップから
@@ -612,6 +617,11 @@ fn reply_token_log_fragment(reply_token: &str) -> String {
 /// 差し替える。本番コード（`main()`）は常にこの定数を使う。
 const DEFAULT_LINE_REPLY_API_URL: &str = "https://api.line.me/v2/bot/message/reply";
 
+/// LINE chat loading API の本番 URL（design doc §6 手順3）。テキストイベント処理の開始前に
+/// 呼び、処理中アニメーションを表示する。テストでは `AppStateInner::line_loading_api_url` を
+/// ローカルのモックサーバへ差し替える。本番コード（`main()`）は常にこの定数を使う。
+const DEFAULT_LINE_LOADING_API_URL: &str = "https://api.line.me/v2/bot/chat/loading/start";
+
 /// `line_adapter` のプロセス全体で共有する状態。`Arc` で安価に clone してハンドラへ渡す。
 struct AppStateInner {
     channel_secret: String,
@@ -626,6 +636,16 @@ struct AppStateInner {
     /// （`main()` が設定する）。テストだけがローカルのモックサーバ URL に差し替える
     /// （Stage 2 レビュー指摘: LINE 返信失敗時の挙動を実 HTTP 呼び出しで検証するため）。
     line_reply_api_url: String,
+    /// LINE chat loading API の呼び出し先。本番は常に [`DEFAULT_LINE_LOADING_API_URL`]
+    /// （`main()` が設定する）。テストはローカルのモックサーバ URL に差し替える
+    /// （`line_reply_api_url` と同じ位置づけ・同じ理由）。
+    line_loading_api_url: String,
+    /// chat loading API 呼び出しの per-request timeout。本番は常に
+    /// [`DEFAULT_LINE_LOADING_TIMEOUT`]（`main()` が設定する）。テストは、ストールした
+    /// chat loading API が応答生成 API 呼び出しをブロックしないことを検証するために短く
+    /// 差し替える（`start_loading_indicator` の doc comment 参照。Stage 1 レビュー指摘
+    /// Critical 1）。
+    line_loading_timeout: Duration,
 }
 
 type AppState = Arc<AppStateInner>;
@@ -681,23 +701,33 @@ async fn webhook_handler(
 
 /// 1 イベント分の処理（design doc §6 手順 2〜4）。
 ///
-/// テキストメッセージの処理順は design doc §6 手順4に準拠する: ① セッションから
-/// case_id・履歴を取得 → ② 応答生成 API を呼ぶ → ③ `assemble_reply` で reply_text と
-/// 更新要否を決める → ④ 応答生成 API が 200 を返していれば、LINE への返信を試みる**前**に
-/// [`apply_customer_turn`] で `case_id` と customer ターンを保存する → ⑤ LINE Reply API
-/// で返信する → ⑥ 返信が成功した場合のみ [`apply_assistant_turn`] で assistant ターンを
-/// 追記する。
+/// テキストメッセージの処理順は design doc §6 手順3・4に準拠する: ロックを取得した直後に
+/// ① chat loading API を呼んで処理中アニメーションを表示する（ロック取得**後**に呼ぶ理由は
+/// 後述） → ② セッションから case_id・履歴を取得 → ③ 応答生成 API を呼ぶ →
+/// ④ `assemble_reply` で reply_text と更新要否を決める → ⑤ 応答生成 API が 200 を返して
+/// いれば、LINE への返信を試みる**前**に [`apply_customer_turn`] で `case_id` と customer
+/// ターンを保存する → ⑥ LINE Reply API で返信する → ⑦ 返信が成功した場合のみ
+/// [`apply_assistant_turn`] で assistant ターンを追記する。
 ///
-/// ④を LINE 返信の成否より前に置く理由: サーバ側では 200 の時点で case が確定し signal が
+/// ⑤を LINE 返信の成否より前に置く理由: サーバ側では 200 の時点で case が確定し signal が
 /// 追記済みのため、以降の発話を同じ case に必ず合流させる必要がある。これを返信の成否で
 /// 左右させると、返信失敗時に次の発話が新規 case となり、蓄積済みの signal がエスカレー
 /// ション判定から脱落する。一方 assistant ターンは顧客が実際に受信していない発話を履歴に
 /// 残さないため、返信成功時のみ追記する。
 ///
-/// ①〜⑥の全体は、同一ユーザーの [`SessionStore::lock_session`] のロックを保持したまま
+/// ①〜⑦の全体は、同一ユーザーの [`SessionStore::lock_session`] のロックを保持したまま
 /// 直列に実行される（Stage 2 レビュー指摘: 同一ユーザーからの並行イベントが get と update
-/// の間に割り込めないようにするため）。LINE push の失敗そのものは `send_line_reply` の
-/// `Err` を通じて呼び出し元（`webhook_handler`）が error ログを出す。
+/// の間に割り込めないようにするため）。**① の chat loading API 呼び出しもこのロックの内側
+/// にある（Stage 2 codex レビュー指摘 Warning 4）**: ロック取得**前**に呼ぶと、同一ユーザー
+/// からの並行イベントの処理順が loading API の応答速度で決まってしまう（loading API が遅い
+/// 先行イベントを、速い後着イベントが追い越してセッションを先に読み・応答生成 API を先に
+/// 呼び・case_id を先に確定させる）。両方の返信は届くため、これは顧客に見える形の障害には
+/// ならず、会話履歴・signal 累積・case_id 確定の順序だけがサイレントに入れ替わり回答品質が
+/// 劣化する（気づく手段が無い）。トレードオフ: ロックの内側に置くと、同一ユーザーの後続
+/// イベントは先行イベントの処理が終わるまで自分のローディング表示が出ない。ただし後続
+/// イベントはどのみち返信自体も待たされるため、実際に処理が始まった時点で表示する方が
+/// 表示として正確であり、会話順序の整合性を優先する。LINE push の失敗そのものは
+/// `send_line_reply` の `Err` を通じて呼び出し元（`webhook_handler`）が error ログを出す。
 async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
     match route_event(event) {
         RoutedEvent::Ignore => Ok(()),
@@ -733,10 +763,17 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             user_id,
             text,
         } => {
-            // ロックはこの分岐を抜けるまで（LINE 返信・(成功時のみ)assistant ターンの保存を
-            // 含めて）保持し続ける。同一ユーザーの次のイベントは、この分岐が終わるまで get
-            // すら開始できない（`SessionStore` の doc comment 参照）。
+            // ロックはこの分岐を抜けるまで（loading indicator の表示・LINE 返信・(成功時の
+            // み)assistant ターンの保存を含めて）保持し続ける。同一ユーザーの次のイベントは、
+            // この分岐が終わるまで get すら開始できない（`SessionStore` の doc comment 参照）。
             let mut session = state.sessions.lock_session(&user_id).await;
+
+            // design doc §6 手順3: セッション読み取り・応答生成 API 呼び出しより前に、処理中
+            // アニメーションを表示する。失敗しても warn ログのみで後続処理を継続する（呼び出し
+            // 先 `start_loading_indicator` の doc comment 参照）。**ロック取得後に呼ぶ**（Stage
+            // 2 codex レビュー指摘 Warning 4。理由は `handle_event` の doc comment 参照）。
+            start_loading_indicator(state, &user_id).await;
+
             let case_id = session.case_id.clone();
             let history = session.history.clone();
 
@@ -923,6 +960,77 @@ async fn send_line_reply(state: &AppState, reply_token: &str, text: &str) -> Res
     Ok(())
 }
 
+/// [`start_loading_indicator`] の per-request timeout の既定値（Stage 1 レビュー指摘 Critical
+/// 1）。本番は常にこの定数を使う（`main()` が設定する）。テストは
+/// `AppStateInner::line_loading_timeout` を短く差し替える。
+const DEFAULT_LINE_LOADING_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// LINE chat loading API（`POST https://api.line.me/v2/bot/chat/loading/start`）を 1 回呼び、
+/// 処理中アニメーションを表示する（design doc §6 手順3）。セッションのロックを取得した
+/// **直後**、セッション読み取り・応答生成 API 呼び出しより前に呼ぶ（`handle_event` 参照。
+/// Stage 2 codex レビュー指摘 Warning 4: ロック取得**前**に呼ぶと、同一ユーザーの並行イベント
+/// の処理順が loading API の応答速度で決まってしまい、会話順序が入れ替わりうる）。
+///
+/// **この呼び出しの失敗は warn ログのみで処理を継続する。** 表示は体験改善であり必須機能では
+/// ないため、`Result` を返さず呼び出し元へ何も伝播させない（ネットワークエラー・非 2xx の
+/// いずれも同様に warn で continue）。
+///
+/// **per-request timeout が必須（Stage 1 レビュー指摘 Critical 1）**: `state.http` は
+/// `main()` で 50 秒のクライアント既定 timeout を持つ（応答生成 API 用）。これをそのまま
+/// 使うと、chat loading API がストールした場合に**応答生成 API を呼ぶ前に最大 50 秒ブロック
+/// する**。design doc §6 の「1 イベントあたりの累積タイムアウトは最大で約 103 秒（chat
+/// loading API の per-request timeout 3 秒を含む）」という Accepted Risk の予算は、この
+/// per-request timeout が無ければ chat loading API 側だけで**さらに +47 秒**（3 秒 → 50 秒）
+/// 膨らみ、約 150 秒に達する。これは LINE reply token の実効予算（実測往復 10〜15 秒、§8）を
+/// 食い潰して顧客が返信を一切受け取れなくなりうる規模である。「失敗は継続する」という設計の
+/// 前提（体験改善であり必須機能ではない）を守るため、ここだけ短い per-request timeout
+/// （既定 [`DEFAULT_LINE_LOADING_TIMEOUT`]、`reqwest::RequestBuilder::timeout` はクライアント
+/// 既定を上書きする）を明示的に掛ける。
+async fn start_loading_indicator(state: &AppState, user_id: &str) {
+    let payload = serde_json::json!({
+        "chatId": user_id,
+        "loadingSeconds": 60,
+    });
+
+    // `.json(&payload)` にリクエストボディのシリアライズと `content-type: application/json`
+    // ヘッダの設定を任せる（Stage 1 レビュー指摘 Suggestion 1: 文字列・数値だけの `Value` の
+    // シリアライズは失敗しえないため、旧実装の `to_vec` エラー分岐は到達不能なデッドコード
+    // だった）。
+    let response = match state
+        .http
+        .post(&state.line_loading_api_url)
+        .timeout(state.line_loading_timeout)
+        .header(
+            "authorization",
+            format!("Bearer {}", state.channel_access_token),
+        )
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                user_id,
+                error = ?err,
+                "line webhook: chat loading api call failed (network/timeout); continuing \
+                 without the loading indicator"
+            );
+            return;
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        tracing::warn!(
+            user_id,
+            %status,
+            "line webhook: chat loading api returned a non-success status; continuing without \
+             the loading indicator"
+        );
+    }
+}
+
 /// `CS_ANSWER_API_URL` の形式検証（Stage 2 レビュー指摘、および一次レビュー指摘: 前方一致では
 /// `http://127.0.0.1.evil.com` 等の外部ホストが素通りしていた）。
 ///
@@ -1040,6 +1148,8 @@ async fn main() -> Result<()> {
         http,
         sessions: SessionStore::new(),
         line_reply_api_url: DEFAULT_LINE_REPLY_API_URL.to_string(),
+        line_loading_api_url: DEFAULT_LINE_LOADING_API_URL.to_string(),
+        line_loading_timeout: DEFAULT_LINE_LOADING_TIMEOUT,
     });
 
     // TTL 経過エントリの定期スイープ（design doc §6: 「アクセス時 + 定期スイープ」の
@@ -1716,7 +1826,33 @@ mod tests {
         }))
     }
 
-    fn test_app_state(answer_api_url: String, line_reply_api_url: String) -> AppState {
+    /// テスト専用: loading indicator と無関係な呼び出し元に渡す安全な既定値。到達不能な固定
+    /// アドレスなので、`start_loading_indicator` が実際に呼ばれても接続エラーで warn する
+    /// だけで済む（失敗しても継続するだけなので害はない）。
+    const UNREACHABLE_LOADING_API_URL: &str = "http://127.0.0.1:1";
+
+    fn test_app_state(
+        answer_api_url: String,
+        line_reply_api_url: String,
+        line_loading_api_url: String,
+    ) -> AppState {
+        test_app_state_with_loading_timeout(
+            answer_api_url,
+            line_reply_api_url,
+            line_loading_api_url,
+            DEFAULT_LINE_LOADING_TIMEOUT,
+        )
+    }
+
+    /// [`test_app_state`] に加え、chat loading API の per-request timeout も差し替えられる版。
+    /// ストールした chat loading API が応答生成 API 呼び出しをブロックしないことを検証する
+    /// テスト（Stage 1 レビュー指摘 Critical 1）だけがこちらを直接使う。
+    fn test_app_state_with_loading_timeout(
+        answer_api_url: String,
+        line_reply_api_url: String,
+        line_loading_api_url: String,
+        line_loading_timeout: Duration,
+    ) -> AppState {
         Arc::new(AppStateInner {
             channel_secret: "test-channel-secret".to_string(),
             channel_access_token: "test-channel-access-token".to_string(),
@@ -1730,6 +1866,8 @@ mod tests {
                 .expect("build test reqwest client"),
             sessions: SessionStore::with_limits(Duration::from_secs(3600), 10),
             line_reply_api_url,
+            line_loading_api_url,
+            line_loading_timeout,
         })
     }
 
@@ -1757,6 +1895,7 @@ mod tests {
         let state = test_app_state(
             format!("{answer_api_base}/reply"),
             format!("{line_ok_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
         );
         let event = text_webhook_event("u1", "rt1", "こんにちは");
 
@@ -1794,6 +1933,7 @@ mod tests {
         let state = test_app_state(
             format!("{answer_api_base}/reply"),
             format!("{line_fail_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
         );
         let event = text_webhook_event("u1", "rt1", "こんにちは");
 
@@ -1841,6 +1981,7 @@ mod tests {
         let state = test_app_state(
             format!("{answer_api_base}/reply"),
             format!("{line_ok_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
         );
         let event = text_webhook_event("u1", "rt1", "こんにちは");
 
@@ -1865,6 +2006,477 @@ mod tests {
              fails: the answer api's 200 is what makes assemble_reply return Some(update) (and \
              thus a customer-turn save) in the first place, so a failure must leave the session \
              exactly as it was before this event"
+        );
+    }
+
+    // ---- start_loading_indicator（design doc §6 手順3: chat loading API） ----
+
+    /// [`loading_capture_handler`] が受け取ったリクエストのうち、テストが検証する部分だけを
+    /// 抜き出したスナップショット。
+    #[derive(Debug, Default, Clone)]
+    struct CapturedLoadingRequest {
+        calls: u32,
+        chat_id: Option<String>,
+        loading_seconds: Option<i64>,
+        authorization: Option<String>,
+        content_type: Option<String>,
+    }
+
+    /// chat loading API のモックハンドラ。呼び出し回数だけでなく、design doc §6 手順3 が定める
+    /// 契約そのもの（`chatId` / `loadingSeconds` / `Authorization` / `Content-Type`）を検証する
+    /// （Stage 1 レビュー指摘 Warning 1: 回数しか見ないモックだと、`chatId` の値が誤っている・
+    /// `Authorization` が欠けている等の契約違反を検出できず、機能全体が本番で無反応のまま
+    /// warn ログ以外に兆候が出ないサイレント never-works になりうる）。
+    ///
+    /// 中身の妥当性はハンドラ内で `panic!` させず、`Arc<Mutex<CapturedLoadingRequest>>` へ
+    /// 記録するだけにとどめる。ハンドラは `spawn_http_mock` が起動する別の tokio task 上で
+    /// 動くため、ここで panic してもテスト本体のアサーションとしては伝播しない
+    /// （コネクションが切れて `start_loading_indicator` 側がネットワークエラーとして warn する
+    /// だけになり、検証したい内容がテスト結果に反映されない）。呼び出し元がロック解放後に
+    /// 値を assert する。
+    async fn loading_capture_handler(
+        State(captured): State<Arc<Mutex<CapturedLoadingRequest>>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> StatusCode {
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+        let mut captured = captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        captured.calls += 1;
+        captured.chat_id = parsed
+            .as_ref()
+            .and_then(|v| v.get("chatId"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        captured.loading_seconds = parsed
+            .as_ref()
+            .and_then(|v| v.get("loadingSeconds"))
+            .and_then(|v| v.as_i64());
+        captured.authorization = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        captured.content_type = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn handle_event_sends_the_chat_loading_api_request_the_contract_requires() {
+        let answer_api_base =
+            spawn_http_mock(Router::new().route("/reply", post(answer_api_ok_handler))).await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+        let captured = Arc::new(Mutex::new(CapturedLoadingRequest::default()));
+        let loading_router = Router::new()
+            .route("/loading", post(loading_capture_handler))
+            .with_state(captured.clone());
+        let loading_base = spawn_http_mock(loading_router).await;
+
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            format!("{loading_base}/loading"),
+        );
+        let event = text_webhook_event("u1", "rt1", "こんにちは");
+
+        handle_event(&state, &event).await.expect(
+            "handle_event must succeed when the chat loading api, answer api, and line reply \
+             all succeed",
+        );
+
+        let captured = captured.lock().unwrap().clone();
+        assert_eq!(
+            captured.calls, 1,
+            "the chat loading api must receive exactly one request per text event (design doc \
+             §6 step 3)"
+        );
+        assert_eq!(
+            captured.chat_id,
+            Some("u1".to_string()),
+            "chatId must be the LINE user id from source.userId"
+        );
+        assert_eq!(
+            captured.loading_seconds,
+            Some(60),
+            "loadingSeconds must be 60 (design doc §6 step 3)"
+        );
+        assert_eq!(
+            captured.authorization,
+            Some("Bearer test-channel-access-token".to_string()),
+            "the channel access token must be sent as a Bearer token, same as send_line_reply"
+        );
+        assert_eq!(
+            captured.content_type.as_deref(),
+            Some("application/json"),
+            "the request body must be sent as application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_does_not_block_on_a_slow_chat_loading_api() {
+        // Stage 1 レビュー指摘 Critical 1 の固定テスト: per-request timeout が無いと、
+        // 50 秒のクライアント既定 timeout に落ちるまで応答生成 API 呼び出しがブロックされる。
+        // per-request timeout を短く（200ms）差し替え、モックの応答をそれより長く（2 秒）
+        // 遅延させることで、timeout が実際に効いていることをテスト自体は短時間で検証する。
+        const TEST_LOADING_TIMEOUT: Duration = Duration::from_millis(200);
+        const MOCK_DELAY: Duration = Duration::from_secs(2);
+
+        let answer_api_base =
+            spawn_http_mock(Router::new().route("/reply", post(answer_api_ok_handler))).await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+        let slow_loading_base = spawn_http_mock(Router::new().route(
+            "/loading",
+            post(|| async move {
+                tokio::time::sleep(MOCK_DELAY).await;
+                StatusCode::OK
+            }),
+        ))
+        .await;
+
+        let state = test_app_state_with_loading_timeout(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            format!("{slow_loading_base}/loading"),
+            TEST_LOADING_TIMEOUT,
+        );
+        let event = text_webhook_event("u1", "rt1", "こんにちは");
+
+        let started = Instant::now();
+        let result = handle_event(&state, &event).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "handle_event must still succeed: a stalled chat loading api must not fail the \
+             overall event handling (design doc §6 step 3, warn-and-continue)"
+        );
+        // Stage 2 レビュー指摘 Suggestion 3: 上限を MOCK_DELAY（2秒）ではなく設定値
+        // （per-request timeout 200ms）に近い 1 秒へ締める。2 秒のままだと timeout が誤って
+        // 1〜1.5 秒に延びる回帰が起きてもこのテストは緑のままになり、固定したい境界（200ms
+        // で切れること）を検証できていなかった。ロック取得（Warning 4 でこのテストより前に
+        // 移動）はマイクロ秒オーダーなので、この上限には実質影響しない。
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "handle_event must return well within 1s: the per-request timeout on the chat \
+             loading api call is {TEST_LOADING_TIMEOUT:?}, so a stalled loading api must cut \
+             the call short long before the mock's {MOCK_DELAY:?} delay or the http client's \
+             50s default. elapsed={elapsed:?}"
+        );
+    }
+
+    /// 応答生成 API のモック: リクエスト body の `message` を到着順に記録してから、通常の
+    /// 200 応答を返す。`handle_event_serializes_the_same_users_concurrent_events...` が
+    /// 「先行イベントの loading API が遅くても、応答生成 API への到達順は入れ替わらない」
+    /// ことを検証するために使う。
+    async fn answer_order_recording_handler(
+        State(order): State<Arc<Mutex<Vec<String>>>>,
+        body: Bytes,
+    ) -> axum::Json<serde_json::Value> {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+                order
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(message.to_string());
+            }
+        }
+        axum::Json(serde_json::json!({
+            "reply_text": "こちらが回答です",
+            "case_id": "case-abc",
+        }))
+    }
+
+    /// [`loading_lock_observation_handler`] の router state。`state_cell` はテスト本体が
+    /// 構築した `AppState` を後から流し込むための入れ物（`test_app_state` が要求する
+    /// `line_loading_api_url` を先に確定させる必要があり、loading モックの router を先に
+    /// 起動してから `AppState` を作る、という構築順の都合上こうなっている）。`observed` は
+    /// ハンドラが観測した「呼び出し時点でロック済みだったか」を書き戻す先。
+    type LoadingLockObservationState = (Arc<Mutex<Option<AppState>>>, Arc<Mutex<Option<bool>>>);
+
+    /// chat loading API のモック: 呼び出された瞬間に、対象ユーザー（`"u1"` 固定）のセッション
+    /// mutex が**既にロックされているか**を `try_lock()` で直接観測し、`observed` へ書き込む。
+    ///
+    /// **Stage 2 codex レビュー round 3 Warning 6(a) の決定論的な主テストが使うハンドラ**。
+    /// 並行イベントを 2 つ走らせて到達順を見る（下の
+    /// `handle_event_serializes_the_same_users_concurrent_events_despite_a_slow_first_loading_call`）
+    /// のとは異なり、**単一イベント**の処理中に「loading API を呼んでいる時点でロックが
+    /// held かどうか」を直接見るため、他タスクのスケジューリングにも時間計測にも依存しない。
+    ///
+    /// `SessionStore::get_or_create` は既存キーがあれば同じ `Arc<TokioMutex<Session>>` を
+    /// 返す（`server/src/bin/line_adapter.rs` の実装参照）。`handle_event` は
+    /// `start_loading_indicator` を呼ぶ**前**に `lock_session`（内部で `get_or_create` を
+    /// 呼ぶ）を完了させているため、正しい実装ではここで呼ぶ `get_or_create("u1")` は
+    /// `handle_event` が保持しているのと同じ `Arc` を返し、その `try_lock()` は必ず失敗
+    /// する（`is_err() == true`）。ロック取得前に loading API を呼ぶ回帰が起きた場合は、
+    /// `"u1"` のエントリがまだ存在せず `get_or_create` が新規作成した未ロックの `Arc` を
+    /// 返すため、`try_lock()` は成功し（`is_err() == false`）、テストは決定論的に赤くなる。
+    async fn loading_lock_observation_handler(
+        State((state_cell, observed)): State<LoadingLockObservationState>,
+    ) -> StatusCode {
+        let app_state = state_cell
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .expect(
+                "the test must populate the AppState cell before calling handle_event, or this \
+                 handler cannot see the same SessionStore instance handle_event is using",
+            );
+        let session_arc = app_state.sessions.get_or_create("u1");
+        let is_locked = session_arc.try_lock().is_err();
+        *observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(is_locked);
+        StatusCode::OK
+    }
+
+    /// Stage 2 codex レビュー round 3 Warning 6(a): Warning 4 の固定を、他タスクの
+    /// スケジューリングや時間計測に依存せず決定論的に検証する主テスト。
+    ///
+    /// 並行イベントは使わない。単一のテキストイベントを処理させ、その最中に chat loading
+    /// API が呼ばれた瞬間、対象ユーザーのセッション mutex が既にロックされていることだけを
+    /// 直接観測する（[`loading_lock_observation_handler`] 参照）。これが緑である限り、
+    /// 「loading API 呼び出しはロック取得後」という Warning 4 の不変条件は sleep や
+    /// タスクの追い越しに関係なく保証されている。
+    ///
+    /// 到達順（A→B）を実際に確認する
+    /// `handle_event_serializes_the_same_users_concurrent_events_despite_a_slow_first_loading_call`
+    /// は、この不変条件が実際に「並行イベントの順序保存」という観測可能な効果につながって
+    /// いることを示す end-to-end の補助テストという位置づけに変える（決定論的な回帰検出は
+    /// このテストが担う）。
+    #[tokio::test]
+    async fn handle_event_holds_the_session_lock_while_calling_the_chat_loading_api() {
+        let answer_api_base =
+            spawn_http_mock(Router::new().route("/reply", post(answer_api_ok_handler))).await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+
+        let state_cell: Arc<Mutex<Option<AppState>>> = Arc::new(Mutex::new(None));
+        let observed: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let loading_router = Router::new()
+            .route("/loading", post(loading_lock_observation_handler))
+            .with_state((state_cell.clone(), observed.clone()));
+        let loading_base = spawn_http_mock(loading_router).await;
+
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            format!("{loading_base}/loading"),
+        );
+        // handle_event を呼ぶ前に、loading モックが参照する AppState を確定させる（この代入は
+        // handle_event の呼び出しより前の同期コードなので、ハンドラが実行される時点では必ず
+        // Some になっている）。
+        *state_cell
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state.clone());
+
+        let event = text_webhook_event("u1", "rt1", "こんにちは");
+        handle_event(&state, &event)
+            .await
+            .expect("handle_event must succeed");
+
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(true),
+            "the session mutex for the event's user must already be locked at the moment the \
+             chat loading api is called; if this is Some(false), the loading call has \
+             regressed to before lock acquisition (Warning 4), and if this is None, the loading \
+             api was never called at all"
+        );
+    }
+
+    /// chat loading API のモックが 1 回目の呼び出しだけブロックするためのハンドシェイク。
+    /// `tokio::sync::Notify` を 2 本使い、sleep の長さではなく実際のイベントでテスト本体と
+    /// モックハンドラの間を同期する（Stage 2 codex レビュー round 2 Warning 5: 「A を spawn
+    /// してから 50ms sleep すれば A が先にロックを取得しているはず」という以前の実装は、
+    /// sleep が「A がロックを取得した」ことも「A が loading handler に到達した」ことも保証
+    /// しないため、CI 高負荷で A のスケジュールが 50ms 以上遅れると、正しい実装でも B が
+    /// 先にロックを取ってテストが偽陽性で落ちうる欠陥があった）。
+    #[derive(Default)]
+    struct LoadingHandshake {
+        call_count: Mutex<u32>,
+        /// 1 回目の呼び出しが handler の中に入った（＝ chat loading API 呼び出し中、修正後の
+        /// 実装ではこの時点でロックを保持中）ことをテスト本体へ知らせる。
+        reached: tokio::sync::Notify,
+        /// テスト本体が 1 回目の呼び出しを解放してよいと伝える。
+        release: tokio::sync::Notify,
+    }
+
+    /// chat loading API のモック: **1 回目の呼び出しだけ** `reached.notify_one()` を呼んでから
+    /// `release.notified()` で待つ。2 回目以降は即応答する。同一 `chatId`（同一ユーザー）の
+    /// 連続呼び出しは body だけでは区別できないため、呼び出し順（＝先着イベントが先に loading
+    /// API を叩く）で区別する。`Notify::notify_one()` は permit を 1 つ蓄えるため、テスト本体の
+    /// `notified()` 登録より先に呼ばれても取りこぼさない（lost wakeup 対策）。
+    async fn loading_handshake_handler(
+        State(handshake): State<Arc<LoadingHandshake>>,
+    ) -> StatusCode {
+        let is_first_call = {
+            let mut count = handshake
+                .call_count
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let is_first_call = *count == 0;
+            *count += 1;
+            is_first_call
+        };
+        if is_first_call {
+            handshake.reached.notify_one();
+            handshake.release.notified().await;
+        }
+        StatusCode::OK
+    }
+
+    /// end-to-end の補助テスト。決定論的な回帰検出は
+    /// `handle_event_holds_the_session_lock_while_calling_the_chat_loading_api`（Warning
+    /// 6(a)）が担う。このテストは、そのロック保持という不変条件が実際に「同一ユーザーの
+    /// 並行イベントの到達順が保存される」という観測可能な効果につながっていることを示す
+    /// （round 2 の Warning 5 で sleep 依存の一部を排除したが、round 3 の Warning 6(b) で
+    /// 残る 2 点をさらに直した: (1) 旧実装の検出はなお 50ms sleep に依存しており「必ず」で
+    /// はなく「高確率で」しか言えない、(2) `reached`/`join!` に期限が無いとロード呼び出し
+    /// 自体が消える等の別種の回帰で無期限にハングしていた。両方とも `tokio::time::timeout`
+    /// で期限を付け、期限切れは明示的な `panic`（テスト失敗）にした）。
+    ///
+    /// 修正前は `start_loading_indicator` がセッションロック取得より前にあったため、同一
+    /// ユーザーからの並行イベントの処理順が loading API の応答速度だけで決まっていた。ここでは
+    /// 先行イベント A の loading API 呼び出しを [`LoadingHandshake`] で意図的にブロックし、
+    /// 後着イベント B の loading API は即応答にする。修正前の実装では B が A を追い越して先に
+    /// 応答生成 API へ到達しうる（実際に踏んだ回帰）。修正後（ロック取得を loading API 呼び
+    /// 出しより前に置く）では、A がロックを保持したまま loading → 応答生成 API → LINE 返信まで
+    /// 一通り終えるまで B は `lock_session` から先に進めないため、到達順は A → B になる。
+    ///
+    /// `handshake.reached.notified().await` を通過した時点で、A は loading handler の中
+    /// （＝修正後の実装ではロックを保持中）にいることが確定するため、「B を spawn するタイミ
+    /// ング」は sleep で仮定していない。**ただし B を spawn した後に残した 50ms sleep は、
+    /// 旧実装（ロック取得前に loading を呼ぶ）を「高確率で」赤くするためのものであり、CI が
+    /// 高負荷でこの 50ms の間に B がまだ応答生成 API へ到達していなければ、旧実装でも緑に
+    /// なりうる（＝この sleep は旧実装の検出を保証しない）。旧実装を決定論的に検出したい
+    /// 場合は上記の Warning 6(a) テストを見ること。** 正しい実装に対しては、この sleep の
+    /// 長短は結果に影響しない（B は `lock_session` で必ずブロックされるため）。
+    #[tokio::test]
+    async fn handle_event_serializes_the_same_users_concurrent_events_despite_a_slow_first_loading_call(
+    ) {
+        /// `reached`/`join!` それぞれに掛ける上限。発火しない・完了しない回帰（loading 呼び
+        /// 出し自体が消える、モック接続に失敗する、タスクが panic する等）を、無期限ハングでは
+        /// なく明示的なテスト失敗にするための期限（Warning 6(b)）。
+        const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let answer_order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let answer_router = Router::new()
+            .route("/reply", post(answer_order_recording_handler))
+            .with_state(answer_order.clone());
+        let answer_api_base = spawn_http_mock(answer_router).await;
+
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+
+        let handshake = Arc::new(LoadingHandshake::default());
+        let loading_router = Router::new()
+            .route("/loading", post(loading_handshake_handler))
+            .with_state(handshake.clone());
+        let loading_base = spawn_http_mock(loading_router).await;
+
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            format!("{loading_base}/loading"),
+        );
+
+        let state_a = state.clone();
+        let task_a = tokio::spawn(async move {
+            let event = text_webhook_event("u1", "rt-a", "Aの本文");
+            handle_event(&state_a, &event).await
+        });
+
+        // A が chat loading API 呼び出しの中（修正後の実装ではロックを保持中）に入るまで待つ。
+        // sleep の長さに依存しないイベント同期（Warning 5）。期限切れはハングではなく失敗に
+        // する（Warning 6(b)）。
+        tokio::time::timeout(WAIT_TIMEOUT, handshake.reached.notified())
+            .await
+            .expect(
+                "handshake.reached did not fire within the timeout: the chat loading api call \
+                 itself may have disappeared from handle_event's text-event branch (a \
+                 different kind of regression than Warning 4)",
+            );
+
+        let state_b = state.clone();
+        let task_b = tokio::spawn(async move {
+            let event = text_webhook_event("u1", "rt-b", "Bの本文");
+            handle_event(&state_b, &event).await
+        });
+        // 旧実装を「高確率で」赤くするための猶予（このテストの doc comment 参照。正しい実装
+        // に対する緑判定はこの sleep の長短に依存しない。旧実装の決定論的な検出は保証しない）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        handshake.release.notify_one();
+
+        let (result_a, result_b) = tokio::time::timeout(WAIT_TIMEOUT, async {
+            tokio::join!(task_a, task_b)
+        })
+        .await
+        .expect(
+            "task A/B did not complete within the timeout: a hang here likely means the chat \
+             loading api call is blocking somewhere it should not (e.g. the per-request \
+             timeout stopped applying)",
+        );
+        result_a
+            .expect("task A must not panic")
+            .expect("handle_event(A) must succeed");
+        result_b
+            .expect("task B must not panic")
+            .expect("handle_event(B) must succeed");
+
+        let order = answer_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            order,
+            vec!["Aの本文".to_string(), "Bの本文".to_string()],
+            "event A must reach the answer api before event B even though A's chat loading api \
+             call is slow: the same-user lock must serialize the whole per-event pipeline \
+             (including the loading indicator), not just the session read/write part"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_continues_when_the_chat_loading_api_fails() {
+        let answer_api_base =
+            spawn_http_mock(Router::new().route("/reply", post(answer_api_ok_handler))).await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+        let loading_fail_base = spawn_http_mock(Router::new().route(
+            "/loading",
+            post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        ))
+        .await;
+
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            format!("{loading_fail_base}/loading"),
+        );
+        let event = text_webhook_event("u1", "rt1", "こんにちは");
+
+        let result = handle_event(&state, &event).await;
+        assert!(
+            result.is_ok(),
+            "a failing chat loading api must not interrupt the rest of handle_event: it is a UX \
+             nicety, not a required step (design doc §6 step 3: 'この呼び出しの失敗は warn ログ \
+             のみで処理を継続する')"
+        );
+
+        let (case_id, _history) = state.sessions.snapshot("u1").await;
+        assert_eq!(
+            case_id,
+            Some("case-abc".to_string()),
+            "the answer api call, session save, and line reply must all complete normally even \
+             though the chat loading api returned 500"
         );
     }
 
