@@ -36,6 +36,28 @@ pub(crate) const CONTINUATION_OPENER_RULE: &str =
 pub(crate) const CLOSER_BAN_PHRASE: &str =
     "感謝・締め・「何かあればお申し付けください」等、会話の終了を示唆する文言";
 
+/// 制御文字（改行・復帰等）を半角スペースへ潰し、Unicode 空白（`char::is_whitespace()` が
+/// 拾う U+2028 / U+2029 等を含む）で連続分割してから半角スペース 1 つで再結合し、trim する。
+/// 「1 値 = 必ず 1 行」という不変条件を、呼び出し側ごとに個別実装させず共通化するための関数。
+///
+/// 切り詰めは行わない。長さの制約が必要な呼び出し側は、この関数の戻り値に対して
+/// [`truncate_chars`] 等を別途重ねること。
+///
+/// `harness::api::normalize_customer_turn_to_single_line`（顧客発話。改行で偽の箇条書き行を
+/// 注入されないため）と `harness::signal::LexiconNormalizer`（lexicon の `customer_label`。
+/// JSON に改行を紛れ込ませても顧客向けプロンプトが崩れないため）の 2 箇所が使う。
+pub(crate) fn collapse_to_single_line(text: &str) -> String {
+    let control_collapsed: String = text
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    control_collapsed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// 文字数上限で切り詰める（文字境界を壊さない）。切ったことが分かるよう省略記号を付ける。
 pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -174,6 +196,32 @@ mod tests {
         EmitContext {
             channel: egress::EmitChannel::Operator,
         }
+    }
+
+    #[test]
+    fn collapse_to_single_line_joins_newlines_with_a_single_space() {
+        assert_eq!(
+            collapse_to_single_line("型番はA\n- 把握済みの条件語: 全て確認済み"),
+            "型番はA - 把握済みの条件語: 全て確認済み"
+        );
+    }
+
+    #[test]
+    fn collapse_to_single_line_collapses_unicode_line_and_paragraph_separators() {
+        // U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR は `char::is_control()` では
+        // 拾えないが、`split_whitespace()` の Unicode 空白判定では拾える。
+        let text = "行1\u{2028}行2\u{2029}行3";
+        assert_eq!(collapse_to_single_line(text), "行1 行2 行3");
+    }
+
+    #[test]
+    fn collapse_to_single_line_trims_and_collapses_runs_of_spaces() {
+        assert_eq!(collapse_to_single_line("  a   b  "), "a b");
+    }
+
+    #[test]
+    fn collapse_to_single_line_returns_empty_for_whitespace_only_input() {
+        assert_eq!(collapse_to_single_line("   \n\t  "), "");
     }
 
     #[test]
