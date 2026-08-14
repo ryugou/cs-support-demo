@@ -114,7 +114,7 @@ env（`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `CS_ANSWER_API_URL` 
 
 1. `X-Line-Signature` を channel secret の HMAC-SHA256（base64）で定数時間比較する。不一致は 400
 2. イベントを順に処理する。`message` かつ `text` 以外のメッセージは `CS_LINE_NONTEXT_TEXT` を返信、`message` 以外のイベントは無視
-3. テキストイベント: セッションストアから該当 user の履歴・case_id を取り、API を 1 回コール（タイムアウト 50 秒）
+3. テキストイベント: まず LINE の chat loading API（`POST https://api.line.me/v2/bot/chat/loading/start`、`chatId` = source.userId、`loadingSeconds` = 60）を呼んで処理中アニメーションを表示する。**この呼び出しの失敗は warn ログのみで処理を継続する**（表示は体験改善であり必須機能ではない）。続けてセッションストアから該当 user の履歴・case_id を取り、API を 1 回コール（タイムアウト 50 秒）
 4. API が 200 を返した時点で、`case_id` と顧客発話（customer ターン）を直ちにセッションへ保存する。サーバ側では 200 の時点で case が確定し signal が追記済みのため、以降の発話を同じ case に必ず合流させる（LINE 返信の成否でこの保存を左右させると、返信失敗時に次の発話が新規 case となり蓄積 signal が判定から脱落する）。その後 `reply_text` を Reply API で返信し、**返信成功時のみ** assistant ターンを履歴へ追記する（顧客が受信していない発話を履歴に残さない）。API が非 200・タイムアウトの場合は `CS_LINE_FALLBACK_TEXT` を返信し、セッションは変更しない
 5. 全イベント処理後に 200 を返す
 
