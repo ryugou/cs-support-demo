@@ -411,7 +411,7 @@ Bearer token を付けていないため、上記は `401` + `WWW-Authenticate` 
   失敗する（`server/src/main.rs` の `read_bearer_token`。空文字がそのまま使われるため fail-closed にならない点に注意）。
 - **`[harness] manual_scoring_v2_enabled = true`（manual 検索スコア v2）**: 型番 run 除外 / TF / 長さ正規化 / 密度 tiebreak の **4 つをまとめて**切り替える kill switch（既定 false、Cloud Run 構成でのみ true）。**切り戻しは `server/config.cloudrun.toml` のこの行を `false` にして再デプロイするだけ**で、スコアも順位も従来へ完全に戻る。
   - 入れた理由: 型番を書いて質問すると、**製品非依存で書かれた正解記事が構造的に減点され**、型番をたまたま含む無関係な長文が上位に来ていた（本番実測。詳細と実測値は `docs/superpowers/specs/2026-08-05-manual-scoring-tf-lengthnorm-design.md`）。順位は `evaluate_answerability` の返信文下書きが使う材料（上位 3 件）を決めるため、**順位汚染はそのまま下書きの品質に出る**。
-  - **corpus 全体の recall は未測定**（vegapunk 不介入のため）。保証しているのは実データ 5 記事に対する順位と、スコアが 0〜1 に収まることだけ。vegapunk 復旧後に `verify_alarmcom` で before/after を測り、閾値の妥当性を再確認すること。
+  - **corpus 全体の recall は測定済み**（2026-08-14、`verify_alarmcom` 各 100 サンプル）: v1 → v2 で recall@1 0.44 → 0.53、recall@k 0.78 → 0.90、MRR 0.566 → 0.692、誤ヒット率 0.168 → 0.119 と全指標で改善し、閾値の妥当性を確認した。質問文は Gemini 生成のため実行間で非同一（section 抽出は決定論的に同一）という測定条件付き。詳細は `docs/superpowers/specs/2026-08-05-manual-scoring-tf-lengthnorm-design.md`。
   - **既知の限界**: カテゴリのハブページ（`/Partner` 等の目次的な記事）は語彙統計では正解記事と区別できず、上位に残りうる。誤った手順は持ち込まないが、材料の 1 枠を消費する。
 - **抜粋の切り詰めは warn に出る**（`server/src/harness/reply.rs` の `truncate_material`）。実データでは記事 5 件中 2 件が `MAX_EXCERPT_CHARS = 2,500` を超え（5,175 字 / 5,477 字）、**半分近くが落ちる**。下書きが「資料に記載がありません」と答えたら、まずこの warn（`route` / `material_id` / `original_chars`）を確認すること。
 
