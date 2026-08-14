@@ -504,6 +504,32 @@ fn service_principal() -> VerifiedIdentity {
     }
 }
 
+/// `reply_text` を [`crate::harness::prompt_input::to_plain_text`] で正規化した `ReplyResponse`
+/// を組み立てる（Issue #27: design doc §2「`/api/reply` の応答確定点でコードによるプレーン
+/// テキスト正規化を必ず通す」）。純粋関数として独立させているのは、`Response`（axum 型）の
+/// body を経由せずに正規化結果を直接 `assert_eq!` できるようにするため
+/// （[`ok_reply_response`] のテストが `ReplyResponse` を直接比較できる）。
+fn build_reply_response(reply_text: String, case_id: String) -> ReplyResponse {
+    ReplyResponse {
+        reply_text: crate::harness::prompt_input::to_plain_text(&reply_text),
+        case_id,
+    }
+}
+
+/// [`build_reply_response`] を 200 OK の `Response` にする薄いラッパー。`reply_handler` 内で
+/// `Json(ReplyResponse { .. })` を組み立てる 4 箇所（希望時間帯の即時返信・回答・聞き返し・
+/// エスカレーション受け止め）を**すべてこの関数経由に統一する**。分岐ごとに
+/// `to_plain_text` 呼び出しを複製すると、新しい分岐が追加されたときに正規化を書き忘れうる
+/// （このファイルの正本である design doc、および `prompt_input.rs` 冒頭の doc コメントが
+/// 記録している「集約前は複数箇所へ複製され drift した」のと同じ失敗パターン）。
+fn ok_reply_response(reply_text: String, case_id: String) -> Response {
+    (
+        StatusCode::OK,
+        Json(build_reply_response(reply_text, case_id)),
+    )
+        .into_response()
+}
+
 /// `ErrorBody` を JSON で返す。
 fn error_response(status: StatusCode, error: &str, message: impl Into<String>) -> Response {
     (
@@ -666,14 +692,7 @@ async fn reply_handler(
                         return conv_state_save_failed(&err, &request_id, case_id);
                     }
                     if let time_pref::TimePrefAction::Reply(text) = action {
-                        return (
-                            StatusCode::OK,
-                            Json(ReplyResponse {
-                                reply_text: text,
-                                case_id: case_id.to_string(),
-                            }),
-                        )
-                            .into_response();
+                        return ok_reply_response(text, case_id.to_string());
                     }
                     // TimePrefAction::PassToEvaluate: 下の evaluate() へ続行。
                 }
@@ -732,14 +751,7 @@ async fn reply_handler(
             }
 
             match action {
-                ReplyAction::Answer(text) => (
-                    StatusCode::OK,
-                    Json(ReplyResponse {
-                        reply_text: text,
-                        case_id: outcome.case_id,
-                    }),
-                )
-                    .into_response(),
+                ReplyAction::Answer(text) => ok_reply_response(text, outcome.case_id),
                 ReplyAction::Clarify => {
                     let missing: &[decision::EvidenceRequirement] = match &outcome.decision {
                         AnswerDecision::Escalate { missing, .. } => missing,
@@ -796,14 +808,7 @@ async fn reply_handler(
                     {
                         return conv_state_save_failed(&err, &request_id, &outcome.case_id);
                     }
-                    (
-                        StatusCode::OK,
-                        Json(ReplyResponse {
-                            reply_text,
-                            case_id: outcome.case_id,
-                        }),
-                    )
-                        .into_response()
+                    ok_reply_response(reply_text, outcome.case_id)
                 }
                 ReplyAction::EscalationReply => {
                     let ack_text = match state.harness.reply_drafter.as_ref() {
@@ -841,14 +846,7 @@ async fn reply_handler(
                     {
                         return conv_state_save_failed(&err, &request_id, &outcome.case_id);
                     }
-                    (
-                        StatusCode::OK,
-                        Json(ReplyResponse {
-                            reply_text,
-                            case_id: outcome.case_id,
-                        }),
-                    )
-                        .into_response()
+                    ok_reply_response(reply_text, outcome.case_id)
                 }
             }
         }
@@ -1763,6 +1761,48 @@ mod tests {
         let (status, code) = classify_evaluate_error(&err);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(code, "internal");
+    }
+
+    // ---- build_reply_response / ok_reply_response（Issue #27 配線テスト）----
+    //
+    // `reply_handler` 内の 4 箇所の `Json(ReplyResponse { .. })` 組み立てを `ok_reply_response`
+    // 経由に統一しているのは実装上の規約であり、型で強制されているわけではない
+    // （`ReplyResponse` のフィールドは pub なので、regression として直接構築されても
+    // コンパイルは通ってしまう）。そのため `ok_reply_response` 自体が実際に正規化済み body を
+    // 返すことは、`build_reply_response` の純粋関数テストとは別に、`Response` の body を
+    // 読み出して確認する（下の `ok_reply_response_normalizes_body_and_preserves_case_id`）。
+
+    #[test]
+    fn build_reply_response_strips_markdown_from_reply_text() {
+        let out = build_reply_response("これは**重要**です".to_string(), "case-1".to_string());
+        assert_eq!(
+            out,
+            ReplyResponse {
+                reply_text: "これは重要です".to_string(),
+                case_id: "case-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_reply_response_passes_through_case_id_unchanged() {
+        // 正規化対象は reply_text のみ。case_id は素通しであることを固定する。
+        let out = build_reply_response("問題ありません。".to_string(), "case-abc123".to_string());
+        assert_eq!(out.case_id, "case-abc123");
+    }
+
+    #[tokio::test]
+    async fn ok_reply_response_normalizes_body_and_preserves_case_id() {
+        let response = ok_reply_response("**重要**なお知らせ".to_string(), "case-2".to_string());
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response body is JSON");
+        assert_eq!(body["reply_text"], "重要なお知らせ");
+        assert_eq!(body["case_id"], "case-2");
     }
 
     // ---- /api/reply ルーティング ----
