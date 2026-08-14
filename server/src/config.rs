@@ -120,7 +120,12 @@ impl Default for LlmConfig {
             endpoint: "https://api.anthropic.com/v1/messages".to_string(),
             api_key_file: None,
             timeout_secs: 20,
-            max_tokens: 300,
+            // Issue #28 C2(a) レビュー指摘: catalog（取扱一覧）注入時は product_references 分の
+            // 出力が増えるため、300 のままだと [llm] enabled = true な新規 config が
+            // max_tokens を書き忘れた場合に stop_reason=max_tokens で LexiconFallback へ落ち、
+            // /api/reply が全件エスカレーションへ倒れる。本番 config.cloudrun.toml と同じ
+            // 600 を既定値にする。
+            max_tokens: 600,
         }
     }
 }
@@ -228,7 +233,7 @@ pub struct HarnessConfig {
     /// 文面の正本は client 側という spec の結論は変わらない（`harness::reply` の doc を参照）。
     #[serde(default)]
     pub customer_reply_draft_enabled: bool,
-    /// 返信文下書きの `max_tokens`。signal 抽出用（`[llm] max_tokens`、既定 300）とは別枠。
+    /// 返信文下書きの `max_tokens`。signal 抽出用（`[llm] max_tokens`、既定 600）とは別枠。
     /// 返信文は数百字必要で、抽出用の上限では途中で切れる。
     #[serde(default = "default_reply_draft_max_tokens")]
     pub customer_reply_draft_max_tokens: u32,

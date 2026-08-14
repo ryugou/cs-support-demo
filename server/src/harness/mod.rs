@@ -114,6 +114,14 @@ pub struct EvaluationOutcome {
     /// 伝えないと、**末尾の注意書きだけが落ちた案内**がそのまま顧客へ送られうる。
     /// 下書きが無いとき（`customer_reply_draft` が `None`）は常に `false`。
     pub customer_reply_draft_truncated: bool,
+    /// 今ターンでLLMが抽出した製品参照（Issue #28 §3.1 二段目）。追加のLLM呼び出しは発生させず、
+    /// 既存のsignal抽出に同乗させて取得する。ここでの判定（foreign→取扱外）は行わない
+    /// （判定はapi.rs側。MCP経由の呼び出しでは何も強制しない。design doc §3.1）。
+    pub product_references: Vec<product_gate::ProductReference>,
+    /// 今ターンに新規追加された signal（累積 signal 集合への差分）。Issue #28 C1 是正:
+    /// 二段目(foreign)確定時に `Harness::demote_case_to_out_of_scope` へ渡し、破棄した
+    /// ターンの signal を `excluded_signals` 属性として記録するために使う。
+    pub new_signals: signal::SignalSet,
 }
 
 /// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
@@ -165,6 +173,61 @@ fn conv_state_from_attrs(attrs: &std::collections::HashMap<String, String>) -> C
             .parse()
             .unwrap_or(0),
     }
+}
+
+/// Issue #28 C1 是正: `demote_case_to_out_of_scope` が `excluded_signals`（CSV 属性）へ
+/// 書いた signal を、今後の累積 signal 集合から除外する。HAS_SIGNAL 辺自体は削除できない
+/// （VegapunkClient に delete API が無い）ため、snapshot から復元した signal 集合に対して
+/// 差し引くことで「破棄したターンの signal を累積に残さない」を実現する。
+///
+/// **除外は永久ではない**: 今ターンに実際に観測された signal は [`prune_excluded_signals`] が
+/// `excluded_signals` 属性そのものから取り除く（`evaluate()` 内で本関数の直後に適用する）。
+/// そのため、破棄したターンの signal がその後の会話で正当に再言及されれば、次ターン以降は
+/// 通常どおり累積へ反映される（レビュー修正1: 除外を永久に効かせると、正当な再言及があっても
+/// hazard signal が累積から落ち続け、`decision::classify_stakes` が fail-open してしまう）。
+fn exclude_recorded_signals(
+    signals: signal::SignalSet,
+    attrs: &std::collections::HashMap<String, String>,
+) -> signal::SignalSet {
+    let excluded = knowledge::csv_signals(
+        attrs
+            .get("excluded_signals")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    signals.difference(&excluded).cloned().collect()
+}
+
+/// レビュー修正1: 今ターンに実際に観測された signal（`observed`。lexicon ∪ LLM 抽出の結果）を
+/// `excluded_signals` 属性から取り除く純関数。
+///
+/// `exclude_recorded_signals` は「その場（prior_signals 復元時）で見えないようにする」だけで、
+/// `excluded_signals` 属性自体は `evaluate()` の末尾で毎ターンそのまま書き戻される。これを
+/// 呼ばないと、二段目(foreign)確定で一度除外された signal が、後続ターンで正当に再観測されても
+/// 永久に累積へ反映されなくなる（hazard signal が消えたまま Stakes が下がり、本来
+/// エスカレーションすべき会話が自動回答へ倒れる fail-open）。
+///
+/// `excluded_signals` 属性が最初から存在しない case には新しく属性を増やさない（無関係な case に
+/// 空文字属性を生やさない）。属性が存在し、かつ差し引きで内容が変わる場合のみ更新する。除外集合の
+/// 全要素が再観測されて空集合になった場合もキーは残し、値を空文字にする（`csv_signals` は空文字を
+/// 「除外なし」として読むため、以降のターンでも安全に扱える）。
+fn prune_excluded_signals(
+    attrs: &mut std::collections::HashMap<String, String>,
+    observed: &signal::SignalSet,
+) {
+    let Some(current) = attrs.get("excluded_signals") else {
+        return;
+    };
+    let excluded = knowledge::csv_signals(current);
+    let pruned: signal::SignalSet = excluded.difference(observed).cloned().collect();
+    if pruned.len() == excluded.len() {
+        // observed との交差が無い → 内容は変わらない。無用な書き込みをしない。
+        return;
+    }
+    attrs.insert(
+        "excluded_signals".to_string(),
+        knowledge::signals_to_csv(&pruned),
+    );
 }
 
 /// [`CaseConvState`] を support_case の属性 map へ書き戻す全属性を組み立てる純関数。
@@ -850,15 +913,21 @@ impl Harness {
         // manual 検索は accumulated signal 集合（会話層）を使うため、hits の取得は
         // accumulated が確定した後ろに回す（下記 manual 取得ブロック）。
         // [正規化] lexicon ∪ LLM のハイブリッド抽出（S1-11 改訂）。今ターン分。
+        // Issue #28 §3.1 二段目: catalog（取扱一覧）を signal 抽出 LLM 呼び出しに同乗させる
+        // ため、抽出より前に allowlist を取得する（§3.2 の材料選別直前で取得していた従来位置
+        // から前倒し。以降の参照はすべてこの束縛を使い回し、二重取得しない）。
+        let allowlist = self.product_allowlist(&ctx.schema).await?;
         // KR 読み込み（gRPC）と signal 抽出（LLM 有効時は HTTP 往復を伴う）は互いに
         // 依存しないため並列発行し、LLM 往復レイテンシを KR 読み込みの裏に隠す。
         let (resolutions, extraction_outcome) = tokio::join!(
             knowledge.load_known_resolutions_with(&ctx.schema, &live_snapshot),
-            self.extractor.extract(question),
+            self.extractor
+                .extract(question, Some(allowlist.display_list())),
         );
         let resolutions = resolutions?;
         let signals = extraction_outcome.signals;
         let extraction_mode = extraction_outcome.mode;
+        let product_references = extraction_outcome.product_references;
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
         // 既存 case_id は存在を確認する。存在すれば復元する。存在しない（未知の id）場合の
         // 扱いは `unknown_case_id_policy` で経路ごとに分ける:
@@ -902,11 +971,10 @@ impl Harness {
                 // 直前の `match case_id { Some(id) => ... }` で `existing_case` を得ているため、
                 // ここに来る時点で `case_id` は必ず `Some`。
                 let id = case_id.expect("existing_case is Some only when case_id was Some");
-                (
-                    id.to_string(),
-                    knowledge::case_signals_from_snapshot(&ctx.schema, id, &live_snapshot),
-                    attrs,
-                )
+                let raw_signals =
+                    knowledge::case_signals_from_snapshot(&ctx.schema, id, &live_snapshot);
+                let prior_signals = exclude_recorded_signals(raw_signals, &attrs);
+                (id.to_string(), prior_signals, attrs)
             }
             None => {
                 let new_id = format!("case-{}", uuid::Uuid::new_v4());
@@ -946,6 +1014,11 @@ impl Harness {
                 (new_id, signal::SignalSet::new(), attrs)
             }
         };
+        // レビュー修正1: 今ターンに実際に観測された signal を excluded_signals から取り除く
+        // （除外の永久化を防ぐ）。`exclude_recorded_signals` だけでは `case_attrs` 自体は
+        // 変更されず、末尾の `knowledge.record(...)` でそのまま書き戻されてしまうため、
+        // ここで `case_attrs` を直接更新して以降の書き戻しに反映させる。
+        prune_excluded_signals(&mut case_attrs, &signals);
         let accumulated: signal::SignalSet = prior_signals.union(&signals).cloned().collect();
         let new_signals: signal::SignalSet = signals.difference(&prior_signals).cloned().collect();
         knowledge
@@ -1047,8 +1120,8 @@ impl Harness {
         // 型番のみを言及する hit を除外する。`retrieved_manual_ids`（監査 lineage）はこの
         // フィルタの影響を受けない意図的な設計（「何を検索で取得したか」の監査記録は、判定・
         // 下書きに使う材料の選別とは独立に保つ）ため、フィルタ前の `retrieved_manual_ids` は
-        // 上のタプル分解のまま変更しない。
-        let allowlist = self.product_allowlist(&ctx.schema).await?;
+        // 上のタプル分解のまま変更しない。`allowlist` は本関数冒頭（signal 抽出 LLM 呼び出しへ
+        // catalog を同乗させる箇所）で取得済みのものをそのまま使う（二重取得しない）。
         let section_hits = filter_out_of_scope_hits(section_hits, &allowlist);
         // [(B) 3 層判定] 純関数。判定根拠は常に「累積 signal 集合 + known_resolution」。
         let best = section_hits.first();
@@ -1204,6 +1277,8 @@ impl Harness {
             extraction_mode,
             customer_reply_draft,
             customer_reply_draft_truncated,
+            product_references,
+            new_signals,
         })
     }
 
@@ -1364,7 +1439,7 @@ impl Harness {
                     .manual
                     .as_ref()
                     .ok_or_else(|| anyhow!("manual store not configured"))?;
-                let extraction_outcome = self.extractor.extract(corrected_answer).await;
+                let extraction_outcome = self.extractor.extract(corrected_answer, None).await;
                 tracing::debug!(
                     mode = extraction_outcome.mode.as_str(),
                     "root_cause_probe signal extraction mode"
@@ -1446,7 +1521,7 @@ impl Harness {
         case_id: Option<&str>,
     ) -> String {
         match self
-            .try_record_out_of_scope_case(ctx, question, case_id)
+            .try_record_out_of_scope_case(ctx, question, case_id, None)
             .await
         {
             Ok(id) => id,
@@ -1469,11 +1544,58 @@ impl Harness {
         }
     }
 
+    /// Issue #28 C1 是正: 二段目(foreign)確定時に、evaluate() が既に書き込んだ case の正本を
+    /// 実際に顧客へ返した内容（取扱外定型応答）に一致させる。read-merge-write 1回
+    /// （`merge_out_of_scope_demotion_attributes`）+ 監査イベント記録。
+    pub async fn demote_case_to_out_of_scope(
+        &self,
+        ctx: &RequestContext,
+        question: &str,
+        case_id: &str,
+        discarded_signals: &signal::SignalSet,
+    ) -> String {
+        match self
+            .try_record_out_of_scope_case(ctx, question, Some(case_id), Some(discarded_signals))
+            .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::error!(
+                    error = ?err,
+                    request_id = %ctx.request_id,
+                    schema = %ctx.schema,
+                    case_id = %case_id,
+                    "failed to demote a case to out_of_scope_product after the second-stage \
+                     gate fired; the customer still received the correct out-of-scope message, \
+                     but the case record still shows the pre-demotion \
+                     last_decision/last_kr_id/last_evidence_* (and this turn's signals were not \
+                     excluded from future accumulation) — investigate vegapunk/knowledge \
+                     connectivity"
+                );
+                case_id.to_string()
+            }
+        }
+    }
+
+    /// `record_out_of_scope_case`（一段目、`demote = None`）と `demote_case_to_out_of_scope`
+    /// （二段目、`demote = Some`）の共通実装。
+    ///
+    /// **なぜ `demote.is_some()` かつ既存 case 不在で `Err` にするか（レビュー修正2）**:
+    /// このメソッドは gRPC 呼び出しを含むため、`load_case` が実際に `None` を返すケース
+    /// （vegapunk との競合状態・case 削除・schema 不一致等）を決定論の単体テストで再現するのが
+    /// 難しい。代わりにここへ理由を明記する。降格対象の case が見つからないまま新規 case を
+    /// 作って id をすり替えると、`evaluate()` が既に書き込んだ元の case（`last_decision` が
+    /// `allowed`/`escalate` のまま、顧客が実際に受け取った取扱外応答と矛盾する）が孤立し、
+    /// 会話がサイレントに別 case へ分岐し、しかもログに何も残らない。これは Issue #28 C1 是正が
+    /// 解消しようとした状態そのものであるため、フォールバック生成ではなく `Err` で気づけるように
+    /// する。呼び出し元 `demote_case_to_out_of_scope` が `Err` を `tracing::error!` で記録し、
+    /// 元の `case_id` をそのまま返すため、顧客への応答・会話継続性はこの `Err` の影響を受けない。
     async fn try_record_out_of_scope_case(
         &self,
         ctx: &RequestContext,
         question: &str,
         case_id: Option<&str>,
+        demote: Option<&signal::SignalSet>,
     ) -> Result<String> {
         let knowledge = self.knowledge()?;
         let existing = match case_id {
@@ -1481,8 +1603,40 @@ impl Harness {
             None => None,
         };
         let resolved_case_id = match (case_id, existing) {
-            (Some(id), Some(_)) => id.to_string(),
+            (Some(id), Some(attrs)) => {
+                if let Some(discarded) = demote {
+                    let merged = merge_out_of_scope_demotion_attributes(&attrs, discarded);
+                    knowledge
+                        .record(
+                            &ctx.schema,
+                            "support_case",
+                            id,
+                            merged.into_iter().collect(),
+                        )
+                        .await?;
+                }
+                id.to_string()
+            }
+            // レビュー修正2: 二段目(foreign)確定の降格（demote = Some）で呼ばれたのに、
+            // 対象 case が見つからない場合は新規 case を黙って作らず Err にする。
+            // `evaluate()` は既にこの case_id へ last_decision（allowed/escalate）・
+            // last_kr_id・last_evidence_* を書き込み済みであり、ここで別 case を新規作成すると
+            // その id をすり替えて返すことになる。結果として (a) 元の case は顧客が実際に受け
+            // 取った取扱外応答と矛盾する内容のまま残り、(b) 会話がサイレントに別 case へ分岐し、
+            // (c) それがログにも出ない。これは Issue #28 C1 是正が解消しようとした状態そのもの。
+            // 呼び出し元 `demote_case_to_out_of_scope` はこの Err を `tracing::error!` で記録した
+            // うえで、元の case_id をそのまま呼び出し元へ返す（会話継続性はそちらで守られる）。
+            (Some(id), None) if demote.is_some() => {
+                return Err(anyhow!(
+                    "demote_case_to_out_of_scope: target case {id} not found in schema {}; \
+                     refusing to silently create a replacement case (the caller already \
+                     recorded allowed/escalate state under the original case_id)",
+                    ctx.schema
+                ));
+            }
             _ => {
+                // 一段目（質問側ゲート、demote = None）の新規 case 作成。上のアームが
+                // demote.is_some() を先に捕捉するため、ここに到達するのは常に demote = None。
                 let new_id = format!("case-{}", uuid::Uuid::new_v4());
                 let attrs: std::collections::HashMap<String, String> = [
                     ("case_id".to_string(), new_id.clone()),
@@ -1520,6 +1674,38 @@ impl Harness {
         .await?;
         Ok(resolved_case_id)
     }
+}
+
+/// Issue #28 C1 是正: `demote_case_to_out_of_scope` が case 属性を実際に顧客へ返した内容
+/// （取扱外定型応答）へ一致させる純関数。`existing`（`question` / `actor` 等を含む
+/// 既存属性の全体）を土台に、`last_decision` を `out_of_scope_product` へ上書きし、
+/// `last_kr_id` / `last_evidence_keys` / `last_evidence_kind` を消去し、
+/// `discarded_signals` を `excluded_signals`（CSV、既存値と union）へ追記する。
+/// `question` を含む無関係な既存属性は `existing.clone()` を土台にするため保持される。
+fn merge_out_of_scope_demotion_attributes(
+    existing: &std::collections::HashMap<String, String>,
+    discarded_signals: &signal::SignalSet,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = existing.clone();
+    merged.insert(
+        "last_decision".to_string(),
+        "out_of_scope_product".to_string(),
+    );
+    merged.insert("last_kr_id".to_string(), String::new());
+    merged.insert("last_evidence_keys".to_string(), String::new());
+    merged.insert("last_evidence_kind".to_string(), String::new());
+    let mut excluded = knowledge::csv_signals(
+        existing
+            .get("excluded_signals")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    excluded.extend(discarded_signals.iter().cloned());
+    merged.insert(
+        "excluded_signals".to_string(),
+        knowledge::signals_to_csv(&excluded),
+    );
+    merged
 }
 
 #[cfg(test)]
@@ -2551,6 +2737,164 @@ mod tests {
             let round_tripped = conv_state_from_attrs(&merged);
             assert_eq!(round_tripped, state);
         }
+    }
+
+    // ---- exclude_recorded_signals（Issue #28 C1 是正） ----
+
+    #[test]
+    fn exclude_recorded_signals_removes_signals_listed_in_the_excluded_signals_attribute() {
+        let signals = contract_test_signals(&["mold", "hazard_x"]);
+        let attrs: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "hazard_x".to_string())]
+                .into_iter()
+                .collect();
+        let result = exclude_recorded_signals(signals, &attrs);
+        assert_eq!(result, contract_test_signals(&["mold"]));
+    }
+
+    #[test]
+    fn exclude_recorded_signals_is_a_no_op_when_the_attribute_is_absent() {
+        let signals = contract_test_signals(&["mold", "hazard_x"]);
+        let attrs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let result = exclude_recorded_signals(signals.clone(), &attrs);
+        assert_eq!(result, signals);
+    }
+
+    // ---- prune_excluded_signals（レビュー修正1: 除外の永久化を防ぐ） ----
+
+    #[test]
+    fn prune_excluded_signals_removes_only_the_reobserved_signal_from_the_excluded_set() {
+        let mut attrs: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "hazard_x,mold".to_string())]
+                .into_iter()
+                .collect();
+        let observed = contract_test_signals(&["hazard_x"]);
+        prune_excluded_signals(&mut attrs, &observed);
+        assert_eq!(
+            attrs.get("excluded_signals").map(String::as_str),
+            Some("mold"),
+            "再観測された hazard_x だけが除外集合から取り除かれ、mold は維持される"
+        );
+    }
+
+    #[test]
+    fn prune_excluded_signals_does_not_add_a_new_key_when_the_attribute_is_absent() {
+        let mut attrs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let observed = contract_test_signals(&["hazard_x"]);
+        prune_excluded_signals(&mut attrs, &observed);
+        assert!(
+            !attrs.contains_key("excluded_signals"),
+            "excluded_signals が最初から無い case に空文字属性を生やしてはいけない"
+        );
+    }
+
+    #[test]
+    fn prune_excluded_signals_leaves_attrs_unchanged_when_observed_does_not_intersect() {
+        let mut attrs: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "mold".to_string())]
+                .into_iter()
+                .collect();
+        let observed = contract_test_signals(&["hazard_x"]);
+        prune_excluded_signals(&mut attrs, &observed);
+        assert_eq!(
+            attrs.get("excluded_signals").map(String::as_str),
+            Some("mold"),
+            "今ターンの signal と除外集合が交差しない場合は書き換えない"
+        );
+    }
+
+    #[test]
+    fn prune_excluded_signals_clears_the_value_but_keeps_the_key_when_everything_is_reobserved() {
+        let mut attrs: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "hazard_x".to_string())]
+                .into_iter()
+                .collect();
+        let observed = contract_test_signals(&["hazard_x"]);
+        prune_excluded_signals(&mut attrs, &observed);
+        assert_eq!(
+            attrs.get("excluded_signals").map(String::as_str),
+            Some(""),
+            "全要素が再観測されたら空文字にする（キー自体は残す）"
+        );
+    }
+
+    // ---- merge_out_of_scope_demotion_attributes（Issue #28 C1 是正） ----
+
+    #[test]
+    fn merge_out_of_scope_demotion_attributes_overwrites_last_decision_and_clears_evidence_fields()
+    {
+        let existing: std::collections::HashMap<String, String> = [
+            ("last_decision".to_string(), "allowed".to_string()),
+            ("last_kr_id".to_string(), "kr-1".to_string()),
+            ("last_evidence_keys".to_string(), "sec-1,sec-2".to_string()),
+            (
+                "last_evidence_kind".to_string(),
+                "known_resolution".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let discarded: signal::SignalSet = signal::SignalSet::new();
+        let merged = merge_out_of_scope_demotion_attributes(&existing, &discarded);
+        assert_eq!(
+            merged.get("last_decision").map(String::as_str),
+            Some("out_of_scope_product")
+        );
+        assert_eq!(merged.get("last_kr_id").map(String::as_str), Some(""));
+        assert_eq!(
+            merged.get("last_evidence_keys").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            merged.get("last_evidence_kind").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn merge_out_of_scope_demotion_attributes_preserves_unrelated_existing_attributes() {
+        // W3 是正の回帰テスト: read-merge-write なので question / actor 等は消えない。
+        let existing: std::collections::HashMap<String, String> = [
+            ("question".to_string(), "元の質問".to_string()),
+            ("actor".to_string(), "google-sub:123".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let discarded: signal::SignalSet = signal::SignalSet::new();
+        let merged = merge_out_of_scope_demotion_attributes(&existing, &discarded);
+        assert_eq!(merged.get("question").map(String::as_str), Some("元の質問"));
+        assert_eq!(
+            merged.get("actor").map(String::as_str),
+            Some("google-sub:123")
+        );
+    }
+
+    #[test]
+    fn merge_out_of_scope_demotion_attributes_unions_excluded_signals_with_any_existing_value() {
+        let existing: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "mold".to_string())]
+                .into_iter()
+                .collect();
+        let discarded = contract_test_signals(&["hazard_x"]);
+        let merged = merge_out_of_scope_demotion_attributes(&existing, &discarded);
+        assert_eq!(
+            merged.get("excluded_signals").map(String::as_str),
+            Some("hazard_x,mold")
+        );
+    }
+
+    #[test]
+    fn merge_out_of_scope_demotion_attributes_dedupes_when_a_signal_is_already_excluded() {
+        let existing: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "mold".to_string())]
+                .into_iter()
+                .collect();
+        let discarded = contract_test_signals(&["mold"]);
+        let merged = merge_out_of_scope_demotion_attributes(&existing, &discarded);
+        assert_eq!(
+            merged.get("excluded_signals").map(String::as_str),
+            Some("mold")
+        );
     }
 
     // ---- require_existing_case_attrs（Warning 2 の回帰防止） ----

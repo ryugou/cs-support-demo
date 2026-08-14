@@ -122,6 +122,9 @@ pub struct EvaluateAnswerabilityResponse {
     /// `customer_reply_draft` の注記のとおり、判定そのものを無効化するため。
     /// 切れた下書きは破棄し、取り次ぐ旨だけを書く。
     pub customer_reply_draft_truncated: bool,
+    /// 今ターンでLLMが抽出した製品参照（Issue #28 §3.1 二段目。追加のLLM呼び出しは発生させない）。
+    /// MCP側ではこの判定（foreign→取扱外）は行わない。
+    pub product_references: Vec<ProductReferenceJson>,
 }
 
 /// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
@@ -139,6 +142,36 @@ impl From<crate::harness::RelatedCase> for RelatedCaseJson {
             case_id: c.case_id,
             question: c.question,
             last_decision: c.last_decision,
+        }
+    }
+}
+
+/// `product_gate::ProductReference` の JSON ミラー（Issue #28 §3.1 二段目）。
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ProductReferenceJson {
+    pub surface: String,
+    pub resolution: String,
+    pub matched_model: Option<String>,
+}
+
+impl From<crate::harness::product_gate::ProductReference> for ProductReferenceJson {
+    fn from(r: crate::harness::product_gate::ProductReference) -> Self {
+        Self {
+            // Issue #28 Suggestion 3: LLM 応答は検証なしに deserialize されるため（`llm.rs`
+            // `parse_one_product_reference`）、surface が意図した最大40文字を超える出力を
+            // 返す可能性がある。反射安全性の上限（`product_gate::MAX_REFLECTABLE_SURFACE_CHARS`
+            // = 64 文字）で切り詰めてから MCP client（CS 担当）へ返す。
+            surface: crate::harness::prompt_input::truncate_chars(
+                &r.surface,
+                crate::harness::product_gate::MAX_REFLECTABLE_SURFACE_CHARS,
+            ),
+            resolution: match r.resolution {
+                crate::harness::product_gate::ProductReferenceResolution::Matched => "matched",
+                crate::harness::product_gate::ProductReferenceResolution::Ambiguous => "ambiguous",
+                crate::harness::product_gate::ProductReferenceResolution::Foreign => "foreign",
+            }
+            .to_string(),
+            matched_model: r.matched_model,
         }
     }
 }
@@ -431,7 +464,8 @@ impl CsSupportRmcpServer {
                 let crate::harness::extraction::ExtractionResult {
                     signals: query_signals,
                     mode: query_extraction_mode,
-                } = self.harness.extractor.extract(&req.query_ja).await;
+                    ..
+                } = self.harness.extractor.extract(&req.query_ja, None).await;
                 let top_k = req.top_k.unwrap_or(5).max(1) as usize;
                 // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
                 // 決定論の search が握る。ここでは候補材料を用意するだけ。
@@ -675,6 +709,11 @@ impl CsSupportRmcpServer {
             extraction_mode: outcome.extraction_mode.as_str().to_string(),
             customer_reply_draft: outcome.customer_reply_draft,
             customer_reply_draft_truncated: outcome.customer_reply_draft_truncated,
+            product_references: outcome
+                .product_references
+                .into_iter()
+                .map(ProductReferenceJson::from)
+                .collect(),
         }))
     }
 
@@ -694,7 +733,8 @@ impl CsSupportRmcpServer {
         let crate::harness::extraction::ExtractionResult {
             signals: question_signals,
             mode: extraction_mode,
-        } = self.harness.extractor.extract(&req.question).await;
+            ..
+        } = self.harness.extractor.extract(&req.question, None).await;
         let resolutions = store
             .load_known_resolutions(&ctx.schema)
             .await
@@ -1173,4 +1213,37 @@ impl ServerHandler for CsSupportRmcpServer {
 
 fn to_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- ProductReferenceJson::from（Issue #28 Suggestion 3） ----
+
+    #[test]
+    fn product_reference_json_from_truncates_a_surface_longer_than_the_reflectable_limit() {
+        // LLM 応答は検証なしに deserialize されるため、意図した最大40文字を超える surface を
+        // 返しうる。MCP client（CS 担当）へ渡す前に反射安全性の上限（64文字）で切り詰める。
+        // `truncate_chars` は切り詰め時に省略記号を1文字付与するため（
+        // `harness::prompt_input::tests::truncate_chars_appends_ellipsis_on_char_boundary`
+        // が同じ挙動を固定している）、切り詰め後の文字数は上限+1になる。
+        let long_surface = "A".repeat(100);
+        let reference = crate::harness::product_gate::ProductReference {
+            surface: long_surface,
+            resolution: crate::harness::product_gate::ProductReferenceResolution::Matched,
+            matched_model: Some("ADC-V724".to_string()),
+        };
+        let json = ProductReferenceJson::from(reference);
+        let limit = crate::harness::product_gate::MAX_REFLECTABLE_SURFACE_CHARS;
+        assert_eq!(
+            json.surface.chars().count(),
+            limit + 1,
+            "surface must be truncated to the reflectable limit ({limit} chars) plus the \
+             ellipsis marker, got {} chars: {:?}",
+            json.surface.chars().count(),
+            json.surface
+        );
+        assert!(json.surface.ends_with('…'));
+    }
 }

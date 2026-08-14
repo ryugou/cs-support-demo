@@ -71,8 +71,13 @@ demote_rejections = 2
 # signal 抽出エージェント（S1-11 改訂: lexicon ∪ LLM のハイブリッド）。
 # API キーは env CS_SUPPORT_LLM_API_KEY（Secret Manager injection）から注入する。
 # enabled = true で鍵を解決できない場合は起動時 fail closed で失敗する。
+# max_tokens: Issue #28 C2-a 是正。既定値 300 のままだと catalog 注入時の
+# product_references 出力（最大3件 × surface最大40文字 + JSON構造）で出力が途中で
+# 切れうる（catalog 注入時のみ発生する回帰。C2-b でも product_references の上限を
+# 5件から3件へ引き下げ、両対策を合わせて余裕を確保する）。
 [llm]
 enabled = true
+max_tokens = 600
 
 # 応答生成 API（POST /{project_id}/api/reply）。LINE アダプタ等の外部呼び出し用。
 # 認証キーは env CS_SUPPORT_ANSWER_API_KEY（Secret Manager injection）から注入する。

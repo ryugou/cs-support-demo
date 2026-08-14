@@ -36,10 +36,12 @@
 **二段目（LLM 解釈 + コード判定）**: 一段目で未検出の場合、evaluate 内で毎ターン実行している既存の signal 抽出 LLM 呼び出しの出力スキーマを拡張し（**追加 LLM 呼び出しなし**）、製品参照を構造化抽出する:
 
 - 抽出スキーマ: `product_references: [{ surface: string, resolution: "matched" | "ambiguous" | "foreign", matched_model: string | null }]`。プロンプトに取扱カタログ（第 2 節の一覧）を注入し、「製品への言及と思われる表層（型番・略記・俗称・カテゴリ的言及）を抽出し、カタログ製品でありうるなら matched / 曖昧なら ambiguous、**カタログのどれでもあり得ない別製品への言及と確信できる場合のみ foreign**」と指示する
-- コード判定: `foreign` の参照について、(a) `surface` が正規化後のメッセージ中に実在すること（幻覚ガード）、(b) `surface` が 2 文字以上であることを検証したうえで、取扱外定型応答を返す（evaluate の結果は使わず破棄。下書きが生成済みでもコストとして受容し、応答には使わない）
+- コード判定: `foreign` の参照について、(a) `surface` が正規化後のメッセージ中に実在すること（幻覚ガード）、(b) `surface` が trim 後 2 文字以上であること、(c) `surface` が trim 後 64 文字以下かつ制御文字（Cc / Cf / Zl / Zp・ゼロ幅を含む）を含まないこと（反射安全性。定型応答・ログへそのまま載せても安全な値であることの検証）、(d) `surface` と `matched_model` のどちらも決定論の allowlist 上で取扱内製品を指していないこと（LLM が製品マスタと矛盾する分類を返した場合への veto。ADC- 接頭辞を欠く型番断片もサフィックス一致で照合する）を検証したうえで、取扱外定型応答を返す（evaluate の結果は使わず破棄。下書きが生成済みでもコストとして受容し、応答には使わない）
 - `matched` / `ambiguous` / 参照なしは通常フロー（曖昧さは聞き返しがカタログから選ばせることで収束する）
 - 抽出の失敗・parse 不能時は二段目をスキップし通常フローへ（一段目のフロアと応答側ゲート 3.5 が防衛線として残る）
 - `EvaluationOutcome` への `product_references` の追加は加算であり、MCP `evaluate_answerability` には新フィールドが増えるのみ（既存フィールドの意味は不変。MCP 側でこの判定は行わない）
+
+**二段目確定時の case 正本の遷移**: `evaluate()` は二段目判定より前に完了しており、対象 case へ signal 累積・`last_decision`（`allowed`/`escalate`）・`last_kr_id`・`last_evidence_keys`・`last_evidence_kind` を既に書き込んでいる。二段目が foreign と確定すると、顧客へ実際に返るのは第 4 節の取扱外定型応答であり、case の正本をこの事実に一致させる。専用の read-merge-write 1 回（`Harness::demote_case_to_out_of_scope`）で、既存属性（`question` を含む）を保持したまま `last_decision` を `out_of_scope_product` へ上書きし、`last_kr_id` / `last_evidence_keys` / `last_evidence_kind` を空文字へ消去する。今ターンに新規追加された signal は HAS_SIGNAL 辺として既に vegapunk へ書き込み済みだが、vegapunk 側に辺の削除 API が無いため物理削除はしない。代わりに同じ書き込みで case 属性 `excluded_signals`（CSV）へ追記し、以降の `evaluate()` が累積 signal を復元する際にこの集合を差し引くことで、破棄したターンの signal を累積へ反映させない。**この除外は永久ではない。** 除外した signal が後続ターンで顧客から改めて言及され今ターンの抽出結果に再度現れた場合は、`excluded_signals` から取り除いたうえで通常どおり累積へ反映する（除外を永久にすると、取扱外ターンで一度でも言及された hazard signal がその後のターンで正当に再観測されても `hazard_signal_count` に数えられず、エスカレーション判定が fail-open する）。
 
 **一段目の正規形検出（決定論）**:
 
@@ -82,15 +84,19 @@
 - 3.2（材料選別）は `evaluate()` 内部でカバレッジ判定（`decision::decide()`）より前に適用される共通処理であり、`/api/reply` だけでなく MCP の `evaluate_answerability` tool にも同じ経路で効く。したがって `evaluate_answerability` が返す `decision` と `hits` も、取扱外型番のみを言及する hit の除外を反映した値になる（「MCP tool の入出力は変更しない」という前提は 3.2 には当てはまらない）
 - 3.2 の allowlist 取得（`product_allowlist()`）が失敗し、かつキャッシュも無い場合は `evaluate()` 自体がエラーを返す（fail closed）。これは `/api/reply` 限定ではなく `evaluate_answerability` にも及ぶ: 製品マスタが未投入（0 件）の schema では `evaluate` そのものが動作しない（第 2 節の fail-closed 検証を参照）
 - 3.3 / 3.4 は生成関数の共通変更であり、MCP 経路の下書きにも同じ前提が効く（CS 担当が検分する下書きにも取扱外断定が混入しないのは望ましい副作用として受容する）
+- `/api/reply` の `decide_reply_action` は、今ターンの signal 抽出 LLM 呼び出しが失敗し `ExtractionMode::LexiconFallback` になった場合、`Allowed` / `Escalate` の判定結果によらず常に `EscalationReply` を返す（fail-closed）。抽出 LLM が不調な状況では同一 API 経由の回答下書き LLM も同様に不調である可能性が高く、通常フロー（自動回答・聞き返し）を維持するより安全側へ倒す方が実質的な追加コストなしで成立する。MCP `evaluate_answerability` はこの判定を行わない（`decide_reply_action` 自体が `/api/reply` 専用の関数のため）
 
 ## 6. テスト
 
 - 型番抽出: 半角/全角・大文字小文字・ハイフン揺れ / 取扱内のみ / 取扱外含む / 型番なし
 - 質問側ゲート: 取扱外 → 定型応答（evaluate 不呼び出し）/ 取扱内・型番なし → 通常フロー
+- 二段目のコード判定 veto: `surface` または `matched_model` が取扱内型番（ADC- 接頭辞ありの完全一致・断片のサフィックス一致の両方）を指す foreign 参照 → 通常フロー / `surface` が 64 文字超または制御文字（Cc/Cf/Zl/Zp・ゼロ幅）を含む → 通常フロー
 - 材料選別: 取扱外のみ言及 → 除外 / 取扱内言及あり → 通過 / 型番なし → 通過 / 全除外 → 既存判定へ
 - プロンプト注入: 一覧文字列と制約文言が clarify / draft の system prompt に含まれる
 - 応答側ゲート: 取扱外言及の生成文 → フォールバック / 取扱内のみ → 通過
 - マスタ取得: キャッシュ利用 / stale 利用 / 初回失敗 → 503
+- 二段目確定時の case demotion: `last_decision` が `out_of_scope_product` へ上書きされる / `last_kr_id` と `last_evidence_keys` と `last_evidence_kind` が空文字になる / `question` など既存属性が保持される / 破棄したターンの signal が `excluded_signals` へ追記され、以降の累積から除外される / 除外済み signal が後続ターンで再観測された場合は `excluded_signals` から取り除かれ通常どおり累積へ反映される（除外は永久ではない）/ 未観測の除外は維持される
+- 抽出 LLM 障害時のフェイルクローズ: `ExtractionMode::LexiconFallback` のとき `decide_reply_action` が `Allowed` / `Escalate` いずれの判定でも `EscalationReply` を返す
 
 ## 7. スコープ外
 
