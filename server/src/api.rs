@@ -11,6 +11,7 @@
 
 use crate::config::AppConfig;
 use crate::harness::decision::{self, AnswerDecision};
+use crate::harness::product_gate;
 use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
 use crate::harness::{clarify, escalation_reply, hours, time_pref, Harness};
 use crate::mcp::ToolService;
@@ -572,6 +573,89 @@ fn conv_state_save_failed(err: &anyhow::Error, request_id: &str, case_id: &str) 
     )
 }
 
+/// Issue #28 §2: 取扱製品 allowlist の取得に失敗した場合の共通処理。vegapunk 不達は検索も
+/// 成立しないため、`classify_evaluate_error` と同じエラー意味論（503 `upstream_unavailable` /
+/// 500 `internal`）に倒す。
+fn product_allowlist_fetch_failed(err: &anyhow::Error, request_id: &str) -> Response {
+    let (status, code) = classify_evaluate_error(err);
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        tracing::warn!(
+            request_id = %request_id,
+            error = ?err,
+            "answer api: product allowlist fetch failed due to upstream (vegapunk) unavailability"
+        );
+    } else {
+        tracing::error!(
+            request_id = %request_id,
+            error = ?err,
+            "answer api: product allowlist fetch failed"
+        );
+    }
+    error_response(
+        status,
+        code,
+        format!(
+            "failed to resolve the product scope allowlist (request_id={request_id}); please retry"
+        ),
+    )
+}
+
+/// Issue #28 §3.5: 応答側ゲート（決定論・最終防衛線）の共通判定。生成文が allowlist 外の型番を
+/// 1 つでも言及していれば `fallback()` の結果に置き換え、`route` ラベル付きで warn する。
+///
+/// 聞き返し（`route = "clarify"`）・受け止め文（`route = "escalation_ack"`）の 2 箇所が使う。
+/// フォールバック文言と warn メッセージは呼び出し元ごとに異なるため両方を引数で渡す（振る舞い
+/// ・ログ内容は元のインライン実装から変更しない）。回答下書きは戻り値の型が `Option<String>`
+/// で異なるため、共有せず [`gate_customer_reply_draft`] に分けている。
+fn gate_generated_text(
+    text: String,
+    allowlist: &product_gate::ProductAllowlist,
+    request_id: &str,
+    case_id: &str,
+    route: &'static str,
+    warn_message: &'static str,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    if allowlist.has_out_of_scope_mention(&text) {
+        tracing::warn!(
+            route = route,
+            request_id = %request_id,
+            case_id = %case_id,
+            "{}",
+            warn_message
+        );
+        fallback()
+    } else {
+        text
+    }
+}
+
+/// Issue #28 §3.5: 応答側ゲート その 1/3（回答下書き）。allowlist 外の型番言及があれば `None`
+/// に落とす。`decide_reply_action` の decision table（`Some(draft) if !truncated => Answer`,
+/// `_ => EscalationReply`）がそのまま `EscalationReply` へ自動的にフォールバックするため、
+/// ここで新しいフォールバック文言を発明しない（元のインライン実装と同じ設計判断）。
+fn gate_customer_reply_draft(
+    draft: Option<String>,
+    allowlist: &product_gate::ProductAllowlist,
+    request_id: &str,
+    case_id: &str,
+) -> Option<String> {
+    let draft = draft?;
+    if allowlist.has_out_of_scope_mention(&draft) {
+        tracing::warn!(
+            route = "answer_draft",
+            request_id = %request_id,
+            case_id = %case_id,
+            "customer reply draft mentions an out-of-scope product model; discarding \
+             the draft (customer_reply_draft = null), which falls back to an \
+             escalation reply"
+        );
+        None
+    } else {
+        Some(draft)
+    }
+}
+
 /// `POST /{project_id}/api/reply`（design doc §2〜§4。会話フロー v1.1 design doc §2・§5）。
 ///
 /// 処理順:
@@ -663,6 +747,23 @@ async fn reply_handler(
 
     let request_id = ctx.request_id.clone();
 
+    // Issue #28 §3.1: 質問側ゲート（決定論・LLM 不使用）。取扱製品スコープの前提化は会話全体の
+    // 入口であり、時間帯希望受付（LLM を伴う）より前、evaluate() より前に置く。取扱外の型番が
+    // 1 つでも見つかれば定型応答（§4）を返し、evaluate() は一切呼ばない（LLM コストも
+    // 発生させない）。
+    let allowlist = match state.harness.product_allowlist(&ctx.schema).await {
+        Ok(allowlist) => allowlist,
+        Err(err) => return product_allowlist_fetch_failed(&err, &request_id),
+    };
+    if let Some(out_of_scope_model) = allowlist.first_out_of_scope_token(&req.message) {
+        let reply_text = product_gate::build_out_of_scope_reply(&out_of_scope_model, &allowlist);
+        let case_id = state
+            .harness
+            .record_out_of_scope_case(&ctx, &req.message, req.case_id.as_deref())
+            .await;
+        return ok_reply_response(reply_text, case_id);
+    }
+
     // ステップ 5: 希望時間帯の受付（会話フロー v1.1 design doc §5）。
     // `evaluate()` を呼ぶ前にすべての state 変更・保存を完了させる。
     if let Some(case_id) = req.case_id.as_deref() {
@@ -691,6 +792,19 @@ async fn reply_handler(
                     if let Err(err) = state.harness.save_conv_state(&ctx, case_id, &conv).await {
                         return conv_state_save_failed(&err, &request_id, case_id);
                     }
+                    // Issue #28 Stage1 Warning 3: この `text` は §3.5 応答側ゲートを通らない。
+                    // 理由（意図的、拡張はしない）:
+                    // - `text` は `time_pref::handle_time_pref` がコードで組み立てた定型文 +
+                    //   `extraction.raw`（LLM が顧客発話から抽出した時間帯ラベル、例「平日の午後」）
+                    //   で構成される。マニュアル材料も回答内容も乗らない。
+                    // - この分岐に到達する時点で、上の §3.1 質問側ゲート
+                    //   （`allowlist.first_out_of_scope_token(&req.message)`）は既に通過済み。
+                    //   取扱外の型番が元の顧客発話にあればここへは来ないため、`extraction.raw` の
+                    //   元になった発話に取扱外型番は含まれない。
+                    // - したがって時間帯ラベルに取扱外型番が正当な経路で混入することは無く、
+                    //   §3.5 を重ねる必要が無い。残るリスクは「LLM が時間帯ラベルに無関係な型番を
+                    //   混入させる」ケースのみで、マニュアル材料・回答内容を伴わない定型文である
+                    //   ことを踏まえて受容している。
                     if let time_pref::TimePrefAction::Reply(text) = action {
                         return ok_reply_response(text, case_id.to_string());
                     }
@@ -729,11 +843,25 @@ async fn reply_handler(
         )
         .await
     {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
             let mut conv = match state.harness.load_conv_state(&ctx, &outcome.case_id).await {
                 Ok(conv) => conv,
                 Err(err) => return conv_state_load_failed(&err, &request_id, &outcome.case_id),
             };
+
+            // Issue #28 §3.5: 応答側ゲート（決定論・最終防衛線）その 1/3。回答下書き。
+            // `decide_reply_action`（下記）より前に判定する: `outcome.customer_reply_draft` を
+            // `None` に落とせば、既存の decision table（`Some(draft) if !truncated => Answer`,
+            // `_ => EscalationReply`）がそのまま `EscalationReply` へ自動的にフォールバックする
+            // （新しいフォールバック文言を発明しない）。判定本体は `gate_customer_reply_draft`
+            // に抽出し、api.rs 単体テストで直接検証する（Stage 1 レビュー指摘: この配線を検証
+            // するテストが無かった）。
+            outcome.customer_reply_draft = gate_customer_reply_draft(
+                outcome.customer_reply_draft.take(),
+                &allowlist,
+                &request_id,
+                &outcome.case_id,
+            );
 
             let action = decide_reply_action(&outcome, &conv, &state.config.api);
 
@@ -789,11 +917,26 @@ async fn reply_handler(
                                 &missing_text,
                                 &known_facts,
                                 is_continuation,
+                                &allowlist,
                             )
                             .await
                         }
                         None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
                     };
+                    // Issue #28 §3.5: 応答側ゲート その 2/3。聞き返し。フォールバック定型文
+                    // 経由でも allowlist 外を含み得ない（定数文字列）ため、判定は無害だが
+                    // 経路を分けず一律に適用する（allowlist は §3.1 のために取得済みのものを使う）。
+                    // 判定本体は `gate_generated_text` に抽出し、api.rs 単体テストで直接検証する。
+                    let reply_text = gate_generated_text(
+                        reply_text,
+                        &allowlist,
+                        &request_id,
+                        &outcome.case_id,
+                        "clarify",
+                        "clarify question mentions an out-of-scope product model; falling \
+                         back to FALLBACK_CLARIFY_TEXT",
+                        || clarify::FALLBACK_CLARIFY_TEXT.to_string(),
+                    );
                     // LLM 下書き経由・フォールバック定型文経由のどちらでも、残り確認回数の
                     // サフィックスは同じ関数を通す（定型文であり LLM 生成物ではないため
                     // egress gate の後でよい）。
@@ -826,6 +969,23 @@ async fn reply_handler(
                             .0
                             .to_string(),
                     };
+                    // Issue #28 §3.5: 応答側ゲート その 3/3。受け止め文。決定的ブロック
+                    // （受付番号等、`build_deterministic_block`）より前でチェックする。判定本体
+                    // は `gate_generated_text` に抽出し、api.rs 単体テストで直接検証する。
+                    let ack_text = gate_generated_text(
+                        ack_text,
+                        &allowlist,
+                        &request_id,
+                        &outcome.case_id,
+                        "escalation_ack",
+                        "escalation ack text mentions an out-of-scope product model; falling \
+                         back to the deterministic ack fallback",
+                        || {
+                            escalation_reply::fallback_ack(is_continuation)
+                                .0
+                                .to_string()
+                        },
+                    );
                     let out_of_hours_now = !hours::is_within_business_hours(
                         &state.config.api.business_hours,
                         chrono::Utc::now(),
@@ -1815,11 +1975,19 @@ mod tests {
     // `self.knowledge()?` が必ず `Err` になる）は実 vegapunk 無しで到達できるため対象に含める
     // （Stage 1 レビュー指摘: 500 応答が内部エラー文字列を漏らさないことの回帰確認）。
 
+    /// テスト用 schema。`test_harness()` の `product_gate` と `test_api_state()` の project
+    /// schema の両方で使う（Issue #28: allowlist を schema 単位にキャッシュするため揃える必要がある）。
+    const TEST_SCHEMA: &str = "urtect";
+
     /// テスト専用の最小 `Harness`。`knowledge: None` なので `evaluate` を呼べば必ず失敗する
     /// （このモジュールのルーティングテストの一部はそれを利用して 500 経路を確認する。他の
     /// テストは 401/400/404 のいずれも `evaluate` へ到達する前に reject されるため問題にならない。
     /// `harness::mod::tests::harness_for_test` と同じ構成。
     /// あちらは private でこのモジュールから使えないため、同じ構成をここで独立に組み立てる）。
+    ///
+    /// `product_gate` だけは `knowledge` と異なり実ネットワークに繋がず新鮮なキャッシュを
+    /// 埋め込んだ状態で構築する（Issue #28 §3.1 は evaluate() より前の全リクエストで動くため、
+    /// `None` のままだと質問側ゲートの本体（型番検出→定型応答/フォールスルー）を一切検証できない）。
     fn test_harness() -> Harness {
         let dir = std::env::temp_dir().join(format!("api-test-harness-{}", uuid::Uuid::new_v4()));
         let lexicon = Arc::new(
@@ -1860,6 +2028,12 @@ mod tests {
             vector_route_enabled: false,
             reply_drafter: None,
             reply_draft_max_tokens: 700,
+            product_gate: Some(crate::harness::product_gate::ProductGate::seeded_for_test(
+                TEST_SCHEMA,
+                crate::harness::product_gate::ProductAllowlist::from_models(vec![
+                    "ADC-V724".to_string()
+                ]),
+            )),
         }
     }
 
@@ -2034,5 +2208,219 @@ fallback_reply_text = "担当者が確認のうえご連絡します"
             !message.contains("knowledge"),
             "message must not leak the internal error string returned by self.knowledge(): {body}"
         );
+    }
+
+    // ---- Issue #28 §3.1: 質問側ゲート（決定論・evaluate 不呼び出し） ----
+    //
+    // `test_harness()` は `knowledge: None` なので、もし万一この経路が `evaluate()` まで
+    // フォールスルーしてしまえば、上のテストと同じく必ず 500（`error: "internal"`、
+    // メッセージは request_id のみを含む定型文）になる。したがって下記テストが 200 と
+    // §4 の定型応答本文を観測できること自体が「evaluate() が呼ばれていない」ことの証拠になる
+    // （evaluate() 経由ではこの 200 + この本文は構造的に出せない）。
+
+    /// 取扱外の型番を含む質問は、evaluate() を経由せず §4 の定型応答を返す。
+    /// これは同時に「§4 自身の応答が §3.5 の応答側ゲートで自己ブロックされない」ことの
+    /// 回帰テストも兼ねる: §3.5 は allowlist 外の型番言及があれば応答を差し替えるが、
+    /// §4 のテンプレートは意図的に検出型番（allowlist 外）を本文に含むため、§3.5 を
+    /// このパスへ誤って適用すると本文が別内容に化ける。以下は本文にその型番が**残っている**
+    /// ことを直接確認する。
+    #[tokio::test]
+    async fn reply_route_out_of_scope_model_returns_the_deterministic_reply_without_calling_evaluate(
+    ) {
+        let router = api_router(test_api_state("correct-key"));
+        let (status, body) = oneshot_json(
+            router,
+            "POST",
+            "/urtect/api/reply",
+            Some("Bearer correct-key"),
+            r#"{"message":"ADC-VDB101の設定を教えてください"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let reply_text = body["reply_text"]
+            .as_str()
+            .expect("reply_text must be a string");
+        assert!(
+            reply_text.contains("ADC-VDB101"),
+            "the out-of-scope template must name the detected model (and must NOT have been \
+             stripped by the §3.5 response gate, which would prove self-blocking): {reply_text}"
+        );
+        assert!(
+            reply_text.contains("ADC-V724"),
+            "the template must list the in-scope allowlist: {reply_text}"
+        );
+        assert!(reply_text.contains("当社では取り扱いがございません"));
+        assert!(
+            body["case_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "a case_id must still be returned even though the audit record could not be \
+             persisted (knowledge: None): {body}"
+        );
+    }
+
+    /// 対照テスト: 取扱内の型番だけ、または型番なしの質問は §3.1 のゲートを素通りし、
+    /// 通常フロー（evaluate()）へ進む。`knowledge: None` のためここでは必ず 500 になるが、
+    /// それは「evaluate() に到達した」ことの証拠であり（上の 200 経路とは非交差の結果になる）、
+    /// §4 のテンプレート文言が一切現れないことを確認する。
+    #[tokio::test]
+    async fn reply_route_in_scope_model_falls_through_to_the_normal_flow() {
+        let router = api_router(test_api_state("correct-key"));
+        let (status, body) = oneshot_json(
+            router,
+            "POST",
+            "/urtect/api/reply",
+            Some("Bearer correct-key"),
+            r#"{"message":"ADC-V724の設定を教えてください"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+        let message = body["message"].as_str().expect("message must be a string");
+        assert!(
+            !message.contains("取り扱いがございません"),
+            "an in-scope-only question must not trigger the §4 out-of-scope template: {body}"
+        );
+    }
+
+    // ---- 応答側ゲート（§3.5、Critical 2）の配線テスト ----
+    //
+    // `ProductAllowlist::has_out_of_scope_mention` 自体の述語は `product_gate.rs` で検証済み。
+    // ここでは `gate_generated_text` / `gate_customer_reply_draft`（api.rs 側の配線: どの変数を
+    // 見るか・どのフォールバックへ倒すか）を、実 vegapunk・実 LLM 無しで直接検証する。
+
+    /// ADC-V724 のみ取扱内、それ以外（例: ADC-VDB101）は取扱外という固定 fixture。
+    /// `test_harness()` の `product_gate` シード（`TEST_SCHEMA` = "ADC-V724" のみ）と揃えてある。
+    fn response_gate_fixture_allowlist() -> product_gate::ProductAllowlist {
+        product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()])
+    }
+
+    #[test]
+    fn gate_customer_reply_draft_discards_a_draft_that_mentions_only_an_out_of_scope_model() {
+        let allow = response_gate_fixture_allowlist();
+        let out = gate_customer_reply_draft(
+            Some("ADC-VDB101の初期設定手順です".to_string()),
+            &allow,
+            "req-1",
+            "case-1",
+        );
+        assert_eq!(
+            out, None,
+            "a draft mentioning only an out-of-scope model must be discarded (falls back to \
+             EscalationReply via decide_reply_action)"
+        );
+    }
+
+    #[test]
+    fn gate_customer_reply_draft_passes_through_a_draft_that_mentions_only_in_scope_models() {
+        let allow = response_gate_fixture_allowlist();
+        let draft = "ADC-V724の初期設定手順です".to_string();
+        let out = gate_customer_reply_draft(Some(draft.clone()), &allow, "req-1", "case-1");
+        assert_eq!(
+            out,
+            Some(draft),
+            "a draft mentioning only in-scope models must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn gate_customer_reply_draft_passes_through_a_draft_with_no_model_mention() {
+        let allow = response_gate_fixture_allowlist();
+        let draft = "Wi-Fiの再接続手順です".to_string();
+        let out = gate_customer_reply_draft(Some(draft.clone()), &allow, "req-1", "case-1");
+        assert_eq!(
+            out,
+            Some(draft),
+            "a draft with no model mention at all must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn gate_customer_reply_draft_discards_a_draft_that_mixes_in_scope_and_out_of_scope_models() {
+        // Issue #28 の完了条件が明示する「混在」条件: 1 文の中に取扱内・取扱外の型番が両方
+        // 出てくる場合でも、取扱外の言及が 1 つでもあればブロックしなければならない
+        // （取扱内の言及があるからといって安全側に倒れて通過させてはいけない）。
+        let allow = response_gate_fixture_allowlist();
+        let out = gate_customer_reply_draft(
+            Some("ADC-V724とADC-VDB101は共通の手順です".to_string()),
+            &allow,
+            "req-1",
+            "case-1",
+        );
+        assert_eq!(
+            out, None,
+            "a draft mixing an in-scope and an out-of-scope model must still be blocked"
+        );
+    }
+
+    #[test]
+    fn gate_generated_text_clarify_route_falls_back_to_fallback_clarify_text() {
+        let allow = response_gate_fixture_allowlist();
+        let out = gate_generated_text(
+            "ADC-VDB101の型番を教えてください".to_string(),
+            &allow,
+            "req-1",
+            "case-1",
+            "clarify",
+            "clarify question mentions an out-of-scope product model; falling back to \
+             FALLBACK_CLARIFY_TEXT",
+            || clarify::FALLBACK_CLARIFY_TEXT.to_string(),
+        );
+        assert_eq!(out, clarify::FALLBACK_CLARIFY_TEXT);
+    }
+
+    #[test]
+    fn gate_generated_text_escalation_ack_route_falls_back_to_fallback_ack() {
+        let allow = response_gate_fixture_allowlist();
+        let out = gate_generated_text(
+            "ADC-VDB101の件、担当者へおつなぎします".to_string(),
+            &allow,
+            "req-1",
+            "case-1",
+            "escalation_ack",
+            "escalation ack text mentions an out-of-scope product model; falling back to the \
+             deterministic ack fallback",
+            || escalation_reply::fallback_ack(false).0.to_string(),
+        );
+        assert_eq!(out, escalation_reply::fallback_ack(false).0);
+    }
+
+    #[test]
+    fn gate_generated_text_and_gate_customer_reply_draft_do_not_self_trigger_on_fallback_templates()
+    {
+        // フォールバック定型文自身が §3.5 に引っかかると、無限に同じ文へ落ちるだけの無意味な
+        // 防御になる（自己矛盾）。回答下書き・聞き返し・受け止め文（初回/継続）の全フォール
+        // バック定型文が、対応するゲート関数を素通りすることを固定する。
+        let allow = response_gate_fixture_allowlist();
+
+        let draft_out = gate_customer_reply_draft(
+            Some(clarify::FALLBACK_CLARIFY_TEXT.to_string()),
+            &allow,
+            "req-1",
+            "case-1",
+        );
+        assert_eq!(
+            draft_out,
+            Some(clarify::FALLBACK_CLARIFY_TEXT.to_string()),
+            "FALLBACK_CLARIFY_TEXT must not be blocked when run through the draft gate"
+        );
+
+        for fallback_text in [
+            clarify::FALLBACK_CLARIFY_TEXT,
+            escalation_reply::fallback_ack(false).0,
+            escalation_reply::fallback_ack(true).0,
+        ] {
+            let out = gate_generated_text(
+                fallback_text.to_string(),
+                &allow,
+                "req-1",
+                "case-1",
+                "regression_probe",
+                "unexpected fallback trigger; this fallback template must never mention an \
+                 out-of-scope product model",
+                || "SHOULD_NOT_BE_USED".to_string(),
+            );
+            assert_eq!(
+                out, fallback_text,
+                "fallback template must not itself be blocked by the §3.5 gate: {fallback_text}"
+            );
+        }
     }
 }

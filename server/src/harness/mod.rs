@@ -9,6 +9,7 @@ pub mod extraction;
 pub mod grading;
 pub mod hours;
 pub mod knowledge;
+pub mod product_gate;
 pub(crate) mod prompt_input;
 pub mod reply;
 pub mod rules;
@@ -66,6 +67,12 @@ pub struct Harness {
     pub reply_drafter: Option<crate::llm::AnthropicClient>,
     /// 返信文下書きの `max_tokens`（config.harness.customer_reply_draft_max_tokens）。
     pub reply_draft_max_tokens: u32,
+    /// 取扱製品スコープ（Issue #28）。vegapunk の Product ノード一覧を TTL 10 分でキャッシュし、
+    /// 質問側ゲート（`api.rs`）・材料選別・プロンプト注入・応答側ゲートの前提として使う。
+    /// `manual` / `corpus` と同じ理由（VegapunkClient を要求するため、実接続を張れない同期
+    /// テストの `harness_for_test()` では構築できない）で `Option` にしてある。本番は
+    /// `Harness::build` が常に `Some` を設定する。
+    pub product_gate: Option<product_gate::ProductGate>,
 }
 
 #[derive(Debug, Clone)]
@@ -349,6 +356,7 @@ impl Harness {
             vector_route_enabled: config.harness.vector_route_enabled,
             reply_drafter,
             reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
+            product_gate: Some(product_gate::ProductGate::new(client)),
         })
     }
 
@@ -362,6 +370,21 @@ impl Harness {
         self.corpus
             .as_deref()
             .ok_or_else(|| anyhow!("corpus loader is not configured"))
+    }
+
+    fn product_gate(&self) -> Result<&product_gate::ProductGate> {
+        self.product_gate
+            .as_ref()
+            .ok_or_else(|| anyhow!("product gate is not configured"))
+    }
+
+    /// 取扱製品 allowlist（Issue #28 design doc §2）。schema 単位に TTL 10 分でキャッシュされる。
+    /// 質問側ゲート（`api.rs`）・材料選別・プロンプト注入・応答側ゲートの共通入口。
+    pub async fn product_allowlist(
+        &self,
+        schema: &str,
+    ) -> Result<Arc<product_gate::ProductAllowlist>> {
+        self.product_gate()?.allowlist(schema).await
     }
 
     /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
@@ -1086,6 +1109,7 @@ impl Harness {
                 &resolutions,
                 history,
                 is_continuation,
+                &ctx.schema,
             )
             .await;
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
@@ -1114,6 +1138,7 @@ impl Harness {
     ///
     /// `is_continuation` は `evaluate()` から素通しされる会話段階フラグ（判定はサーバ側が
     /// コードで行う。`reply::build_reply_system_prompt` の doc を参照）。
+    #[allow(clippy::too_many_arguments)]
     async fn draft_customer_reply(
         &self,
         question: &str,
@@ -1122,8 +1147,23 @@ impl Harness {
         resolutions: &[rules::KnownResolution],
         history: &[reply::ReplyHistoryTurn],
         is_continuation: bool,
+        schema: &str,
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
+        // Issue #28: 取扱製品スコープの前提化（§3.2/§3.4）。allowlist が引けない限り
+        // 材料選別もプロンプト制約も組み立てられないため、fetch 失敗はここで下書き自体を
+        // 諦める（他の生成失敗と同じ「warn して None、evaluate 自体は成功させる」規律）。
+        let allowlist = match self.product_allowlist(schema).await {
+            Ok(allowlist) => allowlist,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "product allowlist fetch failed; returning the evaluation without a draft \
+                     (customer_reply_draft = null). The decision itself is unaffected"
+                );
+                return None;
+            }
+        };
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
         // 引いて渡す（引けなければ材料ゼロのまま = でっち上げない。reply.rs の doc を参照）。
         let kr_answer = match decision {
@@ -1137,8 +1177,8 @@ impl Harness {
                 .map(|kr| kr.answer.as_str()),
             _ => None,
         };
-        let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
-        let system = reply::build_reply_system_prompt(&brief, is_continuation);
+        let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer, &allowlist);
+        let system = reply::build_reply_system_prompt(&brief, is_continuation, &allowlist);
         let user = reply::build_reply_user_message(question, &brief, history);
         let draft = match drafter
             .draft_reply(
@@ -1314,6 +1354,100 @@ impl Harness {
         file.flush().await?;
         Ok(())
     }
+
+    /// Issue #28 §3.1: 取扱外定型応答も case へ記録し、audit_event_id を発行する
+    /// （design doc §3.1「監査: 取扱外応答も case に記録する」）。`req.case_id` が解決できれば
+    /// それを使い、できなければ新規採番する（`evaluate()` の新規 case 作成ブロックと同型だが、
+    /// signal 累積・decision 属性更新などフル evaluate() の処理は行わない。case ノードの存在確保と
+    /// 監査記録だけを行う）。
+    ///
+    /// **監査記録に失敗しても、この安全ゲートの応答そのものは失敗させない。** 「当社の取扱外
+    /// 製品と正直に伝える」という安全性は allowlist 側の決定論ロジックだけで既に成立しており、
+    /// それを audit backend（vegapunk）の可用性に依存させると、vegapunk 障害時に**安全な断り
+    /// 文言すら返せなくなる**（`draft_customer_reply` が生成失敗を non-fatal に扱っているのと
+    /// 同じ設計判断）。ただし監査記録が欠落した事実は運用者が追えなければならないため、
+    /// 必ず `tracing::error!` で警告する（握りつぶさない）。
+    pub async fn record_out_of_scope_case(
+        &self,
+        ctx: &RequestContext,
+        question: &str,
+        case_id: Option<&str>,
+    ) -> String {
+        match self
+            .try_record_out_of_scope_case(ctx, question, case_id)
+            .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                let fallback_id = case_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("case-{}", uuid::Uuid::new_v4()));
+                tracing::error!(
+                    error = ?err,
+                    request_id = %ctx.request_id,
+                    schema = %ctx.schema,
+                    case_id = %fallback_id,
+                    "failed to record an audit trail for an out-of-scope product reply; the \
+                     customer still received the correct out-of-scope message (that safety \
+                     property does not depend on audit availability), but this conversation has \
+                     NO case/audit record — investigate vegapunk/knowledge connectivity"
+                );
+                fallback_id
+            }
+        }
+    }
+
+    async fn try_record_out_of_scope_case(
+        &self,
+        ctx: &RequestContext,
+        question: &str,
+        case_id: Option<&str>,
+    ) -> Result<String> {
+        let knowledge = self.knowledge()?;
+        let existing = match case_id {
+            Some(id) => knowledge.load_case(&ctx.schema, id).await?,
+            None => None,
+        };
+        let resolved_case_id = match (case_id, existing) {
+            (Some(id), Some(_)) => id.to_string(),
+            _ => {
+                let new_id = format!("case-{}", uuid::Uuid::new_v4());
+                let attrs: std::collections::HashMap<String, String> = [
+                    ("case_id".to_string(), new_id.clone()),
+                    ("request_id".to_string(), ctx.request_id.clone()),
+                    ("actor".to_string(), ctx.actor.sub.clone()),
+                    ("actor_email".to_string(), ctx.actor.email.clone()),
+                    ("question".to_string(), question.to_string()),
+                    ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),
+                ]
+                .into_iter()
+                .collect();
+                knowledge
+                    .record(
+                        &ctx.schema,
+                        "support_case",
+                        &new_id,
+                        attrs.into_iter().collect(),
+                    )
+                    .await?;
+                new_id
+            }
+        };
+        self.audit_with_nodes(
+            ctx,
+            "out_of_scope_product",
+            None,
+            Vec::new(),
+            vec![knowledge::harness_node_id(
+                &ctx.schema,
+                "support_case",
+                &resolved_case_id,
+            )],
+            None,
+        )
+        .await?;
+        Ok(resolved_case_id)
+    }
 }
 
 #[cfg(test)]
@@ -1356,6 +1490,9 @@ mod tests {
             // 返信文下書きはデモ用で既定 off。テストは判定そのものを見るため常に無効。
             reply_drafter: None,
             reply_draft_max_tokens: 700,
+            // VegapunkClient の実接続を要求するため、`manual` / `corpus` と同じ理由で
+            // 同期テストヘルパでは構築しない（`product_gate.rs` の非同期テストが別途カバーする）。
+            product_gate: None,
         }
     }
 
@@ -1573,9 +1710,17 @@ mod tests {
         .expect("llm client must build from the stub config")
         .expect("enabled = true with a readable key file must yield a client");
 
+        const SCHEMA: &str = "test-schema";
         let harness = Harness {
             reply_drafter: Some(drafter),
             ng: production_ng_dictionary(),
+            // Issue #28: draft_customer_reply が §3.2/§3.4 のために allowlist を取得する。
+            // 実接続を張れないこのテスト環境では、`schema` に対して新鮮なキャッシュを
+            // 埋め込んだ ProductGate を使う（RPC を一切発行しない）。
+            product_gate: Some(product_gate::ProductGate::seeded_for_test(
+                SCHEMA,
+                product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()]),
+            )),
             ..harness_for_test()
         };
         let decision = decision::AnswerDecision::Allowed {
@@ -1603,6 +1748,7 @@ mod tests {
                 &[],
                 &[],
                 is_continuation,
+                SCHEMA,
             )
             .await;
         (draft, log)
