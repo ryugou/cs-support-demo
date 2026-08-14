@@ -301,6 +301,7 @@ cs-support-mcp/
 - 使わない tunnel port: `16840`
 - 禁止: ローカルで `vegapunk` を起動しない
 - 禁止: `ssh -L 16840:...` の tunnel を張らない
+- 注記: `evaluate`（MCP `evaluate_answerability` を含む）は Product ノード（製品マスタ）を必須とする fail-closed 経路になった（Issue #28）。レガシー project `sivira-cs-demo` は製品マスタが未投入のため、マスタを投入するまで MCP の `evaluate_answerability` は動作しない
 
 `.mcp.json` は使わない（demo 開発時の localhost 登録ごと削除済み）。MCP クライアントからの接続は
 claude.ai のカスタムコネクタ経由に一本化する。ローカルサーバへ疎通確認するときは、下記の `curl` を使う。
