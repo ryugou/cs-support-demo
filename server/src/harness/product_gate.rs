@@ -22,8 +22,33 @@ use unicode_normalization::UnicodeNormalization;
 /// 製品マスタ（Product ノード一覧）の TTL キャッシュ既定値（design doc §2）。
 const PRODUCT_ALLOWLIST_TTL: Duration = Duration::from_secs(600);
 
-/// 型番トークンの抽出パターン（design doc §3.1 で確定した正規表現そのもの）。
-/// `(?i)` で大文字小文字を無視するため、`[A-Z0-9]` は `a-z0-9` にもマッチする。
+/// 型番トークンの抽出パターン（2026-08-14 裁定。全面 case-insensitive・貪欲マッチ）。`(?i)` で
+/// 大文字小文字を無視するため、`[A-Z]` は `a-z` にもマッチする。
+///
+/// 構造: "ADC-" の後、英数字とハイフンを貪欲に読み進める。末尾サフィックスの文字数やマッチ
+/// 終端直後の文字種を一切制限しない。
+///
+/// # なぜこの単純な式に戻したか（旧方式のfail-open）
+///
+/// 一時期、末尾サフィックスを「高々1文字の大文字」に制限し（`[A-Z]?`）、かつ
+/// `extract_model_tokens` 側でマッチ終端直後が ASCII 英数字なら**マッチ全体を丸ごと破棄**する
+/// 境界チェックを重ねる方式を採用していた。狙いは「ADC-V724camera」のような型番直後に英字が
+/// 続く語を型番として誤検出しない（fail-closed 側の偽陽性を避ける）ことだった。
+///
+/// しかしこれはユーザーにより棄却された。顧客は型番を `adc-v521ir` のように**小文字**で、かつ
+/// 2文字以上のサフィックス（"ir" 等）付きで入力するのが普通である。旧方式では `[A-Z]?` が
+/// 高々1文字しか許さないため正規表現が `adc-v521i` までしかマッチできず、続く `r` が ASCII
+/// 英数字であるため境界チェックがマッチ全体を丸ごと破棄していた。結果、型番トークンが一切
+/// 検出されず `extract_model_tokens` が空配列を返す。これは **fail-open**（取扱外型番への
+/// 言及が「言及なし」として §3.1 質問側ゲートを素通りする）であり、reviewer が Critical (C-1)
+/// として FAIL 判定した。
+///
+/// 2026-08-14 裁定: 検出は全面 case-insensitive・貪欲マッチへ戻す。これにより「型番直後に
+/// 区切りなしで英字が続く語」（例:「ADC-V724camera」）は「ADC-V724CAMERA」として一体抽出され、
+/// allowlist（型番のみ）と不一致になり取扱外扱いになる、という稀な偽陽性が生じる
+/// （`extract_model_tokens` の doc コメントの Accepted Risk を参照）。これは fail-closed 側
+/// （実際には取扱内の製品を誤って「取扱外」と断る）であり、日本語の顧客文で型番に英単語が
+/// 直結する書き方は実質発生しないため、Accepted Risk として受容する。
 fn model_token_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -31,28 +56,65 @@ fn model_token_regex() -> &'static regex::Regex {
     })
 }
 
-/// 型番トークン比較用の正規化: NFKC（全角英数・全角ハイフンを半角へ）してから大文字化する
-/// （design doc §3.1）。
-fn normalize_model_token(raw: &str) -> String {
-    raw.nfkc().collect::<String>().to_uppercase()
+/// Unicode のハイフン様記号（U+2010〜U+2015 の各種ダッシュ、U+2212 数学マイナス記号、
+/// 全角ハイフンマイナス U+FF0D）を ASCII `'-'` へ変換し、U+00AD SOFT HYPHEN を除去する
+/// （Issue #28 codex レビュー採用3）。
+///
+/// 全角ハイフンマイナスは NFKC でも半角化されるが、それ以外（U+2010 HYPHEN、U+2212 MINUS SIGN
+/// 等）は正準/互換分解が定義されておらず NFKC の対象外なので、NFKC の前段でここで明示変換
+/// しないと、顧客が ASCII ハイフン以外の文字で型番を書いた場合に型番トークンとして検出されない
+/// （§3.1 の質問側ゲートが素通りし false negative になる）。
+///
+/// U+00AD SOFT HYPHEN はゼロ幅の書式制御文字（本来はソフトウェアによる行末ハイフネーション
+/// 挿入位置を示す）で、正準分解が定義されておらず NFKC でも消えない。除去しないと、コピペや
+/// 自動整形の過程で型番の途中に紛れ込んだ場合に、そのままでは正規表現がマッチせず検出漏れ
+/// （false negative）になる。ハイフンとして扱う（`-` へ変換する）のではなく除去するのは、
+/// SOFT HYPHEN が視覚的には非表示であり、`-` に変換すると「ADC-V724」が「ADC--V724」のように
+/// 余分なハイフンを持つ形になってしまうため。
+fn normalize_hyphens(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c != '\u{00AD}')
+        .map(|c| match c {
+            '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{FF0D}' => '-',
+            other => other,
+        })
+        .collect()
 }
 
-/// テキストから型番トークンを検出順（出現順）に抽出する。抽出前に文字列全体を NFKC 正規化し、
-/// マッチした断片を大文字化して返す（比較は常にこの正規化後の形で行う）。
+/// 型番トークン比較用の正規化: Unicode ハイフン類を ASCII `'-'` へ変換し、NFKC（全角英数を
+/// 半角へ）してから大文字化する（design doc §3.1、Issue #28 codex レビュー採用3）。
+fn normalize_model_token(raw: &str) -> String {
+    normalize_hyphens(raw)
+        .nfkc()
+        .collect::<String>()
+        .to_uppercase()
+}
+
+/// テキストから型番トークンを検出順（出現順）に抽出する。抽出前に文字列全体の Unicode
+/// ハイフン類を ASCII `'-'` へ変換（SOFT HYPHEN は除去）してから NFKC 正規化し、マッチした
+/// 断片を大文字化して返す（比較は常にこの正規化後の形で行う）。
+///
+/// 境界チェックは行わない（2026-08-14 裁定。`model_token_regex` の doc コメント参照）。
+///
+/// # Accepted Risk（2026-08-14 裁定）
+///
+/// 全面貪欲マッチのため、型番直後に区切りなしで英字が続く語（例:「ADC-V724camera」）は
+/// 「ADC-V724CAMERA」として一体抽出される。これは allowlist（型番のみ）と一致せず、実際には
+/// 取扱内の「ADC-V724」について聞いている顧客を誤って「取扱外」と断ってしまう偽陽性になる。
+/// 日本語の顧客文で型番に英単語が直結する書き方（スペースや助詞を挟まない）は実質発生しない
+/// ため、fail-open（旧方式が引き起こしていた検出漏れ）よりましな fail-closed 側の代償として
+/// 受容する。回帰テスト `accepted_risk_...` で固定化している。
 ///
 /// `質問側ゲート`（§3.1）・`材料選別`（§3.2）・`応答側ゲート`（§3.5）の 3 箇所が共通で使う
 /// 唯一の抽出経路（重複実装しない）。
 pub fn extract_model_tokens(text: &str) -> Vec<String> {
-    let normalized: String = text.nfkc().collect();
+    let normalized: String = normalize_hyphens(text).nfkc().collect();
     model_token_regex()
         .find_iter(&normalized)
         .map(|m| {
-            // `[A-Z0-9-]*` は貪欲マッチのため、顧客が区切りに打つハイフンや原文の折返し由来の
-            // 末尾ハイフンまで取り込む（例:「ADC-V724-の設定」→ `ADC-V724-`）。これを trim せず
-            // allowlist と比較すると、取扱内の製品が一致せず誤って「取り扱いがございません」と
-            // 断ってしまう。正規表現は `ADC-` の直後に `[A-Z0-9]` を必ず 1 文字要求するため、
-            // 末尾ハイフンを落としても空文字にはならない。語中のハイフン（多段ハイフン型番、
-            // 例 `ADC-SEM100-ADT`）は末尾ではないため保持される。
+            // 正規表現の `[A-Z0-9-]*` は末尾ハイフンも貪欲に飲み込むため、顧客が区切りに打つ
+            // ハイフンや原文の折返し由来の末尾ハイフン（例:「ADC-V724-の設定」）が型番の一部に
+            // なってしまう。trim して allowlist の "ADC-V724" と一致させる。
             m.as_str().to_uppercase().trim_end_matches('-').to_string()
         })
         .collect()
@@ -111,6 +173,12 @@ impl ProductAllowlist {
     /// `query_nodes` の `NodeResult` 一覧から allowlist を組み立てる。`model` 属性が欠けた
     /// ノードはスキーマ上あり得ないはずだが、fail-closed で黙って落とさず warn して除外する
     /// （運用者が「なぜ allowlist から消えたか」をログだけで追えるように）。
+    ///
+    /// allowlist は `model` 属性のみで構築する（`name` は併合しない。W-3 是正）。以前は `name`
+    /// 属性も正規化して一致判定（`normalized`）へマージしていたが、`extract_model_tokens` は
+    /// 常に「ADC-」で始まる型番形式のトークンしか生成しないため、`name`（現行データでは
+    /// `name == model`、design doc §1）由来のマージは実利用上到達しない不要な複雑さだった。
+    /// 単純化のため撤去する。
     pub(crate) fn from_nodes(nodes: Vec<crate::proto::graphrag::NodeResult>) -> Self {
         let models: Vec<String> = nodes
             .into_iter()
@@ -142,11 +210,17 @@ impl ProductAllowlist {
             .find(|t| !self.is_in_scope(t))
     }
 
-    /// `text` に allowlist 外の型番言及が 1 つでもあるか（§3.5 応答側ゲート用）。
-    pub fn has_out_of_scope_mention(&self, text: &str) -> bool {
+    /// `text` から検出した allowlist 外の型番をすべて返す（重複除去・出現順）。Issue #28 codex
+    /// レビュー採用5: §3.5 応答側ゲートの warn ログに「何が検出されたか」を残すために使う
+    /// （従来は `has_out_of_scope_mention` の真偽値しか無く、運用者がログだけでは検出型番を
+    /// 特定できなかった）。
+    pub fn out_of_scope_mentions(&self, text: &str) -> Vec<String> {
+        let mut seen = HashSet::new();
         extract_model_tokens(text)
-            .iter()
-            .any(|t| !self.is_in_scope(t))
+            .into_iter()
+            .filter(|t| !self.is_in_scope(t))
+            .filter(|t| seen.insert(t.clone()))
+            .collect()
     }
 
     /// §3.2 材料選別の判定: `text`（材料の生本文。truncate 前）が allowlist 外の型番だけを
@@ -430,6 +504,87 @@ mod tests {
         );
     }
 
+    // ---- extract_model_tokens: 全面 case-insensitive・貪欲マッチ（2026-08-14 裁定、C-1回帰） ----
+
+    #[test]
+    fn extract_model_tokens_finds_the_full_lowercase_token_with_a_multi_char_suffix() {
+        // C-1 本体の回帰テスト。旧方式（末尾サフィックス高々1文字の大文字 + 境界チェック）は
+        // 顧客が普段書く「adc-v521ir」（小文字・2文字以上のサフィックス "ir"）を
+        // "adc-v521i" までしかマッチできず、続く "r" が ASCII 英数字であるため境界チェックが
+        // マッチ全体を丸ごと破棄していた。fail-open（型番トークンが1つも検出されず §3.1
+        // 質問側ゲートを素通りする）だったため、全面貪欲マッチへ戻した。
+        assert_eq!(
+            extract_model_tokens("adc-v521irが動きません"),
+            vec!["ADC-V521IR"]
+        );
+    }
+
+    #[test]
+    fn extract_model_tokens_finds_the_full_uppercase_token_with_a_multi_char_suffix() {
+        assert_eq!(
+            extract_model_tokens("ADC-V521IRの調子が悪いです"),
+            vec!["ADC-V521IR"]
+        );
+        assert_eq!(
+            extract_model_tokens("ADC-V522IRの調子が悪いです"),
+            vec!["ADC-V522IR"]
+        );
+    }
+
+    #[test]
+    fn extract_model_tokens_still_extracts_the_token_when_followed_by_japanese_text() {
+        // "の設定" のような通常の日本語直後でも型番は問題なく検出される。
+        assert_eq!(
+            extract_model_tokens("ADC-V724の設定を教えてください"),
+            vec!["ADC-V724"]
+        );
+    }
+
+    #[test]
+    fn extract_model_tokens_soft_hyphen_is_removed_so_the_full_token_is_still_detected() {
+        // U+00AD SOFT HYPHEN はゼロ幅の書式制御文字で、コピペ・自動整形の過程で型番の途中に
+        // 紛れ込むことがある。NFKC でも消えないため、除去しないと検出漏れになる。
+        assert_eq!(
+            extract_model_tokens("ADC-V521\u{00AD}IRの設定を教えてください"),
+            vec!["ADC-V521IR"]
+        );
+    }
+
+    #[test]
+    fn accepted_risk_a_trailing_ascii_word_is_absorbed_into_the_token_and_becomes_out_of_scope() {
+        // Accepted Risk（2026-08-14 裁定）の明文化。「ADC-V724camera」は全面貪欲マッチにより
+        // "ADC-V724CAMERA" として一体抽出され、allowlist（型番のみ）と不一致になるため
+        // 「取扱外」扱いになる。これは実際には取扱内の ADC-V724 について聞いている顧客を
+        // 誤って断ってしまう fail-closed 側の偽陽性だが、fail-open（型番検出漏れ）より優先して
+        // 意図的に受容した結果である。fixture_allowlist は ADC-V724 を含む。
+        let allow = fixture_allowlist();
+        assert_eq!(
+            allow.first_out_of_scope_token("ADC-V724cameraの調子が悪いです"),
+            Some("ADC-V724CAMERA".to_string())
+        );
+    }
+
+    // ---- extract_model_tokens: Unicode ハイフン類の正規化（Issue #28 codex レビュー採用3） ----
+
+    #[test]
+    fn extract_model_tokens_normalizes_u2010_hyphen_to_ascii_hyphen() {
+        // U+2010 HYPHEN。ASCII '-' (U+002D) とは異なるコードポイントで、NFKC でも半角化
+        // されない。顧客がこの文字で型番を書いた場合に検出漏れ(false negative)にならないこと。
+        assert_eq!(
+            extract_model_tokens("ADC\u{2010}V724の設定を教えてください"),
+            vec!["ADC-V724"]
+        );
+    }
+
+    #[test]
+    fn extract_model_tokens_normalizes_u2212_minus_sign_to_ascii_hyphen() {
+        // U+2212 MINUS SIGN（数学記号）。同じく NFKC の対象外。
+        assert_eq!(
+            extract_model_tokens("ADC\u{2212}V724の設定を教えてください"),
+            vec!["ADC-V724"]
+        );
+    }
+
     // ---- ProductAllowlist ----
 
     fn fixture_allowlist() -> ProductAllowlist {
@@ -518,11 +673,67 @@ mod tests {
     }
 
     #[test]
-    fn has_out_of_scope_mention_true_for_out_of_scope_and_false_for_in_scope_only() {
+    fn first_out_of_scope_token_is_none_for_a_mixed_case_in_scope_model() {
+        // 全面 case-insensitive マッチの実効テスト: 大文字小文字混在の型番表記
+        // （"Adc-V724x"）でも正規化後に allowlist の "ADC-V724X" と一致する。
+        // fixture_allowlist は ADC-V724X を含む。
         let allow = fixture_allowlist();
-        assert!(allow.has_out_of_scope_mention("ADC-VDB101はどうですか"));
-        assert!(!allow.has_out_of_scope_mention("ADC-V724はどうですか"));
-        assert!(!allow.has_out_of_scope_mention("型番の記載はありません"));
+        assert_eq!(
+            allow.first_out_of_scope_token("Adc-V724xの調子はどうですか"),
+            None
+        );
+    }
+
+    #[test]
+    fn first_out_of_scope_token_c1_regression_at_the_gate_composition_level() {
+        // これは C-1（fail-open）の回帰テストであり、抽出レベル
+        // （`extract_model_tokens_finds_the_full_lowercase_token_with_a_multi_char_suffix`）だけ
+        // でなく、実際に本番で壊れた層（allowlist との突合を含むゲート合成）でも固定する。
+        // 顧客が小文字・複数文字サフィックスで書いた型番（"adc-v521ir"）が §3.1 質問側ゲートを
+        // 素通りせず、取扱外として検出されること。fixture_allowlist は ADC-V521IR を含まない。
+        let allow = fixture_allowlist();
+        assert_eq!(
+            allow.first_out_of_scope_token("adc-v521irが動きません"),
+            Some("ADC-V521IR".to_string())
+        );
+    }
+
+    // ---- out_of_scope_mentions（Issue #28 codex レビュー採用5） ----
+
+    #[test]
+    fn out_of_scope_mentions_returns_all_distinct_out_of_scope_models_in_order() {
+        let allow = fixture_allowlist();
+        assert_eq!(
+            allow.out_of_scope_mentions("ADC-VDB101とADC-VDB201のどちらでも使えますか"),
+            vec!["ADC-VDB101".to_string(), "ADC-VDB201".to_string()]
+        );
+    }
+
+    #[test]
+    fn out_of_scope_mentions_is_empty_when_only_in_scope_models_are_mentioned() {
+        let allow = fixture_allowlist();
+        assert!(allow
+            .out_of_scope_mentions("ADC-V724とADC-V523の違いは何ですか")
+            .is_empty());
+    }
+
+    #[test]
+    fn out_of_scope_mentions_is_empty_when_no_model_is_mentioned() {
+        // 修正2で撤去した `has_out_of_scope_mention` の単体テストが検証していた3述語のうち
+        // 「型番なしのとき偽（＝ここでは空）になる」ケースを移植する（テストの意味を失わせない）。
+        let allow = fixture_allowlist();
+        assert!(allow
+            .out_of_scope_mentions("型番の記載はありません")
+            .is_empty());
+    }
+
+    #[test]
+    fn out_of_scope_mentions_deduplicates_repeated_mentions() {
+        let allow = fixture_allowlist();
+        assert_eq!(
+            allow.out_of_scope_mentions("ADC-VDB101について。もう一度、ADC-VDB101について教えて"),
+            vec!["ADC-VDB101".to_string()]
+        );
     }
 
     // ---- out_of_scope_material_exclusion（design doc §3.2 / §6） ----
@@ -699,6 +910,58 @@ mod tests {
             node_type: KIND_PRODUCT.to_string(),
             attributes,
         }
+    }
+
+    /// `model` に加えて `name` 属性も持つ Product ノード（W-3 是正のテスト用: name が
+    /// 一致判定・表示のどちらにも一切現れないことを検証するために使う）。
+    fn product_node_with_name(model: &str, name: &str) -> crate::proto::graphrag::NodeResult {
+        let mut attributes = HashMap::new();
+        attributes.insert("model".to_string(), model.to_string());
+        attributes.insert("name".to_string(), name.to_string());
+        crate::proto::graphrag::NodeResult {
+            node_id: format!("urtect:gen1:Product:{model}"),
+            node_type: KIND_PRODUCT.to_string(),
+            attributes,
+        }
+    }
+
+    // ---- ProductAllowlist::from_nodes: name は一致判定に含めない（W-3 是正） ----
+
+    #[test]
+    fn from_nodes_ignores_the_name_attribute_and_builds_the_allowlist_from_model_only() {
+        // 以前は name 属性も正規化して一致判定（`normalized`）へマージしていたが、W-3 是正で
+        // 撤去した（`extract_model_tokens` は常に「ADC-」形式のトークンしか生成しないため、
+        // name 由来のマージは実利用上到達しない不要な複雑さだった）。意図的に model と異なる
+        // name を使い、name 由来の値が一致判定にも表示文字列にも一切現れないことを証明する。
+        let allowlist = ProductAllowlist::from_nodes(vec![product_node_with_name(
+            "ADC-V724",
+            "V724 Outdoor Camera",
+        )]);
+        assert!(
+            !allowlist.is_in_scope(&normalize_model_token("V724 Outdoor Camera")),
+            "the 'name' attribute must not be merged into the in-scope match set"
+        );
+        assert_eq!(
+            allowlist.display_list(),
+            "ADC-V724",
+            "the display string must be built from 'model' only, never from 'name': {}",
+            allowlist.display_list()
+        );
+    }
+
+    #[test]
+    fn from_nodes_allowlist_gates_in_scope_and_out_of_scope_models_via_the_real_call_path() {
+        // W-3 の置き換えテスト: `from_nodes` で構築した allowlist を、実際の呼び出し経路
+        // （`first_out_of_scope_token`）に通して end-to-end で検証する。
+        let allowlist = ProductAllowlist::from_nodes(vec![product_node("ADC-V724")]);
+        assert_eq!(
+            allowlist.first_out_of_scope_token("ADC-V724の調子はどうですか"),
+            None
+        );
+        assert_eq!(
+            allowlist.first_out_of_scope_token("ADC-V999の調子はどうですか"),
+            Some("ADC-V999".to_string())
+        );
     }
 
     #[test]

@@ -263,6 +263,76 @@ fn clarification_allowed(decision: &decision::AnswerDecision) -> bool {
     )
 }
 
+/// Issue #28 codex レビュー採用1(Critical): `hits` をカバレッジ判定(`decision::decide`)へ渡す
+/// 前に、材料テキスト(title_ja + body_ja + body_en のうち空でないもの全て)が「取扱外型番のみを
+/// 言及し、取扱型番の言及が1つも無い」節を除外する。汎用材料(型番言及なし)は通す。
+///
+/// **この関数を `evaluate()` 内、`best_manual_score` / `best_manual_sections` の算出より前に
+/// 呼ぶことが本修正の核心。** 以前は同じ除外判定を `reply::build_reply_brief_with_resolution`
+/// （判定確定・下書き生成の直前）でしか行っておらず、材料が全除外されても `decide()` には
+/// フィルタ前の `best_manual_score` がそのまま渡っていた。取扱外型番のみを言及する記事が
+/// たまたま高スコアで検索に掛かると、判定は `Allowed` のまま確定し、その後ろで下書きの材料が
+/// 0 件になるという矛盾（「回答してよい」+「材料なし」）が起きていた。ここで先に除外すれば、
+/// 全除外時は `section_hits` が空になり、以降の `best_manual_score` / `best_manual_sections` の
+/// 計算・`decide()` が自然にカバレッジ不足として扱う（聞き返し/エスカレーションへ倒れる）。
+///
+/// `title_ja` / `body_ja` / `body_en` のうち空でないものすべてを半角スペース区切りで連結して
+/// から `out_of_scope_material_exclusion` に渡す（検査対象に `title_ja` も含めるのは codex
+/// レビュー採用4）。`body_ja` と `body_en` のどちらか一方だけを選ぶ（`Option::or`）実装は、
+/// `body_ja = Some("")`（翻訳が `missing` / `stale` の section で実際に起きる。`body_ja` 属性が
+/// 空文字のまま `body_en` にだけ本文がある）のとき `Some("")` を有効値として選んでしまい
+/// `body_en` を一切検査しない fail-open だった（2026-08-14 修正。回帰テスト
+/// `filter_out_of_scope_hits_excludes_when_japanese_body_is_empty_and_english_body_has_only_
+/// out_of_scope_model` 参照）。ゲートは「検査漏れゼロ」が最優先の fail-closed 判定なので、
+/// 利用可能なテキストは全部見る。`out_of_scope_material_exclusion` は「取扱内型番の言及が1つ
+/// でもあれば除外しない」仕様なので、検査対象を広げても取扱内記事を過剰に除外することはない
+/// （取扱内の言及も同時に拾えるため）。
+///
+/// **一方、抜粋生成側（`reply::build_reply_brief_with_resolution` の `.or()`）は `body_ja` /
+/// `body_en` のどちらか一方だけを選ぶ実装のまま変更していない**（Issue #28 のスコープ外。LLM へ
+/// 渡す材料の選び方を変えるのは別途判断が必要）。ここでの不整合に見える差は意図的なもの:
+/// ゲートは「除外すべきか」を判定するために広く検査するが、抜粋生成は「顧客に見せる1つの本文」
+/// を選ぶ処理であり目的が異なる。
+///
+/// 除外時は debug ログ（section_key / 検出型番）を出す。監査ログ（WORM）ではなく debug に
+/// 留めるのは、除外そのものが「異常」ではなく検索結果の通常のノイズだから
+/// （§3.2 は「除外時は debug ログ」と定める）。
+fn filter_out_of_scope_hits(
+    hits: Vec<SectionHit>,
+    allowlist: &product_gate::ProductAllowlist,
+) -> Vec<SectionHit> {
+    hits.into_iter()
+        .filter(|h| {
+            // title_ja は常に含める。body_ja / body_en は Some かつ非空のものだけ追加する
+            // （`Option::or` で一方だけ選ぶと `body_ja = Some("")` のとき body_en が一切検査
+            // されない fail-open になる。上の doc コメント参照）。
+            let combined = [
+                Some(h.title_ja.as_str()),
+                h.body_ja.as_deref(),
+                h.body_en.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+            match allowlist.out_of_scope_material_exclusion(&combined) {
+                Some(detected) => {
+                    tracing::debug!(
+                        section_key = %h.section_key,
+                        model = %detected,
+                        "excluding manual hit from the coverage decision and reply draft: it \
+                         mentions only out-of-scope product model(s) (title_ja/body_ja/body_en) \
+                         and no in-scope model"
+                    );
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect()
+}
+
 /// `Harness::evaluate()` に渡された case_id が既存 case として解決できなかった場合の挙動。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownCaseIdPolicy {
@@ -973,6 +1043,13 @@ impl Harness {
                     (hits, ids)
                 }
             };
+        // Issue #28 codex レビュー採用1(Critical): カバレッジ判定(decide())より前に、取扱外
+        // 型番のみを言及する hit を除外する。`retrieved_manual_ids`（監査 lineage）はこの
+        // フィルタの影響を受けない意図的な設計（「何を検索で取得したか」の監査記録は、判定・
+        // 下書きに使う材料の選別とは独立に保つ）ため、フィルタ前の `retrieved_manual_ids` は
+        // 上のタプル分解のまま変更しない。
+        let allowlist = self.product_allowlist(&ctx.schema).await?;
+        let section_hits = filter_out_of_scope_hits(section_hits, &allowlist);
         // [(B) 3 層判定] 純関数。判定根拠は常に「累積 signal 集合 + known_resolution」。
         let best = section_hits.first();
         let best_manual_score = best.map(|h| h.score);
@@ -1109,7 +1186,7 @@ impl Harness {
                 &resolutions,
                 history,
                 is_continuation,
-                &ctx.schema,
+                &allowlist,
             )
             .await;
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
@@ -1134,7 +1211,16 @@ impl Harness {
     /// `None` を返し、**評価そのものは成功させる**。
     ///
     /// 材料の選別（Escalate ではマニュアル本文を一切渡さない）は `reply::build_reply_brief`
-    /// が担う。ここはその結果を送るだけで、安全判断をこの関数に持ち込まない。
+    /// が担う。取扱外型番のみを言及する材料の除外（Issue #28 §3.2）は、判定確定前の
+    /// `evaluate()` 側で `filter_out_of_scope_hits` により既に完了しているため、ここへ渡って
+    /// くる `hits` はフィルタ済み。この関数はその結果を送るだけで、安全判断をこの関数に
+    /// 持ち込まない。
+    ///
+    /// `allowlist` は `evaluate()` が判定確定前に取得済みのものをそのまま受け取る（Issue #28
+    /// codex レビュー採用1: allowlist の fetch を判定前の 1 箇所へ集約し、ここでの再取得は
+    /// しない。以前はここで `self.product_allowlist(schema)` を再度呼んでいたが、二重取得は
+    /// TTL キャッシュ経由とはいえ無駄であり、かつ「判定と下書きが異なる瞬間の allowlist を
+    /// 見る」余地を生む）。
     ///
     /// `is_continuation` は `evaluate()` から素通しされる会話段階フラグ（判定はサーバ側が
     /// コードで行う。`reply::build_reply_system_prompt` の doc を参照）。
@@ -1147,23 +1233,9 @@ impl Harness {
         resolutions: &[rules::KnownResolution],
         history: &[reply::ReplyHistoryTurn],
         is_continuation: bool,
-        schema: &str,
+        allowlist: &product_gate::ProductAllowlist,
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
-        // Issue #28: 取扱製品スコープの前提化（§3.2/§3.4）。allowlist が引けない限り
-        // 材料選別もプロンプト制約も組み立てられないため、fetch 失敗はここで下書き自体を
-        // 諦める（他の生成失敗と同じ「warn して None、evaluate 自体は成功させる」規律）。
-        let allowlist = match self.product_allowlist(schema).await {
-            Ok(allowlist) => allowlist,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "product allowlist fetch failed; returning the evaluation without a draft \
-                     (customer_reply_draft = null). The decision itself is unaffected"
-                );
-                return None;
-            }
-        };
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
         // 引いて渡す（引けなければ材料ゼロのまま = でっち上げない。reply.rs の doc を参照）。
         let kr_answer = match decision {
@@ -1177,8 +1249,8 @@ impl Harness {
                 .map(|kr| kr.answer.as_str()),
             _ => None,
         };
-        let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer, &allowlist);
-        let system = reply::build_reply_system_prompt(&brief, is_continuation, &allowlist);
+        let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
+        let system = reply::build_reply_system_prompt(&brief, is_continuation, allowlist);
         let user = reply::build_reply_user_message(question, &brief, history);
         let draft = match drafter
             .draft_reply(
@@ -1710,17 +1782,9 @@ mod tests {
         .expect("llm client must build from the stub config")
         .expect("enabled = true with a readable key file must yield a client");
 
-        const SCHEMA: &str = "test-schema";
         let harness = Harness {
             reply_drafter: Some(drafter),
             ng: production_ng_dictionary(),
-            // Issue #28: draft_customer_reply が §3.2/§3.4 のために allowlist を取得する。
-            // 実接続を張れないこのテスト環境では、`schema` に対して新鮮なキャッシュを
-            // 埋め込んだ ProductGate を使う（RPC を一切発行しない）。
-            product_gate: Some(product_gate::ProductGate::seeded_for_test(
-                SCHEMA,
-                product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()]),
-            )),
             ..harness_for_test()
         };
         let decision = decision::AnswerDecision::Allowed {
@@ -1740,6 +1804,11 @@ mod tests {
             score: 0.9,
             source_url: None,
         }];
+        // Issue #28 codex レビュー採用1: allowlist は `evaluate()` が判定前に取得済みのものを
+        // 渡す設計になったため、`draft_customer_reply` 自体はもう schema も ProductGate も
+        // 必要としない。このテストはその関数を直接呼ぶだけなので、allowlist を直接組み立てて
+        // 渡す（実接続は張らない）。
+        let allowlist = product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()]);
         let draft = harness
             .draft_customer_reply(
                 "カメラが反応しません",
@@ -1748,7 +1817,7 @@ mod tests {
                 &[],
                 &[],
                 is_continuation,
-                SCHEMA,
+                &allowlist,
             )
             .await;
         (draft, log)
@@ -2102,6 +2171,216 @@ mod tests {
         assert!(
             clarification_allowed(&d),
             "layer 3 UnknownAddedSignal from decide() must allow clarification"
+        );
+    }
+
+    // ---- filter_out_of_scope_hits（Issue #28 codex レビュー採用1・採用4） ----
+
+    fn scoped_hit(section_key: &str, title_ja: &str, body: &str) -> SectionHit {
+        scoped_hit_with_bodies(section_key, title_ja, Some(body), None)
+    }
+
+    /// `body_ja` / `body_en` を個別に指定できる版（修正1の回帰テスト用: 翻訳が `missing` /
+    /// `stale` の section を模して `body_ja = Some("")` かつ `body_en` にだけ本文がある hit を
+    /// 再現するために使う）。
+    fn scoped_hit_with_bodies(
+        section_key: &str,
+        title_ja: &str,
+        body_ja: Option<&str>,
+        body_en: Option<&str>,
+    ) -> SectionHit {
+        SectionHit {
+            section_key: section_key.to_string(),
+            title_ja: title_ja.to_string(),
+            body_ja: body_ja.map(str::to_string),
+            body_en: body_en.map(str::to_string),
+            translation_status: None,
+            breadcrumb: Vec::new(),
+            score: 0.9,
+            source_url: None,
+        }
+    }
+
+    fn scoped_allowlist() -> product_gate::ProductAllowlist {
+        product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()])
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_excludes_a_hit_that_mentions_only_out_of_scope_models() {
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit(
+            "sec-a",
+            "タイトル",
+            "ADC-VDB101の初期設定手順です",
+        )];
+        assert!(filter_out_of_scope_hits(hits, &allow).is_empty());
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_keeps_a_hit_that_also_mentions_an_in_scope_model() {
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit(
+            "sec-a",
+            "タイトル",
+            "ADC-V724とADC-VDB101は共通の手順です",
+        )];
+        let filtered = filter_out_of_scope_hits(hits, &allow);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].section_key, "sec-a");
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_keeps_a_hit_with_no_model_mention() {
+        // 型番言及の無い汎用材料（Wi-Fi 再接続等）は通す（design doc §3.2）。
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit("sec-a", "タイトル", "Wi-Fiの再接続手順です")];
+        assert_eq!(filter_out_of_scope_hits(hits, &allow).len(), 1);
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_excludes_when_the_out_of_scope_model_is_only_in_the_title() {
+        // codex レビュー採用4: 検査対象に title_ja も含める。body には型番言及が無く
+        // title_ja にのみ取扱外型番がある節も除外されること。
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit(
+            "sec-a",
+            "ADC-VDB101の初期設定",
+            "この手順は共通の内容です",
+        )];
+        assert!(filter_out_of_scope_hits(hits, &allow).is_empty());
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_returns_empty_when_every_candidate_is_out_of_scope_only() {
+        let allow = scoped_allowlist();
+        let hits = vec![
+            scoped_hit("sec-a", "タイトル", "ADC-VDB101の設定"),
+            scoped_hit("sec-b", "タイトル", "ADC-VDB201の設定"),
+        ];
+        assert!(filter_out_of_scope_hits(hits, &allow).is_empty());
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_detects_a_mention_far_into_a_long_body() {
+        // `filter_out_of_scope_hits` は `evaluate()` の中で、`reply::build_reply_brief_with_
+        // resolution`（本文を `MAX_EXCERPT_CHARS` で truncate する箇所）より前の生本文に対して
+        // 動く。ここで見る本文がどれだけ長くても、切り捨てとは無関係に全文を検査できることを
+        // 固定する（切り捨て位置に依存する実装への回帰を防ぐ）。
+        let filler = "あ".repeat(3_000);
+        let body = format!("{filler}ADC-VDB101の設定です");
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit("sec-a", "タイトル", &body)];
+        assert!(
+            filter_out_of_scope_hits(hits, &allow).is_empty(),
+            "an out-of-scope mention far into a long body must still trigger exclusion"
+        );
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_excludes_when_japanese_body_is_empty_and_english_body_has_only_out_of_scope_model(
+    ) {
+        // 修正1の回帰テスト（Critical、2026-08-14）。翻訳が `missing` / `stale` の section は
+        // `body_ja` 属性が空文字のまま `body_en` にだけ本文を持つ（design doc の「言語と翻訳
+        // 方針」参照）。`body_ja.as_deref().or(body_en.as_deref())` のように一方だけを選ぶ実装は
+        // `body_ja = Some("")` を有効値として選んでしまい、`body_en` を一切検査しない fail-open
+        // になっていた。修正前のコードではこのテストは失敗する（ADC-VDB101 が検査対象に入らず
+        // 除外されない）。
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit_with_bodies(
+            "sec-a",
+            "初期設定",
+            Some(""),
+            Some("Setup instructions for ADC-VDB101"),
+        )];
+        assert!(filter_out_of_scope_hits(hits, &allow).is_empty());
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_keeps_when_japanese_body_is_empty_and_english_body_mentions_an_in_scope_model(
+    ) {
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit_with_bodies(
+            "sec-a",
+            "初期設定",
+            Some(""),
+            Some("Setup instructions for ADC-V724"),
+        )];
+        let filtered = filter_out_of_scope_hits(hits, &allow);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].section_key, "sec-a");
+    }
+
+    /// **Critical 1 の回帰防止（判定レベルの検証）。**
+    ///
+    /// 修正前は、材料の取扱外除外が `decision::decide()` の**後**（`reply::
+    /// build_reply_brief_with_resolution`）でしか効かず、hits 全件が取扱外型番のみを言及して
+    /// いても、フィルタ前の `best_manual_score` / `best_manual_sections` がそのまま
+    /// `decide()` へ渡っていた。高スコアの取扱外記事が検索に掛かると、判定は `Allowed` の
+    /// まま確定し、その後ろで下書きの材料だけが 0 件になるという矛盾が起きていた。
+    ///
+    /// ここでは `evaluate()` が実際に行う計算手順（`section_hits.first()` →
+    /// `best_manual_score` / `best_manual_sections` → `decision::decide()`）を、
+    /// フィルタ適用の有無それぞれについて再現する。フィルタ無し（対照・修正前の挙動）では
+    /// `Allowed` になること、フィルタ有り（修正後の実装）では `Allowed` にならないことの
+    /// 両方を確認することで、「フィルタを判定より前に置いたこと自体が結果を変える」ことを
+    /// 直接証明する。
+    #[test]
+    fn all_hits_out_of_scope_only_prevents_a_manual_allowed_decision() {
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit(
+            "sec-a",
+            "ADC-VDB101の初期設定",
+            "ADC-VDB101の初期設定手順です",
+        )];
+
+        // 対照（フィルタ無し）: 修正前の実装はこの経路を通っていたため、高スコアの hit が
+        // 1 件でもあれば Allowed になっていたことをまず確認する。
+        let unfiltered_best_score = hits.first().map(|h| h.score);
+        let unfiltered_sections: Vec<String> = hits.iter().map(|h| h.section_key.clone()).collect();
+        let d_unfiltered = decision::decide(&decision::DecisionInput {
+            question_signals: &contract_test_signals(&[]),
+            question_raw: "ADC-VDB101の設定を教えてください",
+            rules: &[],
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: unfiltered_best_score,
+            best_manual_sections: &unfiltered_sections,
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d_unfiltered, decision::AnswerDecision::Allowed { .. }),
+            "precondition: without the Issue #28 fix, a single high-scoring out-of-scope-only \
+             hit alone would already be Allowed, got {d_unfiltered:?}"
+        );
+
+        // 修正後（フィルタ有り）: `evaluate()` と同じ順序で filter_out_of_scope_hits を先に
+        // 通すと、全除外により hits が空になり、Allowed にならない。
+        let filtered = filter_out_of_scope_hits(hits, &allow);
+        assert!(
+            filtered.is_empty(),
+            "precondition: all hits must be excluded"
+        );
+        let best_manual_score = filtered.first().map(|h| h.score);
+        let best_manual_sections: Vec<String> =
+            filtered.iter().map(|h| h.section_key.clone()).collect();
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &contract_test_signals(&[]),
+            question_raw: "ADC-VDB101の設定を教えてください",
+            rules: &[],
+            domains: &[],
+            resolutions: &[],
+            best_manual_score,
+            best_manual_sections: &best_manual_sections,
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            !matches!(d, decision::AnswerDecision::Allowed { .. }),
+            "hits that mention only out-of-scope models must not survive into an Allowed \
+             decision once the Issue #28 fix filters them out before decide(): {d:?}"
         );
     }
 

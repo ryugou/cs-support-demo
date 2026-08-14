@@ -212,7 +212,7 @@ fn test_allowlist() -> crate::harness::product_gate::ProductAllowlist {
 /// テストのための薄いラッパである。
 #[cfg(test)]
 fn build_reply_brief(decision: &AnswerDecision, hits: &[SectionHit]) -> ReplyBrief {
-    build_reply_brief_with_resolution(decision, hits, None, &test_allowlist())
+    build_reply_brief_with_resolution(decision, hits, None)
 }
 
 /// [`build_reply_brief`] に、KR 由来 Allowed 用の承認済み回答本文（`kr.answer`）を足した版。
@@ -224,11 +224,20 @@ fn build_reply_brief(decision: &AnswerDecision, hits: &[SectionHit]) -> ReplyBri
 ///
 /// 引けなかった場合は `None` を渡すこと。材料ゼロの Answer になるが、**でっち上げた材料を
 /// 渡すより安全**であり、この状態は呼び出し側が下書き自体を諦める判断に使える。
+///
+/// **Issue #28 §3.2 の取扱外型番のみを言及する材料の除外は、ここでは行わない。**
+/// 以前はこの関数が `allowlist: &ProductAllowlist` を受け取り、`Allowed`（manual 由来）分岐の
+/// 中で `out_of_scope_material_exclusion` を呼んでいたが、それは `decision::decide()` が判定を
+/// 確定させた**後**にしか効かなかった（codex レビュー Critical 1）。除外の結果 `hits` が
+/// 全滅しても、判定はフィルタ前の `best_manual_score` で既に `Allowed` に確定済みのため、
+/// 「回答してよい」+「材料 0 件」という矛盾が起きていた。現在は
+/// `harness::filter_out_of_scope_hits` が `evaluate()` 内で `decision::decide()` を呼ぶ**前**に
+/// 同じ除外を行い、除外後の `hits` をこの関数へ渡す。したがってここへ来る `hits` は既に
+/// フィルタ済みであり、この関数が allowlist を意識する必要は無い（二重チェックしない）。
 pub fn build_reply_brief_with_resolution(
     decision: &AnswerDecision,
     hits: &[SectionHit],
     known_resolution_answer: Option<&str>,
-    allowlist: &ProductAllowlist,
 ) -> ReplyBrief {
     match decision {
         AnswerDecision::Allowed {
@@ -291,19 +300,9 @@ pub fn build_reply_brief_with_resolution(
                     if body.is_empty() {
                         return None;
                     }
-                    // Issue #28 §3.2: allowlist 外の型番のみを言及し、allowlist 内の言及が
-                    // 1 つも無い材料は除外する（truncate 前の生本文で判定する。truncate は
-                    // 後段でしか効かないため、先に切ると allowlist 外言及が切り落とされて
-                    // 誤って通過させてしまう）。型番言及の無い汎用材料は通す。
-                    if let Some(detected) = allowlist.out_of_scope_material_exclusion(body) {
-                        tracing::debug!(
-                            section_key = %h.section_key,
-                            model = %detected,
-                            "excluding manual material from the reply draft: it mentions only \
-                             out-of-scope product model(s) and no in-scope model"
-                        );
-                        return None;
-                    }
+                    // Issue #28 §3.2 の取扱外型番除外はここでは行わない（`hits` は
+                    // `harness::filter_out_of_scope_hits` により `evaluate()` 側で除外済み。
+                    // 上の doc コメントを参照）。
                     Some(ReplyExcerpt {
                         // 題名は外部サイト由来。ここでは無害化せず、`build_reply_user_message`
                         // の一律経路に任せる（無害化を生成箇所へ散らさない）。
@@ -614,8 +613,7 @@ mod tests {
             stakes: Stakes::Low,
             threshold: 0.6,
         };
-        let brief =
-            build_reply_brief_with_resolution(&decision, &[], Some(poisoned), &test_allowlist());
+        let brief = build_reply_brief_with_resolution(&decision, &[], Some(poisoned));
         let msg = build_reply_user_message("質問", &brief, &[]);
         assert_eq!(
             msg.matches("</資料>").count(),
@@ -648,12 +646,7 @@ mod tests {
             stakes: Stakes::Low,
             threshold: 0.6,
         };
-        let brief = build_reply_brief_with_resolution(
-            &decision,
-            &[],
-            Some("承認済みの回答本文"),
-            &test_allowlist(),
-        );
+        let brief = build_reply_brief_with_resolution(&decision, &[], Some("承認済みの回答本文"));
         assert_eq!(brief.kind, ReplyKind::Answer);
         assert_eq!(brief.excerpts.len(), 1);
         assert!(brief.excerpts[0].body.contains("承認済みの回答本文"));
@@ -674,7 +667,7 @@ mod tests {
             stakes: Stakes::Low,
             threshold: 0.6,
         };
-        let brief = build_reply_brief_with_resolution(&decision, &[], None, &test_allowlist());
+        let brief = build_reply_brief_with_resolution(&decision, &[], None);
         assert!(brief.excerpts.is_empty());
     }
 
@@ -712,68 +705,11 @@ mod tests {
         assert!(!brief.excerpts[0].body.contains("採用外の本文"));
     }
 
-    // ---- Issue #28 §3.2: 材料選別（取扱製品スコープ） ----
-
-    /// 取扱外の型番のみを言及する材料は除外される。
-    #[test]
-    fn answer_brief_excludes_material_that_mentions_only_out_of_scope_models() {
-        let hits = vec![hit("sec-a", "ADC-VDB101の初期設定手順です")];
-        let brief = build_reply_brief(&allowed(&["sec-a"]), &hits);
-        assert!(
-            brief.excerpts.is_empty(),
-            "material mentioning only an out-of-scope model must be excluded"
-        );
-    }
-
-    /// 取扱内の型番の言及も含む材料は、取扱外の型番が混在していても通す。
-    #[test]
-    fn answer_brief_keeps_material_that_also_mentions_an_in_scope_model() {
-        let hits = vec![hit(
-            "sec-a",
-            "ADC-V724とADC-VDB101は共通の手順です。設定方法を説明します。",
-        )];
-        let brief = build_reply_brief(&allowed(&["sec-a"]), &hits);
-        assert_eq!(brief.excerpts.len(), 1);
-        assert!(brief.excerpts[0].body.contains("共通の手順"));
-    }
-
-    /// 型番言及の無い汎用材料（Wi-Fi 再接続等）は通す。
-    #[test]
-    fn answer_brief_keeps_material_with_no_model_mention() {
-        let hits = vec![hit(
-            "sec-a",
-            "Wi-Fiの再接続手順です。ルーターを再起動してください。",
-        )];
-        let brief = build_reply_brief(&allowed(&["sec-a"]), &hits);
-        assert_eq!(brief.excerpts.len(), 1);
-    }
-
-    /// 全ての候補材料が取扱外のみを言及していても、特別扱いせず材料 0 件の Answer になる
-    /// （既存の判定ロジックに委ねる。design doc §3.2）。
-    #[test]
-    fn answer_brief_yields_zero_excerpts_when_all_candidates_are_out_of_scope_only() {
-        let hits = vec![
-            hit("sec-a", "ADC-VDB101の設定"),
-            hit("sec-b", "ADC-VDB201の設定"),
-        ];
-        let brief = build_reply_brief(&allowed(&["sec-a", "sec-b"]), &hits);
-        assert_eq!(brief.kind, ReplyKind::Answer);
-        assert!(brief.excerpts.is_empty());
-    }
-
-    /// truncate 前の生本文で判定すること: allowlist 外の言及が MAX_EXCERPT_CHARS を超えた
-    /// 位置にあっても、切り捨てられて見えなくなる前に検出して除外する。
-    #[test]
-    fn answer_brief_detects_out_of_scope_mention_beyond_the_truncation_limit() {
-        let filler = "あ".repeat(MAX_EXCERPT_CHARS + 100);
-        let body = format!("{filler}ADC-VDB101の設定です");
-        let hits = vec![hit("sec-a", &body)];
-        let brief = build_reply_brief(&allowed(&["sec-a"]), &hits);
-        assert!(
-            brief.excerpts.is_empty(),
-            "out-of-scope mention past the truncation cutoff must still trigger exclusion"
-        );
-    }
+    // Issue #28 §3.2（取扱外型番のみを言及する材料の除外）のテストは、判定確定前の
+    // `harness::filter_out_of_scope_hits` へ移設済み（codex レビュー Critical 1: 除外を
+    // `decision::decide()` より前へ移したため、この関数自体はもう allowlist を見ない）。
+    // `server/src/harness/mod.rs` の `mod tests` 内「---- filter_out_of_scope_hits ----」を
+    // 参照。
 
     /// **実データで踏んだ回帰の再現テスト。**
     ///
@@ -1223,7 +1159,7 @@ mod tests {
             threshold: 0.6,
         };
         let logs = capture_warnings(|| {
-            build_reply_brief_with_resolution(&decision, &[], Some(&long), &test_allowlist());
+            build_reply_brief_with_resolution(&decision, &[], Some(&long));
         });
         assert!(logs.contains("WARN"), "{logs}");
         assert!(logs.contains("known_resolution"), "{logs}");

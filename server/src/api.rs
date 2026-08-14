@@ -607,6 +607,15 @@ fn product_allowlist_fetch_failed(err: &anyhow::Error, request_id: &str) -> Resp
 /// フォールバック文言と warn メッセージは呼び出し元ごとに異なるため両方を引数で渡す（振る舞い
 /// ・ログ内容は元のインライン実装から変更しない）。回答下書きは戻り値の型が `Option<String>`
 /// で異なるため、共有せず [`gate_customer_reply_draft`] に分けている。
+///
+/// warn には `detected_models`（Issue #28 codex レビュー採用5）を添える。以前は
+/// `has_out_of_scope_mention` の真偽値しか無く、警戒すべき型番がどれかはログだけでは分からず、
+/// 運用者が再現に本文を掘り直す必要があった。
+///
+/// S-2 是正: 以前は `has_out_of_scope_mention` で真偽判定した**後**、warn ログのために
+/// `out_of_scope_mentions` を**再度**呼んでおり、`extract_model_tokens` を含む同じスキャンを
+/// テキスト 1 本につき 2 回走らせていた。`out_of_scope_mentions` を 1 回だけ呼び、その結果の
+/// `is_empty()` で分岐する形にして、判定とログ材料を同じ 1 回のスキャンで賄う。
 fn gate_generated_text(
     text: String,
     allowlist: &product_gate::ProductAllowlist,
@@ -616,11 +625,13 @@ fn gate_generated_text(
     warn_message: &'static str,
     fallback: impl FnOnce() -> String,
 ) -> String {
-    if allowlist.has_out_of_scope_mention(&text) {
+    let detected_models = allowlist.out_of_scope_mentions(&text);
+    if !detected_models.is_empty() {
         tracing::warn!(
             route = route,
             request_id = %request_id,
             case_id = %case_id,
+            detected_models = ?detected_models,
             "{}",
             warn_message
         );
@@ -634,6 +645,13 @@ fn gate_generated_text(
 /// に落とす。`decide_reply_action` の decision table（`Some(draft) if !truncated => Answer`,
 /// `_ => EscalationReply`）がそのまま `EscalationReply` へ自動的にフォールバックするため、
 /// ここで新しいフォールバック文言を発明しない（元のインライン実装と同じ設計判断）。
+///
+/// warn に `detected_models` を添える（Issue #28 codex レビュー採用5。`gate_generated_text` と
+/// 同じ欠陥を持つ双子関数のため揃えて直す。片方だけ直すとログの一貫性が崩れる）。
+///
+/// S-2 是正: `gate_generated_text` と同じく、以前は `has_out_of_scope_mention` →
+/// `out_of_scope_mentions` の二重呼び出しで `extract_model_tokens` が 2 回走っていた。
+/// 1 回のスキャンで判定とログを両方賄う。
 fn gate_customer_reply_draft(
     draft: Option<String>,
     allowlist: &product_gate::ProductAllowlist,
@@ -641,11 +659,13 @@ fn gate_customer_reply_draft(
     case_id: &str,
 ) -> Option<String> {
     let draft = draft?;
-    if allowlist.has_out_of_scope_mention(&draft) {
+    let detected_models = allowlist.out_of_scope_mentions(&draft);
+    if !detected_models.is_empty() {
         tracing::warn!(
             route = "answer_draft",
             request_id = %request_id,
             case_id = %case_id,
+            detected_models = ?detected_models,
             "customer reply draft mentions an out-of-scope product model; discarding \
              the draft (customer_reply_draft = null), which falls back to an \
              escalation reply"
@@ -2282,7 +2302,7 @@ fallback_reply_text = "担当者が確認のうえご連絡します"
 
     // ---- 応答側ゲート（§3.5、Critical 2）の配線テスト ----
     //
-    // `ProductAllowlist::has_out_of_scope_mention` 自体の述語は `product_gate.rs` で検証済み。
+    // `ProductAllowlist::out_of_scope_mentions` 自体の述語は `product_gate.rs` で検証済み。
     // ここでは `gate_generated_text` / `gate_customer_reply_draft`（api.rs 側の配線: どの変数を
     // 見るか・どのフォールバックへ倒すか）を、実 vegapunk・実 LLM 無しで直接検証する。
 
@@ -2422,5 +2442,95 @@ fallback_reply_text = "担当者が確認のうえご連絡します"
                 "fallback template must not itself be blocked by the §3.5 gate: {fallback_text}"
             );
         }
+    }
+
+    // ---- 応答側ゲートの warn ログ（Issue #28 codex レビュー採用5: detected_models） ----
+    //
+    // `tracing` の warn を捕まえるテスト用ライタ。このリポジトリの他モジュール
+    // （`harness::reply` / `harness::product_gate` の `mod tests`）と同じ最小構成を、
+    // このモジュール用に独立して組む（dev-dependency は増やさない。`tracing-subscriber` は
+    // 本体の依存に既にある）。
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            let buf = self.0.lock().expect("log buffer mutex poisoned");
+            String::from_utf8(buf.clone()).expect("tracing fmt writes utf-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer mutex poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `f` の実行中に出た WARN 以上のログを文字列で返す。
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        logs.text()
+    }
+
+    #[test]
+    fn gate_customer_reply_draft_warn_log_names_the_detected_out_of_scope_model() {
+        let allow = response_gate_fixture_allowlist();
+        let logs = capture_warnings(|| {
+            gate_customer_reply_draft(
+                Some("ADC-VDB101の初期設定手順です".to_string()),
+                &allow,
+                "req-1",
+                "case-1",
+            );
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("ADC-VDB101"),
+            "the warn log must name the detected out-of-scope model so operators do not have \
+             to dig the draft body back out to know what triggered the gate: {logs}"
+        );
+    }
+
+    #[test]
+    fn gate_generated_text_warn_log_names_the_detected_out_of_scope_model() {
+        let allow = response_gate_fixture_allowlist();
+        let logs = capture_warnings(|| {
+            gate_generated_text(
+                "ADC-VDB101の型番を教えてください".to_string(),
+                &allow,
+                "req-1",
+                "case-1",
+                "clarify",
+                "clarify question mentions an out-of-scope product model; falling back to \
+                 FALLBACK_CLARIFY_TEXT",
+                || clarify::FALLBACK_CLARIFY_TEXT.to_string(),
+            );
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains("ADC-VDB101"),
+            "the warn log must name the detected out-of-scope model: {logs}"
+        );
     }
 }
