@@ -1,5 +1,9 @@
 [
+  { "model": "ADC-V523", "name": "ADC-V523", "aliases": [] },
+  { "model": "ADC-V523X", "name": "ADC-V523X", "aliases": [] },
   { "model": "ADC-V724", "name": "ADC-V724", "aliases": [] },
   { "model": "ADC-V724X", "name": "ADC-V724X", "aliases": [] },
-  { "model": "ADC-VC727P", "name": "ADC-VC727P", "aliases": [] }
+  { "model": "ADC-VC729P", "name": "ADC-VC729P", "aliases": [] },
+  { "model": "ADC-VC727P", "name": "ADC-VC727P", "aliases": [] },
+  { "model": "ADC-VC827P", "name": "ADC-VC827P", "aliases": [] }
 ]
