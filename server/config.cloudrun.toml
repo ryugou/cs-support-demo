@@ -10,6 +10,9 @@
 bind_addr = "0.0.0.0:8080"
 # VPC peering 越しの punkrecord-egghead 実 IP。Cloud Run では env VEGAPUNK_ENDPOINT で上書きする。
 vegapunk_endpoint = "http://10.10.0.2:6840"
+# 管理 SPA（/admin）の静的ビルド成果物。Docker イメージ内 WORKDIR /app/server からの相対で
+# /app/server/admin-ui/browser（デフォルト値と同じだが、他の path 設定と同様に明示する）。
+admin_static_dir = "admin-ui/browser"
 
 # project は urtect 1 件に絞る。`Authenticator` は `allowed_schemas` に config 全 project の
 # schema を複製するため（server/src/harness/authn.rs）、project を増やすとその schema も

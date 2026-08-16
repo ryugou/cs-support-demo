@@ -42,6 +42,17 @@ pub struct AppConfig {
     /// 応答生成 API（`POST /{project_id}/api/reply`）の設定。既定は無効。
     #[serde(default)]
     pub api: ApiConfig,
+    /// 管理 SPA（`/admin` 配下）の静的ビルド成果物ディレクトリ（`index.html` を含む）。
+    /// design doc（`2026-08-16-admin-dashboard-design.md` §5）: 同一 axum サーバの
+    /// `/admin` から静的配信する。config ファイルからの相対パス（`config_dir` 基準）または
+    /// 絶対パスのどちらも許容する（main.rs 側で解決する。`HarnessConfig` 配下の各 `*_path` と
+    /// 同じ「相対は config_dir 基準」方針に揃える）。
+    #[serde(default = "default_admin_static_dir")]
+    pub admin_static_dir: String,
+}
+
+fn default_admin_static_dir() -> String {
+    "admin-ui/browser".to_string()
 }
 
 /// 応答生成 API の設定。API キーは env `CS_SUPPORT_ANSWER_API_KEY`（Secret Manager 注入）
@@ -486,6 +497,33 @@ tz = "UTC"
         assert_eq!(cfg.api.business_hours.start, "09:00");
         assert_eq!(cfg.api.business_hours.end, "21:00");
         assert_eq!(cfg.api.business_hours.tz, "UTC");
+    }
+
+    #[test]
+    fn admin_static_dir_defaults_when_absent() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.admin_static_dir, "admin-ui/browser");
+    }
+
+    #[test]
+    fn admin_static_dir_can_be_overridden() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+admin_static_dir = "../admin-ui/dist/admin-ui/browser"
+[[projects]]
+project_id = "p"
+schema = "s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.admin_static_dir, "../admin-ui/dist/admin-ui/browser");
     }
 
     #[test]
