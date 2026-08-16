@@ -1,0 +1,93 @@
+<div class="w-[32rem] max-w-full rounded-lg bg-white p-6 shadow-md">
+  <h2 class="text-base font-semibold text-slate-900">訂正を登録</h2>
+  <p class="mt-1 text-sm text-slate-500">
+    このターンの応答を訂正し、ノウハウとして登録します。登録内容は今後の回答生成で参照されます。
+  </p>
+
+  <p class="mt-4 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+    {{ question }}
+  </p>
+
+  @if (errorMessage(); as message) {
+    <div class="mt-4 rounded border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+      {{ message }}
+    </div>
+  }
+
+  <div class="mt-4">
+    <label class="block text-sm font-medium text-slate-700" for="correction-signals-input">
+      signals（必須、1件以上）
+    </label>
+    <div class="mt-1 flex flex-wrap gap-1.5 rounded border border-slate-300 p-2">
+      @for (signal of signals(); track signal) {
+        <span
+          class="inline-flex items-center gap-1 rounded bg-primary-soft px-2 py-0.5 text-xs font-medium text-primary"
+        >
+          {{ signal }}
+          <button
+            type="button"
+            class="text-primary/70 hover:text-primary"
+            aria-label="signal を削除"
+            (click)="removeSignal(signal)"
+          >
+            &times;
+          </button>
+        </span>
+      }
+      <input
+        id="correction-signals-input"
+        type="text"
+        class="min-w-[8rem] flex-1 border-none text-sm outline-none"
+        placeholder="signal を入力して Enter"
+        [ngModel]="newSignalText()"
+        (ngModelChange)="newSignalText.set($event)"
+        (keydown.enter)="addSignal()"
+      />
+    </div>
+  </div>
+
+  <div class="mt-4">
+    <label class="block text-sm font-medium text-slate-700" for="correction-applicability">
+      applicability（必須、適用条件）
+    </label>
+    <textarea
+      id="correction-applicability"
+      rows="3"
+      class="mt-1 block w-full rounded border border-slate-300 p-2 text-sm text-slate-800 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+      [ngModel]="applicability()"
+      (ngModelChange)="applicability.set($event)"
+    ></textarea>
+  </div>
+
+  <div class="mt-4">
+    <label class="block text-sm font-medium text-slate-700" for="correction-answer">
+      answer（必須、訂正後の回答）
+    </label>
+    <textarea
+      id="correction-answer"
+      rows="4"
+      class="mt-1 block w-full rounded border border-slate-300 p-2 text-sm text-slate-800 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+      placeholder="訂正後の正しい回答を入力"
+      [ngModel]="answer()"
+      (ngModelChange)="answer.set($event)"
+    ></textarea>
+  </div>
+
+  <div class="mt-6 flex justify-end gap-2">
+    <button
+      type="button"
+      class="rounded border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+      (click)="cancel()"
+    >
+      キャンセル
+    </button>
+    <button
+      type="button"
+      class="rounded bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:cursor-not-allowed disabled:opacity-50"
+      [disabled]="!canSubmit()"
+      (click)="submit()"
+    >
+      {{ submitting() ? '登録中…' : '登録する' }}
+    </button>
+  </div>
+</div>
