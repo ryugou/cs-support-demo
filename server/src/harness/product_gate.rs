@@ -1426,8 +1426,8 @@ mod tests {
     #[test]
     fn confirmed_foreign_reference_is_none_when_surface_is_a_bare_model_fragment_followed_by_text()
     {
-        // "V724ドアベル" は「型番断片 + 後続テキスト」で、既存の部分文字列判定
-        // （surface 全体を正規化した文字列が allowlist の型番の部分文字列か）では
+        // "V724ドアベル" は「型番断片 + 後続テキスト」で、surface 全体のサフィックス
+        // 一致判定（正規化した surface 全体が allowlist の型番の末尾か）では
         // 捕まえられない（正規化後の文字列が allowlist のどの型番よりも長くなるため）。
         // 新設の suffix veto（`extract_bare_fragments` + `ends_with("-{fragment}")`）で
         // 捕まえる。
