@@ -1274,6 +1274,47 @@ mod tests {
     use super::*;
     use crate::harness::signal::Signal;
 
+    // ---- 検索非汚染（Issue #31 design doc §2 受け入れ条件）----
+    //
+    // `search_ids_with_scores`（意味検索、`client.search` の結果を marker で絞る経路）は
+    // node_id が `kind_marker(KIND_SECTION)` / `kind_marker(KIND_PRODUCT)` を含むものだけを
+    // 通す。ConversationTurn の node_id（`harness_node_id(schema, "ConversationTurn", key)`）が
+    // これらのマーカーに構造的に一致しないことを、実際に使われている定数・関数で固定する
+    // （ネットワーク I/O 無し）。
+
+    #[test]
+    fn conversation_turn_node_id_does_not_match_the_manual_section_marker() {
+        let schema = "urtect";
+        let turn_id =
+            crate::harness::knowledge::harness_node_id(schema, "ConversationTurn", "turn-abc");
+        let marker = kind_marker(KIND_SECTION);
+        assert!(
+            !turn_id.contains(&marker),
+            "ConversationTurn node_id must not match the ManualSection marker: {turn_id}"
+        );
+    }
+
+    #[test]
+    fn conversation_turn_node_id_does_not_match_the_product_marker() {
+        let schema = "urtect";
+        let turn_id =
+            crate::harness::knowledge::harness_node_id(schema, "ConversationTurn", "turn-abc");
+        let marker = kind_marker(KIND_PRODUCT);
+        assert!(
+            !turn_id.contains(&marker),
+            "ConversationTurn node_id must not match the Product marker: {turn_id}"
+        );
+    }
+
+    #[test]
+    fn manual_section_query_type_literal_is_not_conversation_turn() {
+        // `get_section` / `load_product_subgraph` 等、型明示クエリのエントリポイントが実際に
+        // 使う定数（`load_section`/`load_product_subgraph` で渡している `KIND_SECTION`）を
+        // 直接固定する。誤って `ConversationTurn` に差し替わればここが落ちる。
+        assert_ne!(KIND_SECTION, "ConversationTurn");
+        assert_eq!(KIND_SECTION, "ManualSection");
+    }
+
     /// 単一節コーパスでスコアを取るテストヘルパ（production 経路と同じ score_against_corpus を使う）。
     /// v1（kill switch off）のスコアを見る。v2 は実データ 5 記事のテスト群で固定する。
     fn score_one(question: &str, body: &str) -> f32 {

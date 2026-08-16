@@ -347,6 +347,68 @@ pub fn build_known_resolution_graph(
     GraphBuild { nodes, edges }
 }
 
+/// `KnownResolution` の型明示クエリで vegapunk へ渡す node_type（`load_known_resolutions_with`
+/// が実際に使う検索エントリポイント）。ConversationTurn 等の新規ノード型を誤って KR 検索の
+/// 対象へ紛れ込ませていないかを固定する回帰テスト
+/// (`known_resolution_query_type_is_not_conversation_turn`) の対象。
+const KIND_KNOWN_RESOLUTION: &str = "KnownResolution";
+
+/// ConversationTurn 1 件分のグラフ表現（ノード + `case -HAS_TURN-> turn` 辺）を組み立てる
+/// 純関数（Issue #31 design doc §2）。`record_conversation_turn` から network I/O を分離して
+/// あるのは、属性組み立て・6 種の reply_kind 分類を実 vegapunk 無しでテストするため
+/// （`build_known_resolution_graph` / `build_answer_evidence_graph` と同じ規律）。
+///
+/// **検索非汚染（design doc §2 受け入れ条件）**: 戻り値は `GraphBuild`（nodes/edges のみ）で
+/// あり、ベクトルを一切含まない型そのものが「この関数が `upsert_vectors` を呼びうる経路を
+/// 持たない」ことを構造的に保証する。呼び出し元 `record_conversation_turn` もこの `GraphBuild`
+/// を `upsert_graph_low_level`（nodes/edges の upsert のみ）に渡すだけで、`upsert_vectors` は
+/// 一切呼ばない。ConversationTurn にベクトルが無ければ、marker フィルタで絞る意味検索
+/// （`search_ids_with_scores`）の候補にすらそもそも挙がらない。
+#[allow(clippy::too_many_arguments)]
+pub fn build_conversation_turn_graph(
+    schema: &str,
+    turn_id: &str,
+    case_id: &str,
+    end_user_id: Option<&str>,
+    seq: u32,
+    created_at: &str,
+    question: &str,
+    reply_text: &str,
+    reply_kind: &str,
+    audit_event_id: &str,
+) -> GraphBuild {
+    let turn_node_id = harness_node_id(schema, "ConversationTurn", turn_id);
+    let case_node_id = harness_node_id(schema, "support_case", case_id);
+    let mut attributes = vec![
+        ("turn_id".to_string(), turn_id.to_string()),
+        ("case_id".to_string(), case_id.to_string()),
+        ("seq".to_string(), seq.to_string()),
+        ("created_at".to_string(), created_at.to_string()),
+        ("question".to_string(), question.to_string()),
+        ("reply_text".to_string(), reply_text.to_string()),
+        ("reply_kind".to_string(), reply_kind.to_string()),
+        ("audit_event_id".to_string(), audit_event_id.to_string()),
+    ];
+    if let Some(id) = end_user_id {
+        attributes.push(("end_user_id".to_string(), id.to_string()));
+    }
+    let node = GraphNode {
+        id: turn_node_id.clone(),
+        node_type: "ConversationTurn".to_string(),
+        attributes,
+    };
+    let edge = GraphEdge {
+        from_id: case_node_id,
+        to_id: turn_node_id,
+        edge_type: "HAS_TURN".to_string(),
+        attributes: Vec::new(),
+    };
+    GraphBuild {
+        nodes: vec![node],
+        edges: vec![edge],
+    }
+}
+
 /// answer_evidence をキー・種別ペアからグラフ表現に組み立てる（S1-2: emit した回答の証跡）。
 /// items は `(section_key, kind)` のペア。kind は `"manual"` | `"known_resolution"`。
 /// evidence_id はここで新規採番するため、呼び出す度に異なるノードが生成される（追記専用・上書きなし）。
@@ -436,7 +498,7 @@ impl KnowledgeStore {
     ) -> Result<Vec<KnownResolution>> {
         let kr_nodes = self
             .client
-            .query_nodes(schema, "KnownResolution", Vec::new(), 1000)
+            .query_nodes(schema, KIND_KNOWN_RESOLUTION, Vec::new(), 1000)
             .await
             .context("load known resolutions")?;
         if kr_nodes.is_empty() {
@@ -579,6 +641,134 @@ impl KnowledgeStore {
             .upsert_graph_low_level(GraphBuild { nodes, edges })
             .await?;
         Ok(())
+    }
+
+    /// 会話ターン 1 件を書き切る（Issue #31 design doc §2）。immutable・部分更新なし。
+    /// `seq` は書き込み直前に当該 case の既存ターン数を数えて採番する（1 起点。1000 件超の
+    /// 会話は想定しないため `query_nodes` の固定 limit=1000 で足りる）。
+    ///
+    /// **呼び出し元の契約**: 書き込み失敗（seq 採番のクエリ・upsert のどちらも）は
+    /// `Err` をそのまま返す。応答を止めない（warn ログのみで継続する）かどうかは
+    /// 呼び出し元（`api.rs::ok_reply_response`）の責務であり、ここでは判断しない。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_conversation_turn(
+        &self,
+        schema: &str,
+        case_id: &str,
+        end_user_id: Option<&str>,
+        question: &str,
+        reply_text: &str,
+        reply_kind: &str,
+        audit_event_id: &str,
+    ) -> Result<()> {
+        let existing = self
+            .client
+            .query_nodes(
+                schema,
+                "ConversationTurn",
+                vec![("case_id", "eq", case_id)],
+                1000,
+            )
+            .await
+            .context("count existing conversation turns for seq assignment")?;
+        let seq = existing.len() as u32 + 1;
+        let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let build = build_conversation_turn_graph(
+            schema,
+            &turn_id,
+            case_id,
+            end_user_id,
+            seq,
+            &created_at,
+            question,
+            reply_text,
+            reply_kind,
+            audit_event_id,
+        );
+        // 検索非汚染: `build_conversation_turn_graph` の doc コメント参照。
+        // `upsert_graph_low_level` は nodes/edges の upsert のみで、`upsert_vectors` は
+        // 呼ばない。
+        self.client.upsert_graph_low_level(build).await?;
+        Ok(())
+    }
+
+    /// 管理 API（`admin.rs`）向け: `ConversationTurn` を `created_at` 降順で 1 ページ取得する
+    /// （Issue #31 design doc §4 のスレッド一覧）。`extra_filter` は `end_user_id` 絞り込み等の
+    /// 追加条件。`offset` は「これまでに消費した raw 件数」（次ページ取得用の内部カーソル。
+    /// `vegapunk::query_nodes_paged` と同じ offset ページング方式。Issue #31 reviewer 指摘5:
+    /// 値ベースの `created_at < cursor` フィルタは `created_at` が完全一致する境界で
+    /// エントリを取りこぼす・重複させる欠陥があったため、この codebase が既に信頼している
+    /// offset ページングに統一した）。
+    pub async fn load_conversation_turns_page(
+        &self,
+        schema: &str,
+        extra_filter: Option<(&str, &str, &str)>,
+        offset: i32,
+        page_size: i32,
+    ) -> Result<Vec<HashMap<String, String>>> {
+        let filters: Vec<(&str, &str, &str)> = extra_filter.into_iter().collect();
+        Ok(self
+            .client
+            .query_nodes_sorted(
+                schema,
+                "ConversationTurn",
+                filters,
+                "created_at",
+                "desc",
+                offset,
+                page_size,
+            )
+            .await
+            .context("load conversation turns page")?
+            .into_iter()
+            .map(|n| n.attributes)
+            .collect())
+    }
+
+    /// 管理 API 向け: 指定 case の `ConversationTurn` を全件取得する（スレッド詳細）。
+    /// `seq` 昇順への並べ替えは呼び出し側の責務（読み取り専用のここでは行わない）。
+    pub async fn load_conversation_turns_for_case(
+        &self,
+        schema: &str,
+        case_id: &str,
+    ) -> Result<Vec<HashMap<String, String>>> {
+        Ok(self
+            .client
+            .query_nodes(
+                schema,
+                "ConversationTurn",
+                vec![("case_id", "eq", case_id)],
+                1000,
+            )
+            .await
+            .context("load conversation turns for case")?
+            .into_iter()
+            .map(|n| n.attributes)
+            .collect())
+    }
+
+    /// 管理 API 向け: 期間内（`created_at >= cutoff_rfc3339`）の `ConversationTurn` を全件取得する
+    /// （Issue #31 design doc §4 の利用状況サマリ）。`query_nodes_paged` で取り切るため、
+    /// 期間内の件数が `QueryNodes` の単発 limit（1000）を超えても欠落しない。
+    pub async fn load_conversation_turns_since(
+        &self,
+        schema: &str,
+        cutoff_rfc3339: &str,
+    ) -> Result<Vec<HashMap<String, String>>> {
+        Ok(self
+            .client
+            .query_nodes_paged(
+                schema,
+                "ConversationTurn",
+                vec![("created_at", "gte", cutoff_rfc3339)],
+                500,
+            )
+            .await
+            .context("load conversation turns since cutoff")?
+            .into_iter()
+            .map(|n| n.attributes)
+            .collect())
     }
 
     /// 過去事例（support_case）を読み出す。scope は schema 引数で強制済み。
@@ -1063,6 +1253,156 @@ mod tests {
             })
             .collect();
         assert_ne!(ids[0], ids[1]);
+    }
+
+    // ---- build_conversation_turn_graph（Issue #31 design doc §2） ----
+
+    fn attr<'a>(node: &'a crate::model::GraphNode, key: &str) -> Option<&'a str> {
+        node.attributes
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn conversation_turn_graph_builds_one_node_and_the_has_turn_edge() {
+        let build = build_conversation_turn_graph(
+            "urtect",
+            "turn-1",
+            "case-1",
+            None,
+            1,
+            "2026-08-16T00:00:00+00:00",
+            "電源が入りません",
+            "電源ケーブルをご確認ください。",
+            "answer",
+            "audit-1",
+        );
+        assert_eq!(build.nodes.len(), 1);
+        assert_eq!(build.edges.len(), 1);
+        let node = &build.nodes[0];
+        assert_eq!(node.node_type, "ConversationTurn");
+        assert_eq!(
+            node.id,
+            harness_node_id("urtect", "ConversationTurn", "turn-1")
+        );
+
+        let edge = &build.edges[0];
+        assert_eq!(edge.edge_type, "HAS_TURN");
+        assert_eq!(
+            edge.from_id,
+            harness_node_id("urtect", "support_case", "case-1")
+        );
+        assert_eq!(edge.to_id, node.id);
+    }
+
+    #[test]
+    fn conversation_turn_graph_records_all_required_attributes() {
+        let build = build_conversation_turn_graph(
+            "urtect",
+            "turn-2",
+            "case-2",
+            None,
+            3,
+            "2026-08-16T01:02:03+00:00",
+            "設定方法を教えてください",
+            "手順は以下のとおりです。",
+            "clarify",
+            "audit-2",
+        );
+        let node = &build.nodes[0];
+        assert_eq!(attr(node, "turn_id"), Some("turn-2"));
+        assert_eq!(attr(node, "case_id"), Some("case-2"));
+        assert_eq!(attr(node, "seq"), Some("3"));
+        assert_eq!(attr(node, "created_at"), Some("2026-08-16T01:02:03+00:00"));
+        assert_eq!(attr(node, "question"), Some("設定方法を教えてください"));
+        assert_eq!(attr(node, "reply_text"), Some("手順は以下のとおりです。"));
+        assert_eq!(attr(node, "reply_kind"), Some("clarify"));
+        assert_eq!(attr(node, "audit_event_id"), Some("audit-2"));
+        // end_user_id を渡していないので属性そのものが存在しない
+        assert_eq!(attr(node, "end_user_id"), None);
+    }
+
+    #[test]
+    fn conversation_turn_graph_includes_end_user_id_only_when_provided() {
+        let build = build_conversation_turn_graph(
+            "urtect",
+            "turn-3",
+            "case-3",
+            Some("a1b2c3"),
+            1,
+            "2026-08-16T00:00:00+00:00",
+            "q",
+            "r",
+            "out_of_scope",
+            "audit-3",
+        );
+        assert_eq!(attr(&build.nodes[0], "end_user_id"), Some("a1b2c3"));
+    }
+
+    /// design doc §2 が列挙する 6 種の reply_kind のうち、実際に到達しうる 5 種（`fallback` は
+    /// api.rs のどの分岐からも到達しないため対象外。api.rs の doc コメント参照）が、すべて
+    /// そのまま `reply_kind` 属性に載ることを固定する（属性組み立ての回帰）。
+    #[test]
+    fn conversation_turn_graph_accepts_all_reachable_reply_kinds() {
+        for kind in [
+            "answer",
+            "clarify",
+            "escalation",
+            "out_of_scope",
+            "time_pref",
+        ] {
+            let build = build_conversation_turn_graph(
+                "urtect",
+                "turn-x",
+                "case-x",
+                None,
+                1,
+                "2026-08-16T00:00:00+00:00",
+                "q",
+                "r",
+                kind,
+                "audit-x",
+            );
+            assert_eq!(
+                attr(&build.nodes[0], "reply_kind"),
+                Some(kind),
+                "reply_kind={kind} must round-trip unchanged"
+            );
+        }
+    }
+
+    /// 検索非汚染（design doc §2 受け入れ条件）: `GraphBuild` は nodes/edges のみを持つ型であり、
+    /// ベクトルという概念自体が無い。この型を返す `build_conversation_turn_graph` は構造的に
+    /// `upsert_vectors` を呼びうる経路を持たない（本テストはその不変条件を明示するドキュメント
+    /// テストで、リグレッションを検出するというより「なぜベクトルが作られないか」を将来の
+    /// 読者に示す）。
+    #[test]
+    fn conversation_turn_graph_never_produces_vectors() {
+        let build = build_conversation_turn_graph(
+            "urtect",
+            "turn-4",
+            "case-4",
+            None,
+            1,
+            "2026-08-16T00:00:00+00:00",
+            "q",
+            "r",
+            "answer",
+            "audit-4",
+        );
+        // GraphBuild { nodes, edges } には vectors フィールドが存在しない。
+        let GraphBuild { nodes, edges } = build;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(edges.len(), 1);
+    }
+
+    // ---- 検索非汚染: KnownResolution 型明示クエリのリテラル固定 ----
+
+    #[test]
+    fn known_resolution_query_type_is_not_conversation_turn() {
+        assert_ne!(KIND_KNOWN_RESOLUTION, "ConversationTurn");
+        assert_eq!(KIND_KNOWN_RESOLUTION, "KnownResolution");
     }
 
     #[test]

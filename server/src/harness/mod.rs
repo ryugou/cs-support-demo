@@ -132,6 +132,29 @@ pub struct RelatedCase {
     pub last_decision: String,
 }
 
+/// [`Harness::register_known_resolution`] のエラー分類。呼び出し側（MCP tool / 管理 API）が
+/// 「担当者の入力が悪い(admission 拒否、400 相当)」と「インフラ側の失敗(vegapunk gRPC、
+/// 500 相当)」を区別してレスポンスを返せるようにする。admission 検証
+/// （`admit_known_resolution`）の失敗は前者、insert/audit の失敗は後者。
+#[derive(Debug)]
+pub enum RegisterKnownResolutionError {
+    /// signals/answer/rationale_text/manual_section_keys が admission 要件
+    /// （role・語彙・NG 語・根拠アンカー等）を満たさない。担当者が入力を直せば解消する。
+    Admission(anyhow::Error),
+    /// vegapunk への insert/audit 呼び出しが失敗した。担当者の入力とは無関係。
+    Infra(anyhow::Error),
+}
+
+impl std::fmt::Display for RegisterKnownResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(err) | Self::Infra(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for RegisterKnownResolutionError {}
+
 /// support_case ノードに永続化する会話状態（会話フロー v1.1 design doc §6）。
 /// すべて加算属性・後方互換（欠落は既定値）。
 #[derive(Debug, Clone, PartialEq)]
@@ -876,6 +899,10 @@ impl Harness {
         history: &[reply::ReplyHistoryTurn],
         is_continuation: bool,
         unknown_case_id_policy: UnknownCaseIdPolicy,
+        // Issue #31 design doc §2: 匿名化済みエンドユーザー識別子。新規 case 作成時のみ
+        // case 属性 `end_user_id` に設定する（既存 case への上書きはしない）。MCP 経路
+        // （`rmcp_server.rs`）は常に `None` を渡す（design doc §3: 対象は /api/reply 経路のみ）。
+        end_user_id: Option<&str>,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
@@ -978,7 +1005,7 @@ impl Harness {
             }
             None => {
                 let new_id = format!("case-{}", uuid::Uuid::new_v4());
-                let attrs: std::collections::HashMap<String, String> = [
+                let mut attrs: std::collections::HashMap<String, String> = [
                     ("case_id".to_string(), new_id.clone()),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
@@ -994,6 +1021,11 @@ impl Harness {
                 ]
                 .into_iter()
                 .collect();
+                // Issue #31 design doc §2: 「初回提供時に設定」。既存 case への上書きは
+                // このアーム（新規作成）にしか到達しないため、自然に「初回のみ」になる。
+                if let Some(id) = end_user_id {
+                    attrs.insert("end_user_id".to_string(), id.to_string());
+                }
                 knowledge
                     .record(
                         &ctx.schema,
@@ -1514,17 +1546,22 @@ impl Harness {
     /// 文言すら返せなくなる**（`draft_customer_reply` が生成失敗を non-fatal に扱っているのと
     /// 同じ設計判断）。ただし監査記録が欠落した事実は運用者が追えなければならないため、
     /// 必ず `tracing::error!` で警告する（握りつぶさない）。
+    /// 戻り値は `(case_id, audit_event_id)`。書き込み・監査に失敗した場合、`audit_event_id`
+    /// は空文字列になる（Issue #31 design doc §1-c: 監査記録そのものの失敗は既存どおり
+    /// `tracing::error!` に残るが、ターン欠落より応答継続を優先するため、この呼び出し元は
+    /// 空文字の `audit_event_id` を持つ ConversationTurn が書かれることをブロッカーにしない）。
     pub async fn record_out_of_scope_case(
         &self,
         ctx: &RequestContext,
         question: &str,
         case_id: Option<&str>,
-    ) -> String {
+        end_user_id: Option<&str>,
+    ) -> (String, String) {
         match self
-            .try_record_out_of_scope_case(ctx, question, case_id, None)
+            .try_record_out_of_scope_case(ctx, question, case_id, None, end_user_id)
             .await
         {
-            Ok(id) => id,
+            Ok((id, audit_event_id)) => (id, audit_event_id),
             Err(err) => {
                 let fallback_id = case_id
                     .map(str::to_string)
@@ -1539,7 +1576,7 @@ impl Harness {
                      property does not depend on audit availability), but this conversation has \
                      NO case/audit record — investigate vegapunk/knowledge connectivity"
                 );
-                fallback_id
+                (fallback_id, String::new())
             }
         }
     }
@@ -1547,18 +1584,29 @@ impl Harness {
     /// Issue #28 C1 是正: 二段目(foreign)確定時に、evaluate() が既に書き込んだ case の正本を
     /// 実際に顧客へ返した内容（取扱外定型応答）に一致させる。read-merge-write 1回
     /// （`merge_out_of_scope_demotion_attributes`）+ 監査イベント記録。
+    /// 戻り値は `(case_id, audit_event_id)`。`record_out_of_scope_case` と同じ理由
+    /// （Issue #31 design doc §1-c）で、失敗時の `audit_event_id` は空文字列になる。
     pub async fn demote_case_to_out_of_scope(
         &self,
         ctx: &RequestContext,
         question: &str,
         case_id: &str,
         discarded_signals: &signal::SignalSet,
-    ) -> String {
+    ) -> (String, String) {
         match self
-            .try_record_out_of_scope_case(ctx, question, Some(case_id), Some(discarded_signals))
+            .try_record_out_of_scope_case(
+                ctx,
+                question,
+                Some(case_id),
+                Some(discarded_signals),
+                // demote は既存 case の read-merge-write のみで新規 case を作らない
+                // （下の match アームが demote.is_some() の場合に新規作成アームへ
+                // 到達しないことを保証している）ため、end_user_id は使われない。
+                None,
+            )
             .await
         {
-            Ok(id) => id,
+            Ok((id, audit_event_id)) => (id, audit_event_id),
             Err(err) => {
                 tracing::error!(
                     error = ?err,
@@ -1572,7 +1620,7 @@ impl Harness {
                      excluded from future accumulation) — investigate vegapunk/knowledge \
                      connectivity"
                 );
-                case_id.to_string()
+                (case_id.to_string(), String::new())
             }
         }
     }
@@ -1596,7 +1644,8 @@ impl Harness {
         question: &str,
         case_id: Option<&str>,
         demote: Option<&signal::SignalSet>,
-    ) -> Result<String> {
+        end_user_id: Option<&str>,
+    ) -> Result<(String, String)> {
         let knowledge = self.knowledge()?;
         let existing = match case_id {
             Some(id) => knowledge.load_case(&ctx.schema, id).await?,
@@ -1638,7 +1687,7 @@ impl Harness {
                 // 一段目（質問側ゲート、demote = None）の新規 case 作成。上のアームが
                 // demote.is_some() を先に捕捉するため、ここに到達するのは常に demote = None。
                 let new_id = format!("case-{}", uuid::Uuid::new_v4());
-                let attrs: std::collections::HashMap<String, String> = [
+                let mut attrs: std::collections::HashMap<String, String> = [
                     ("case_id".to_string(), new_id.clone()),
                     ("request_id".to_string(), ctx.request_id.clone()),
                     ("actor".to_string(), ctx.actor.sub.clone()),
@@ -1648,6 +1697,10 @@ impl Harness {
                 ]
                 .into_iter()
                 .collect();
+                // Issue #31 design doc §2: 「初回提供時に設定」。新規作成アームなので常に初回。
+                if let Some(id) = end_user_id {
+                    attrs.insert("end_user_id".to_string(), id.to_string());
+                }
                 knowledge
                     .record(
                         &ctx.schema,
@@ -1659,20 +1712,103 @@ impl Harness {
                 new_id
             }
         };
-        self.audit_with_nodes(
-            ctx,
-            "out_of_scope_product",
-            None,
-            Vec::new(),
-            vec![knowledge::harness_node_id(
+        let audit_event_id = self
+            .audit_with_nodes(
+                ctx,
+                "out_of_scope_product",
+                None,
+                Vec::new(),
+                vec![knowledge::harness_node_id(
+                    &ctx.schema,
+                    "support_case",
+                    &resolved_case_id,
+                )],
+                None,
+            )
+            .await?;
+        Ok((resolved_case_id, audit_event_id))
+    }
+
+    /// 会話ターン 1 件を書き切る（Issue #31 design doc §2）。`api.rs::ok_reply_response` の
+    /// 薄いラッパー入口。書き込み失敗時に応答を止めない判断は呼び出し元の責務
+    /// （`KnowledgeStore::record_conversation_turn` の doc コメント参照）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_conversation_turn(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+        end_user_id: Option<&str>,
+        question: &str,
+        reply_text: &str,
+        reply_kind: &str,
+        audit_event_id: &str,
+    ) -> Result<()> {
+        self.knowledge()?
+            .record_conversation_turn(
                 &ctx.schema,
-                "support_case",
-                &resolved_case_id,
-            )],
-            None,
-        )
-        .await?;
-        Ok(resolved_case_id)
+                case_id,
+                end_user_id,
+                question,
+                reply_text,
+                reply_kind,
+                audit_event_id,
+            )
+            .await
+    }
+
+    /// 会話層: support_case の累積 signal 集合を読む（管理 API のスレッド詳細向け、Issue #31
+    /// design doc §4）。`KnowledgeStore::load_case_signals` は private フィールド経由でしか
+    /// 呼べないため、`Harness` から呼べる pub 入口をここに置く。
+    pub async fn load_case_signals(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+    ) -> Result<signal::SignalSet> {
+        self.knowledge()?
+            .load_case_signals(&ctx.schema, case_id)
+            .await
+    }
+
+    /// 検証済みノウハウ（KnownResolution）の登録: admission 検証 → insert → 監査記録の 3 段。
+    /// `add_known_resolution`（MCP tool、`rmcp_server.rs`）と `/admin/api/corrections`
+    /// （管理画面の訂正登録、Issue #31）の両方がこの入口を共有する（ロジックを2箇所に
+    /// 複製しない）。`origin` は呼び出し元ごとに異なる文言を渡す
+    /// （`escalation:{id}` / `manual` / `case:{case_id}:turn:{turn_id}`）。
+    /// 戻り値は `(kr_id, audit_event_id)`。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_known_resolution(
+        &self,
+        ctx: &RequestContext,
+        signals: &[String],
+        answer: &str,
+        applicability: &str,
+        rationale_text: Option<&str>,
+        manual_section_keys: &[String],
+        origin: String,
+    ) -> std::result::Result<(String, String), RegisterKnownResolutionError> {
+        let signal_set = self
+            .admit_known_resolution(ctx, signals, answer, rationale_text, manual_section_keys)
+            .map_err(RegisterKnownResolutionError::Admission)?;
+        let store = self.store().map_err(RegisterKnownResolutionError::Infra)?;
+        let new_kr = knowledge::NewKnownResolution {
+            signal_set,
+            applicability: applicability.to_string(),
+            answer: answer.to_string(),
+            origin,
+            created_by: ctx.actor.sub.clone(),
+            created_by_email: ctx.actor.email.clone(),
+            rationale_text: rationale_text.map(str::to_string),
+            manual_section_keys: manual_section_keys.to_vec(),
+        };
+        let kr_id = store
+            .insert_known_resolution(&ctx.schema, &new_kr, ctx.manual_schema)
+            .await
+            .map_err(RegisterKnownResolutionError::Infra)?;
+        let audit_event_id = self
+            .audit(ctx, "kr_insert", None, vec![kr_id.clone()])
+            .await
+            .map_err(RegisterKnownResolutionError::Infra)?;
+        Ok((kr_id, audit_event_id))
     }
 }
 
@@ -1713,9 +1849,17 @@ mod tests {
     use super::*;
 
     fn harness_for_test() -> Harness {
+        harness_for_test_with_lexicon(r#"{"signals":[]}"#)
+    }
+
+    /// [`harness_for_test`] の lexicon だけ差し替えられる版。`register_known_resolution` の
+    /// 「admission 成功 → insert/audit へ進む」経路を確認するには、語彙に最低 1 つ signal が
+    /// 要る（既定の空語彙では admission が常に「unknown signal」で拒否され、insert/audit へ
+    /// 到達できない）。
+    fn harness_for_test_with_lexicon(lexicon_json: &str) -> Harness {
         let dir = std::env::temp_dir().join(format!("harness-test-{}", uuid::Uuid::new_v4()));
         // build() と同じく単一の lexicon を normalizer / lexicon / extractor で共有する。
-        let lexicon = Arc::new(signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap());
+        let lexicon = Arc::new(signal::LexiconNormalizer::from_json(lexicon_json).unwrap());
         Harness {
             // config actor ホワイトリスト廃止（authn.rs 参照）に伴い、Authenticator は
             // project schema 一覧のみを受け取る。email 突合はしない。
@@ -1899,6 +2043,115 @@ mod tests {
                 crate::config::ManualSchemaKind::LegacySection,
             )
             .is_err());
+    }
+
+    // ---- register_known_resolution（Issue #31: add_known_resolution と管理API訂正登録の
+    // 共有 harness 入口）----
+
+    fn supervisor_ctx(
+        schema: &str,
+        manual_schema: crate::config::ManualSchemaKind,
+    ) -> RequestContext {
+        RequestContext {
+            actor: authn::Actor {
+                sub: "google-sub:reg-test".to_string(),
+                email: "reg-test@sivira.co".to_string(),
+                role: authn::Role::Supervisor,
+                allowed_schemas: vec![schema.to_string()],
+            },
+            scope: scope::AccessScope {
+                allowed_schemas: vec![schema.to_string()],
+                max_sensitivity: None,
+                label_allowlist: None,
+            },
+            schema: schema.to_string(),
+            request_id: "req-register-test".to_string(),
+            manual_schema,
+        }
+    }
+
+    /// admission 検証（`admit_known_resolution`）で拒否される入力は
+    /// `RegisterKnownResolutionError::Admission` として返り、insert/audit（vegapunk gRPC、
+    /// `knowledge: None` のため必ず失敗する）へは進まない。到達していれば `Infra` になるはず
+    /// なので、`Admission` が返ること自体が「admission が insert より先に評価され、
+    /// 失敗時はそこで止まる」ことの証拠になる。
+    #[tokio::test]
+    async fn register_known_resolution_rejects_empty_signals_before_touching_infra() {
+        let harness = harness_for_test();
+        let ctx = supervisor_ctx("sivira-cs-demo", crate::config::ManualSchemaKind::ManualV1);
+        let err = harness
+            .register_known_resolution(
+                &ctx,
+                &[],
+                "回答文",
+                "全ロット",
+                Some("理由"),
+                &[],
+                "manual".to_string(),
+            )
+            .await
+            .expect_err("empty signals must be rejected at admission");
+        match err {
+            RegisterKnownResolutionError::Admission(inner) => {
+                assert!(
+                    inner.to_string().contains("signals"),
+                    "unexpected admission error: {inner}"
+                );
+            }
+            RegisterKnownResolutionError::Infra(inner) => {
+                panic!("must not reach the infra step on an admission failure: {inner}")
+            }
+        }
+    }
+
+    /// signal が語彙に無い場合も admission 段で拒否される（vocab チェック）。
+    #[tokio::test]
+    async fn register_known_resolution_rejects_unknown_signal() {
+        let harness = harness_for_test(); // 空語彙
+        let ctx = supervisor_ctx("sivira-cs-demo", crate::config::ManualSchemaKind::ManualV1);
+        let err = harness
+            .register_known_resolution(
+                &ctx,
+                &["mold".to_string()],
+                "回答文",
+                "全ロット",
+                Some("理由"),
+                &[],
+                "manual".to_string(),
+            )
+            .await
+            .expect_err("unknown signal must be rejected at admission");
+        assert!(matches!(err, RegisterKnownResolutionError::Admission(_)));
+    }
+
+    /// admission を通過する入力（既知 signal・評価根拠あり・egress 通過）は insert 段へ進む。
+    /// `knowledge: None` のテスト harness では insert が必ず失敗するため、`Infra` variant が
+    /// 返ることが「admission を実際に通過した」ことの証拠になる（admission が拒否していれば
+    /// `Admission` になるはずで、`Infra` はそちらを通過しない限り到達しない）。
+    #[tokio::test]
+    async fn register_known_resolution_reaches_infra_step_when_admission_passes() {
+        let harness = harness_for_test_with_lexicon(
+            r#"{ "signals": [
+                { "signal": "mold", "class": "hazard", "surface_forms": ["カビ"] }
+            ] }"#,
+        );
+        let ctx = supervisor_ctx("sivira-cs-demo", crate::config::ManualSchemaKind::ManualV1);
+        let err = harness
+            .register_known_resolution(
+                &ctx,
+                &["mold".to_string()],
+                "回答文",
+                "全ロット",
+                Some("理由"),
+                &[],
+                "manual".to_string(),
+            )
+            .await
+            .expect_err("knowledge: None must fail at the insert step");
+        assert!(
+            matches!(err, RegisterKnownResolutionError::Infra(_)),
+            "admission-passing input must reach the infra step, got: {err:?}"
+        );
     }
 
     // ---- 下書き生成と出口ゲートの**配線**（spec S1-4「egress 位置の固定」）----

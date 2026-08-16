@@ -3,7 +3,7 @@ use crate::{
         correction::{correction_intake, CorrectionRouting, FeedbackSource},
         egress::{egress_gate, EgressVerdict, EmitChannel, EmitContext},
         grading::AnswerOutcome,
-        knowledge::{NewKnownResolution, PastCase},
+        knowledge::PastCase,
         rules::{KrMatch, SourceAuthority},
         Harness, RequestContext,
     },
@@ -681,6 +681,9 @@ impl CsSupportRmcpServer {
                 // fallback（design doc §2）を MCP 経路まで広げると、CS 担当の入力ミスが
                 // 黙って新規 case へ合流し、会話層の累積 signal が失われたまま気づけなくなる。
                 crate::harness::UnknownCaseIdPolicy::Reject,
+                // 2026-08-16 admin dashboard design doc §3: end_user_id は /api/reply 経路
+                // 限定（MCP は CS 担当の対話でありスレッド概念が異なる。design doc §7）。
+                None,
             )
             .await
             .map_err(to_error)?;
@@ -1156,41 +1159,31 @@ impl CsSupportRmcpServer {
         Parameters(req): Parameters<AddKnownResolutionRequest>,
     ) -> Result<Json<AddKnownResolutionResponse>, ErrorData> {
         let ctx = self.begin(&extensions)?;
-        // admission 判定（役割・語彙・NG 語）は Harness に一元化されている
-        let signal_set = self
+        let origin = req
+            .origin_escalation_id
+            .clone()
+            .map(|id| format!("escalation:{id}"))
+            .unwrap_or_else(|| "manual".to_string());
+        // admission 検証 → insert → 監査記録の共有入口（Issue #31: `/admin/api/corrections`
+        // と同じ harness 入口を使う。ロジックを2箇所に複製しない）。
+        let (kr_id, audit_event_id) = self
             .harness
-            .admit_known_resolution(
+            .register_known_resolution(
                 &ctx,
                 &req.signals,
                 &req.answer,
+                &req.applicability,
                 req.rationale_text.as_deref(),
                 &req.manual_section_keys,
+                origin,
             )
-            .map_err(|err| ErrorData::invalid_request(err.to_string(), None))?;
-        let store = self.harness.store().map_err(to_error)?;
-        let new_kr = NewKnownResolution {
-            signal_set,
-            applicability: req.applicability.clone(),
-            answer: req.answer.clone(),
-            origin: req
-                .origin_escalation_id
-                .clone()
-                .map(|id| format!("escalation:{id}"))
-                .unwrap_or_else(|| "manual".to_string()),
-            created_by: ctx.actor.sub.clone(),
-            created_by_email: ctx.actor.email.clone(),
-            rationale_text: req.rationale_text.clone(),
-            manual_section_keys: req.manual_section_keys.clone(),
-        };
-        let kr_id = store
-            .insert_known_resolution(&ctx.schema, &new_kr, ctx.manual_schema)
             .await
-            .map_err(to_error)?;
-        let audit_event_id = self
-            .harness
-            .audit(&ctx, "kr_insert", None, vec![kr_id.clone()])
-            .await
-            .map_err(to_error)?;
+            .map_err(|err| match err {
+                crate::harness::RegisterKnownResolutionError::Admission(inner) => {
+                    ErrorData::invalid_request(inner.to_string(), None)
+                }
+                crate::harness::RegisterKnownResolutionError::Infra(inner) => to_error(inner),
+            })?;
         Ok(Json(AddKnownResolutionResponse {
             kr_id,
             audit_event_id,

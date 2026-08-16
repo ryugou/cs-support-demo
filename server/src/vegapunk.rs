@@ -378,6 +378,56 @@ impl VegapunkClient {
         .context("query nodes")
     }
 
+    /// `query_nodes` の `sort_by`/`sort_order` を明示できる版（管理 API の時系列一覧向け、
+    /// Issue #31）。`QueryNodesRequest` にはこの 2 フィールドが元々存在するが、既存の
+    /// `query_nodes` は両方 `None` 固定で呼んでいるため、新規 RPC を足さずに既存フィールドを
+    /// 使うだけの薄いオーバーロードとしてここに分離する（既存呼び出し元の挙動は変えない）。
+    /// `offset` は呼び出し元（`harness::knowledge::load_conversation_turns_page`）がページング
+    /// カーソルとして明示する（Issue #31 reviewer 指摘5: 当初は offset 固定 `Some(0)` のまま
+    /// `created_at < cursor` という値ベースの filter でページングしていたが、`created_at` が
+    /// 完全一致する境界でエントリを取りこぼす・重複させる欠陥があったため、offset ベースの
+    /// ページングへ切り替えた）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_nodes_sorted(
+        &self,
+        schema: &str,
+        node_type: &str,
+        filters: Vec<(&str, &str, &str)>,
+        sort_by: &str,
+        sort_order: &str,
+        offset: i32,
+        limit: i32,
+    ) -> Result<Vec<crate::proto::graphrag::NodeResult>> {
+        let req = QueryNodesRequest {
+            schema: schema.to_string(),
+            node_type: node_type.to_string(),
+            filters: filters
+                .into_iter()
+                .map(|(key, op, value)| AttributeFilter {
+                    key: key.to_string(),
+                    op: op.to_string(),
+                    value: value.to_string(),
+                })
+                .collect(),
+            sort_by: Some(sort_by.to_string()),
+            sort_order: Some(sort_order.to_string()),
+            limit: Some(limit),
+            offset: Some(offset),
+            traverse: None,
+        };
+        self.call(
+            |mut client, request| async move {
+                client
+                    .query_nodes(request)
+                    .await
+                    .map(|resp| resp.into_inner().nodes)
+            },
+            req,
+        )
+        .await
+        .context("query nodes sorted")
+    }
+
     /// `query_nodes` を offset ページングで最後まで読み切り、一致ノードを全件返す。
     ///
     /// `GetGraphSnapshot` は `max_nodes` に backend 側ハード上限 5000 があり、数万ノード規模の
