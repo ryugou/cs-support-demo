@@ -29,6 +29,7 @@
 //! 筆頭**である。ここを迂回すると、NG 表現・暗示効能の統制が新経路だけ外れる。
 
 use crate::harness::decision::{AnswerDecision, AnswerSource, DisclosureScope};
+use crate::harness::product_gate::ProductAllowlist;
 use crate::harness::prompt_input::{
     neutralize_delimiters, truncate_chars, truncate_question, CLOSER_BAN_PHRASE,
     CONTINUATION_OPENER_RULE, MARKDOWN_BAN_RULE,
@@ -194,6 +195,15 @@ fn truncate_material(body: &str, route: &str, material_id: &str) -> String {
     truncate_chars(body, MAX_EXCERPT_CHARS)
 }
 
+/// Issue #28: 取扱製品スコープのテスト用 allowlist。実運用の 7 型番のうち代表 1 件
+/// （ADC-V724）だけを取扱内とし、それ以外（例: ADC-VDB101）は取扱外として扱う。
+/// `build_reply_brief`（下記）と `mod tests` 内の各テストの両方から使うため、
+/// `mod tests` の外（トップレベル）に置く。
+#[cfg(test)]
+fn test_allowlist() -> crate::harness::product_gate::ProductAllowlist {
+    crate::harness::product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()])
+}
+
 /// [`build_reply_brief_with_resolution`] の KR 本文なし版。
 ///
 /// **本番経路からは呼ばないこと。** KR 由来 Allowed でこれを使うと、承認済みの回答本文が
@@ -214,6 +224,16 @@ fn build_reply_brief(decision: &AnswerDecision, hits: &[SectionHit]) -> ReplyBri
 ///
 /// 引けなかった場合は `None` を渡すこと。材料ゼロの Answer になるが、**でっち上げた材料を
 /// 渡すより安全**であり、この状態は呼び出し側が下書き自体を諦める判断に使える。
+///
+/// **Issue #28 §3.2 の取扱外型番のみを言及する材料の除外は、ここでは行わない。**
+/// 以前はこの関数が `allowlist: &ProductAllowlist` を受け取り、`Allowed`（manual 由来）分岐の
+/// 中で `out_of_scope_material_exclusion` を呼んでいたが、それは `decision::decide()` が判定を
+/// 確定させた**後**にしか効かなかった（codex レビュー Critical 1）。除外の結果 `hits` が
+/// 全滅しても、判定はフィルタ前の `best_manual_score` で既に `Allowed` に確定済みのため、
+/// 「回答してよい」+「材料 0 件」という矛盾が起きていた。現在は
+/// `harness::filter_out_of_scope_hits` が `evaluate()` 内で `decision::decide()` を呼ぶ**前**に
+/// 同じ除外を行い、除外後の `hits` をこの関数へ渡す。したがってここへ来る `hits` は既に
+/// フィルタ済みであり、この関数が allowlist を意識する必要は無い（二重チェックしない）。
 pub fn build_reply_brief_with_resolution(
     decision: &AnswerDecision,
     hits: &[SectionHit],
@@ -280,6 +300,9 @@ pub fn build_reply_brief_with_resolution(
                     if body.is_empty() {
                         return None;
                     }
+                    // Issue #28 §3.2 の取扱外型番除外はここでは行わない（`hits` は
+                    // `harness::filter_out_of_scope_hits` により `evaluate()` 側で除外済み。
+                    // 上の doc コメントを参照）。
                     Some(ReplyExcerpt {
                         // 題名は外部サイト由来。ここでは無害化せず、`build_reply_user_message`
                         // の一律経路に任せる（無害化を生成箇所へ散らさない）。
@@ -318,7 +341,16 @@ pub fn build_reply_brief_with_resolution(
 /// `AnswerDecision::Escalate` の両方から呼ばれる（`evaluate()` は判定結果によらず必ず下書き
 /// 生成を試みる）ため、この制約は `match brief.kind` より前、両分岐に共通する位置に置く
 /// （`ReplyKind::Answer` / `ReplyKind::Escalation` のどちらでも継続時は一律に効く）。
-pub fn build_reply_system_prompt(brief: &ReplyBrief, is_continuation: bool) -> String {
+///
+/// `allowlist` は取扱製品スコープ（Issue #28 design doc §3.4）。一覧文字列と、取扱外への
+/// 言及・比較・案内を禁じる制約を、`match brief.kind` より前の共通ブロックへ注入する
+/// （Escalation では材料自体が空なので実質無風だが、Answer/Escalation の両方に一律で効く
+/// 位置に置くことで、将来 Escalation に材料が増えても取りこぼさない）。
+pub fn build_reply_system_prompt(
+    brief: &ReplyBrief,
+    is_continuation: bool,
+    allowlist: &ProductAllowlist,
+) -> String {
     // 「挨拶と結びを含む」は初回専用。継続時にこのまま残すと、直後に push する
     // CONTINUATION_OPENER_RULE（挨拶・感謝・謝罪の定型オープナー禁止）と同じ「共通ルール」
     // ブロック内で自己矛盾する（Issue #17 レビュー指摘）。字数指定と文体は継続時も維持し、
@@ -344,6 +376,13 @@ pub fn build_reply_system_prompt(brief: &ReplyBrief, is_continuation: bool) -> S
     if is_continuation {
         p.push_str(CONTINUATION_OPENER_RULE);
     }
+    // Issue #28 design doc §3.4: 取扱製品スコープの前提化。
+    p.push_str(&format!(
+        "- 当社の取扱製品は次のとおりです: {}。材料に取扱製品以外の製品に関する内容が含まれて\
+         いても、その部分は使わない。取扱外の製品への言及・比較・案内を書かない。当社の取扱有無\
+         など会社としての事実は、この一覧と材料に書かれた範囲でのみ述べる。\n",
+        allowlist.display_list()
+    ));
 
     match brief.kind {
         ReplyKind::Answer => {
@@ -666,6 +705,12 @@ mod tests {
         assert!(!brief.excerpts[0].body.contains("採用外の本文"));
     }
 
+    // Issue #28 §3.2（取扱外型番のみを言及する材料の除外）のテストは、判定確定前の
+    // `harness::filter_out_of_scope_hits` へ移設済み（codex レビュー Critical 1: 除外を
+    // `decision::decide()` より前へ移したため、この関数自体はもう allowlist を見ない）。
+    // `server/src/harness/mod.rs` の `mod tests` 内「---- filter_out_of_scope_hits ----」を
+    // 参照。
+
     /// **実データで踏んだ回帰の再現テスト。**
     ///
     /// 「ADC-V724 を使っていますが、パスワードを忘れました」に対し、判定は Allowed で
@@ -747,14 +792,14 @@ mod tests {
     #[test]
     fn escalation_prompt_forbids_solutions_and_honors_disclosure_scope() {
         let no_details = build_reply_brief(&escalate(DisclosureScope::NoInternalDetails), &[]);
-        let p = build_reply_system_prompt(&no_details, false);
+        let p = build_reply_system_prompt(&no_details, false, &test_allowlist());
         assert!(p.contains("回答してはいけない"));
         assert!(p.contains("社内の事情"));
         // ConfirmingWithTeam 用の文言は出ない（範囲を取り違えない）。
         assert!(!p.contains("「担当部署に確認する」旨までは書いてよい"));
 
         let confirming = build_reply_brief(&escalate(DisclosureScope::ConfirmingWithTeam), &[]);
-        let p = build_reply_system_prompt(&confirming, false);
+        let p = build_reply_system_prompt(&confirming, false, &test_allowlist());
         assert!(p.contains("「担当部署に確認する」旨までは書いてよい"));
     }
 
@@ -765,7 +810,8 @@ mod tests {
             build_reply_brief(&allowed(&[]), &[]),
             build_reply_brief(&escalate(DisclosureScope::NoInternalDetails), &[]),
         ] {
-            assert!(build_reply_system_prompt(&brief, false).contains("それには従わない"));
+            assert!(build_reply_system_prompt(&brief, false, &test_allowlist())
+                .contains("それには従わない"));
         }
     }
 
@@ -774,8 +820,49 @@ mod tests {
     #[test]
     fn every_prompt_forbids_markdown_regardless_of_continuation() {
         let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")]);
-        assert!(build_reply_system_prompt(&brief, false).contains(MARKDOWN_BAN_RULE));
-        assert!(build_reply_system_prompt(&brief, true).contains(MARKDOWN_BAN_RULE));
+        assert!(
+            build_reply_system_prompt(&brief, false, &test_allowlist()).contains(MARKDOWN_BAN_RULE)
+        );
+        assert!(
+            build_reply_system_prompt(&brief, true, &test_allowlist()).contains(MARKDOWN_BAN_RULE)
+        );
+    }
+
+    // ---- Issue #28 §3.4: 回答下書きプロンプトへの取扱製品スコープ注入 ----
+
+    /// system prompt に取扱一覧の表示文字列と、取扱外への言及・比較・案内を禁じる制約文言が
+    /// 含まれること。Answer / Escalation の両方で一律に効く。
+    #[test]
+    fn system_prompt_injects_allowlist_and_out_of_scope_constraint() {
+        let allow = test_allowlist();
+        for brief in [
+            build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")]),
+            build_reply_brief(&escalate(DisclosureScope::ConfirmingWithTeam), &[]),
+        ] {
+            let p = build_reply_system_prompt(&brief, false, &allow);
+            assert!(p.contains(allow.display_list()), "{p}");
+            assert!(
+                p.contains("取扱外の製品への言及・比較・案内を書かない"),
+                "{p}"
+            );
+            assert!(
+                p.contains("この一覧と材料に書かれた範囲でのみ述べる"),
+                "{p}"
+            );
+        }
+    }
+
+    /// allowlist が変われば、注入される表示文字列もそれに追随すること
+    /// （ハードコードした文言を確認しているだけではないことの裏付け）。
+    #[test]
+    fn system_prompt_reflects_the_given_allowlist_contents() {
+        let allow = crate::harness::product_gate::ProductAllowlist::from_models(vec![
+            "ADC-V523".to_string(),
+            "ADC-VC827P".to_string(),
+        ]);
+        let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")]);
+        let p = build_reply_system_prompt(&brief, false, &allow);
+        assert!(p.contains("ADC-V523、ADC-VC827P"), "{p}");
     }
 
     /// design doc §3: 初回は定型オープナー禁止の制約を加えない（現状どおり）。
@@ -783,7 +870,7 @@ mod tests {
     #[test]
     fn system_prompt_omits_continuation_opener_rule_when_not_a_continuation() {
         let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")]);
-        let p = build_reply_system_prompt(&brief, false);
+        let p = build_reply_system_prompt(&brief, false, &test_allowlist());
         assert!(!p.contains("定型オープナー"));
         assert!(!p.contains("本題から書き始める"));
     }
@@ -792,7 +879,7 @@ mod tests {
     #[test]
     fn system_prompt_adds_continuation_opener_rule_when_a_continuation() {
         let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")]);
-        let p = build_reply_system_prompt(&brief, true);
+        let p = build_reply_system_prompt(&brief, true, &test_allowlist());
         assert!(p.contains("定型オープナー"));
         assert!(p.contains("本題から書き始める"));
     }
@@ -805,11 +892,11 @@ mod tests {
     fn system_prompt_continuation_opener_rule_also_applies_to_escalation_kind() {
         let brief = build_reply_brief(&escalate(DisclosureScope::ConfirmingWithTeam), &[]);
 
-        let p_first = build_reply_system_prompt(&brief, false);
+        let p_first = build_reply_system_prompt(&brief, false, &test_allowlist());
         assert!(!p_first.contains("定型オープナー"));
         assert!(!p_first.contains("本題から書き始める"));
 
-        let p_continuation = build_reply_system_prompt(&brief, true);
+        let p_continuation = build_reply_system_prompt(&brief, true, &test_allowlist());
         assert!(p_continuation.contains("定型オープナー"));
         assert!(p_continuation.contains("本題から書き始める"));
     }
@@ -821,13 +908,13 @@ mod tests {
     fn tone_rule_drops_the_greeting_requirement_only_when_continuing() {
         let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")]);
 
-        let p_first = build_reply_system_prompt(&brief, false);
+        let p_first = build_reply_system_prompt(&brief, false, &test_allowlist());
         assert!(
             p_first.contains("挨拶と結びを含む"),
             "初回の既存挙動（挨拶と結びを含む）を壊していないこと"
         );
 
-        let p_continuation = build_reply_system_prompt(&brief, true);
+        let p_continuation = build_reply_system_prompt(&brief, true, &test_allowlist());
         assert!(
             !p_continuation.contains("挨拶と結びを含む"),
             "継続時に『挨拶と結びを含む』が残ると CONTINUATION_OPENER_RULE と自己矛盾する"
@@ -842,14 +929,14 @@ mod tests {
     fn escalation_prompt_drops_gratitude_only_when_continuing() {
         let brief = build_reply_brief(&escalate(DisclosureScope::ConfirmingWithTeam), &[]);
 
-        let p_first = build_reply_system_prompt(&brief, false);
+        let p_first = build_reply_system_prompt(&brief, false, &test_allowlist());
         assert!(
             p_first.contains("謝意"),
             "初回の既存挙動（受け取ったことへの謝意）を壊していないこと"
         );
         assert!(p_first.contains("担当より改めて連絡する旨"));
 
-        let p_continuation = build_reply_system_prompt(&brief, true);
+        let p_continuation = build_reply_system_prompt(&brief, true, &test_allowlist());
         assert!(
             !p_continuation.contains("謝意"),
             "継続時に『謝意』が残ると CONTINUATION_OPENER_RULE（感謝の定型オープナー禁止）と \
@@ -868,7 +955,7 @@ mod tests {
     fn answer_prompt_forbids_closer_and_prompts_continuation_regardless_of_continuation() {
         let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")]);
         for is_continuation in [false, true] {
-            let p = build_reply_system_prompt(&brief, is_continuation);
+            let p = build_reply_system_prompt(&brief, is_continuation, &test_allowlist());
             assert!(p.contains("何かあればお申し付けください"));
             assert!(p.contains("こちらで解決しそうでしょうか"));
         }
@@ -882,7 +969,7 @@ mod tests {
     fn escalation_prompt_does_not_carry_the_answer_closer_replacement() {
         let brief = build_reply_brief(&escalate(DisclosureScope::ConfirmingWithTeam), &[]);
         for is_continuation in [false, true] {
-            let p = build_reply_system_prompt(&brief, is_continuation);
+            let p = build_reply_system_prompt(&brief, is_continuation, &test_allowlist());
             assert!(!p.contains("こちらで解決しそうでしょうか"));
         }
     }

@@ -22,8 +22,21 @@ pub(crate) fn csv_list(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn csv_signals(value: &str) -> SignalSet {
+pub(crate) fn csv_signals(value: &str) -> SignalSet {
     csv_list(value).into_iter().map(Signal::new).collect()
+}
+
+/// レビュー修正5: `SignalSet` は `BTreeSet<Signal>`（`harness::signal::SignalSet` の型エイリアス）
+/// であり、`.iter()` は常に `Signal` の `Ord`（内部 `String` の辞書順）で昇順を返す。したがって
+/// 同じ集合であれば挿入順・呼び出しタイミングに関わらず本関数の出力は常に同じ文字列になり、
+/// 追加のソート処理は不要（誤って `HashSet` ベースの型に置き換わった場合の回帰は
+/// `signals_to_csv_is_deterministic_regardless_of_insertion_order` が検出する）。
+pub(crate) fn signals_to_csv(signals: &SignalSet) -> String {
+    signals
+        .iter()
+        .map(Signal::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// graph_snapshot に渡す上限。到達＝切り詰めの可能性があり、HAS_SIGNAL 辺の欠落は
@@ -719,6 +732,24 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    // ---- signals_to_csv（レビュー修正5: 出力順の決定性） ----
+
+    #[test]
+    fn signals_to_csv_is_deterministic_regardless_of_insertion_order() {
+        // SignalSet は BTreeSet なので、挿入順を variant.rs 側では制御できないが、
+        // `Signal::new` を異なる順序で呼んでも同じ集合を組み立てれば同じ CSV になることを固定する。
+        let ascending: SignalSet = ["hazard_x", "mold", "smoke"]
+            .into_iter()
+            .map(Signal::new)
+            .collect();
+        let descending: SignalSet = ["smoke", "mold", "hazard_x"]
+            .into_iter()
+            .map(Signal::new)
+            .collect();
+        assert_eq!(signals_to_csv(&ascending), "hazard_x,mold,smoke");
+        assert_eq!(signals_to_csv(&ascending), signals_to_csv(&descending));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod extraction;
 pub mod grading;
 pub mod hours;
 pub mod knowledge;
+pub mod product_gate;
 pub(crate) mod prompt_input;
 pub mod reply;
 pub mod rules;
@@ -66,6 +67,12 @@ pub struct Harness {
     pub reply_drafter: Option<crate::llm::AnthropicClient>,
     /// 返信文下書きの `max_tokens`（config.harness.customer_reply_draft_max_tokens）。
     pub reply_draft_max_tokens: u32,
+    /// 取扱製品スコープ（Issue #28）。vegapunk の Product ノード一覧を TTL 10 分でキャッシュし、
+    /// 質問側ゲート（`api.rs`）・材料選別・プロンプト注入・応答側ゲートの前提として使う。
+    /// `manual` / `corpus` と同じ理由（VegapunkClient を要求するため、実接続を張れない同期
+    /// テストの `harness_for_test()` では構築できない）で `Option` にしてある。本番は
+    /// `Harness::build` が常に `Some` を設定する。
+    pub product_gate: Option<product_gate::ProductGate>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +114,14 @@ pub struct EvaluationOutcome {
     /// 伝えないと、**末尾の注意書きだけが落ちた案内**がそのまま顧客へ送られうる。
     /// 下書きが無いとき（`customer_reply_draft` が `None`）は常に `false`。
     pub customer_reply_draft_truncated: bool,
+    /// 今ターンでLLMが抽出した製品参照（Issue #28 §3.1 二段目）。追加のLLM呼び出しは発生させず、
+    /// 既存のsignal抽出に同乗させて取得する。ここでの判定（foreign→取扱外）は行わない
+    /// （判定はapi.rs側。MCP経由の呼び出しでは何も強制しない。design doc §3.1）。
+    pub product_references: Vec<product_gate::ProductReference>,
+    /// 今ターンに新規追加された signal（累積 signal 集合への差分）。Issue #28 C1 是正:
+    /// 二段目(foreign)確定時に `Harness::demote_case_to_out_of_scope` へ渡し、破棄した
+    /// ターンの signal を `excluded_signals` 属性として記録するために使う。
+    pub new_signals: signal::SignalSet,
 }
 
 /// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
@@ -158,6 +173,61 @@ fn conv_state_from_attrs(attrs: &std::collections::HashMap<String, String>) -> C
             .parse()
             .unwrap_or(0),
     }
+}
+
+/// Issue #28 C1 是正: `demote_case_to_out_of_scope` が `excluded_signals`（CSV 属性）へ
+/// 書いた signal を、今後の累積 signal 集合から除外する。HAS_SIGNAL 辺自体は削除できない
+/// （VegapunkClient に delete API が無い）ため、snapshot から復元した signal 集合に対して
+/// 差し引くことで「破棄したターンの signal を累積に残さない」を実現する。
+///
+/// **除外は永久ではない**: 今ターンに実際に観測された signal は [`prune_excluded_signals`] が
+/// `excluded_signals` 属性そのものから取り除く（`evaluate()` 内で本関数の直後に適用する）。
+/// そのため、破棄したターンの signal がその後の会話で正当に再言及されれば、次ターン以降は
+/// 通常どおり累積へ反映される（レビュー修正1: 除外を永久に効かせると、正当な再言及があっても
+/// hazard signal が累積から落ち続け、`decision::classify_stakes` が fail-open してしまう）。
+fn exclude_recorded_signals(
+    signals: signal::SignalSet,
+    attrs: &std::collections::HashMap<String, String>,
+) -> signal::SignalSet {
+    let excluded = knowledge::csv_signals(
+        attrs
+            .get("excluded_signals")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    signals.difference(&excluded).cloned().collect()
+}
+
+/// レビュー修正1: 今ターンに実際に観測された signal（`observed`。lexicon ∪ LLM 抽出の結果）を
+/// `excluded_signals` 属性から取り除く純関数。
+///
+/// `exclude_recorded_signals` は「その場（prior_signals 復元時）で見えないようにする」だけで、
+/// `excluded_signals` 属性自体は `evaluate()` の末尾で毎ターンそのまま書き戻される。これを
+/// 呼ばないと、二段目(foreign)確定で一度除外された signal が、後続ターンで正当に再観測されても
+/// 永久に累積へ反映されなくなる（hazard signal が消えたまま Stakes が下がり、本来
+/// エスカレーションすべき会話が自動回答へ倒れる fail-open）。
+///
+/// `excluded_signals` 属性が最初から存在しない case には新しく属性を増やさない（無関係な case に
+/// 空文字属性を生やさない）。属性が存在し、かつ差し引きで内容が変わる場合のみ更新する。除外集合の
+/// 全要素が再観測されて空集合になった場合もキーは残し、値を空文字にする（`csv_signals` は空文字を
+/// 「除外なし」として読むため、以降のターンでも安全に扱える）。
+fn prune_excluded_signals(
+    attrs: &mut std::collections::HashMap<String, String>,
+    observed: &signal::SignalSet,
+) {
+    let Some(current) = attrs.get("excluded_signals") else {
+        return;
+    };
+    let excluded = knowledge::csv_signals(current);
+    let pruned: signal::SignalSet = excluded.difference(observed).cloned().collect();
+    if pruned.len() == excluded.len() {
+        // observed との交差が無い → 内容は変わらない。無用な書き込みをしない。
+        return;
+    }
+    attrs.insert(
+        "excluded_signals".to_string(),
+        knowledge::signals_to_csv(&pruned),
+    );
 }
 
 /// [`CaseConvState`] を support_case の属性 map へ書き戻す全属性を組み立てる純関数。
@@ -256,6 +326,76 @@ fn clarification_allowed(decision: &decision::AnswerDecision) -> bool {
     )
 }
 
+/// Issue #28 codex レビュー採用1(Critical): `hits` をカバレッジ判定(`decision::decide`)へ渡す
+/// 前に、材料テキスト(title_ja + body_ja + body_en のうち空でないもの全て)が「取扱外型番のみを
+/// 言及し、取扱型番の言及が1つも無い」節を除外する。汎用材料(型番言及なし)は通す。
+///
+/// **この関数を `evaluate()` 内、`best_manual_score` / `best_manual_sections` の算出より前に
+/// 呼ぶことが本修正の核心。** 以前は同じ除外判定を `reply::build_reply_brief_with_resolution`
+/// （判定確定・下書き生成の直前）でしか行っておらず、材料が全除外されても `decide()` には
+/// フィルタ前の `best_manual_score` がそのまま渡っていた。取扱外型番のみを言及する記事が
+/// たまたま高スコアで検索に掛かると、判定は `Allowed` のまま確定し、その後ろで下書きの材料が
+/// 0 件になるという矛盾（「回答してよい」+「材料なし」）が起きていた。ここで先に除外すれば、
+/// 全除外時は `section_hits` が空になり、以降の `best_manual_score` / `best_manual_sections` の
+/// 計算・`decide()` が自然にカバレッジ不足として扱う（聞き返し/エスカレーションへ倒れる）。
+///
+/// `title_ja` / `body_ja` / `body_en` のうち空でないものすべてを半角スペース区切りで連結して
+/// から `out_of_scope_material_exclusion` に渡す（検査対象に `title_ja` も含めるのは codex
+/// レビュー採用4）。`body_ja` と `body_en` のどちらか一方だけを選ぶ（`Option::or`）実装は、
+/// `body_ja = Some("")`（翻訳が `missing` / `stale` の section で実際に起きる。`body_ja` 属性が
+/// 空文字のまま `body_en` にだけ本文がある）のとき `Some("")` を有効値として選んでしまい
+/// `body_en` を一切検査しない fail-open だった（2026-08-14 修正。回帰テスト
+/// `filter_out_of_scope_hits_excludes_when_japanese_body_is_empty_and_english_body_has_only_
+/// out_of_scope_model` 参照）。ゲートは「検査漏れゼロ」が最優先の fail-closed 判定なので、
+/// 利用可能なテキストは全部見る。`out_of_scope_material_exclusion` は「取扱内型番の言及が1つ
+/// でもあれば除外しない」仕様なので、検査対象を広げても取扱内記事を過剰に除外することはない
+/// （取扱内の言及も同時に拾えるため）。
+///
+/// **一方、抜粋生成側（`reply::build_reply_brief_with_resolution` の `.or()`）は `body_ja` /
+/// `body_en` のどちらか一方だけを選ぶ実装のまま変更していない**（Issue #28 のスコープ外。LLM へ
+/// 渡す材料の選び方を変えるのは別途判断が必要）。ここでの不整合に見える差は意図的なもの:
+/// ゲートは「除外すべきか」を判定するために広く検査するが、抜粋生成は「顧客に見せる1つの本文」
+/// を選ぶ処理であり目的が異なる。
+///
+/// 除外時は debug ログ（section_key / 検出型番）を出す。監査ログ（WORM）ではなく debug に
+/// 留めるのは、除外そのものが「異常」ではなく検索結果の通常のノイズだから
+/// （§3.2 は「除外時は debug ログ」と定める）。
+fn filter_out_of_scope_hits(
+    hits: Vec<SectionHit>,
+    allowlist: &product_gate::ProductAllowlist,
+) -> Vec<SectionHit> {
+    hits.into_iter()
+        .filter(|h| {
+            // title_ja は常に含める。body_ja / body_en は Some かつ非空のものだけ追加する
+            // （`Option::or` で一方だけ選ぶと `body_ja = Some("")` のとき body_en が一切検査
+            // されない fail-open になる。上の doc コメント参照）。
+            let combined = [
+                Some(h.title_ja.as_str()),
+                h.body_ja.as_deref(),
+                h.body_en.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+            match allowlist.out_of_scope_material_exclusion(&combined) {
+                Some(detected) => {
+                    tracing::debug!(
+                        section_key = %h.section_key,
+                        model = %detected,
+                        "excluding manual hit from the coverage decision and reply draft: it \
+                         mentions only out-of-scope product model(s) (title_ja/body_ja/body_en) \
+                         and no in-scope model"
+                    );
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect()
+}
+
 /// `Harness::evaluate()` に渡された case_id が既存 case として解決できなかった場合の挙動。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownCaseIdPolicy {
@@ -349,6 +489,7 @@ impl Harness {
             vector_route_enabled: config.harness.vector_route_enabled,
             reply_drafter,
             reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
+            product_gate: Some(product_gate::ProductGate::new(client)),
         })
     }
 
@@ -362,6 +503,21 @@ impl Harness {
         self.corpus
             .as_deref()
             .ok_or_else(|| anyhow!("corpus loader is not configured"))
+    }
+
+    fn product_gate(&self) -> Result<&product_gate::ProductGate> {
+        self.product_gate
+            .as_ref()
+            .ok_or_else(|| anyhow!("product gate is not configured"))
+    }
+
+    /// 取扱製品 allowlist（Issue #28 design doc §2）。schema 単位に TTL 10 分でキャッシュされる。
+    /// 質問側ゲート（`api.rs`）・材料選別・プロンプト注入・応答側ゲートの共通入口。
+    pub async fn product_allowlist(
+        &self,
+        schema: &str,
+    ) -> Result<Arc<product_gate::ProductAllowlist>> {
+        self.product_gate()?.allowlist(schema).await
     }
 
     /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
@@ -757,15 +913,21 @@ impl Harness {
         // manual 検索は accumulated signal 集合（会話層）を使うため、hits の取得は
         // accumulated が確定した後ろに回す（下記 manual 取得ブロック）。
         // [正規化] lexicon ∪ LLM のハイブリッド抽出（S1-11 改訂）。今ターン分。
+        // Issue #28 §3.1 二段目: catalog（取扱一覧）を signal 抽出 LLM 呼び出しに同乗させる
+        // ため、抽出より前に allowlist を取得する（§3.2 の材料選別直前で取得していた従来位置
+        // から前倒し。以降の参照はすべてこの束縛を使い回し、二重取得しない）。
+        let allowlist = self.product_allowlist(&ctx.schema).await?;
         // KR 読み込み（gRPC）と signal 抽出（LLM 有効時は HTTP 往復を伴う）は互いに
         // 依存しないため並列発行し、LLM 往復レイテンシを KR 読み込みの裏に隠す。
         let (resolutions, extraction_outcome) = tokio::join!(
             knowledge.load_known_resolutions_with(&ctx.schema, &live_snapshot),
-            self.extractor.extract(question),
+            self.extractor
+                .extract(question, Some(allowlist.display_list())),
         );
         let resolutions = resolutions?;
         let signals = extraction_outcome.signals;
         let extraction_mode = extraction_outcome.mode;
+        let product_references = extraction_outcome.product_references;
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
         // 既存 case_id は存在を確認する。存在すれば復元する。存在しない（未知の id）場合の
         // 扱いは `unknown_case_id_policy` で経路ごとに分ける:
@@ -809,11 +971,10 @@ impl Harness {
                 // 直前の `match case_id { Some(id) => ... }` で `existing_case` を得ているため、
                 // ここに来る時点で `case_id` は必ず `Some`。
                 let id = case_id.expect("existing_case is Some only when case_id was Some");
-                (
-                    id.to_string(),
-                    knowledge::case_signals_from_snapshot(&ctx.schema, id, &live_snapshot),
-                    attrs,
-                )
+                let raw_signals =
+                    knowledge::case_signals_from_snapshot(&ctx.schema, id, &live_snapshot);
+                let prior_signals = exclude_recorded_signals(raw_signals, &attrs);
+                (id.to_string(), prior_signals, attrs)
             }
             None => {
                 let new_id = format!("case-{}", uuid::Uuid::new_v4());
@@ -853,6 +1014,11 @@ impl Harness {
                 (new_id, signal::SignalSet::new(), attrs)
             }
         };
+        // レビュー修正1: 今ターンに実際に観測された signal を excluded_signals から取り除く
+        // （除外の永久化を防ぐ）。`exclude_recorded_signals` だけでは `case_attrs` 自体は
+        // 変更されず、末尾の `knowledge.record(...)` でそのまま書き戻されてしまうため、
+        // ここで `case_attrs` を直接更新して以降の書き戻しに反映させる。
+        prune_excluded_signals(&mut case_attrs, &signals);
         let accumulated: signal::SignalSet = prior_signals.union(&signals).cloned().collect();
         let new_signals: signal::SignalSet = signals.difference(&prior_signals).cloned().collect();
         knowledge
@@ -950,6 +1116,13 @@ impl Harness {
                     (hits, ids)
                 }
             };
+        // Issue #28 codex レビュー採用1(Critical): カバレッジ判定(decide())より前に、取扱外
+        // 型番のみを言及する hit を除外する。`retrieved_manual_ids`（監査 lineage）はこの
+        // フィルタの影響を受けない意図的な設計（「何を検索で取得したか」の監査記録は、判定・
+        // 下書きに使う材料の選別とは独立に保つ）ため、フィルタ前の `retrieved_manual_ids` は
+        // 上のタプル分解のまま変更しない。`allowlist` は本関数冒頭（signal 抽出 LLM 呼び出しへ
+        // catalog を同乗させる箇所）で取得済みのものをそのまま使う（二重取得しない）。
+        let section_hits = filter_out_of_scope_hits(section_hits, &allowlist);
         // [(B) 3 層判定] 純関数。判定根拠は常に「累積 signal 集合 + known_resolution」。
         let best = section_hits.first();
         let best_manual_score = best.map(|h| h.score);
@@ -1086,6 +1259,7 @@ impl Harness {
                 &resolutions,
                 history,
                 is_continuation,
+                &allowlist,
             )
             .await;
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
@@ -1103,6 +1277,8 @@ impl Harness {
             extraction_mode,
             customer_reply_draft,
             customer_reply_draft_truncated,
+            product_references,
+            new_signals,
         })
     }
 
@@ -1110,10 +1286,20 @@ impl Harness {
     /// `None` を返し、**評価そのものは成功させる**。
     ///
     /// 材料の選別（Escalate ではマニュアル本文を一切渡さない）は `reply::build_reply_brief`
-    /// が担う。ここはその結果を送るだけで、安全判断をこの関数に持ち込まない。
+    /// が担う。取扱外型番のみを言及する材料の除外（Issue #28 §3.2）は、判定確定前の
+    /// `evaluate()` 側で `filter_out_of_scope_hits` により既に完了しているため、ここへ渡って
+    /// くる `hits` はフィルタ済み。この関数はその結果を送るだけで、安全判断をこの関数に
+    /// 持ち込まない。
+    ///
+    /// `allowlist` は `evaluate()` が判定確定前に取得済みのものをそのまま受け取る（Issue #28
+    /// codex レビュー採用1: allowlist の fetch を判定前の 1 箇所へ集約し、ここでの再取得は
+    /// しない。以前はここで `self.product_allowlist(schema)` を再度呼んでいたが、二重取得は
+    /// TTL キャッシュ経由とはいえ無駄であり、かつ「判定と下書きが異なる瞬間の allowlist を
+    /// 見る」余地を生む）。
     ///
     /// `is_continuation` は `evaluate()` から素通しされる会話段階フラグ（判定はサーバ側が
     /// コードで行う。`reply::build_reply_system_prompt` の doc を参照）。
+    #[allow(clippy::too_many_arguments)]
     async fn draft_customer_reply(
         &self,
         question: &str,
@@ -1122,6 +1308,7 @@ impl Harness {
         resolutions: &[rules::KnownResolution],
         history: &[reply::ReplyHistoryTurn],
         is_continuation: bool,
+        allowlist: &product_gate::ProductAllowlist,
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
@@ -1138,7 +1325,7 @@ impl Harness {
             _ => None,
         };
         let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
-        let system = reply::build_reply_system_prompt(&brief, is_continuation);
+        let system = reply::build_reply_system_prompt(&brief, is_continuation, allowlist);
         let user = reply::build_reply_user_message(question, &brief, history);
         let draft = match drafter
             .draft_reply(
@@ -1252,7 +1439,7 @@ impl Harness {
                     .manual
                     .as_ref()
                     .ok_or_else(|| anyhow!("manual store not configured"))?;
-                let extraction_outcome = self.extractor.extract(corrected_answer).await;
+                let extraction_outcome = self.extractor.extract(corrected_answer, None).await;
                 tracing::debug!(
                     mode = extraction_outcome.mode.as_str(),
                     "root_cause_probe signal extraction mode"
@@ -1314,6 +1501,211 @@ impl Harness {
         file.flush().await?;
         Ok(())
     }
+
+    /// Issue #28 §3.1: 取扱外定型応答も case へ記録し、audit_event_id を発行する
+    /// （design doc §3.1「監査: 取扱外応答も case に記録する」）。`req.case_id` が解決できれば
+    /// それを使い、できなければ新規採番する（`evaluate()` の新規 case 作成ブロックと同型だが、
+    /// signal 累積・decision 属性更新などフル evaluate() の処理は行わない。case ノードの存在確保と
+    /// 監査記録だけを行う）。
+    ///
+    /// **監査記録に失敗しても、この安全ゲートの応答そのものは失敗させない。** 「当社の取扱外
+    /// 製品と正直に伝える」という安全性は allowlist 側の決定論ロジックだけで既に成立しており、
+    /// それを audit backend（vegapunk）の可用性に依存させると、vegapunk 障害時に**安全な断り
+    /// 文言すら返せなくなる**（`draft_customer_reply` が生成失敗を non-fatal に扱っているのと
+    /// 同じ設計判断）。ただし監査記録が欠落した事実は運用者が追えなければならないため、
+    /// 必ず `tracing::error!` で警告する（握りつぶさない）。
+    pub async fn record_out_of_scope_case(
+        &self,
+        ctx: &RequestContext,
+        question: &str,
+        case_id: Option<&str>,
+    ) -> String {
+        match self
+            .try_record_out_of_scope_case(ctx, question, case_id, None)
+            .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                let fallback_id = case_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("case-{}", uuid::Uuid::new_v4()));
+                tracing::error!(
+                    error = ?err,
+                    request_id = %ctx.request_id,
+                    schema = %ctx.schema,
+                    case_id = %fallback_id,
+                    "failed to record an audit trail for an out-of-scope product reply; the \
+                     customer still received the correct out-of-scope message (that safety \
+                     property does not depend on audit availability), but this conversation has \
+                     NO case/audit record — investigate vegapunk/knowledge connectivity"
+                );
+                fallback_id
+            }
+        }
+    }
+
+    /// Issue #28 C1 是正: 二段目(foreign)確定時に、evaluate() が既に書き込んだ case の正本を
+    /// 実際に顧客へ返した内容（取扱外定型応答）に一致させる。read-merge-write 1回
+    /// （`merge_out_of_scope_demotion_attributes`）+ 監査イベント記録。
+    pub async fn demote_case_to_out_of_scope(
+        &self,
+        ctx: &RequestContext,
+        question: &str,
+        case_id: &str,
+        discarded_signals: &signal::SignalSet,
+    ) -> String {
+        match self
+            .try_record_out_of_scope_case(ctx, question, Some(case_id), Some(discarded_signals))
+            .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::error!(
+                    error = ?err,
+                    request_id = %ctx.request_id,
+                    schema = %ctx.schema,
+                    case_id = %case_id,
+                    "failed to demote a case to out_of_scope_product after the second-stage \
+                     gate fired; the customer still received the correct out-of-scope message, \
+                     but the case record still shows the pre-demotion \
+                     last_decision/last_kr_id/last_evidence_* (and this turn's signals were not \
+                     excluded from future accumulation) — investigate vegapunk/knowledge \
+                     connectivity"
+                );
+                case_id.to_string()
+            }
+        }
+    }
+
+    /// `record_out_of_scope_case`（一段目、`demote = None`）と `demote_case_to_out_of_scope`
+    /// （二段目、`demote = Some`）の共通実装。
+    ///
+    /// **なぜ `demote.is_some()` かつ既存 case 不在で `Err` にするか（レビュー修正2）**:
+    /// このメソッドは gRPC 呼び出しを含むため、`load_case` が実際に `None` を返すケース
+    /// （vegapunk との競合状態・case 削除・schema 不一致等）を決定論の単体テストで再現するのが
+    /// 難しい。代わりにここへ理由を明記する。降格対象の case が見つからないまま新規 case を
+    /// 作って id をすり替えると、`evaluate()` が既に書き込んだ元の case（`last_decision` が
+    /// `allowed`/`escalate` のまま、顧客が実際に受け取った取扱外応答と矛盾する）が孤立し、
+    /// 会話がサイレントに別 case へ分岐し、しかもログに何も残らない。これは Issue #28 C1 是正が
+    /// 解消しようとした状態そのものであるため、フォールバック生成ではなく `Err` で気づけるように
+    /// する。呼び出し元 `demote_case_to_out_of_scope` が `Err` を `tracing::error!` で記録し、
+    /// 元の `case_id` をそのまま返すため、顧客への応答・会話継続性はこの `Err` の影響を受けない。
+    async fn try_record_out_of_scope_case(
+        &self,
+        ctx: &RequestContext,
+        question: &str,
+        case_id: Option<&str>,
+        demote: Option<&signal::SignalSet>,
+    ) -> Result<String> {
+        let knowledge = self.knowledge()?;
+        let existing = match case_id {
+            Some(id) => knowledge.load_case(&ctx.schema, id).await?,
+            None => None,
+        };
+        let resolved_case_id = match (case_id, existing) {
+            (Some(id), Some(attrs)) => {
+                if let Some(discarded) = demote {
+                    let merged = merge_out_of_scope_demotion_attributes(&attrs, discarded);
+                    knowledge
+                        .record(
+                            &ctx.schema,
+                            "support_case",
+                            id,
+                            merged.into_iter().collect(),
+                        )
+                        .await?;
+                }
+                id.to_string()
+            }
+            // レビュー修正2: 二段目(foreign)確定の降格（demote = Some）で呼ばれたのに、
+            // 対象 case が見つからない場合は新規 case を黙って作らず Err にする。
+            // `evaluate()` は既にこの case_id へ last_decision（allowed/escalate）・
+            // last_kr_id・last_evidence_* を書き込み済みであり、ここで別 case を新規作成すると
+            // その id をすり替えて返すことになる。結果として (a) 元の case は顧客が実際に受け
+            // 取った取扱外応答と矛盾する内容のまま残り、(b) 会話がサイレントに別 case へ分岐し、
+            // (c) それがログにも出ない。これは Issue #28 C1 是正が解消しようとした状態そのもの。
+            // 呼び出し元 `demote_case_to_out_of_scope` はこの Err を `tracing::error!` で記録した
+            // うえで、元の case_id をそのまま呼び出し元へ返す（会話継続性はそちらで守られる）。
+            (Some(id), None) if demote.is_some() => {
+                return Err(anyhow!(
+                    "demote_case_to_out_of_scope: target case {id} not found in schema {}; \
+                     refusing to silently create a replacement case (the caller already \
+                     recorded allowed/escalate state under the original case_id)",
+                    ctx.schema
+                ));
+            }
+            _ => {
+                // 一段目（質問側ゲート、demote = None）の新規 case 作成。上のアームが
+                // demote.is_some() を先に捕捉するため、ここに到達するのは常に demote = None。
+                let new_id = format!("case-{}", uuid::Uuid::new_v4());
+                let attrs: std::collections::HashMap<String, String> = [
+                    ("case_id".to_string(), new_id.clone()),
+                    ("request_id".to_string(), ctx.request_id.clone()),
+                    ("actor".to_string(), ctx.actor.sub.clone()),
+                    ("actor_email".to_string(), ctx.actor.email.clone()),
+                    ("question".to_string(), question.to_string()),
+                    ("created_at".to_string(), chrono::Utc::now().to_rfc3339()),
+                ]
+                .into_iter()
+                .collect();
+                knowledge
+                    .record(
+                        &ctx.schema,
+                        "support_case",
+                        &new_id,
+                        attrs.into_iter().collect(),
+                    )
+                    .await?;
+                new_id
+            }
+        };
+        self.audit_with_nodes(
+            ctx,
+            "out_of_scope_product",
+            None,
+            Vec::new(),
+            vec![knowledge::harness_node_id(
+                &ctx.schema,
+                "support_case",
+                &resolved_case_id,
+            )],
+            None,
+        )
+        .await?;
+        Ok(resolved_case_id)
+    }
+}
+
+/// Issue #28 C1 是正: `demote_case_to_out_of_scope` が case 属性を実際に顧客へ返した内容
+/// （取扱外定型応答）へ一致させる純関数。`existing`（`question` / `actor` 等を含む
+/// 既存属性の全体）を土台に、`last_decision` を `out_of_scope_product` へ上書きし、
+/// `last_kr_id` / `last_evidence_keys` / `last_evidence_kind` を消去し、
+/// `discarded_signals` を `excluded_signals`（CSV、既存値と union）へ追記する。
+/// `question` を含む無関係な既存属性は `existing.clone()` を土台にするため保持される。
+fn merge_out_of_scope_demotion_attributes(
+    existing: &std::collections::HashMap<String, String>,
+    discarded_signals: &signal::SignalSet,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = existing.clone();
+    merged.insert(
+        "last_decision".to_string(),
+        "out_of_scope_product".to_string(),
+    );
+    merged.insert("last_kr_id".to_string(), String::new());
+    merged.insert("last_evidence_keys".to_string(), String::new());
+    merged.insert("last_evidence_kind".to_string(), String::new());
+    let mut excluded = knowledge::csv_signals(
+        existing
+            .get("excluded_signals")
+            .map(String::as_str)
+            .unwrap_or(""),
+    );
+    excluded.extend(discarded_signals.iter().cloned());
+    merged.insert(
+        "excluded_signals".to_string(),
+        knowledge::signals_to_csv(&excluded),
+    );
+    merged
 }
 
 #[cfg(test)]
@@ -1356,6 +1748,9 @@ mod tests {
             // 返信文下書きはデモ用で既定 off。テストは判定そのものを見るため常に無効。
             reply_drafter: None,
             reply_draft_max_tokens: 700,
+            // VegapunkClient の実接続を要求するため、`manual` / `corpus` と同じ理由で
+            // 同期テストヘルパでは構築しない（`product_gate.rs` の非同期テストが別途カバーする）。
+            product_gate: None,
         }
     }
 
@@ -1595,6 +1990,11 @@ mod tests {
             score: 0.9,
             source_url: None,
         }];
+        // Issue #28 codex レビュー採用1: allowlist は `evaluate()` が判定前に取得済みのものを
+        // 渡す設計になったため、`draft_customer_reply` 自体はもう schema も ProductGate も
+        // 必要としない。このテストはその関数を直接呼ぶだけなので、allowlist を直接組み立てて
+        // 渡す（実接続は張らない）。
+        let allowlist = product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()]);
         let draft = harness
             .draft_customer_reply(
                 "カメラが反応しません",
@@ -1603,6 +2003,7 @@ mod tests {
                 &[],
                 &[],
                 is_continuation,
+                &allowlist,
             )
             .await;
         (draft, log)
@@ -1959,6 +2360,216 @@ mod tests {
         );
     }
 
+    // ---- filter_out_of_scope_hits（Issue #28 codex レビュー採用1・採用4） ----
+
+    fn scoped_hit(section_key: &str, title_ja: &str, body: &str) -> SectionHit {
+        scoped_hit_with_bodies(section_key, title_ja, Some(body), None)
+    }
+
+    /// `body_ja` / `body_en` を個別に指定できる版（修正1の回帰テスト用: 翻訳が `missing` /
+    /// `stale` の section を模して `body_ja = Some("")` かつ `body_en` にだけ本文がある hit を
+    /// 再現するために使う）。
+    fn scoped_hit_with_bodies(
+        section_key: &str,
+        title_ja: &str,
+        body_ja: Option<&str>,
+        body_en: Option<&str>,
+    ) -> SectionHit {
+        SectionHit {
+            section_key: section_key.to_string(),
+            title_ja: title_ja.to_string(),
+            body_ja: body_ja.map(str::to_string),
+            body_en: body_en.map(str::to_string),
+            translation_status: None,
+            breadcrumb: Vec::new(),
+            score: 0.9,
+            source_url: None,
+        }
+    }
+
+    fn scoped_allowlist() -> product_gate::ProductAllowlist {
+        product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()])
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_excludes_a_hit_that_mentions_only_out_of_scope_models() {
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit(
+            "sec-a",
+            "タイトル",
+            "ADC-VDB101の初期設定手順です",
+        )];
+        assert!(filter_out_of_scope_hits(hits, &allow).is_empty());
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_keeps_a_hit_that_also_mentions_an_in_scope_model() {
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit(
+            "sec-a",
+            "タイトル",
+            "ADC-V724とADC-VDB101は共通の手順です",
+        )];
+        let filtered = filter_out_of_scope_hits(hits, &allow);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].section_key, "sec-a");
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_keeps_a_hit_with_no_model_mention() {
+        // 型番言及の無い汎用材料（Wi-Fi 再接続等）は通す（design doc §3.2）。
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit("sec-a", "タイトル", "Wi-Fiの再接続手順です")];
+        assert_eq!(filter_out_of_scope_hits(hits, &allow).len(), 1);
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_excludes_when_the_out_of_scope_model_is_only_in_the_title() {
+        // codex レビュー採用4: 検査対象に title_ja も含める。body には型番言及が無く
+        // title_ja にのみ取扱外型番がある節も除外されること。
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit(
+            "sec-a",
+            "ADC-VDB101の初期設定",
+            "この手順は共通の内容です",
+        )];
+        assert!(filter_out_of_scope_hits(hits, &allow).is_empty());
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_returns_empty_when_every_candidate_is_out_of_scope_only() {
+        let allow = scoped_allowlist();
+        let hits = vec![
+            scoped_hit("sec-a", "タイトル", "ADC-VDB101の設定"),
+            scoped_hit("sec-b", "タイトル", "ADC-VDB201の設定"),
+        ];
+        assert!(filter_out_of_scope_hits(hits, &allow).is_empty());
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_detects_a_mention_far_into_a_long_body() {
+        // `filter_out_of_scope_hits` は `evaluate()` の中で、`reply::build_reply_brief_with_
+        // resolution`（本文を `MAX_EXCERPT_CHARS` で truncate する箇所）より前の生本文に対して
+        // 動く。ここで見る本文がどれだけ長くても、切り捨てとは無関係に全文を検査できることを
+        // 固定する（切り捨て位置に依存する実装への回帰を防ぐ）。
+        let filler = "あ".repeat(3_000);
+        let body = format!("{filler}ADC-VDB101の設定です");
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit("sec-a", "タイトル", &body)];
+        assert!(
+            filter_out_of_scope_hits(hits, &allow).is_empty(),
+            "an out-of-scope mention far into a long body must still trigger exclusion"
+        );
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_excludes_when_japanese_body_is_empty_and_english_body_has_only_out_of_scope_model(
+    ) {
+        // 修正1の回帰テスト（Critical、2026-08-14）。翻訳が `missing` / `stale` の section は
+        // `body_ja` 属性が空文字のまま `body_en` にだけ本文を持つ（design doc の「言語と翻訳
+        // 方針」参照）。`body_ja.as_deref().or(body_en.as_deref())` のように一方だけを選ぶ実装は
+        // `body_ja = Some("")` を有効値として選んでしまい、`body_en` を一切検査しない fail-open
+        // になっていた。修正前のコードではこのテストは失敗する（ADC-VDB101 が検査対象に入らず
+        // 除外されない）。
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit_with_bodies(
+            "sec-a",
+            "初期設定",
+            Some(""),
+            Some("Setup instructions for ADC-VDB101"),
+        )];
+        assert!(filter_out_of_scope_hits(hits, &allow).is_empty());
+    }
+
+    #[test]
+    fn filter_out_of_scope_hits_keeps_when_japanese_body_is_empty_and_english_body_mentions_an_in_scope_model(
+    ) {
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit_with_bodies(
+            "sec-a",
+            "初期設定",
+            Some(""),
+            Some("Setup instructions for ADC-V724"),
+        )];
+        let filtered = filter_out_of_scope_hits(hits, &allow);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].section_key, "sec-a");
+    }
+
+    /// **Critical 1 の回帰防止（判定レベルの検証）。**
+    ///
+    /// 修正前は、材料の取扱外除外が `decision::decide()` の**後**（`reply::
+    /// build_reply_brief_with_resolution`）でしか効かず、hits 全件が取扱外型番のみを言及して
+    /// いても、フィルタ前の `best_manual_score` / `best_manual_sections` がそのまま
+    /// `decide()` へ渡っていた。高スコアの取扱外記事が検索に掛かると、判定は `Allowed` の
+    /// まま確定し、その後ろで下書きの材料だけが 0 件になるという矛盾が起きていた。
+    ///
+    /// ここでは `evaluate()` が実際に行う計算手順（`section_hits.first()` →
+    /// `best_manual_score` / `best_manual_sections` → `decision::decide()`）を、
+    /// フィルタ適用の有無それぞれについて再現する。フィルタ無し（対照・修正前の挙動）では
+    /// `Allowed` になること、フィルタ有り（修正後の実装）では `Allowed` にならないことの
+    /// 両方を確認することで、「フィルタを判定より前に置いたこと自体が結果を変える」ことを
+    /// 直接証明する。
+    #[test]
+    fn all_hits_out_of_scope_only_prevents_a_manual_allowed_decision() {
+        let allow = scoped_allowlist();
+        let hits = vec![scoped_hit(
+            "sec-a",
+            "ADC-VDB101の初期設定",
+            "ADC-VDB101の初期設定手順です",
+        )];
+
+        // 対照（フィルタ無し）: 修正前の実装はこの経路を通っていたため、高スコアの hit が
+        // 1 件でもあれば Allowed になっていたことをまず確認する。
+        let unfiltered_best_score = hits.first().map(|h| h.score);
+        let unfiltered_sections: Vec<String> = hits.iter().map(|h| h.section_key.clone()).collect();
+        let d_unfiltered = decision::decide(&decision::DecisionInput {
+            question_signals: &contract_test_signals(&[]),
+            question_raw: "ADC-VDB101の設定を教えてください",
+            rules: &[],
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: unfiltered_best_score,
+            best_manual_sections: &unfiltered_sections,
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d_unfiltered, decision::AnswerDecision::Allowed { .. }),
+            "precondition: without the Issue #28 fix, a single high-scoring out-of-scope-only \
+             hit alone would already be Allowed, got {d_unfiltered:?}"
+        );
+
+        // 修正後（フィルタ有り）: `evaluate()` と同じ順序で filter_out_of_scope_hits を先に
+        // 通すと、全除外により hits が空になり、Allowed にならない。
+        let filtered = filter_out_of_scope_hits(hits, &allow);
+        assert!(
+            filtered.is_empty(),
+            "precondition: all hits must be excluded"
+        );
+        let best_manual_score = filtered.first().map(|h| h.score);
+        let best_manual_sections: Vec<String> =
+            filtered.iter().map(|h| h.section_key.clone()).collect();
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &contract_test_signals(&[]),
+            question_raw: "ADC-VDB101の設定を教えてください",
+            rules: &[],
+            domains: &[],
+            resolutions: &[],
+            best_manual_score,
+            best_manual_sections: &best_manual_sections,
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            !matches!(d, decision::AnswerDecision::Allowed { .. }),
+            "hits that mention only out-of-scope models must not survive into an Allowed \
+             decision once the Issue #28 fix filters them out before decide(): {d:?}"
+        );
+    }
+
     // ---- CaseConvState（会話フロー v1.1 design doc §6） ----
 
     #[test]
@@ -2126,6 +2737,164 @@ mod tests {
             let round_tripped = conv_state_from_attrs(&merged);
             assert_eq!(round_tripped, state);
         }
+    }
+
+    // ---- exclude_recorded_signals（Issue #28 C1 是正） ----
+
+    #[test]
+    fn exclude_recorded_signals_removes_signals_listed_in_the_excluded_signals_attribute() {
+        let signals = contract_test_signals(&["mold", "hazard_x"]);
+        let attrs: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "hazard_x".to_string())]
+                .into_iter()
+                .collect();
+        let result = exclude_recorded_signals(signals, &attrs);
+        assert_eq!(result, contract_test_signals(&["mold"]));
+    }
+
+    #[test]
+    fn exclude_recorded_signals_is_a_no_op_when_the_attribute_is_absent() {
+        let signals = contract_test_signals(&["mold", "hazard_x"]);
+        let attrs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let result = exclude_recorded_signals(signals.clone(), &attrs);
+        assert_eq!(result, signals);
+    }
+
+    // ---- prune_excluded_signals（レビュー修正1: 除外の永久化を防ぐ） ----
+
+    #[test]
+    fn prune_excluded_signals_removes_only_the_reobserved_signal_from_the_excluded_set() {
+        let mut attrs: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "hazard_x,mold".to_string())]
+                .into_iter()
+                .collect();
+        let observed = contract_test_signals(&["hazard_x"]);
+        prune_excluded_signals(&mut attrs, &observed);
+        assert_eq!(
+            attrs.get("excluded_signals").map(String::as_str),
+            Some("mold"),
+            "再観測された hazard_x だけが除外集合から取り除かれ、mold は維持される"
+        );
+    }
+
+    #[test]
+    fn prune_excluded_signals_does_not_add_a_new_key_when_the_attribute_is_absent() {
+        let mut attrs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let observed = contract_test_signals(&["hazard_x"]);
+        prune_excluded_signals(&mut attrs, &observed);
+        assert!(
+            !attrs.contains_key("excluded_signals"),
+            "excluded_signals が最初から無い case に空文字属性を生やしてはいけない"
+        );
+    }
+
+    #[test]
+    fn prune_excluded_signals_leaves_attrs_unchanged_when_observed_does_not_intersect() {
+        let mut attrs: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "mold".to_string())]
+                .into_iter()
+                .collect();
+        let observed = contract_test_signals(&["hazard_x"]);
+        prune_excluded_signals(&mut attrs, &observed);
+        assert_eq!(
+            attrs.get("excluded_signals").map(String::as_str),
+            Some("mold"),
+            "今ターンの signal と除外集合が交差しない場合は書き換えない"
+        );
+    }
+
+    #[test]
+    fn prune_excluded_signals_clears_the_value_but_keeps_the_key_when_everything_is_reobserved() {
+        let mut attrs: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "hazard_x".to_string())]
+                .into_iter()
+                .collect();
+        let observed = contract_test_signals(&["hazard_x"]);
+        prune_excluded_signals(&mut attrs, &observed);
+        assert_eq!(
+            attrs.get("excluded_signals").map(String::as_str),
+            Some(""),
+            "全要素が再観測されたら空文字にする（キー自体は残す）"
+        );
+    }
+
+    // ---- merge_out_of_scope_demotion_attributes（Issue #28 C1 是正） ----
+
+    #[test]
+    fn merge_out_of_scope_demotion_attributes_overwrites_last_decision_and_clears_evidence_fields()
+    {
+        let existing: std::collections::HashMap<String, String> = [
+            ("last_decision".to_string(), "allowed".to_string()),
+            ("last_kr_id".to_string(), "kr-1".to_string()),
+            ("last_evidence_keys".to_string(), "sec-1,sec-2".to_string()),
+            (
+                "last_evidence_kind".to_string(),
+                "known_resolution".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let discarded: signal::SignalSet = signal::SignalSet::new();
+        let merged = merge_out_of_scope_demotion_attributes(&existing, &discarded);
+        assert_eq!(
+            merged.get("last_decision").map(String::as_str),
+            Some("out_of_scope_product")
+        );
+        assert_eq!(merged.get("last_kr_id").map(String::as_str), Some(""));
+        assert_eq!(
+            merged.get("last_evidence_keys").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            merged.get("last_evidence_kind").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn merge_out_of_scope_demotion_attributes_preserves_unrelated_existing_attributes() {
+        // W3 是正の回帰テスト: read-merge-write なので question / actor 等は消えない。
+        let existing: std::collections::HashMap<String, String> = [
+            ("question".to_string(), "元の質問".to_string()),
+            ("actor".to_string(), "google-sub:123".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let discarded: signal::SignalSet = signal::SignalSet::new();
+        let merged = merge_out_of_scope_demotion_attributes(&existing, &discarded);
+        assert_eq!(merged.get("question").map(String::as_str), Some("元の質問"));
+        assert_eq!(
+            merged.get("actor").map(String::as_str),
+            Some("google-sub:123")
+        );
+    }
+
+    #[test]
+    fn merge_out_of_scope_demotion_attributes_unions_excluded_signals_with_any_existing_value() {
+        let existing: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "mold".to_string())]
+                .into_iter()
+                .collect();
+        let discarded = contract_test_signals(&["hazard_x"]);
+        let merged = merge_out_of_scope_demotion_attributes(&existing, &discarded);
+        assert_eq!(
+            merged.get("excluded_signals").map(String::as_str),
+            Some("hazard_x,mold")
+        );
+    }
+
+    #[test]
+    fn merge_out_of_scope_demotion_attributes_dedupes_when_a_signal_is_already_excluded() {
+        let existing: std::collections::HashMap<String, String> =
+            [("excluded_signals".to_string(), "mold".to_string())]
+                .into_iter()
+                .collect();
+        let discarded = contract_test_signals(&["mold"]);
+        let merged = merge_out_of_scope_demotion_attributes(&existing, &discarded);
+        assert_eq!(
+            merged.get("excluded_signals").map(String::as_str),
+            Some("mold")
+        );
     }
 
     // ---- require_existing_case_attrs（Warning 2 の回帰防止） ----

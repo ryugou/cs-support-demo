@@ -47,50 +47,67 @@ pub fn audit_extraction_mode(mode: Option<ExtractionMode>) -> String {
         .unwrap_or_else(|| "not_applicable".to_string())
 }
 
-/// 抽出結果（signal 集合 + どの経路で得られたか）。
+/// 抽出結果（signal 集合 + どの経路で得られたか + 製品参照）。
 #[derive(Debug, Clone)]
 pub struct ExtractionResult {
     pub signals: SignalSet,
     pub mode: ExtractionMode,
+    /// 今ターンでLLMが抽出した製品参照（Issue #28 §3.1 二段目）。`catalog` を渡さない呼び出し
+    /// （`extract(_, None)`）や lexicon 単独経路では常に空。
+    pub product_references: Vec<super::product_gate::ProductReference>,
 }
 
 /// Harness が保持する抽出口の trait 境界。`evaluate` / `root_cause_probe` はこれ経由で
 /// signal を得る（lexicon 単体の `SignalNormalizer` は admission 検証用に別途残す）。
+///
+/// `catalog` は Issue #28 §3.1 二段目用の取扱製品一覧（`ProductAllowlist::display_list()`）。
+/// `evaluate()` は `Some` を渡し、それ以外（プレビュー系 tool・`root_cause_probe`）は `None` を
+/// 渡す（追加の LLM 呼び出しは作らない前提のため、catalog 注入は evaluate の同乗呼び出しのみ）。
 #[async_trait::async_trait]
 pub trait AsyncSignalExtractor: Send + Sync {
-    async fn extract(&self, question: &str) -> ExtractionResult;
+    async fn extract(&self, question: &str, catalog: Option<&str>) -> ExtractionResult;
 }
 
 /// LLM 分類の抽象境界。`AnthropicClient::classify_signals` はテストで直接叩けない
 /// （実 API 呼び出し）ため、この trait でモック注入できるようにする。
 #[async_trait::async_trait]
 pub trait ClassifyLlm: Send + Sync {
-    async fn classify(&self, question: &str) -> anyhow::Result<Vec<String>>;
+    async fn classify(
+        &self,
+        question: &str,
+        catalog: Option<&str>,
+    ) -> anyhow::Result<crate::llm::ClassificationOutput>;
 }
 
 /// `AnthropicClient` を `ClassifyLlm` として使うためのアダプタ。
-/// system prompt（injection 対策文言 + signal 語彙）は構築時に 1 度だけ組み立て、
-/// 以後の呼び出しで使い回す（毎ターン `build_system_prompt` を再実行しない）。
+///
+/// system prompt は `vocabulary_prompt`（生の語彙プロンプト、構築時に 1 度だけ保持）から
+/// **毎ターン** `crate::llm::build_system_prompt` で組み立て直す。catalog（取扱一覧）は
+/// リクエストごとに変わりうる（Issue #28 §3.1 二段目）ため、system_prompt をキャッシュせず
+/// 呼び出しのたびに再構築する必要がある。
 pub struct AnthropicSignalClassifier {
     client: AnthropicClient,
-    system_prompt: String,
+    vocabulary_prompt: String,
 }
 
 impl AnthropicSignalClassifier {
     pub fn new(client: AnthropicClient, vocabulary_prompt: String) -> Self {
         Self {
             client,
-            system_prompt: crate::llm::build_system_prompt(&vocabulary_prompt),
+            vocabulary_prompt,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl ClassifyLlm for AnthropicSignalClassifier {
-    async fn classify(&self, question: &str) -> anyhow::Result<Vec<String>> {
-        self.client
-            .classify_signals(question, &self.system_prompt)
-            .await
+    async fn classify(
+        &self,
+        question: &str,
+        catalog: Option<&str>,
+    ) -> anyhow::Result<crate::llm::ClassificationOutput> {
+        let system_prompt = crate::llm::build_system_prompt(&self.vocabulary_prompt, catalog);
+        self.client.classify_signals(question, &system_prompt).await
     }
 }
 
@@ -116,19 +133,21 @@ impl HybridExtractor {
 
 #[async_trait::async_trait]
 impl AsyncSignalExtractor for HybridExtractor {
-    async fn extract(&self, question: &str) -> ExtractionResult {
+    async fn extract(&self, question: &str, catalog: Option<&str>) -> ExtractionResult {
         let lexicon_signals = self.lexicon.normalize(question);
         let Some(llm) = &self.llm else {
             return ExtractionResult {
                 signals: lexicon_signals,
                 mode: ExtractionMode::LexiconOnly,
+                product_references: Vec::new(),
             };
         };
-        match llm.classify(question).await {
-            Ok(raw_names) => {
+        match llm.classify(question, catalog).await {
+            Ok(output) => {
                 // 語彙内の signal だけ採用してから lexicon 分と和集合する
                 // （mod.rs の累積 signal 集合と同じ union/collect の作法に揃える）。
-                let llm_signals: SignalSet = raw_names
+                let llm_signals: SignalSet = output
+                    .signals
                     .into_iter()
                     .filter(|name| {
                         let known = self.lexicon.contains_signal(name);
@@ -145,6 +164,10 @@ impl AsyncSignalExtractor for HybridExtractor {
                 ExtractionResult {
                     signals: lexicon_signals.union(&llm_signals).cloned().collect(),
                     mode: ExtractionMode::Hybrid,
+                    // product_references は signals のような語彙フィルタが不要（そもそも
+                    // lexicon には無い概念）。妥当性検証（foreign の幻覚ガード等）は
+                    // 呼び出し側（product_gate::confirmed_foreign_reference）の役割。
+                    product_references: output.product_references,
                 }
             }
             Err(err) => {
@@ -155,6 +178,7 @@ impl AsyncSignalExtractor for HybridExtractor {
                 ExtractionResult {
                     signals: lexicon_signals,
                     mode: ExtractionMode::LexiconFallback,
+                    product_references: Vec::new(),
                 }
             }
         }
@@ -182,26 +206,56 @@ mod tests {
 
     struct MockLlm {
         result: Result<Vec<String>, String>,
+        product_references: Vec<super::super::product_gate::ProductReference>,
+        /// `classify` に渡された catalog をそのまま記録する（Issue #28 §3.1 二段目:
+        /// catalog 伝播テスト用）。
+        catalog_log: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     impl MockLlm {
-        fn ok(signals: Vec<&str>) -> Arc<dyn ClassifyLlm> {
+        /// 呼び出し内容の検査（`catalog_log` 等）が必要なテスト用に、trait object へ
+        /// 型消去する前の `Arc<MockLlm>` を返す。
+        fn new(
+            result: Result<Vec<String>, String>,
+            product_references: Vec<super::super::product_gate::ProductReference>,
+        ) -> Arc<Self> {
             Arc::new(Self {
-                result: Ok(signals.into_iter().map(str::to_string).collect()),
+                result,
+                product_references,
+                catalog_log: std::sync::Mutex::new(Vec::new()),
             })
         }
 
+        fn ok(signals: Vec<&str>) -> Arc<dyn ClassifyLlm> {
+            Self::new(
+                Ok(signals.into_iter().map(str::to_string).collect()),
+                Vec::new(),
+            )
+        }
+
         fn err() -> Arc<dyn ClassifyLlm> {
-            Arc::new(Self {
-                result: Err("llm unavailable".to_string()),
-            })
+            Self::new(Err("llm unavailable".to_string()), Vec::new())
         }
     }
 
     #[async_trait::async_trait]
     impl ClassifyLlm for MockLlm {
-        async fn classify(&self, _question: &str) -> anyhow::Result<Vec<String>> {
-            self.result.clone().map_err(|msg| anyhow::anyhow!(msg))
+        async fn classify(
+            &self,
+            _question: &str,
+            catalog: Option<&str>,
+        ) -> anyhow::Result<crate::llm::ClassificationOutput> {
+            self.catalog_log
+                .lock()
+                .expect("catalog_log mutex poisoned")
+                .push(catalog.map(str::to_string));
+            self.result
+                .clone()
+                .map(|signals| crate::llm::ClassificationOutput {
+                    signals,
+                    product_references: self.product_references.clone(),
+                })
+                .map_err(|msg| anyhow::anyhow!(msg))
         }
     }
 
@@ -211,7 +265,7 @@ mod tests {
             lexicon(),
             Some(MockLlm::ok(vec!["discoloration", "evil_signal"])),
         );
-        let r = ex.extract("カビが生えた").await;
+        let r = ex.extract("カビが生えた", None).await;
         assert!(r.signals.iter().any(|s| s.as_str() == "mold")); // lexicon 床は不変
         assert!(r.signals.iter().any(|s| s.as_str() == "discoloration")); // LLM 追加分（語彙内）
         assert!(r.signals.iter().all(|s| s.as_str() != "evil_signal")); // 語彙外破棄
@@ -221,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn llm_failure_falls_back_to_lexicon() {
         let ex = HybridExtractor::new(lexicon(), Some(MockLlm::err()));
-        let r = ex.extract("カビが生えた").await;
+        let r = ex.extract("カビが生えた", None).await;
         assert!(r.signals.iter().any(|s| s.as_str() == "mold"));
         assert!(matches!(r.mode, ExtractionMode::LexiconFallback));
     }
@@ -229,9 +283,57 @@ mod tests {
     #[tokio::test]
     async fn no_llm_configured_is_lexicon_only() {
         let ex = HybridExtractor::new(lexicon(), None);
-        let r = ex.extract("カビが生えた").await;
+        let r = ex.extract("カビが生えた", None).await;
         assert!(r.signals.iter().any(|s| s.as_str() == "mold"));
         assert!(matches!(r.mode, ExtractionMode::LexiconOnly));
+    }
+
+    // ---- Issue #28 §3.1 二段目: product_references の伝播 / catalog 引数の透過 ----
+
+    #[tokio::test]
+    async fn hybrid_extraction_propagates_product_references_from_the_llm() {
+        let product_references = vec![super::super::product_gate::ProductReference {
+            surface: "ADC-VDB101".to_string(),
+            resolution: super::super::product_gate::ProductReferenceResolution::Foreign,
+            matched_model: None,
+        }];
+        let mock = MockLlm::new(Ok(Vec::new()), product_references.clone());
+        let ex = HybridExtractor::new(lexicon(), Some(mock as Arc<dyn ClassifyLlm>));
+        let r = ex
+            .extract("ADC-VDB101について教えてください", Some("ADC-V724"))
+            .await;
+        assert_eq!(r.product_references, product_references);
+        assert!(matches!(r.mode, ExtractionMode::Hybrid));
+    }
+
+    #[tokio::test]
+    async fn llm_failure_results_in_empty_product_references() {
+        let ex = HybridExtractor::new(lexicon(), Some(MockLlm::err()));
+        let r = ex.extract("カビが生えた", Some("ADC-V724")).await;
+        assert!(r.product_references.is_empty());
+        assert!(matches!(r.mode, ExtractionMode::LexiconFallback));
+    }
+
+    #[tokio::test]
+    async fn no_llm_configured_results_in_empty_product_references() {
+        let ex = HybridExtractor::new(lexicon(), None);
+        let r = ex.extract("カビが生えた", Some("ADC-V724")).await;
+        assert!(r.product_references.is_empty());
+    }
+
+    #[tokio::test]
+    async fn extract_propagates_the_catalog_argument_to_classify() {
+        let mock = MockLlm::new(Ok(Vec::new()), Vec::new());
+        let catalog_log_handle = mock.clone();
+        let ex = HybridExtractor::new(lexicon(), Some(mock as Arc<dyn ClassifyLlm>));
+        ex.extract("カビが生えた", Some("ADC-V523、ADC-V724")).await;
+        assert_eq!(
+            *catalog_log_handle
+                .catalog_log
+                .lock()
+                .expect("catalog_log mutex poisoned"),
+            vec![Some("ADC-V523、ADC-V724".to_string())]
+        );
     }
 
     #[test]
