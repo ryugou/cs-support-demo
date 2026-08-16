@@ -15,3 +15,9 @@ server/certs
 server/data/audit/
 docs
 .superpowers
+# admin-ui はビルド成果物（dist）のみをイメージへ同梱する（Dockerfile の admin-ui-builder
+# ステージで `npm ci` + `npm run build` を実行する）。node_modules・dist・.angular の
+# ローカル生成物はビルドコンテキスト転送の無駄・イメージ汚染を避けるため除外する。
+admin-ui/node_modules
+admin-ui/dist
+admin-ui/.angular

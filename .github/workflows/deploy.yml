@@ -36,6 +36,13 @@ env:
   GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
   RUN_REGION: ${{ vars.RUN_REGION }}
   GAR_IMAGE: ${{ vars.GAR_IMAGE }}
+  # 管理画面（/admin）が GIS（Google Identity Services）のログインに使う OAuth client_id。
+  # 公開識別子なので secrets ではなく vars で扱う（cs-support-mcp service の
+  # CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID env と同一の値。CLAUDE.md 参照）。
+  # 未設定のままだと Dockerfile 側の admin-ui-builder ステージが fail closed で
+  # ビルドを止める（誤った client_id を焼き込んだ「ログイン不能な /admin」を
+  # 気づかず出荷しないため）。
+  CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID }}
   # CI が同一イメージ tag へ更新する対象。ここが唯一の正本で、CLAUDE.md の記述は
   # この 2 行に追従させる。リソースを増やしたらここに足す。
   RUN_SERVICES: "cs-support-mcp cs-support-line"
@@ -98,6 +105,10 @@ jobs:
           tags: |
             ${{ steps.image.outputs.tag }}
             ${{ env.GAR_IMAGE }}:latest
+          # CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID を渡さないと Dockerfile の
+          # admin-ui-builder ステージが fail closed でビルドを落とす（上記 env 参照）。
+          build-args: |
+            CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID=${{ env.CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
