@@ -139,6 +139,24 @@ pub fn extract_model_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// [`ProductAllowlist::matches_in_scope_model`] の条件 2（surface 全体の allowlist 型番への
+/// サフィックス一致）が対象にする断片の最小文字数（Issue #28 codex レビュー Warning 是正、
+/// 修正2）。
+///
+/// 1〜2文字の断片は allowlist 型番の末尾数文字と偶然一致しやすく、真の foreign 参照を誤って
+/// veto してしまうため 3 文字未満は対象外とする。例えば取扱 7 型番の実在する 2 文字末尾
+/// （`"23"`（ADC-V523）・`"24"`（ADC-V724）・`"7P"`（ADC-VC727P / ADC-VC827P）等）は、
+/// `ends_with` 実装下では `MIN_FRAGMENT_VETO_CHARS` が無ければそのまま偶然一致して veto される
+/// （回帰テスト `confirmed_foreign_reference_still_fires_when_surface_is_a_two_char_fragment_matching_an_in_scope_suffix`
+/// が、この定数を下げると red になることを固定している）。
+///
+/// **この定数は空文字ガードも兼ねている**（`"...".ends_with("")` は常に true になるため、
+/// `MIN_FRAGMENT_VETO_CHARS` が 0 まで下がると空文字 surface が無条件で veto される）。ただし
+/// Issue #28 W-1 是正でこの定数に依存しない明示的な空文字ガードを
+/// [`ProductAllowlist::matches_in_scope_model`] 内に別途置いたため、この定数を変更しても
+/// 空文字の扱いは変わらない（多層防御）。
+const MIN_FRAGMENT_VETO_CHARS: usize = 3;
+
 /// 取扱製品の allowlist（1 schema 分のスナップショット）。
 ///
 /// 正規化済み型番の集合（大文字比較用）と、顧客向け表示文字列（ソート済みで「、」連結）の
@@ -227,43 +245,89 @@ impl ProductAllowlist {
     /// `confirmed_foreign_reference` が LLM の `foreign` 分類を採用する前の veto に使う:
     /// LLM が製品マスタと矛盾する分類（取扱内製品を `foreign` と誤答）を返しても、決定論の
     /// 製品マスタ（allowlist）の方を正とし、誤答を採用しない。`normalized` が private のため
-    /// このモジュール内（`ProductAllowlist` の impl）に置く。
+    /// このモジュール内（`ProductAllowlist` の impl）に置く。呼び出し側は `surface` にも
+    /// `matched_model` にも同じこのメソッドを使う（Issue #28 W1-a 修正1で対称化した）。
     ///
     /// 3 つの判定を or で combine する:
     /// 1. `surface` から `extract_model_tokens` で型番トークンを抽出した結果に、allowlist 内の
     ///    型番が 1 つでも含まれる（surface が「ADC-V724について」のような文でも拾える）。
     /// 2. `surface` 全体を `normalize_model_token` で正規化した文字列が、allowlist 内の
-    ///    いずれかの型番の**部分文字列**である（surface が型番の断片や略記、例えば
-    ///    `"V724"` のような場合でも、それが取扱内型番 `"ADC-V724"` の一部でしかないケースを
-    ///    捕まえて veto する）。空文字は常に false（空文字はすべての文字列の部分文字列に
-    ///    なってしまい、無条件で veto が成立してしまうため明示的に除外する）。
+    ///    いずれかの型番の**サフィックス**である（surface が型番の断片や略記、例えば
+    ///    `"V724"` のような場合でも、それが取扱内型番 `"ADC-V724"` の末尾でしかないケースを
+    ///    捕まえて veto する）。[`MIN_FRAGMENT_VETO_CHARS`] 文字未満の断片は対象外（下記
+    ///    doc comment 参照）。
     /// 3. `surface` から `extract_bare_fragments` で "ADC-" 接頭辞の無い型番断片
     ///    （例: `"V724"`）を抽出し、allowlist 内のいずれかの型番がその断片を
     ///    `"-{fragment}"` サフィックスとして持つ（Issue #28 W1-b）。条件 2 は
-    ///    「surface 全体」を 1 つの文字列として部分文字列判定するため、`"V724ドアベル"` の
+    ///    「surface 全体」を 1 つの文字列としてサフィックス判定するため、`"V724ドアベル"` の
     ///    ように型番断片の後に文字が続く surface では一致しない（正規化後の文字列が
-    ///    allowlist のどの型番より長くなり、部分文字列関係が成立しない）。この条件はそれを
-    ///    捕まえる。
+    ///    allowlist のどの型番よりも長くなり、サフィックス関係が成立しない）。この条件は
+    ///    それを捕まえる。
+    ///
+    /// # veto は Accepted Risk であり「安全側」ではない（W-3 是正で書き直し）
+    ///
+    /// 条件 2・3 はどちらも偶然の部分一致で誤って veto しうる（例: 3 文字ちょうどの断片
+    /// `"724"` は無関係な他社製品の型番の一部であっても `"ADC-V724"` とサフィックス一致して
+    /// veto される）。これは §3.1 質問側ゲートの **false negative**（本来 foreign と扱うべき
+    /// 参照を見逃す）である。
+    ///
+    /// 以前の版は「§3.2 材料選別・§3.5 応答側ゲートが別途防ぐので安全性の逆方向の失敗は
+    /// 起きない」と断言していたが、これは成立しない。§3.2 (`out_of_scope_material_exclusion`) も
+    /// §3.5 (`api.rs` の `gate_generated_text` / `gate_customer_reply_draft`) も、どちらも
+    /// [`extract_model_tokens`]（正規表現 `(?i)ADC-[A-Z0-9][A-Z0-9-]*`）に依存しており、
+    /// **`ADC-` 接頭辞付きの型番の文字列出現**しか検出できない。したがって次のいずれかに
+    /// 該当すると、§3.2 / §3.5 はこの veto の見逃しを回収できない:
+    /// - 顧客の質問が型番ではなく非型番の名称（例:「Ring のドアベル」）で取扱外製品を指して
+    ///   おり、検索材料・生成文のどちらにも `ADC-` 型番の文字列が現れない
+    /// - 生成された応答文が質問中の型番をそのまま再掲しない（§3.5 は「生成文に取扱外型番を
+    ///   書かない」ための防衛線であり、「取扱外の質問に答えない」ことは保証しない）
+    ///
+    /// この場合、決定論のゲート（§3.1 / §3.2 / §3.5）では完全には回復できず、残る防衛線は
+    /// §3.3 / §3.4 のプロンプト注入（LLM が聞き返し・下書きの内容を自制することに期待する、
+    /// 非決定論の防衛線）だけになる。したがって条件 2・3 の偶然一致は「安全側だから問題ない」
+    /// のではなく、**受容した残余リスク（Accepted Risk）**として扱う。
+    ///
+    /// # 既知の限界: 末尾を欠いた断片は veto されない（W-4 是正で追記）
+    ///
+    /// 逆方向（取扱内顧客を誤って断ってしまう側）の既知の限界もある。接頭辞側を残して末尾を
+    /// 欠いた断片（例: 取扱内 `ADC-VC729P` の末尾 `P` を落とした `"VC729"`）は、条件 2
+    /// （surface 全体が allowlist 型番の**サフィックス**か）にも条件 3（"ADC-" 無し断片の
+    /// `"-{fragment}"` サフィックス一致）にも一致しない（`"VC729"` は `"ADC-VC729P"` の
+    /// サフィックスではなくプレフィックス寄りの部分文字列であるため）。この場合 veto されず
+    /// `confirmed_foreign_reference` が発火し、取扱内製品を持つ顧客を誤って「取扱外」と断って
+    /// しまう。`ADC-VC727P` / `ADC-VC827P` も同様に末尾 `P` を落とすと同じ限界に当たる。
+    /// spec §3.1 (d) の「サフィックス一致で照合する」規則に忠実な結果であり、照合規則を
+    /// 広げるには spec 側の更新と `VC727` / `VC827` との衝突分析が必要なため、現状は受容する
+    /// （characterization test
+    /// `confirmed_foreign_reference_still_fires_for_a_prefix_only_fragment_of_an_in_scope_model`
+    /// で固定）。
     pub(crate) fn matches_in_scope_model(&self, surface: &str) -> bool {
-        if extract_model_tokens(surface)
+        let trimmed = surface.trim();
+        if trimmed.is_empty() {
+            // 空文字は allowlist の全型番の suffix になってしまう（`"...".ends_with("")` は
+            // 常に true）ため明示的に拒否する。MIN_FRAGMENT_VETO_CHARS の暗黙の副作用にだけ
+            // 頼らない（Issue #28 W-1 是正: この定数が将来引き下げられても、この不変条件は
+            // ここで独立に守られる）。
+            return false;
+        }
+        if extract_model_tokens(trimmed)
             .iter()
             .any(|token| self.is_in_scope(token))
         {
             return true;
         }
-        let normalized_surface = normalize_model_token(surface.trim());
-        if !normalized_surface.is_empty()
+        let normalized_surface = normalize_model_token(trimmed);
+        if normalized_surface.chars().count() >= MIN_FRAGMENT_VETO_CHARS
             && self
                 .normalized
                 .iter()
-                .any(|model| model.contains(&normalized_surface))
+                .any(|model| model.ends_with(&normalized_surface))
         {
             return true;
         }
-        extract_bare_fragments(surface).iter().any(|fragment| {
-            self.normalized
-                .iter()
-                .any(|model| model.ends_with(&format!("-{fragment}")))
+        extract_bare_fragments(trimmed).iter().any(|fragment| {
+            let suffix = format!("-{fragment}");
+            self.normalized.iter().any(|model| model.ends_with(&suffix))
         })
     }
 
@@ -365,33 +429,46 @@ pub(crate) const MAX_REFLECTABLE_SURFACE_CHARS: usize = 64;
 /// クライアント側の長さ制限（例: LINE アダプタの 4,900 文字切り詰め）で失われ、顧客の入力が
 /// そのまま返るだけの応答になりうる。
 ///
-/// `char::is_control`（Unicode Cc）に加え、Cf（書式制御）・Zl（LINE SEPARATOR）・
-/// Zp（PARAGRAPH SEPARATOR）・主要なゼロ幅文字を拒否する（Issue #28 W2 是正）。
+/// 拒否は Unicode 一般カテゴリ Cc（制御文字）・Cf（書式制御）・Zl（LINE SEPARATOR）・
+/// Zp（PARAGRAPH SEPARATOR）をまとめた正規表現クラス [`reflection_unsafe_char_regex`] で行う
+/// （Issue #28 codex レビュー是正: 列挙方式から Unicode 一般カテゴリの網羅方式へ変更。`regex`
+/// crate は既存依存のため新規 crate 追加は不要）。
+///
+/// U+00AD SOFT HYPHEN・U+180E MONGOLIAN VOWEL SEPARATOR は、旧列挙リストが拒否していた文字の
+/// うち `regex` crate 同梱の Unicode テーブルで `\p{Cf}` にマッチするため、この正規表現クラス
+/// でカバーされる（reviewer 実測で確認済み）。
+///
+/// ただし旧列挙リストの `'\u{2060}'..='\u{2069}'` 範囲に含まれていた **U+2065 は例外**で、
+/// Unicode 一般カテゴリが Cn（未割り当て）のため `\p{Cf}` にマッチせず、このクラスだけでは
+/// 拾えない。U+2065 は Default_Ignorable_Code_Point（将来の書式制御文字用に予約された不可視
+/// 領域）であり、準拠レンダラでは不可視になる。設計 spec
+/// （`docs/superpowers/specs/2026-08-14-product-scope-design.md`）が規定する反射安全性のクラス
+/// は「Cc / Cf / Zl / Zp・ゼロ幅を含む」であり、U+2065 の明示はその明文からは外れるが、旧実装
+/// との後方互換のために [`reflection_unsafe_char_regex`] のパターンへ直接追加して保持している。
+/// これ以外に旧列挙リストからの退行は無いことを reviewer が U+0000〜U+10FFFF 全スカラ値の
+/// スイープで確認済み。
 fn is_safe_to_reflect(surface: &str) -> bool {
     let char_count = surface.chars().count();
-    char_count <= MAX_REFLECTABLE_SURFACE_CHARS && !surface.chars().any(is_reflection_unsafe_char)
+    char_count <= MAX_REFLECTABLE_SURFACE_CHARS && !reflection_unsafe_char_regex().is_match(surface)
 }
 
-/// `char::is_control`（Unicode Cc）に加え、Cf（書式制御）・Zl（LINE SEPARATOR）・
-/// Zp（PARAGRAPH SEPARATOR）・主要なゼロ幅文字を拒否する（Issue #28 W2 是正）。
-/// 新規 crate 依存を避けるため、Unicode 全カテゴリ表ではなく該当する既知のコードポイント
-/// 範囲を明示的に列挙する。
-fn is_reflection_unsafe_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{2028}' // Zl LINE SEPARATOR
-            | '\u{2029}' // Zp PARAGRAPH SEPARATOR
-            | '\u{200B}'..='\u{200F}' // Cf: zero width space/ZWNJ/ZWJ/LRM/RLM等
-            | '\u{202A}'..='\u{202E}' // Cf: bidi format controls
-            | '\u{2060}'..='\u{2069}' // Cf: word joiner/invisible operators等
-            | '\u{FEFF}' // Cf: BOM / zero width no-break space
-        )
+/// [`is_safe_to_reflect`] が拒否する文字クラス: Unicode 一般カテゴリ Cc（制御文字）・
+/// Cf（書式制御）・Zl（LINE SEPARATOR）・Zp（PARAGRAPH SEPARATOR）に加え、旧列挙方式との
+/// 後方互換のため U+2065（Cn・Default_Ignorable、カテゴリ指定では拾えない）を明示追加している
+/// （Issue #28 codex レビュー是正、reviewer 実測指摘によるフォローアップ）。
+fn reflection_unsafe_char_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{2065}]")
+            .expect("reflection unsafe char regex must compile")
+    })
 }
 
 /// Issue #28 §3.1 二段目のコード判定本体: LLM が `foreign` と分類した参照のうち、
-/// **matched_model の非矛盾**（`matched_model` が allowlist 内の型番を指していない。
-/// resolution=foreign と matched_model=取扱内型番という自己矛盾出力の veto。W1-a 是正）、
+/// **matched_model の非矛盾**（`matched_model` が決定論の allowlist 上で取扱内製品を指して
+/// いない。resolution=foreign と matched_model=取扱内型番という自己矛盾出力の veto。W1-a
+/// 是正。`surface` 側と同じ [`ProductAllowlist::matches_in_scope_model`] を使うため、"ADC-"
+/// 接頭辞を欠く型番断片一致も matched_model 側で捕まる。修正1でこの対称性を導入した）、
 /// **幻覚ガード**（`surface` が正規化後の `message` 中に実在する）、**最小長**
 /// （`surface` が trim 後 2 文字以上）、**反射安全性**（trim 後 64 文字以下・制御文字・
 /// 書式制御/ゼロ幅文字なし。Warning 3 / W2 是正）、**製品マスタとの非矛盾**（`surface` が
@@ -414,13 +491,18 @@ pub fn confirmed_foreign_reference<'a>(
             return false;
         }
         if let Some(matched_model) = r.matched_model.as_deref() {
-            let normalized = normalize_model_token(matched_model.trim());
-            if !normalized.is_empty() && allowlist.is_in_scope(&normalized) {
+            if allowlist.matches_in_scope_model(matched_model.trim()) {
                 // LLM が resolution=foreign としながら matched_model に取扱内型番を入れる
-                // 自己矛盾出力を返した場合の veto（Issue #28 W1-a）。
+                // 自己矛盾出力を返した場合の veto（Issue #28 W1-a）。surface 側の veto と同じ
+                // `matches_in_scope_model` を使うため、"ADC-" 接頭辞を欠く型番断片
+                // （例: "V724"）のサフィックス一致も matched_model 側で捕まる（Issue #28 W1-b
+                // 是正の対称化）。
                 tracing::warn!(
+                    matched_model_chars = matched_model.trim().chars().count(),
+                    surface_chars = r.surface.trim().chars().count(),
                     "llm classified a product reference as foreign but supplied a matched_model \
-                     that is in the product master allowlist (self-contradictory output); vetoing"
+                     that matches an in-scope product master model (self-contradictory output); \
+                     vetoing"
                 );
                 return false;
             }
@@ -888,8 +970,8 @@ mod tests {
     fn confirmed_foreign_reference_matches_across_fullwidth_and_case_differences() {
         // surface "vdb101"（allowlist 外の型番）が message 中の全角 "ＶＤＢ１０１" に一致する
         // （NFKC + 小文字化）。以前は "v724" を使っていたが、Warning 4 是正で
-        // `matches_in_scope_model` が追加され、"v724" は allowlist 内 "ADC-V724" の部分文字列
-        // として veto される（別テスト `..._is_none_when_surface_is_a_substring_of_an_in_scope_model`
+        // `matches_in_scope_model` が追加され、"v724" は allowlist 内 "ADC-V724" のサフィックス
+        // として veto される（別テスト `..._is_none_when_surface_is_a_suffix_of_an_in_scope_model`
         // で固定）ため、全半角/大小文字の一致ロジック自体は allowlist 外の型番で検証する。
         let refs = vec![foreign_ref("vdb101")];
         assert_eq!(
@@ -1018,6 +1100,150 @@ mod tests {
         );
     }
 
+    // ---- confirmed_foreign_reference: 反射安全性の拒否対象への Cf 文字追加（修正3） ----
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_u061c_arabic_letter_mark() {
+        let surface = "ADC-VDB101\u{061C}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_u180e_mongolian_vowel_separator() {
+        let surface = "ADC-VDB101\u{180E}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_u206a_range_start() {
+        let surface = "ADC-VDB101\u{206A}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_u206f_range_end() {
+        let surface = "ADC-VDB101\u{206F}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_ufff9_range_start() {
+        let surface = "ADC-VDB101\u{FFF9}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_ufffb_range_end() {
+        let surface = "ADC-VDB101\u{FFFB}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    // ---- reflection_unsafe_char_regex: 拒否クラスへの追加（Issue #28 codex レビュー Critical/修正3） ----
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_u00ad_soft_hyphen() {
+        // `normalize_hyphens` は U+00AD SOFT HYPHEN（ゼロ幅の書式制御文字、Cf）を除去するが、
+        // `is_safe_to_reflect` は正規化前の生 surface に対して呼ばれるため、その除去には依存
+        // できない。現行実装では U+00AD は `\p{Cf}` に含まれるため、個別の列挙なしにカテゴリ
+        // 判定で拒否される。このテストはその挙動を固定する。
+        let surface = "ADC-VDB101\u{00AD}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_ue0001_tags_block_start() {
+        // U+E0001 LANGUAGE TAG（Cf、Tags ブロックの開始付近）。不可視テキスト埋め込みの定番
+        // ベクタ。現行パターンが拒否するのは Tags ブロック（U+E0000〜U+E007F）のうち割り当て済み
+        // Cf のコードポイント（U+E0001 と U+E0020〜U+E007F）のみで、U+E0000・U+E0002〜U+E001F は
+        // 未割り当て（Cn）のため素通りする（reviewer 実測）。素通り分も Default_Ignorable では
+        // あり不可視だが、現行 spec 規定（Cc/Cf/Zl/Zp）の範囲外の既知の限界として受容している
+        // （塞ぐ判断は今回のスコープ外）。
+        let surface = "ADC-VDB101\u{E0001}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_ue007f_tags_block_end() {
+        // U+E007F CANCEL TAG（Tags ブロックの終端）。
+        let surface = "ADC-VDB101\u{E007F}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_u0600_arabic_number_sign_not_in_old_enum_list(
+    ) {
+        // U+0600 ARABIC NUMBER SIGN（Cf）。旧列挙方式の拒否リストには含まれていなかった文字で、
+        // 正規表現クラス方式（Issue #28 codex レビュー是正）が Unicode 一般カテゴリ Cf を網羅的に
+        // 拒否することを確認する回帰テスト。
+        let surface = "ADC-VDB101\u{0600}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_contains_u2065_unassigned_default_ignorable(
+    ) {
+        // U+2065 は Cn（未割り当て）だが Default_Ignorable であり、カテゴリ指定では拾えないため
+        // 正規表現に明示追加している。この明示を外すとこのテストが red になる
+        // （reviewer 実測指摘: 旧列挙方式の '\u{2060}'..='\u{2069}' 範囲からの退行是正）。
+        let surface = "ADC-VDB101\u{2065}X";
+        let message = format!("{surface}について教えてください");
+        let refs = vec![foreign_ref(surface)];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, &message, &fixture_allowlist()),
+            None
+        );
+    }
+
     // ---- confirmed_foreign_reference: 製品マスタとの非矛盾（Issue #28 codex Stage2 Warning 4）----
 
     #[test]
@@ -1042,13 +1268,30 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_foreign_reference_is_none_when_surface_is_a_substring_of_an_in_scope_model() {
-        // "V724" は allowlist 内 "ADC-V724" の部分文字列にすぎない（型番プレフィックス
-        // "ADC-" を欠いた略記）。誤って取扱外と断らないよう veto する。
+    fn confirmed_foreign_reference_is_none_when_surface_is_a_suffix_of_an_in_scope_model() {
+        // "V724" は allowlist 内 "ADC-V724" の末尾（"ADC-" 接頭辞を省いたサフィックス）に
+        // すぎない。誤って取扱外と断らないよう veto する（S-1 是正: `ends_with` 実装での
+        // 実際の一致関係に合わせて名前・コメントを訂正。中間部分文字列の一致ではない）。
         let refs = vec![foreign_ref("V724")];
         assert_eq!(
             confirmed_foreign_reference(&refs, "V724の調子が悪いです", &fixture_allowlist()),
             None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_still_fires_for_a_prefix_only_fragment_of_an_in_scope_model() {
+        // W-4 是正: characterization test（既知の限界の固定）。"VC729" は取扱内
+        // "ADC-VC729P" の末尾 "P" を欠いた断片で、条件2（surface 全体が allowlist 型番の
+        // サフィックスか）にも条件3（"ADC-" 無し断片の "-{fragment}" サフィックス一致）にも
+        // 一致しない（"VC729" は "ADC-VC729P" のサフィックスではない）。これは望ましい挙動
+        // ではなく、取扱内顧客を誤って「取扱外」と断ってしまう方向の既知の限界を固定する
+        // （spec §3.1 (d) のサフィックス一致規則に忠実であるため現状は受容する。
+        // `ADC-VC727P` / `ADC-VC827P` も末尾 "P" を落とすと同じ限界に当たる）。
+        let refs = vec![foreign_ref("VC729")];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, "VC729について教えてください", &fixture_allowlist()),
+            Some(&refs[0])
         );
     }
 
@@ -1100,6 +1343,81 @@ mod tests {
                 &fixture_allowlist()
             ),
             None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_matched_model_is_a_bare_fragment_without_the_adc_prefix(
+    ) {
+        // matched_model が "ADC-" 接頭辞を欠く断片（"V724"）でも、allowlist の "ADC-V724" と
+        // サフィックス一致するため veto される（修正1: surface と同じ matches_in_scope_model を
+        // matched_model にも適用）。
+        let refs = vec![ProductReference {
+            surface: "Ringのドアベル".to_string(),
+            resolution: ProductReferenceResolution::Foreign,
+            matched_model: Some("V724".to_string()),
+        }];
+        assert_eq!(
+            confirmed_foreign_reference(
+                &refs,
+                "Ringのドアベルについて教えてください",
+                &fixture_allowlist()
+            ),
+            None
+        );
+    }
+
+    // ---- matches_in_scope_model / confirmed_foreign_reference: 空文字ガード（Issue #28 W-1 是正） ----
+    //
+    // `"...".ends_with("")` は常に true になるため、空文字 surface / matched_model は無条件で
+    // veto されてしまいうる。`llm.rs::parse_one_product_reference` 側で `matched_model` の
+    // 空文字/空白は `None` へ落とすようにしたが（多層防御の1層目）、ここでは
+    // `ProductAllowlist::matches_in_scope_model` 自身が持つ明示的なガード（2層目）を、
+    // llm.rs の parse 層を経由しない直接構築の `ProductReference` で独立に固定する。
+
+    #[test]
+    fn matches_in_scope_model_is_false_for_an_empty_string() {
+        assert!(!fixture_allowlist().matches_in_scope_model(""));
+    }
+
+    #[test]
+    fn matches_in_scope_model_is_false_for_a_whitespace_only_string() {
+        assert!(!fixture_allowlist().matches_in_scope_model("   "));
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_still_fires_when_matched_model_is_an_empty_string() {
+        // llm.rs の trim-and-filter をバイパスして直接構築している点に注意（そちら側の
+        // 検証は llm.rs::tests::parse_treats_a_blank_matched_model_as_none が別途固定する）。
+        let refs = vec![ProductReference {
+            surface: "Ringのドアベル".to_string(),
+            resolution: ProductReferenceResolution::Foreign,
+            matched_model: Some(String::new()),
+        }];
+        assert_eq!(
+            confirmed_foreign_reference(
+                &refs,
+                "Ringのドアベルについて教えてください",
+                &fixture_allowlist()
+            ),
+            Some(&refs[0])
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_still_fires_when_matched_model_is_whitespace_only() {
+        let refs = vec![ProductReference {
+            surface: "Ringのドアベル".to_string(),
+            resolution: ProductReferenceResolution::Foreign,
+            matched_model: Some("   ".to_string()),
+        }];
+        assert_eq!(
+            confirmed_foreign_reference(
+                &refs,
+                "Ringのドアベルについて教えてください",
+                &fixture_allowlist()
+            ),
+            Some(&refs[0])
         );
     }
 
@@ -1201,6 +1519,61 @@ mod tests {
     #[test]
     fn matches_in_scope_model_true_for_a_bare_fragment_without_the_adc_prefix() {
         assert!(fixture_allowlist().matches_in_scope_model("V724"));
+    }
+
+    // ---- matches_in_scope_model: 断片照合の厳格化（contains → suffix, 3文字未満は不発） ----
+
+    #[test]
+    fn confirmed_foreign_reference_is_none_when_surface_is_a_three_char_fragment_matching_an_in_scope_suffix(
+    ) {
+        // "724" は3文字ちょうどでMIN_FRAGMENT_VETO_CHARSを満たし、"ADC-V724" とサフィックス一致
+        // するため veto される（偶然一致の受容: doc comment 参照）。
+        let refs = vec![foreign_ref("724")];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, "724について教えてください", &fixture_allowlist()),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_still_fires_for_a_non_suffix_two_char_fragment_v7() {
+        // "V7" は "ADC-V724" のどの型番の末尾2文字でもない（実在する2文字末尾は "23"/"3X"/
+        // "24"/"4X"/"9P"/"7P"）。`ends_with` 実装では最初からサフィックス不一致のため veto
+        // されない。旧 `contains` 実装では "ADC-V724" の中間 "V7" に偶然一致して誤 veto して
+        // いたが、`ends_with` への厳格化で是正され、真の foreign 参照として発火する
+        // （W-2 是正: MIN_FRAGMENT_VETO_CHARS 未満という理由付けは誤りだったため訂正）。
+        let refs = vec![foreign_ref("V7")];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, "V7について教えてください", &fixture_allowlist()),
+            Some(&refs[0])
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_still_fires_for_a_non_suffix_two_char_fragment_ad() {
+        // "AD" も同様にどの型番の末尾でもない。旧 `contains` 実装では "ADC-V724" の先頭 "AD" に
+        // 偶然一致していたが、`ends_with` では先頭一致は無関係になるため veto されない
+        // （W-2 是正: コメント訂正）。
+        let refs = vec![foreign_ref("AD")];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, "ADについて教えてください", &fixture_allowlist()),
+            Some(&refs[0])
+        );
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_still_fires_when_surface_is_a_two_char_fragment_matching_an_in_scope_suffix(
+    ) {
+        // MIN_FRAGMENT_VETO_CHARS そのものを検証する回帰（W-2 是正）。"24" は実在する
+        // "ADC-V724" の末尾2文字（真のサフィックス）だが、2文字は MIN_FRAGMENT_VETO_CHARS(3)
+        // 未満のため対象外となり veto されず発火する。この定数を 2 以下へ下げると
+        // "ADC-V724".ends_with("24") が条件2で拾われて veto され、このテストは red になる
+        // （実装を一時的に MIN_FRAGMENT_VETO_CHARS = 2 へ書き換えて red を確認済み。復元済み）。
+        let refs = vec![foreign_ref("24")];
+        assert_eq!(
+            confirmed_foreign_reference(&refs, "24について教えてください", &fixture_allowlist()),
+            Some(&refs[0])
+        );
     }
 
     #[test]
@@ -1607,5 +1980,55 @@ mod tests {
         let allowlist = ProductAllowlist::from_nodes(vec![product_node("ADC-V724")]);
         validate_allowlist_not_empty(&allowlist, "urtect")
             .expect("an allowlist with at least one usable model must pass validation");
+    }
+
+    // ---- reflection_unsafe_char_regex / is_safe_to_reflect: 直接テスト（Issue #28 codex
+    // レビュー2巡目 Suggestion 採用）。上の "reflection_unsafe_char_regex: 拒否クラスへの追加"
+    // セクションは `confirmed_foreign_reference` 越しの間接テストで、しかも危険文字を含む
+    // surface が拒否される異常系のみを固定していた。ここでは正規表現本体と
+    // `is_safe_to_reflect` を直接呼び、(a) 通常 surface が安全と判定される正常系、
+    // (b) パターンを構成するリテラル文字自体は拒否されないこと、(c) 拒否対象の各カテゴリの
+    // 代表がマッチすること、(d) 長さ境界を固定する。もしパターンからバックスラッシュが
+    // 欠落して Unicode property escape ではなくただの文字集合に退化しても、(a)/(b) がこの
+    // セクションの中で直接 red になる。
+
+    #[test]
+    fn is_safe_to_reflect_accepts_ordinary_surfaces() {
+        // これはパターンが Unicode property escape として解釈されていることの直接的な検証で
+        // ある。もしバックスラッシュが落ちてただの文字集合（`[pCcpCfpZlpZpu2065]` 相当）に
+        // なると、'C' や 'p' や '{' を含む通常の surface が誤って危険文字扱いされ、この
+        // テストが red になる。
+        assert!(is_safe_to_reflect("ADC-VDB101X"));
+        assert!(is_safe_to_reflect("ADC-V724"));
+        assert!(is_safe_to_reflect("Ringのドアベル"));
+        assert!(is_safe_to_reflect("ＡＤＣ－Ｖ７２４"));
+    }
+
+    #[test]
+    fn reflection_unsafe_char_regex_does_not_match_the_literal_characters_of_its_own_pattern() {
+        // パターンを構成する文字（p, {, }, C, c, f, Z, l, u, 数字）自体はリテラルとしては
+        // 拒否対象ではない。バックスラッシュ欠落による退化（Unicode property escape → ただの
+        // 文字集合）を直接検出する回帰テストである。
+        assert!(!reflection_unsafe_char_regex().is_match("p{Cc}p{Cf}p{Zl}p{Zp}u{2065}"));
+    }
+
+    #[test]
+    fn reflection_unsafe_char_regex_matches_each_rejected_category() {
+        assert!(reflection_unsafe_char_regex().is_match("\u{0009}")); // Cc（TAB）
+        assert!(reflection_unsafe_char_regex().is_match("\u{00AD}")); // Cf（SOFT HYPHEN）
+        assert!(reflection_unsafe_char_regex().is_match("\u{0600}")); // Cf（ARABIC NUMBER SIGN）
+        assert!(reflection_unsafe_char_regex().is_match("\u{2028}")); // Zl（LINE SEPARATOR）
+        assert!(reflection_unsafe_char_regex().is_match("\u{2029}")); // Zp（PARAGRAPH SEPARATOR）
+        assert!(reflection_unsafe_char_regex().is_match("\u{2065}")); // Cn だが明示追加（Default_Ignorable）
+    }
+
+    #[test]
+    fn is_safe_to_reflect_rejects_surfaces_longer_than_the_reflectable_limit() {
+        assert!(is_safe_to_reflect(
+            &"あ".repeat(MAX_REFLECTABLE_SURFACE_CHARS)
+        ));
+        assert!(!is_safe_to_reflect(
+            &"あ".repeat(MAX_REFLECTABLE_SURFACE_CHARS + 1)
+        ));
     }
 }

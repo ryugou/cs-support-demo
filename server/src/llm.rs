@@ -457,9 +457,25 @@ fn parse_one_product_reference(
             return None;
         }
     };
+    // Issue #28 W-1 是正で `matched_model` にも `surface` と同じ「trim 後空文字なら不採用」
+    // という**規則**を揃えた。ただし格納する値そのものの trim 有無は両者で非対称のままである
+    // 点に注意（読み違えないこと）:
+    // - `surface`（上の `surface` の束縛、`match map.get("surface")` のブロック）: trim は
+    //   空判定にのみ使い、格納するのは untrimmed の生値（`s.to_string()`）。
+    // - `matched_model`（このすぐ下）: `.map(str::trim)` により、格納するのは trim 済みの値。
+    // LLM が null の代わりに空文字/空白のみを返すことは珍しくなく、ここで trim 後空文字を
+    // `None` へ落とすのは、境界（parse 層）で不正な値を生成しないという入力検証の位置取りで
+    // ある（多層防御の1層目）。`ProductAllowlist::matches_in_scope_model`
+    // （`product_gate.rs`）側にも独立した空文字ガードがあり（2層目）、どちらか一方が外れても
+    // 即座に `ends_with("")` が常に true になる無条件 veto にはならない。「`ends_with("")` が
+    // 常に true になる」のは、その2層目のガードが無かった場合にだけ成立する話である。
+    // 要素自体は破棄しない（`surface` と `resolution` が正しければ参照としては有効なため、
+    // `matched_model` だけ `None` へ落とす）。
     let matched_model = map
         .get("matched_model")
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map(str::to_string);
     Some(crate::harness::product_gate::ProductReference {
         surface,
@@ -986,6 +1002,77 @@ mod tests {
         assert_eq!(out.signals, vec!["mold"]);
         assert_eq!(out.product_references.len(), 1);
         assert_eq!(out.product_references[0].surface, "ADC-V724");
+    }
+
+    // ---- Issue #28 W-1 是正: matched_model の空文字/空白は None へ落とす ----
+    //
+    // `surface` は非空検証済み（`parse_one_product_reference` の `surface` 束縛、
+    // `Some(s) if !s.trim().is_empty()` のガード）だが、`matched_model`
+    // は従来 LLM の JSON からそのまま `Some` に詰めていた。LLM が null の代わりに空文字を返す
+    // ケースは珍しくなく、ここで trim 後空文字を `None` へ落とすのは、境界（parse 層）で
+    // 不正な値を生成しないという入力検証の位置取りである（多層防御の1層目）。
+    // `ProductAllowlist::matches_in_scope_model`（`product_gate.rs`）側にも独立した空文字
+    // ガードがあり（2層目）、`ends_with("")` が常に true になって無条件 veto になるのは、
+    // その2層目のガードが無かった場合にだけ成立する話である。`surface` と同じ
+    // 「trim 後非空のみ Some」に揃える。
+
+    #[test]
+    fn parse_treats_a_blank_matched_model_as_none() {
+        let out = parse_signal_response(
+            r#"{"signals": [], "product_references": [
+                {"surface": "Ringのドアベル", "resolution": "foreign", "matched_model": ""}
+            ]}"#,
+        )
+        .expect("a blank matched_model must not fail the whole parse");
+        assert_eq!(out.product_references.len(), 1);
+        assert_eq!(out.product_references[0].matched_model, None);
+    }
+
+    #[test]
+    fn parse_treats_a_whitespace_only_matched_model_as_none() {
+        let out = parse_signal_response(
+            r#"{"signals": [], "product_references": [
+                {"surface": "Ringのドアベル", "resolution": "foreign", "matched_model": "   "}
+            ]}"#,
+        )
+        .expect("a whitespace-only matched_model must not fail the whole parse");
+        assert_eq!(out.product_references.len(), 1);
+        assert_eq!(out.product_references[0].matched_model, None);
+    }
+
+    #[test]
+    fn parse_keeps_a_non_blank_matched_model_trimmed() {
+        // 通常ケースの回帰: 非空の matched_model はこれまでどおり Some に詰まる（前後に空白が
+        // 無い通常入力では trim の有無が結果に現れないため、この形では trim 済み格納である
+        // ことまでは確認できない。それは次の
+        // `parse_trims_a_matched_model_with_surrounding_whitespace` が確認する）。
+        let out = parse_signal_response(
+            r#"{"signals": [], "product_references": [
+                {"surface": "ADC-V724", "resolution": "matched", "matched_model": "ADC-V724"}
+            ]}"#,
+        )
+        .expect("a normal matched_model must parse");
+        assert_eq!(
+            out.product_references[0].matched_model,
+            Some("ADC-V724".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_trims_a_matched_model_with_surrounding_whitespace() {
+        // `matched_model` は `.map(str::trim)` で trim してから格納される（`surface` とは異なり、
+        // 格納する値そのものが trim 済みになる）。前後に空白を含む matched_model が trim 済みの
+        // 値で格納されることを確認する。
+        let out = parse_signal_response(
+            r#"{"signals": [], "product_references": [
+                {"surface": "ADC-V724", "resolution": "matched", "matched_model": "  ADC-V724  "}
+            ]}"#,
+        )
+        .expect("a matched_model with surrounding whitespace must parse");
+        assert_eq!(
+            out.product_references[0].matched_model,
+            Some("ADC-V724".to_string())
+        );
     }
 
     #[test]
