@@ -61,7 +61,9 @@
 
 ## 5. SPA（Angular v22 + Tailwind + Angular CDK）
 
-- 配信: 同一 axum サーバの `/admin` 配下から静的配信（ビルド成果物を Docker イメージへ同梱）。`/admin` への未認証アクセスは Google OAuth へ誘導
+- 配信: 同一 axum サーバの `/admin` 配下から静的配信（ビルド成果物を Docker イメージへ同梱し `ServeDir` で配信。`/admin` 配下の未知パスは SPA フォールバックとして `index.html` を返す）。静的配信自体は認証不要（アプリシェルに秘密は含まれない）。データはすべて認証必須の `/admin/api` からのみ取得する
+- **SPA の認証フロー**: ブラウザで Google Identity Services（OAuth 2.0 token model）を実行し、取得した Google access token を `Authorization: Bearer` として `/admin/api` へ送る。サーバ側は既存の `require_google_auth`（`GoogleTokenVerifier`: tokeninfo 照会・`aud` 完全一致・`email_verified`）をそのまま適用し、**サーバの認証コードに変更を加えない**。client_id は既存の公開値（`CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` と同一）を SPA 設定に埋め込む（公開識別子のため可）。未認証・トークン失効時は SPA がログイン画面を表示し再取得する
+- **運用前提（ユーザー作業）**: Google Cloud Console の当該 OAuth クライアントに、承認済み JavaScript 生成元として本番 URL（`https://cs-support-mcp-235108918288.asia-northeast1.run.app`）を追加する必要がある（未登録だと GIS のトークン取得が失敗する）
 - デザイン: Stripe Dashboard 風・モダン。メインカラー `#0093A4`。実装開始前に `~/.claude/specs/frontend-style.md` を必ず Read する
 - 画面 3 枚:
   1. **スレッド一覧**: 上部に stats カード（本日/7 日のターン数・スレッド数・reply_kind 分布・ユニークユーザー）、下にスレッドテーブル（クリックで詳細へ）
