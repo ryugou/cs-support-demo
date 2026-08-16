@@ -242,6 +242,34 @@ async fn main() -> Result<()> {
         let tools = tools.clone();
         let harness = harness.clone();
         let manual_schema = project.manual_schema;
+
+        let auth_state = cs_support_mcp::oauth::middleware::AuthState {
+            verifier: verifier.clone(),
+            resource_metadata_url: format!(
+                "https://{public_host}/.well-known/oauth-protected-resource/{}/mcp",
+                project.project_id
+            ),
+        };
+        // `/{project_id}/admin/api`（2026-08-16 admin dashboard design doc §4）。MCP と同じ
+        // Google 認証（`require_google_auth`）で保護する。`resource_metadata_url` は MCP 用の
+        // ものを再利用してよい（design doc §4: OAuth 基盤の再利用であり、admin 専用の discovery
+        // metadata は無い）。`auth_state` はここで clone してから MCP 側の
+        // `from_fn_with_state` へ渡す（あちらは値を消費する）。`harness` も同様に、この後の
+        // `mcp` クロージャ（`move ||`）が消費する**前**にここで clone しておく。
+        let admin_state = cs_support_mcp::admin::AdminState {
+            schema: schema.clone(),
+            manual_schema,
+            harness: harness.clone(),
+        };
+        let admin_guarded = cs_support_mcp::admin::admin_router(admin_state).layer(
+            axum::middleware::from_fn_with_state(
+                auth_state.clone(),
+                cs_support_mcp::oauth::middleware::require_google_auth,
+            ),
+        );
+        let admin_path = format!("/{}/admin/api", project.project_id);
+        app = app.nest_service(&admin_path, admin_guarded);
+
         let mcp = StreamableHttpService::new(
             move || {
                 Ok(CsSupportRmcpServer::new(
@@ -254,13 +282,6 @@ async fn main() -> Result<()> {
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts()),
         );
-        let auth_state = cs_support_mcp::oauth::middleware::AuthState {
-            verifier: verifier.clone(),
-            resource_metadata_url: format!(
-                "https://{public_host}/.well-known/oauth-protected-resource/{}/mcp",
-                project.project_id
-            ),
-        };
         let guarded =
             axum::Router::new()
                 .fallback_service(mcp)
