@@ -1,0 +1,16 @@
+/* You can add global styles to this file, and also import other style files */
+
+@import 'tailwindcss';
+
+/*
+ * コーポレートカラー #0093A4 をトークン化する（frontend-style.md）。Tailwind v4 は
+ * tailwind.config.js の `theme.colors` ではなく、CSS の `@theme` ブロックでトークンを
+ * 定義する（v3 からの構文変更）。コンポーネント側で `#0093A4` をハードコードせず、
+ * `bg-primary` / `text-primary` / `border-primary` / `ring-primary` を使う。
+ */
+@theme {
+  --color-primary: #0093a4;
+  --color-primary-hover: #007786;
+  --color-primary-soft: #e6f5f7;
+}
+

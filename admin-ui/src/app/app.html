@@ -1,0 +1,7 @@
+@if (auth.accessToken()) {
+  <app-shell>
+    <router-outlet />
+  </app-shell>
+} @else {
+  <app-login />
+}
