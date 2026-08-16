@@ -56,7 +56,7 @@
 | `POST /admin/api/corrections` | `{ case_id, turn_id, signals: string[], applicability: string, answer: string, rationale_text?: string }` → 既存 add_known_resolution と同じ harness 入口を、ログイン中の Google identity の actor で呼ぶ。応答 `{ kr_id, audit_event_id }` |
 | `GET /admin/api/stats/summary?days=` | 期間内のターン数・スレッド数・reply_kind 分布・ユニーク end_user_id 数 |
 
-- ページングは cursor（`created_at` + `turn_id`）方式。エラー形式は `/api/reply` と同一
+- ページングは、内部フェッチ済みの `ConversationTurn` 生ノード件数（offset）を符号化した不透明カーソル方式。値ベースの `created_at` 比較フィルタは使わない（同時刻の境界エントリが `created_at < cursor` で恒久的に脱落するため）。offset ベースの完全性は `vegapunk.rs::query_nodes_paged` と同じ前提（total_count 突合による fail closed）に乗る。vegapunk の `AttributeFilter` に OR・複合キー比較があるかは未確認のため、それに依存するカーソル実装は採らない。クライアントは `next_cursor` を不透明な文字列として扱う。エラー形式は `/api/reply` と同一
 - 一覧系は vegapunk への型スコープクエリで実装（新 RPC 不要の範囲で設計し、既存 QueryNodes / traverse を使う）
 
 ## 5. SPA（Angular v22 + Tailwind + Angular CDK）
