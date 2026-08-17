@@ -45,7 +45,7 @@
 ### 2.3 営業への接続(URTECT 優遇とリード獲得)
 
 - 相談条件に URTECT 製品(ADC-V523 / V523X / V724 / V724X / VC729P / VC727P / VC827P)が合致する場合は URTECT 製品を先に提案する。合致しない場合は `partner_product` 材料の範囲で他社カテゴリ・製品を紹介し、詳細確認は公式サイトへ誘導する。優遇はプロンプト規則と材料の厚み(own_product エントリのみ提案情報が詳しい)で実現し、事実の捏造・他社の貶めはしない
-- 応答文に URTECT 型番が登場したターンでは、製品カード(カルーセル)を添付する(第 7.2 節の決定論ルール)
+- 話題に合致する製品材料(own_product / partner_product)がある場合は、会話の流れでさり気なく紹介する(人感センサーライトの話題なら「こういうものがありますよ」)。他社製品・カテゴリも紹介対象とする。応答文で紹介した製品は製品カード(カルーセル)で見せる(第 7.2 節の決定論ルール)
 - 導入・購入の意欲が読み取れたら、応答の末尾で「担当者から詳しくご案内できます」と 1 会話につき 1 回だけ提案する(押し売りしない。断られたら再提案しない)
 - 顧客が担当者連絡を望んだら、時間帯受付フロー(第 4.4 節)で希望時間帯を確定し、リードとして記録する
 
@@ -77,7 +77,7 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
 {
   "product_cards": [
     {
-      "product_key": "ADC-V724",
+      "material_key": "own_product:adc-v724",
       "title": "URTECT ADC-V724",
       "description": "屋外対応・夜間撮影。スマホから映像確認",
       "image_url": "https://<advisor host>/static/products/adc-v724.jpg",
@@ -89,7 +89,7 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
 ```
 
 - `line_adapter` は `product_cards` が非空のとき、テキスト応答の後に LINE カルーセルテンプレートを 1 通送る。ボタンは message action(タップで `button_message` がユーザー発話として送信され、通常パイプラインに入る)のみ。postback・独自判断はアダプタに持たせない
-- カードは最大 3 件。`title` / `description` / `image_url` は own_product 材料と同梱画像から組み立てる(第 7.2 節)
+- カードは最大 3 件。own_product / partner_product 材料から組み立てる(第 7.2 節)。`image_url` は任意で、無い列は画像なしで成立する。他社製品の実写画像は権利上使わず、使うのは同梱の自社製品画像と自前の汎用カテゴリ画像のみ
 
 `reply_kind` の値は advisor 固有に次の 8 値とする。管理画面のバッジ表示に追加する:
 
@@ -160,7 +160,7 @@ LLM Call #1 が失敗(タイムアウト・パース不能)した場合は 1 回
 3. 時間帯が確定したら `lead_requested = true` と `preferred_contact_time` を case へ書き戻し、`lead` 定型(「◯◯に担当者からご連絡しますね」+ 継続誘導)を返す
 4. 担当者はリードを管理画面のスレッド詳細(case メタ)で確認する。デモでは通知連携(メール・Slack 等)は行わない
 
-case 属性の加算: `lead_offered`(bool)、`lead_requested`(bool)、`shown_product_cards`(string、カード表示済み型番の CSV)。`preferred_contact_time` は既存属性を流用する。
+case 属性の加算: `lead_offered`(bool)、`lead_requested`(bool)、`shown_product_cards`(string、カード表示済み material_key の CSV)。`preferred_contact_time` は既存属性を流用する。
 
 ## 5. schema とデータ計画
 
@@ -177,7 +177,8 @@ case 属性の加算: `lead_offered`(bool)、`lead_requested`(bool)、`shown_pro
   - `category` string optional: `intrusion` / `monitoring` / `package_theft` / `stalking` / `fire_disaster`(第 4.2 節 `concern` と同一語彙)
   - `product_key` string optional(`own_product` のとき URTECT 型番)
   - `price_band` string optional(`own_product` / `partner_product`)
-  - `card_description` string optional(`own_product` のみ。製品カードの 1 行説明)
+  - `card_description` string optional(`own_product` / `partner_product`。製品カードの 1 行説明。これを持つ材料だけがカード化対象)
+  - `card_match_terms` string optional(`own_product` / `partner_product`。応答文とのカード合致判定に使う語の CSV。省略時は `title_ja` と `product_key` で照合する)
 - `support_case`、`ConversationTurn`、known_resolution 系ノード: 現行 CS と同一定義(正本: `2026-08-16-admin-dashboard-design.md` と `specs/production-cs-mcp.md`)に、第 4.4 節の case 属性 3 つを加算。検索非汚染の閉じ込めテスト(ターン・case が材料検索に現れない)を homesec にも適用する
 
 エッジは初期投入では張らない。シナリオと材料の関連は `category` 属性の一致で代替し、構造 traversal は PDCA 後の課題とする。
@@ -228,10 +229,10 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 
 ### 7.2 製品カードの添付判定(決定論)
 
-1. 出口関門を通過した最終応答文から URTECT 型番を抽出する(型番 allowlist と同じ regex)
-2. case の `shown_product_cards` に未記録の型番だけを対象に、own_product 材料(`title_ja` / `card_description` / `product_key`)と同梱画像からカードを最大 3 件組み立てる
+1. 今回のターンで注入した own_product / partner_product 材料(`card_description` を持つもの)それぞれについて、出口関門を通過した最終応答文(正規化後)に `card_match_terms`(省略時は `title_ja` / `product_key`)のいずれかが含まれるかを文字列照合する
+2. 合致した材料のうち、case の `shown_product_cards`(material_key 単位)に未記録のものをカード化する。3 件を超えるときは own_product を優先し、残りは検索ヒット順
 3. 送出したら `shown_product_cards` へ追記する(同じカードを同一会話で繰り返し出さない)
-4. カードの `image_url` は advisor 自ホストの `/static/products/` のみ。材料に無い型番のカードは組み立てない(応答文が関門を通過している時点で URTECT 7 型番に限定済み)
+4. カードの `image_url` は advisor 自ホストの `/static/products/` の同梱画像(自社製品・汎用カテゴリ)のみ。今回注入していない材料のカードは組み立てない
 
 ## 8. 障害時挙動
 
@@ -247,7 +248,7 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 
 1. 現行 CS(urtect)の経路・挙動を変更しない。共有モジュールへ変更を入れる場合、既存テストが無変更で PASS すること。`line_adapter` の `product_cards` 描画は加算であり、フィールド省略時(CS 経路)の挙動は従来と同一であること
 2. advisor は MCP endpoint・OAuth AS・署名鍵を持たない
-3. 応答内の URL は注入材料の `source_url` のみ、ADC- 型番は URTECT 7 型番のみ。カード画像は advisor 自ホストの同梱画像のみ
+3. 応答内の URL は注入材料の `source_url` のみ、ADC- 型番は URTECT 7 型番のみ。カードは今回注入した製品材料からのみ組み立て、カード画像は advisor 自ホストの同梱画像のみ
 4. Markdown 記法を含む応答を顧客へ返さない
 5. `emergency == true` のターンは、他のどの応答種別よりも `safety` 定型を優先する
 6. 担当者連絡の提案は 1 会話につき 1 回まで(`lead_offered`)
@@ -262,13 +263,13 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
   - `homesec-line`: command `/usr/local/bin/line_adapter`、`--max-instances=1`、VPC connector 不要。env: `CS_ANSWER_API_URL`(advisor の reply URL)。Secret 注入: `CS_ANSWER_API_KEY` ← `homesec-answer-api-key`、`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` ← 新 secret `homesec-line-channel-secret` / `homesec-line-channel-access-token`
 - 新 Cloud Run job: `ingest-homesec`(merge-schema と同じ VPC connector / SA / Secret 注入)
 - 新 secret は 3 件のみ: `homesec-answer-api-key`(`openssl rand -base64 32`)、`homesec-line-channel-secret` / `homesec-line-channel-access-token`(LINE Developers console 発行値)
-- ユーザー作業: 新 LINE OA の作成と channel secret / access token の発行、webhook URL 設定(`https://<homesec-line の URL>/line/webhook`)、Google Cloud Console の承認済み JavaScript 生成元へ advisor の URL を追加(管理画面ログイン用)、**製品画像 7 点の提供**(カルーセル用。JPEG、1 枚 1MB 以下目安)
+- ユーザー作業: 新 LINE OA の作成と channel secret / access token の発行、webhook URL 設定(`https://<homesec-line の URL>/line/webhook`)、Google Cloud Console の承認済み JavaScript 生成元へ advisor の URL を追加(管理画面ログイン用)、**製品画像 7 点の提供**(カルーセル用。JPEG、1 枚 1MB 以下目安。他社カテゴリ用の汎用画像は任意 — 無ければ画像なしカードで表示する)
 
 ## 11. テスト
 
 - 応答種別決定(第 4.3 節)の全分岐(emergency 優先、time_pref モード継続、out_of_domain、handoff、リード受付開始、clarify 予算、answer)
 - リードフロー: 提案 1 回制限(`lead_offered`)、営業時間外希望の即時案内、確定時の case 書き戻しと `lead` 定型
-- 製品カード: 応答文中の型番からの組み立て、最大 3 件、`shown_product_cards` による再表示抑止、材料を引けないときは添付しない
+- 製品カード: 応答文と `card_match_terms` の合致判定(own / partner の両方)、own 優先の 3 件上限、`shown_product_cards`(material_key 単位)による再表示抑止、材料を引けないときは添付しない、画像なし材料がカード化できること
 - `line_adapter`: `product_cards` 非空でカルーセル送信、省略時は従来挙動(既存テスト無変更 PASS)
 - 出口関門: 材料外 URL・URTECT 外型番・保証表現・資格作業語・企業 CS 定型句の各違反で fallback に差し替わること
 - 条件語彙: 語彙外の値が破棄され warn が出ること
