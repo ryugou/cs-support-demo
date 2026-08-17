@@ -53,11 +53,11 @@
 - Produces: `config.rs` に `pub struct AdvisorConfig`(上記 3 キー、`Option<AdvisorConfig>` で AppConfig へ加算 — CS の config には影響しない)
 
 **Steps:**
-- [ ] `homesec.yml` を書く(cs-support.yml の該当ノード型を複製し advisor_material を追加)
-- [ ] `written_support_case_attribute_keys()` に 3 属性を加算し、既存 2 テスト(cs-schema / cs-support)が新属性宣言込みで PASS することを確認。同方式で `homesec_yml_declares_...` テストを追加
-- [ ] `AdvisorConfig` を追加し、`config.homesec.toml` のロードテスト(3 キーが読めること・既存 config で None のこと)を書く → 実装 → PASS
-- [ ] Cargo.toml / Dockerfile 配線(この時点で bin は `fn main() {}` の空実装で cargo build を通す)
-- [ ] `cargo test` / `cargo fmt --check` → commit `feat(advisor): schema, config, and build wiring (#34)`
+- [x] `homesec.yml` を書く(cs-support.yml の該当ノード型を複製し advisor_material を追加)
+- [x] `written_support_case_attribute_keys()` に 3 属性を加算し、既存 2 テスト(cs-schema / cs-support)が新属性宣言込みで PASS することを確認。同方式で `homesec_yml_declares_...` テストを追加
+- [x] `AdvisorConfig` を追加し、`config.homesec.toml` のロードテスト(3 キーが読めること・既存 config で None のこと)を書く → 実装 → PASS
+- [x] Cargo.toml / Dockerfile 配線(この時点で bin は `fn main() {}` の空実装で cargo build を通す)
+- [x] `cargo test` / `cargo fmt --check` → commit `feat(advisor): schema, config, and build wiring (#34)`
 
 ### Task 2: ingest_homesec CLI と materials.json の器
 
@@ -72,10 +72,10 @@
 - Produces: `materials.json` の型 = spec §5.1 属性そのまま(serde struct `MaterialEntry`)。バリデーション: `statistic`・`partner_product` は `source_url` 必須 / `material_key` は `{kind}:{slug}` 形式 / `card_description` があれば card_match_terms 省略時照合語(`title_ja`, `product_key`)が非空
 
 **Steps:**
-- [ ] `MaterialEntry` の parse + バリデーション失敗ケースのテストを書く → 実装 → PASS
-- [ ] GraphBuild 組み立て(advisor_material ノード、edge 無し)のテスト → 実装 → PASS
-- [ ] main: `--config` / `--materials-file` / `--validate-only`(投入せず検証のみ)引数、schema 登録 → 冪等 upsert。同一入力 2 回で同一 GraphBuild になるテスト
-- [ ] `cargo test` / fmt → commit `feat(advisor): homesec ingest cli and seed materials (#34)`
+- [x] `MaterialEntry` の parse + バリデーション失敗ケースのテストを書く → 実装 → PASS
+- [x] GraphBuild 組み立て(advisor_material ノード、edge 無し)のテスト → 実装 → PASS
+- [x] main: `--config` / `--materials-file` / `--validate-only`(投入せず検証のみ)引数、schema 登録 → 冪等 upsert。同一入力 2 回で同一 GraphBuild になるテスト
+- [x] `cargo test` / fmt → commit `feat(advisor): homesec ingest cli and seed materials (#34)`
 
 ### Task 3: 理解(LLM Call #1)と条件語彙
 
