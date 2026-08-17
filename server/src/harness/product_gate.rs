@@ -1729,55 +1729,18 @@ mod tests {
         Arc::new(VegapunkClient::connect_lazy("http://127.0.0.1:1", "test").expect("connect_lazy"))
     }
 
-    /// `tracing` の warn を捕まえるテスト用ライタ（`harness::reply` の `CapturedLogs` と
-    /// 同型。dev-dependency を増やさず、テスト内で完結する最小の subscriber を組む）。
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn text(&self) -> String {
-            let buf = self.0.lock().expect("log buffer mutex poisoned");
-            String::from_utf8(buf.clone()).expect("tracing fmt writes utf-8")
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("log buffer mutex poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
-        type Writer = Self;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// `fut` の実行中に出た WARN 以上のログを文字列で返す（`harness::reply` の
-    /// `capture_warnings` の非同期版）。`tracing::subscriber::set_default` はスレッドローカル
-    /// なので、`#[tokio::test]` の既定（current-thread）ランタイムで `.await` をまたいでも
-    /// 同じスレッド上で実行される限り有効に保たれる。
+    /// `capture_warnings` の非同期版）。capture 機構本体（グローバル subscriber の 1 回
+    /// インストール + スレッドローカルバッファ）は `test_support` を参照。Dispatch を
+    /// 差し替える旧方式は、capture 機構を使わないテストが先に無介入で同じコールサイトを
+    /// 叩くと interest cache が「無効」に確定し手遅れになる問題があったため廃止した
+    /// （詳細は `test_support` の doc コメント）。`#[tokio::test]` の既定（current-thread）
+    /// ランタイムで `.await` をまたいでも同じスレッド上で実行される限り有効。
     async fn capture_warnings<Fut, T>(fut: Fut) -> (T, String)
     where
         Fut: std::future::Future<Output = T>,
     {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(logs.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let result = fut.await;
-        (result, logs.text())
+        crate::test_support::capture_logs_async(fut).await
     }
 
     /// `capture_warnings` の同期版。`ProductAllowlist::from_models` のような同期関数（Stage1
@@ -1786,15 +1749,7 @@ mod tests {
     where
         F: FnOnce() -> T,
     {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(logs.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let result = f();
-        (result, logs.text())
+        crate::test_support::capture_logs(f)
     }
 
     #[tokio::test]

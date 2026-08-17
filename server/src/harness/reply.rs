@@ -731,11 +731,13 @@ mod tests {
         // **下限そのものを固定する。** filler の長さだけを assert すると、上限を 1,200 等へ
         // 下げる変更が緑のまま通り、実記事では手順の途中切れが復活する（テスト名が
         // "late material survives" なので守られていると誤読される）。
-        assert!(
-            MAX_EXCERPT_CHARS >= 2_500,
-            "excerpts must be long enough to hold a whole procedure section; the real article's \
-             reset steps start at 1,048 chars and run on from there"
-        );
+        const {
+            assert!(
+                MAX_EXCERPT_CHARS >= 2_500,
+                "excerpts must be long enough to hold a whole procedure section; the real \
+                 article's reset steps start at 1,048 chars and run on from there"
+            );
+        }
 
         // 実記事と同じ位置関係を再現する: 手順が 1,048 文字目から始まり、そこから
         // さらに続く（手順が丸ごと入ることを見る。冒頭だけ入って末尾が落ちるのは不可）。
@@ -1012,54 +1014,19 @@ mod tests {
         ));
     }
 
-    /// `tracing` の warn を捕まえるテスト用ライタ。
+    /// `f` の実行中に出た WARN 以上のログを文字列で返す。
     ///
-    /// このリポジトリにログ検証の流儀は無かったため、テスト内で完結する最小の subscriber を
-    /// 組む（dev-dependency は足さない。`tracing-subscriber` は本体の依存に既にある）。
     /// **切り詰めの観測を構造体のフィールドで代用しない**のは、S-3 が求めているのが
     /// 「運用者がログだけで切り詰めに気付けること」そのものだからである。値で観測すると、
     /// ログを消しても緑のままになる。
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn text(&self) -> String {
-            let buf = self.0.lock().expect("log buffer mutex poisoned");
-            String::from_utf8(buf.clone()).expect("tracing fmt writes utf-8")
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("log buffer mutex poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
-        type Writer = Self;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// `f` の実行中に出た WARN 以上のログを文字列で返す。subscriber は thread-local に
-    /// 差し込むので、テストの並列実行と干渉しない。
+    ///
+    /// capture 機構本体（グローバル subscriber の 1 回インストール + スレッドローカル
+    /// バッファ）は `test_support` を参照。Dispatch を差し替える方式は、この capture 機構を
+    /// 使わないテストが先に無介入で同じコールサイトを叩くと tracing-core の interest cache
+    /// が「無効」に確定してしまい手遅れになる問題があったため廃止した（詳細は
+    /// `test_support` の doc コメント）。
     fn capture_warnings(f: impl FnOnce()) -> String {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(logs.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        logs.text()
+        crate::test_support::capture_logs(f).1
     }
 
     #[test]

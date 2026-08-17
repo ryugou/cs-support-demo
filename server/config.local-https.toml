@@ -2,6 +2,9 @@ bind_addr = "127.0.0.1:3443"
 tls_cert_path = "certs/cert.pem"
 tls_key_path = "certs/key.pem"
 vegapunk_endpoint = "http://vegapunk.local:6840"
+# 管理 SPA（/admin）の静的ビルド成果物。`server/` から `cargo run` する運用のため
+# `admin-ui/` は 1 階層上。ビルドコマンドは admin-ui/README または CLAUDE.md を参照。
+admin_static_dir = "../admin-ui/dist/admin-ui/browser"
 
 [[projects]]
 project_id = "sivira-cs-demo"

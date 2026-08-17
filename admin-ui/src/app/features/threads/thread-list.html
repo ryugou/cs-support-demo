@@ -1,0 +1,83 @@
+<div class="space-y-6">
+  <section>
+    <div class="flex items-center justify-between">
+      <h1 class="text-lg font-semibold text-slate-900">スレッド一覧</h1>
+      <div class="inline-flex rounded border border-slate-300 bg-white p-0.5 text-sm">
+        <button
+          type="button"
+          class="rounded px-3 py-1 font-medium"
+          [class]="statsDays() === 1 ? 'bg-primary text-white' : 'text-slate-600 hover:bg-slate-50'"
+          (click)="setStatsRange(1)"
+        >
+          本日
+        </button>
+        <button
+          type="button"
+          class="rounded px-3 py-1 font-medium"
+          [class]="statsDays() === 7 ? 'bg-primary text-white' : 'text-slate-600 hover:bg-slate-50'"
+          (click)="setStatsRange(7)"
+        >
+          7日間
+        </button>
+      </div>
+    </div>
+
+    @if (statsError(); as message) {
+      <div class="mt-3 rounded border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+        {{ message }}
+      </div>
+    } @else if (stats(); as s) {
+      <div class="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+        <app-stat-tile label="ターン数" [value]="s.turn_count" />
+        <app-stat-tile label="スレッド数" [value]="s.thread_count" />
+        <app-stat-tile label="ユニークユーザー数" [value]="s.unique_end_user_count" />
+        <div class="rounded-lg border border-slate-200 bg-white p-4">
+          <div class="text-xs font-medium uppercase tracking-wide text-slate-500">状態の内訳</div>
+          <div class="mt-2 flex flex-wrap gap-1.5">
+            @for (entry of s.reply_kind_counts | keyvalue; track entry.key) {
+              <span class="inline-flex items-center gap-1 rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-700">
+                {{ replyKindLabel(entry.key) }}: {{ entry.value }}
+              </span>
+            } @empty {
+              <span class="text-xs text-slate-400">データなし</span>
+            }
+          </div>
+        </div>
+      </div>
+    } @else if (statsLoading()) {
+      <p class="mt-3 text-sm text-slate-400">読み込み中…</p>
+    }
+  </section>
+
+  <section>
+    @if (threadsError(); as message) {
+      <div class="mb-3 rounded border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+        {{ message }}
+      </div>
+    }
+    <app-threads-table
+      [threads]="threads()"
+      [showEndUserColumn]="true"
+      (rowClick)="onRowClick($event)"
+      (userClick)="onUserClick($event)"
+    />
+    <div class="mt-3 flex justify-end gap-2">
+      <button
+        type="button"
+        class="rounded border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+        [disabled]="atFirstPage()"
+        (click)="goFirst()"
+      >
+        最初から
+      </button>
+      <button
+        type="button"
+        class="rounded border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+        [disabled]="!nextCursor()"
+        (click)="goNext()"
+      >
+        次のページへ
+      </button>
+    </div>
+  </section>
+</div>

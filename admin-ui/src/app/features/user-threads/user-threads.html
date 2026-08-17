@@ -1,0 +1,35 @@
+<div class="space-y-4">
+  <div>
+    <h1 class="text-lg font-semibold text-slate-900">ユーザー別スレッド一覧</h1>
+    <p class="mt-1 text-sm text-slate-500">
+      end_user_id: <span class="font-mono text-slate-700">{{ endUserId() }}</span>
+    </p>
+  </div>
+
+  @if (error(); as message) {
+    <div class="rounded border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+      {{ message }}
+    </div>
+  }
+
+  <app-threads-table [threads]="threads()" [showEndUserColumn]="false" (rowClick)="onRowClick($event)" />
+
+  <div class="flex justify-end gap-2">
+    <button
+      type="button"
+      class="rounded border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+      [disabled]="atFirstPage()"
+      (click)="goFirst()"
+    >
+      最初から
+    </button>
+    <button
+      type="button"
+      class="rounded border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+      [disabled]="!nextCursor()"
+      (click)="goNext()"
+    >
+      次のページへ
+    </button>
+  </div>
+</div>

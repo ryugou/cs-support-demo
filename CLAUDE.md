@@ -36,7 +36,8 @@ Production CS MCP の設計・実装では、必ず `specs/production-cs-mcp.md`
 - 翻訳: 初期検証では fixture の日本語訳を使ってよい。Production では翻訳状態と再翻訳境界を明示する。
 
 Python は使用しない。提案もしない。Python ファイルを作らない。
-TypeScript も使用しない。tsx / npm / package.json を追加しない。
+
+TypeScript 禁止・`tsx` / `npm` / `package.json` 追加禁止のルールは **MCP サーバ実装（`server/` 配下）に限る**。管理画面 SPA（`admin-ui/` 配下、Angular v22 + Tailwind + Angular CDK）は対象外とし、npm / package.json などの npm 資材は `admin-ui/` 内に閉じる（`server/` の依存・ビルドに混ぜない）。Docker イメージには `admin-ui/` のビルド成果物（静的ファイル）のみを同梱する。改訂はユーザー承認済み（2026-08-14、Issue #31、`docs/superpowers/specs/2026-08-16-admin-dashboard-design.md` §5）。
 
 ## 現行サンプル実装メモ
 
@@ -430,6 +431,14 @@ CI の `build-deploy` job が、`cs-support-mcp` / `cs-support-line` の両 serv
 ```sh
 gcloud run jobs list --project sivira-cs-support --region asia-northeast1 --format='value(metadata.name)'
 gcloud run services list --project sivira-cs-support --region asia-northeast1 --format='value(metadata.name)'
+```
+
+#### 管理画面（/admin）の GitHub Actions variable（初回のみ）
+
+`.github/workflows/deploy.yml` の `build-deploy` job は、GitHub Actions variable `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` を `docker/build-push-action` の `build-args` として `Dockerfile` の `admin-ui-builder` ステージへ渡す。値は `cs-support-mcp` service の env `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`（Google Cloud Console 発行の公開 client id）と同一のものを設定する。**未設定のまま main へマージすると、CI の `Build and push image` ステップが `admin-ui-builder` の fail-closed 検査（値が空、または英数字・`-`・`.`・`_` 以外の文字を含む場合にビルド自体を失敗させる）で落ち、デプロイ経路全体が止まる。**
+
+```sh
+gh variable set CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID --body '<Google Cloud Console で発行済みの OAuth Client ID>'
 ```
 
 #### OAuth 署名鍵（初回のみ）

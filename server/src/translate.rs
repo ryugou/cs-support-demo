@@ -334,7 +334,7 @@ fn is_retryable_status(status: StatusCode) -> bool {
 /// プロンプト差分がテスト・ログ間で安定するようキーでソートする。
 fn glossary_prompt_lines(glossary: &Glossary) -> String {
     let mut entries: Vec<(&String, &String)> = glossary.iter().collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_by_key(|(a, _)| *a);
     entries
         .into_iter()
         .map(|(en, ja)| format!("- {en} => {ja}"))

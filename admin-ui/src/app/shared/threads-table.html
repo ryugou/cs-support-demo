@@ -1,0 +1,55 @@
+<div class="overflow-hidden rounded-lg border border-slate-200 bg-white">
+  <table class="w-full text-left text-sm">
+    <thead>
+      <tr class="border-b border-slate-200 text-xs font-medium uppercase tracking-wide text-slate-500">
+        <th class="px-4 py-3">質問</th>
+        @if (showEndUserColumn()) {
+          <th class="px-4 py-3">ユーザー</th>
+        }
+        <th class="px-4 py-3 text-right">ターン数</th>
+        <th class="px-4 py-3">最新状態</th>
+        <th class="px-4 py-3">最終更新</th>
+      </tr>
+    </thead>
+    <tbody>
+      @for (thread of threads(); track thread.case_id) {
+        <tr
+          data-testid="thread-row"
+          class="cursor-pointer border-b border-slate-100 last:border-b-0 hover:bg-slate-50"
+          (click)="onRowClick(thread.case_id)"
+        >
+          <td class="px-4 py-3 text-slate-800">{{ thread.question_preview }}</td>
+          @if (showEndUserColumn()) {
+            <td class="px-4 py-3">
+              @if (thread.end_user_id; as endUserId) {
+                <button
+                  type="button"
+                  data-testid="user-link"
+                  class="text-primary hover:underline"
+                  (click)="onUserClick($event, endUserId)"
+                >
+                  {{ endUserId }}
+                </button>
+              } @else {
+                <span class="text-slate-400">&mdash;</span>
+              }
+            </td>
+          }
+          <td class="px-4 py-3 text-right tabular-nums text-slate-700">{{ thread.turn_count }}</td>
+          <td class="px-4 py-3">
+            <app-reply-kind-badge [kind]="thread.last_reply_kind" />
+          </td>
+          <td class="px-4 py-3 text-slate-500">
+            {{ thread.last_created_at | date: 'yyyy/MM/dd HH:mm' : '+0900' }}
+          </td>
+        </tr>
+      } @empty {
+        <tr>
+          <td [attr.colspan]="showEndUserColumn() ? 5 : 4" class="px-4 py-8 text-center text-slate-400">
+            スレッドがありません
+          </td>
+        </tr>
+      }
+    </tbody>
+  </table>
+</div>

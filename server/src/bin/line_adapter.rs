@@ -23,7 +23,7 @@ use axum::routing::post;
 use axum::Router;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::net::SocketAddr;
@@ -452,6 +452,18 @@ struct AnswerApiRequest {
     history: Option<Vec<AnswerApiHistoryEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     case_id: Option<String>,
+    /// 2026-08-16 admin dashboard design doc §3: 生の LINE userId をサーバへ渡さないための
+    /// 匿名化済みエンドユーザー識別子（[`hash_line_user_id`] 参照）。
+    end_user_id: String,
+}
+
+/// LINE userId の SHA-256 の 16 進表現、先頭 32 文字を `end_user_id` として使う
+/// （2026-08-16 admin dashboard design doc §3）。生の platform ID をサーバへ渡さないための
+/// 匿名化。`end_user_id` は `/api/reply` 側で 1〜64 字のバリデーションを通すため、32 文字は
+/// その範囲内に収まる。
+fn hash_line_user_id(user_id: &str) -> String {
+    let digest = Sha256::digest(user_id.as_bytes());
+    format!("{digest:x}").chars().take(32).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -845,6 +857,7 @@ async fn call_answer_api(
         message: message.to_string(),
         history: (!history_entries.is_empty()).then_some(history_entries),
         case_id,
+        end_user_id: hash_line_user_id(user_id),
     };
     let body = match serde_json::to_vec(&request) {
         Ok(b) => b,
@@ -1217,6 +1230,42 @@ mod tests {
         let sig = sign(secret, body);
         let tampered: &[u8] = br#"{"events":[{"type":"follow"}]}"#;
         assert!(!verify_signature(secret, tampered, &sig));
+    }
+
+    // ---- hash_line_user_id（2026-08-16 admin dashboard design doc §3） ----
+
+    #[test]
+    fn hash_line_user_id_is_32_lowercase_hex_chars() {
+        let hashed = hash_line_user_id("U1234567890abcdef1234567890abcdef");
+        assert_eq!(hashed.chars().count(), 32);
+        assert!(
+            hashed
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "must be lowercase hex: {hashed}"
+        );
+    }
+
+    #[test]
+    fn hash_line_user_id_is_deterministic() {
+        let a = hash_line_user_id("Usame-user-id");
+        let b = hash_line_user_id("Usame-user-id");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hash_line_user_id_differs_for_different_inputs() {
+        let a = hash_line_user_id("Uuser-a");
+        let b = hash_line_user_id("Uuser-b");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_line_user_id_never_leaks_the_raw_user_id() {
+        // 生の LINE userId をそのまま含んではならない（匿名化の趣旨そのもの）。
+        let raw = "Uraw-line-user-id-should-not-appear";
+        let hashed = hash_line_user_id(raw);
+        assert!(!hashed.contains(raw));
     }
 
     #[test]

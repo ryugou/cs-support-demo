@@ -107,6 +107,22 @@ nodes:
       last_request_id: { type: string }
       last_decision: { type: string }
       last_kr_id: { type: string }
+      # Allowed-manual の場合のみ非空。evaluate() の decision_result から導出する根拠
+      # （harness/mod.rs の case_attrs 組み立て。answer_evidence の元になる材料）。
+      last_evidence_keys: { type: string }
+      last_evidence_kind: { type: string }
+      # 会話フロー v1.1（CaseConvState、harness/mod.rs::merge_conv_state_attributes）
+      clarify_turns: { type: int }
+      awaiting_time_pref: { type: string }
+      time_pref_false_count: { type: int }
+      preferred_contact_time: { type: string }
+      time_pref_extraction_error_count: { type: int }
+      # Issue #28 二段目確定の降格で除外された signal の CSV（harness/mod.rs::exclude_recorded_signals）
+      excluded_signals: { type: string }
+      # Issue #31 design doc §2: 匿名化済みエンドユーザー識別子（任意、初回提供時に設定）
+      end_user_id: { type: string }
+      # Issue #31 design doc §2: ConversationTurn.seq 採番用カウンタ（read-merge-write）
+      turn_count: { type: int }
   answer_attempt:
     attributes:
       attempt_id: { type: string, required: true }
@@ -157,6 +173,21 @@ nodes:
       route_to: { type: string }
       question: { type: string }
       created_at: { type: string }
+  # Issue #31 design doc §2: /api/reply の応答確定点で 1 ターン = 1 ノードを書き切る
+  # （immutable、部分更新なし）。埋め込みベクトルは持たない（検索非汚染。§2 受け入れ条件）。
+  # 属性・required は harness/knowledge.rs の build_conversation_turn_graph が実際に書く
+  # 値に一致させてある（end_user_id のみ Some のときだけ書くため任意）。
+  ConversationTurn:
+    attributes:
+      turn_id: { type: string, required: true }
+      case_id: { type: string, required: true }
+      end_user_id: { type: string }
+      seq: { type: int, required: true }
+      created_at: { type: string, required: true }
+      question: { type: string, required: true }
+      reply_text: { type: string, required: true }
+      reply_kind: { type: string, required: true }
+      audit_event_id: { type: string, required: true }
 
 edges:
   HAS_DOCUMENT: { from: product, to: document }
@@ -167,6 +198,8 @@ edges:
   # support_case を from に含めるのは会話層の累積 signal 集合をグラフで持つため（S1-11 追記 3）
   HAS_SIGNAL: { from: [KnownResolution, support_case], to: Signal }
   BECAUSE: { from: KnownResolution, to: section }
+  # Issue #31 design doc §2
+  HAS_TURN: { from: support_case, to: ConversationTurn }
 
 traceable_pairs:
   - claim: section

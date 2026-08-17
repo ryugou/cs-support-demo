@@ -1,5 +1,8 @@
 bind_addr = "0.0.0.0:8080"
 vegapunk_endpoint = "http://vegapunk-server:50051"
+# 管理 SPA（/admin）の静的ビルド成果物。Docker イメージ内 WORKDIR /app/server からの相対で
+# /app/server/admin-ui/browser（デフォルト値と同じだが、他の path 設定と同様に明示する）。
+admin_static_dir = "admin-ui/browser"
 
 [[projects]]
 project_id = "sivira-cs-demo"

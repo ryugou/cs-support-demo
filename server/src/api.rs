@@ -13,7 +13,7 @@ use crate::config::AppConfig;
 use crate::harness::decision::{self, AnswerDecision};
 use crate::harness::product_gate;
 use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
-use crate::harness::{clarify, escalation_reply, hours, time_pref, Harness};
+use crate::harness::{clarify, escalation_reply, hours, time_pref, Harness, RequestContext};
 use crate::mcp::ToolService;
 use crate::oauth::VerifiedIdentity;
 use axum::extract::rejection::JsonRejection;
@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-/// リクエストボディ（design doc §2）。
+/// リクエストボディ（design doc §2、`end_user_id` は 2026-08-16 admin dashboard design doc §3
+/// の加算フィールド）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReplyRequest {
     pub message: String,
@@ -34,6 +35,10 @@ pub struct ReplyRequest {
     pub history: Option<Vec<HistoryEntry>>,
     #[serde(default)]
     pub case_id: Option<String>,
+    /// 匿名化済みエンドユーザー識別子（1〜64 字。`[a-f0-9]` 想定だが形式は強制しない）。
+    /// 未提供でも従来どおり動作する（後方互換、design doc §3）。
+    #[serde(default)]
+    pub end_user_id: Option<String>,
 }
 
 /// `history` 1 要素。時系列昇順（古い→新しい）で渡される想定（design doc §2）。
@@ -74,6 +79,9 @@ pub const MIN_HISTORY_TEXT_CHARS: usize = 1;
 pub const MAX_HISTORY_TEXT_CHARS: usize = 2_000;
 /// `case_id` の最大文字数（design doc §2）。
 pub const MAX_CASE_ID_CHARS: usize = 128;
+/// `end_user_id` の最小・最大文字数（2026-08-16 admin dashboard design doc §3）。
+pub const MIN_END_USER_ID_CHARS: usize = 1;
+pub const MAX_END_USER_ID_CHARS: usize = 64;
 
 /// リクエスト検証（design doc §2 の制約表）。
 ///
@@ -119,6 +127,16 @@ pub fn validate(req: &ReplyRequest) -> Result<(), String> {
         if chars > MAX_CASE_ID_CHARS {
             return Err(format!(
                 "case_id must be at most {MAX_CASE_ID_CHARS} characters, got {chars}"
+            ));
+        }
+    }
+
+    if let Some(end_user_id) = &req.end_user_id {
+        let chars = end_user_id.chars().count();
+        if !(MIN_END_USER_ID_CHARS..=MAX_END_USER_ID_CHARS).contains(&chars) {
+            return Err(format!(
+                "end_user_id must be between {MIN_END_USER_ID_CHARS} and \
+                 {MAX_END_USER_ID_CHARS} characters, got {chars}"
             ));
         }
     }
@@ -529,6 +547,13 @@ fn service_principal() -> VerifiedIdentity {
     }
 }
 
+/// `ok_reply_response` が `record_conversation_turn` の完了を待つ上限。この定数を独立させて
+/// いるのは、直前に別関数のための doc コメント段落を置くと rustdoc がその段落をこの定数の
+/// 説明として扱ってしまうため（Issue #31 reviewer 指摘 W-3: 旧配置では
+/// [`build_reply_response`] の 6 箇所統一ラッパーという説明がこの定数の doc として誤って
+/// 表示されていた）。定数の直前は空行のみとし、doc コメント段落を隣接させない。
+const CONVERSATION_TURN_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `reply_text` を [`crate::harness::prompt_input::to_plain_text`] で正規化した `ReplyResponse`
 /// を組み立てる（Issue #27: design doc §2「`/api/reply` の応答確定点でコードによるプレーン
 /// テキスト正規化を必ず通す」）。純粋関数として独立させているのは、`Response`（axum 型）の
@@ -542,21 +567,93 @@ fn build_reply_response(reply_text: String, case_id: String) -> ReplyResponse {
 }
 
 /// [`build_reply_response`] を 200 OK の `Response` にする薄いラッパー。`reply_handler` 内で
-/// `Json(ReplyResponse { .. })` を組み立てる 4 箇所（希望時間帯の即時返信・回答・聞き返し・
-/// エスカレーション受け止め）を**すべてこの関数経由に統一する**。分岐ごとに
-/// `to_plain_text` 呼び出しを複製すると、新しい分岐が追加されたときに正規化を書き忘れうる
-/// （このファイルの正本である design doc、および `prompt_input.rs` 冒頭の doc コメントが
-/// 記録している「集約前は複数箇所へ複製され drift した」のと同じ失敗パターン）。
-fn ok_reply_response(reply_text: String, case_id: String) -> Response {
-    (
-        StatusCode::OK,
-        Json(build_reply_response(reply_text, case_id)),
+/// `Json(ReplyResponse { .. })` を組み立てる 6 箇所（取扱外定型応答 1/2 段目・希望時間帯の
+/// 即時返信・回答・聞き返し・エスカレーション受け止め）を**すべてこの関数経由に統一する**。
+/// 分岐ごとに `to_plain_text` 呼び出しを複製すると、新しい分岐が追加されたときに正規化を
+/// 書き忘れうる（このファイルの正本である design doc、および `prompt_input.rs` 冒頭の doc
+/// コメントが記録している「集約前は複数箇所へ複製され drift した」のと同じ失敗パターン）。
+///
+/// 2026-08-16 admin dashboard design doc §2・§3: 正規化直後に `ConversationTurn` の書き切りを
+/// 行う（応答確定点そのもの）。**書き込み失敗は応答を止めない**（warn ログのみで継続する。
+/// ターン欠落は許容し、`audit_event_id` を使えば監査ログとの突合で検出できる。両方の warn ログに
+/// `audit_event_id` フィールドを含めているのはこの突合を実現するため）。
+///
+/// **Issue #31 codex レビュー C2、および一次レビューでの差し戻し**: `record_conversation_turn`
+/// は vegapunk gRPC を経由するため `GrpcLimits::default().timeout_secs`（120 秒、`vegapunk.rs`）
+/// まで応答をブロックしうる。これに対して一時 `tokio::spawn` で fire-and-forget にしたが、これは
+/// 別の契約違反を生んだ: `KnowledgeStore::record_conversation_turn` は support_case ノードの
+/// read-merge-write（`turn_count` だけ差し替えて全属性を再送）を行うため、この書き込みを
+/// リクエストの寿命から完全に切り離すと、read してから write するまでの間に後続リクエストの
+/// `save_conv_state` が割り込んだ場合、その書き込みを丸ごと巻き戻す
+/// （`harness::mod::Harness::save_conv_state` の doc コメントが明文化している lost update 契約と
+/// 同じ危険）。そのため切り離さず、**上限（[`CONVERSATION_TURN_WRITE_TIMEOUT`]、5 秒）付きで
+/// await する**。これで「応答を返す前に turn 書き込みが完了している」という happens-before が
+/// 保たれたまま、120 秒ブロックしうるという本来の C2 指摘も解消する。上限で打ち切った場合は
+/// ターン欠落として許容するが、vegapunk 側では書き込みが継続し得るため、切り捨てた側の
+/// クライアント（この関数）から見て「本当に書けなかった」とは限らない点に注意（残存リスクとして
+/// warn ログに残す）。
+#[allow(clippy::too_many_arguments)]
+async fn ok_reply_response(
+    state: &ApiState,
+    ctx: &RequestContext,
+    reply_kind: &str,
+    question: &str,
+    audit_event_id: &str,
+    end_user_id: Option<&str>,
+    reply_text: String,
+    case_id: String,
+) -> Response {
+    let response = build_reply_response(reply_text, case_id);
+    match tokio::time::timeout(
+        CONVERSATION_TURN_WRITE_TIMEOUT,
+        state.harness.record_conversation_turn(
+            ctx,
+            &response.case_id,
+            end_user_id,
+            question,
+            &response.reply_text,
+            reply_kind,
+            audit_event_id,
+        ),
     )
-        .into_response()
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = ?err,
+                case_id = %response.case_id,
+                reply_kind,
+                audit_event_id = %audit_event_id,
+                "answer api: failed to record a ConversationTurn; continuing without blocking \
+                 the reply (2026-08-16 admin dashboard design doc §2: turn loss is tolerated, \
+                 audit correlation still works via audit_event_id)"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                case_id = %response.case_id,
+                reply_kind,
+                timeout_secs = CONVERSATION_TURN_WRITE_TIMEOUT.as_secs(),
+                audit_event_id = %audit_event_id,
+                "answer api: gave up waiting for a ConversationTurn write at the timeout; \
+                 returning the reply anyway. the write is not detached (support_case's \
+                 read-merge-write would otherwise clobber a concurrent request's write — see \
+                 harness::mod::Harness::save_conv_state's lost-update contract), so it may still \
+                 be committed on the backend after this point; turn loss is tolerated \
+                 (2026-08-16 admin dashboard design doc §2)"
+            );
+        }
+    }
+    (StatusCode::OK, Json(response)).into_response()
 }
 
-/// `ErrorBody` を JSON で返す。
-fn error_response(status: StatusCode, error: &str, message: impl Into<String>) -> Response {
+/// `ErrorBody` を JSON で返す。管理 API（`admin.rs`）も同じエラー形式を再利用する。
+pub(crate) fn error_response(
+    status: StatusCode,
+    error: &str,
+    message: impl Into<String>,
+) -> Response {
     (
         status,
         Json(ErrorBody {
@@ -877,11 +974,26 @@ async fn reply_handler(
     };
     if let Some(out_of_scope_model) = allowlist.first_out_of_scope_token(&req.message) {
         let reply_text = product_gate::build_out_of_scope_reply(&out_of_scope_model, &allowlist);
-        let case_id = state
+        let (case_id, audit_event_id) = state
             .harness
-            .record_out_of_scope_case(&ctx, &req.message, req.case_id.as_deref())
+            .record_out_of_scope_case(
+                &ctx,
+                &req.message,
+                req.case_id.as_deref(),
+                req.end_user_id.as_deref(),
+            )
             .await;
-        return ok_reply_response(reply_text, case_id);
+        return ok_reply_response(
+            &state,
+            &ctx,
+            "out_of_scope",
+            &req.message,
+            &audit_event_id,
+            req.end_user_id.as_deref(),
+            reply_text,
+            case_id,
+        )
+        .await;
     }
 
     // ステップ 5: 希望時間帯の受付（会話フロー v1.1 design doc §5）。
@@ -926,7 +1038,39 @@ async fn reply_handler(
                     //   混入させる」ケースのみで、マニュアル材料・回答内容を伴わない定型文である
                     //   ことを踏まえて受容している。
                     if let time_pref::TimePrefAction::Reply(text) = action {
-                        return ok_reply_response(text, case_id.to_string());
+                        // 2026-08-16 admin dashboard design doc §1-c: この経路は従来
+                        // 監査イベントを発行していなかった。ConversationTurn の
+                        // `audit_event_id` を空文字のままにしないため、ここで新規に発行する。
+                        // 監査記録自体が失敗しても応答は継続する（空文字の audit_event_id で
+                        // 続行。ターン欠落より応答継続を優先する設計判断は §1-c 全体で共通）。
+                        let audit_event_id = match state
+                            .harness
+                            .audit(&ctx, "time_pref_reply", None, vec![case_id.to_string()])
+                            .await
+                        {
+                            Ok(id) => id,
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = ?err,
+                                    request_id = %request_id,
+                                    case_id,
+                                    "answer api: time_pref_reply audit failed; continuing with \
+                                     an empty audit_event_id"
+                                );
+                                String::new()
+                            }
+                        };
+                        return ok_reply_response(
+                            &state,
+                            &ctx,
+                            "time_pref",
+                            &req.message,
+                            &audit_event_id,
+                            req.end_user_id.as_deref(),
+                            text,
+                            case_id.to_string(),
+                        )
+                        .await;
                     }
                     // TimePrefAction::PassToEvaluate: 下の evaluate() へ続行。
                 }
@@ -960,6 +1104,7 @@ async fn reply_handler(
             // /api/reply は design doc §2 の契約: 未知 case_id はエラーにせず新規 case
             // として処理する（クライアント保存漏れ・再起動由来の未知 id は通常運用）。
             crate::harness::UnknownCaseIdPolicy::StartNew,
+            req.end_user_id.as_deref(),
         )
         .await
     {
@@ -983,7 +1128,7 @@ async fn reply_handler(
                 // case が二重に作られることはない。evaluate 側の allowed:*/escalate:* 監査も
                 // 同じ case_id 上に残るため、両者を突き合わせれば「evaluate の判定を二段目が
                 // 上書きした」ことを相関できる。
-                let case_id = state
+                let (case_id, audit_event_id) = state
                     .harness
                     .demote_case_to_out_of_scope(
                         &ctx,
@@ -992,7 +1137,17 @@ async fn reply_handler(
                         &short_circuit.discarded_signals,
                     )
                     .await;
-                return ok_reply_response(short_circuit.reply_text, case_id);
+                return ok_reply_response(
+                    &state,
+                    &ctx,
+                    "out_of_scope",
+                    &req.message,
+                    &audit_event_id,
+                    req.end_user_id.as_deref(),
+                    short_circuit.reply_text,
+                    case_id,
+                )
+                .await;
             }
 
             let mut conv = match state.harness.load_conv_state(&ctx, &outcome.case_id).await {
@@ -1030,7 +1185,19 @@ async fn reply_handler(
             }
 
             match action {
-                ReplyAction::Answer(text) => ok_reply_response(text, outcome.case_id),
+                ReplyAction::Answer(text) => {
+                    ok_reply_response(
+                        &state,
+                        &ctx,
+                        "answer",
+                        &req.message,
+                        &outcome.audit_event_id,
+                        req.end_user_id.as_deref(),
+                        text,
+                        outcome.case_id,
+                    )
+                    .await
+                }
                 ReplyAction::Clarify => {
                     let missing: &[decision::EvidenceRequirement] = match &outcome.decision {
                         AnswerDecision::Escalate { missing, .. } => missing,
@@ -1102,7 +1269,17 @@ async fn reply_handler(
                     {
                         return conv_state_save_failed(&err, &request_id, &outcome.case_id);
                     }
-                    ok_reply_response(reply_text, outcome.case_id)
+                    ok_reply_response(
+                        &state,
+                        &ctx,
+                        "clarify",
+                        &req.message,
+                        &outcome.audit_event_id,
+                        req.end_user_id.as_deref(),
+                        reply_text,
+                        outcome.case_id,
+                    )
+                    .await
                 }
                 ReplyAction::EscalationReply => {
                     let ack_text = match state.harness.reply_drafter.as_ref() {
@@ -1157,7 +1334,17 @@ async fn reply_handler(
                     {
                         return conv_state_save_failed(&err, &request_id, &outcome.case_id);
                     }
-                    ok_reply_response(reply_text, outcome.case_id)
+                    ok_reply_response(
+                        &state,
+                        &ctx,
+                        "escalation",
+                        &req.message,
+                        &outcome.audit_event_id,
+                        req.end_user_id.as_deref(),
+                        reply_text,
+                        outcome.case_id,
+                    )
+                    .await
                 }
             }
         }
@@ -1207,6 +1394,7 @@ mod tests {
             message: "カメラが反応しません".to_string(),
             history: None,
             case_id: None,
+            end_user_id: None,
         }
     }
 
@@ -1221,6 +1409,7 @@ mod tests {
             message: "  ".into(),
             history: None,
             case_id: None,
+            end_user_id: None,
         };
         assert!(validate(&req).is_err());
     }
@@ -1231,6 +1420,7 @@ mod tests {
             message: "あ".repeat(MAX_MESSAGE_CHARS + 1),
             history: None,
             case_id: None,
+            end_user_id: None,
         };
         let err = validate(&req).expect_err("5,001 chars must be rejected");
         assert!(err.contains("message"), "error must name the field: {err}");
@@ -1242,6 +1432,7 @@ mod tests {
             message: "あ".repeat(MAX_MESSAGE_CHARS),
             history: None,
             case_id: None,
+            end_user_id: None,
         };
         assert!(validate(&req).is_ok());
     }
@@ -1319,6 +1510,58 @@ mod tests {
     fn validate_accepts_case_id_at_exactly_128_chars() {
         let req = ReplyRequest {
             case_id: Some("c".repeat(MAX_CASE_ID_CHARS)),
+            ..valid_request()
+        };
+        assert!(validate(&req).is_ok());
+    }
+
+    // ---- end_user_id（2026-08-16 admin dashboard design doc §3）----
+
+    #[test]
+    fn validate_accepts_missing_end_user_id() {
+        // 未提供でも従来どおり動作する（後方互換）。
+        assert!(validate(&valid_request()).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_end_user_id() {
+        let req = ReplyRequest {
+            end_user_id: Some(String::new()),
+            ..valid_request()
+        };
+        let err = validate(&req).expect_err("empty end_user_id must be rejected");
+        assert!(
+            err.contains("end_user_id"),
+            "error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_end_user_id_over_64_chars() {
+        let req = ReplyRequest {
+            end_user_id: Some("a".repeat(MAX_END_USER_ID_CHARS + 1)),
+            ..valid_request()
+        };
+        let err = validate(&req).expect_err("65 char end_user_id must be rejected");
+        assert!(
+            err.contains("end_user_id"),
+            "error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_end_user_id_at_exactly_64_chars() {
+        let req = ReplyRequest {
+            end_user_id: Some("a".repeat(MAX_END_USER_ID_CHARS)),
+            ..valid_request()
+        };
+        assert!(validate(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_end_user_id_at_exactly_1_char() {
+        let req = ReplyRequest {
+            end_user_id: Some("a".to_string()),
             ..valid_request()
         };
         assert!(validate(&req).is_ok());
@@ -2132,7 +2375,23 @@ mod tests {
 
     #[tokio::test]
     async fn ok_reply_response_normalizes_body_and_preserves_case_id() {
-        let response = ok_reply_response("**重要**なお知らせ".to_string(), "case-2".to_string());
+        let state = test_api_state("correct-key");
+        let ctx = test_request_context(&state);
+        // `test_harness()` は `knowledge: None` なので ConversationTurn の書き込みは必ず
+        // 失敗する（warn ログのみで応答は止めない、下の
+        // `ok_reply_response_still_returns_a_response_when_turn_recording_fails` が明示的に
+        // その契約を確認する）。ここでは正規化と case_id の素通しだけを見る。
+        let response = ok_reply_response(
+            &state,
+            &ctx,
+            "answer",
+            "質問文",
+            "audit-1",
+            None,
+            "**重要**なお知らせ".to_string(),
+            "case-2".to_string(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
@@ -2142,6 +2401,107 @@ mod tests {
             serde_json::from_slice(&bytes).expect("response body is JSON");
         assert_eq!(body["reply_text"], "重要なお知らせ");
         assert_eq!(body["case_id"], "case-2");
+    }
+
+    /// 2026-08-16 admin dashboard design doc §2: 「書き込み失敗は応答を止めない」の直接確認。
+    /// `test_harness()` の `knowledge: None` により `record_conversation_turn` は必ず失敗するが、
+    /// それでも 200 が返ることを固定する。
+    #[tokio::test]
+    async fn ok_reply_response_still_returns_a_response_when_turn_recording_fails() {
+        let state = test_api_state("correct-key");
+        let ctx = test_request_context(&state);
+        let response = ok_reply_response(
+            &state,
+            &ctx,
+            "clarify",
+            "質問文",
+            "audit-2",
+            Some("end-user-abc"),
+            "聞き返し文です。".to_string(),
+            "case-3".to_string(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a ConversationTurn write failure must not block the reply"
+        );
+    }
+
+    /// 一次レビューでの差し戻し（Issue #31 codex レビュー C2 の再修正）: `record_conversation_turn`
+    /// の gRPC 呼び出しが `CONVERSATION_TURN_WRITE_TIMEOUT` を超えて遅延しても、
+    /// `ok_reply_response` がその上限で待つのを諦めて応答を返すことの直接証拠。
+    ///
+    /// 「accept しない」（bind はするが `accept()` を一切呼ばない）TCP リスナーへ向けた
+    /// `VegapunkClient` を使うと、gRPC の h2 ハンドシェイクが進まないまま `GrpcLimits.timeout_secs`
+    /// まで応答しない（＝「遅延」を模擬できる）。ここでは `GrpcLimits.timeout_secs` を
+    /// `CONVERSATION_TURN_WRITE_TIMEOUT` より十分大きく（60 秒）設定し、応答が「gRPC の timeout」
+    /// ではなく「こちらの `CONVERSATION_TURN_WRITE_TIMEOUT`」で打ち切られたことを、経過時間の
+    /// 上下両方の境界で区別する。
+    ///
+    /// 実時間で待つ（`start_paused` によるバーチャルタイムは不採用）: このテストが遅延させたい
+    /// 対象は tokio のタイマーではなく、accept しない TCP リスナーへの実ソケット接続であり、
+    /// I/O ドライバに実オブジェクトが登録された状態ではポーズ済みクロックの自動前進が働かない
+    /// （`tokio::time::pause` のドキュメントが明記する制約）ため、素直に実時間で
+    /// `CONVERSATION_TURN_WRITE_TIMEOUT`（5 秒）分待つ。実測はこのテスト単体で約 5〜6 秒。
+    #[tokio::test]
+    async fn ok_reply_response_gives_up_on_a_stalled_conversation_turn_write_at_the_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read local addr");
+        // listener を drop すると接続が即座に reset され「遅延」を再現できなくなるため、
+        // テストの終わりまで保持する（accept は一度も呼ばない）。
+        let _listener = listener;
+
+        // CONVERSATION_TURN_WRITE_TIMEOUT (5s) より十分大きくする。これにより、応答が返る
+        // タイミングが「gRPC の timeout」ではなく「こちらの上限」で決まっていることを、
+        // elapsed の上限側の assert で区別できる。
+        const GRPC_TIMEOUT_SECS: u64 = 60;
+        let limits = crate::vegapunk::GrpcLimits {
+            timeout_secs: GRPC_TIMEOUT_SECS,
+            ..Default::default()
+        };
+        let client = crate::vegapunk::VegapunkClient::connect_lazy_with_limits(
+            &format!("http://{addr}"),
+            "",
+            limits,
+        )
+        .expect("lazy connect never touches the network");
+        let knowledge = crate::harness::knowledge::KnowledgeStore::new(Arc::new(client));
+        let state = test_api_state_with_harness(
+            "correct-key",
+            test_harness_with_knowledge(Some(knowledge)),
+        );
+        let ctx = test_request_context(&state);
+
+        let start = std::time::Instant::now();
+        let response = ok_reply_response(
+            &state,
+            &ctx,
+            "answer",
+            "質問文",
+            "audit-slow",
+            None,
+            "回答文です。".to_string(),
+            "case-slow".to_string(),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed >= CONVERSATION_TURN_WRITE_TIMEOUT,
+            "ok_reply_response must wait at least CONVERSATION_TURN_WRITE_TIMEOUT before giving \
+             up on a stalled write; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(GRPC_TIMEOUT_SECS),
+            "ok_reply_response must give up at CONVERSATION_TURN_WRITE_TIMEOUT rather than \
+             waiting for the much longer gRPC timeout ({GRPC_TIMEOUT_SECS}s); took {elapsed:?} \
+             (a regression back to an un-timed-out blocking await would show up as \
+             ~{GRPC_TIMEOUT_SECS}s here)"
+        );
     }
 
     // ---- /api/reply ルーティング ----
@@ -2168,6 +2528,17 @@ mod tests {
     /// 埋め込んだ状態で構築する（Issue #28 §3.1 は evaluate() より前の全リクエストで動くため、
     /// `None` のままだと質問側ゲートの本体（型番検出→定型応答/フォールスルー）を一切検証できない）。
     fn test_harness() -> Harness {
+        test_harness_with_knowledge(None)
+    }
+
+    /// [`test_harness`] の `knowledge` を差し替えられる版。`ok_reply_response` が
+    /// `CONVERSATION_TURN_WRITE_TIMEOUT` で打ち切ることの検証（Issue #31 codex レビュー C2）
+    /// には、gRPC 呼び出しが実際に遅延する `KnowledgeStore` が要る（`knowledge: None` は
+    /// 同期的に即 `Err` を返すため「応答が `CONVERSATION_TURN_WRITE_TIMEOUT` で打ち切られる」
+    /// ことを再現できない）。
+    fn test_harness_with_knowledge(
+        knowledge: Option<crate::harness::knowledge::KnowledgeStore>,
+    ) -> Harness {
         let dir = std::env::temp_dir().join(format!("api-test-harness-{}", uuid::Uuid::new_v4()));
         let lexicon = Arc::new(
             crate::harness::signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap(),
@@ -2187,7 +2558,7 @@ mod tests {
             worm: Arc::new(
                 crate::harness::audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap(),
             ),
-            knowledge: None,
+            knowledge,
             thresholds: crate::harness::decision::Thresholds {
                 low: 0.6,
                 mid: 0.8,
@@ -2217,6 +2588,12 @@ mod tests {
     }
 
     fn test_api_state(api_key: &str) -> ApiState {
+        test_api_state_with_harness(api_key, test_harness())
+    }
+
+    /// [`test_api_state`] の `harness` を差し替えられる版（Issue #31 codex レビュー C2 の
+    /// テストが、`knowledge: Some(..)` を持つ `Harness` を注入するために使う）。
+    fn test_api_state_with_harness(api_key: &str, harness: Harness) -> ApiState {
         let toml = r#"
 bind_addr = "127.0.0.1:3443"
 vegapunk_endpoint = "http://vegapunk.invalid:6840"
@@ -2236,10 +2613,27 @@ fallback_reply_text = "担当者が確認のうえご連絡します"
         .expect("lazy connect never touches the network");
         ApiState {
             config: Arc::new(config),
-            harness: Arc::new(test_harness()),
+            harness: Arc::new(harness),
             tools: ToolService::new(vegapunk),
             api_key: api_key.to_string(),
         }
+    }
+
+    /// `ok_reply_response` の直接テスト向けに、`test_api_state` と同じ schema (`TEST_SCHEMA`)
+    /// で `RequestContext` を組み立てる。
+    fn test_request_context(state: &ApiState) -> RequestContext {
+        let identity = crate::oauth::VerifiedIdentity {
+            sub: "ok-reply-response-test-sub".to_string(),
+            email: "ok-reply-response-test@sivira.co".to_string(),
+        };
+        state
+            .harness
+            .begin(
+                &identity,
+                TEST_SCHEMA,
+                crate::config::ManualSchemaKind::default(),
+            )
+            .expect("begin")
     }
 
     async fn oneshot_json(
@@ -2436,6 +2830,51 @@ fallback_reply_text = "担当者が確認のうえご連絡します"
         );
     }
 
+    /// 2026-08-16 admin dashboard design doc §1-b/§2: 取扱外定型応答（1段目、site 1）が
+    /// `ok_reply_response` を `reply_kind = "out_of_scope"` で呼ぶことをエンドツーエンドで
+    /// 固定する。`test_harness()` は `knowledge: None` なので `ConversationTurn` の書き込みは
+    /// 必ず失敗し warn ログへ落ちる（`ok_reply_response` の doc コメント）。その warn の
+    /// `reply_kind` フィールドを直接観測することで、他の分岐と取り違えていないことを
+    /// vegapunk 無しで確認できる。
+    ///
+    /// `ok_reply_response` は `record_conversation_turn` を `CONVERSATION_TURN_WRITE_TIMEOUT`
+    /// 付きで await してから応答を返す（Issue #31 codex レビュー C2 の一次レビューでの
+    /// 差し戻しにより、fire-and-forget な `tokio::spawn` から現在の await-with-timeout へ
+    /// 変更済み）。そのため warn ログは応答が返る時点で既に書かれており、`tokio::spawn` 時代に
+    /// 必要だった `yield_now` によるスケジューラへの明示的な実行機会付与は不要。
+    #[tokio::test]
+    async fn reply_route_out_of_scope_model_records_the_out_of_scope_reply_kind() {
+        // tracing capture 機構本体（グローバル subscriber の 1 回インストール + スレッド
+        // ローカルバッファ）は `test_support` を参照。このテストは router の oneshot 全体を
+        // capture ウィンドウに含める必要があるため、`capture_warnings` ヘルパ（同期版）では
+        // なく `test_support::capture_logs_async` を直接使う。
+        let ((status, _body), log_text) = crate::test_support::capture_logs_async(async {
+            oneshot_json(
+                api_router(test_api_state("correct-key")),
+                "POST",
+                "/urtect/api/reply",
+                Some("Bearer correct-key"),
+                r#"{"message":"ADC-VDB101の設定を教えてください"}"#,
+            )
+            .await
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(
+            log_text.contains("failed to record a ConversationTurn"),
+            "expected a ConversationTurn write-failure warning, got: {log_text}"
+        );
+        assert!(
+            log_text.contains("reply_kind"),
+            "the warning must carry a reply_kind field: {log_text}"
+        );
+        assert!(
+            log_text.contains("out_of_scope"),
+            "the warning must name the out_of_scope branch (not some other reply_kind): {log_text}"
+        );
+    }
+
     /// 対照テスト: 取扱内の型番だけ、または型番なしの質問は §3.1 のゲートを素通りし、
     /// 通常フロー（evaluate()）へ進む。`knowledge: None` のためここでは必ず 500 になるが、
     /// それは「evaluate() に到達した」ことの証拠であり（上の 200 経路とは非交差の結果になる）、
@@ -2605,51 +3044,14 @@ fallback_reply_text = "担当者が確認のうえご連絡します"
 
     // ---- 応答側ゲートの warn ログ（Issue #28 codex レビュー採用5: detected_models） ----
     //
-    // `tracing` の warn を捕まえるテスト用ライタ。このリポジトリの他モジュール
-    // （`harness::reply` / `harness::product_gate` の `mod tests`）と同じ最小構成を、
-    // このモジュール用に独立して組む（dev-dependency は増やさない。`tracing-subscriber` は
-    // 本体の依存に既にある）。
-
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn text(&self) -> String {
-            let buf = self.0.lock().expect("log buffer mutex poisoned");
-            String::from_utf8(buf.clone()).expect("tracing fmt writes utf-8")
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("log buffer mutex poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
-        type Writer = Self;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
+    // capture 機構本体（グローバル subscriber の 1 回インストール + スレッドローカル
+    // バッファ）は `test_support` を参照。Dispatch を差し替える旧方式は、capture 機構を
+    // 使わないテストが先に無介入で同じコールサイトを叩くと interest cache が「無効」に
+    // 確定し手遅れになる問題があったため廃止した（詳細は `test_support` の doc コメント）。
 
     /// `f` の実行中に出た WARN 以上のログを文字列で返す。
     fn capture_warnings(f: impl FnOnce()) -> String {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .with_writer(logs.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        logs.text()
+        crate::test_support::capture_logs(f).1
     }
 
     #[test]

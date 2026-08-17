@@ -33,3 +33,9 @@ sivira-cs-demo:gen1:section:svr-hb100-user-guide#charging
 
 The demo intentionally has no issue/trouble-log nodes. Product manuals, sections,
 and specs must be sufficient for the first customer-support demo.
+
+Node/edge types added additively after the original demo scope (Production CS MCP
+Step 1 knowledge types such as `support_case`, `KnownResolution`, `Signal`, and the
+Issue #31 admin dashboard's `ConversationTurn` / `HAS_TURN`) are not re-documented
+here; [cs-schema.yml](cs-schema.yml) is the source of truth for the full node/edge
+list. This file only covers the registration flow for the original four types above.
