@@ -347,6 +347,57 @@ pub fn build_known_resolution_graph(
     GraphBuild { nodes, edges }
 }
 
+/// support_case の既存属性から次の ConversationTurn の `seq` を算出する純関数（1 起点）。
+/// `turn_count` 属性が未設定、または int としてパースできない場合は 0 件として扱う
+/// （旧データ・ターン未記録の case でも fail closed にしない。read の結果をここへ渡すのは
+/// 呼び出し元 [`KnowledgeStore::record_conversation_turn`] の責務）。
+fn next_turn_seq(existing_case_attrs: &HashMap<String, String>) -> u32 {
+    existing_case_attrs
+        .get("turn_count")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
+        + 1
+}
+
+/// support_case の read-merge-write 用属性を組み立てる純関数。既存属性を全て保持しつつ
+/// `turn_count` だけ新しい seq へ上書きする（`harness::mod::merge_conv_state_attributes` /
+/// `merge_out_of_scope_demotion_attributes` と同じ規律。`UpsertNodes` は全置換のため部分送信
+/// すると既存属性が消える）。
+fn merge_turn_count_attribute(
+    existing_case_attrs: &HashMap<String, String>,
+    seq: u32,
+) -> Vec<(String, String)> {
+    let mut merged = existing_case_attrs.clone();
+    merged.insert("turn_count".to_string(), seq.to_string());
+    merged.into_iter().collect()
+}
+
+/// `ConversationTurn` の属性 map 列を `created_at` 降順・同値時は `turn_id` 昇順で安定
+/// ソートする純関数（Issue #31 codex レビュー W2(a)）。vegapunk 側の `sort_by=created_at` は
+/// 完全一致する境界の順序を保証しないため、この二次キーで決定的にする（`turn_id` は
+/// ConversationTurn の一意 upsert key）。`created_at` / `turn_id` が欠けている行は空文字列
+/// 扱いで並べる（不完全な行自体は `TurnRow::from_attrs` 側で別途弾かれるため、ここでは
+/// 並び順の決定性だけを保証すれば足りる）。
+fn stable_sort_by_created_at_desc_then_turn_id(rows: &mut [HashMap<String, String>]) {
+    rows.sort_by(|a, b| {
+        let created_a = a.get("created_at").map(String::as_str).unwrap_or("");
+        let created_b = b.get("created_at").map(String::as_str).unwrap_or("");
+        created_b.cmp(created_a).then_with(|| {
+            let turn_a = a.get("turn_id").map(String::as_str).unwrap_or("");
+            let turn_b = b.get("turn_id").map(String::as_str).unwrap_or("");
+            turn_a.cmp(turn_b)
+        })
+    });
+}
+
+/// `load_conversation_turns_page` が返す 1 ページ分。管理 API（`admin.rs::build_threads_page`）
+/// が短ページ終端時に backend 申告の `total_count` と実消費件数を突合して fail closed する
+/// ための材料（Issue #31 codex レビュー W2(b)）。
+pub struct ConversationTurnsPage {
+    pub rows: Vec<HashMap<String, String>>,
+    pub total_count: i64,
+}
+
 /// `KnownResolution` の型明示クエリで vegapunk へ渡す node_type（`load_known_resolutions_with`
 /// が実際に使う検索エントリポイント）。ConversationTurn 等の新規ノード型を誤って KR 検索の
 /// 対象へ紛れ込ませていないかを固定する回帰テスト
@@ -644,12 +695,28 @@ impl KnowledgeStore {
     }
 
     /// 会話ターン 1 件を書き切る（Issue #31 design doc §2）。immutable・部分更新なし。
-    /// `seq` は書き込み直前に当該 case の既存ターン数を数えて採番する（1 起点。1000 件超の
-    /// 会話は想定しないため `query_nodes` の固定 limit=1000 で足りる）。
+    /// `seq` は support_case 属性 `turn_count` を read-merge-write して採番する（1 起点。
+    /// Issue #31 codex レビュー W1: 旧実装は `query_nodes` の固定 limit=1000 で既存ターン数を
+    /// 数える方式で、1000 件超の会話で seq が重複していた）。
     ///
-    /// **呼び出し元の契約**: 書き込み失敗（seq 採番のクエリ・upsert のどちらも）は
-    /// `Err` をそのまま返す。応答を止めない（warn ログのみで継続する）かどうかは
-    /// 呼び出し元（`api.rs::ok_reply_response`）の責務であり、ここでは判断しない。
+    /// **書き込み順序（turn_count → ConversationTurn）**: support_case.turn_count を先に
+    /// 進めてから ConversationTurn ノードを書く。逆順だと「ConversationTurn の書き込みは
+    /// 成功したが turn_count の書き戻しが失敗する」場合に、次回呼び出しが同じ seq を再採番して
+    /// 重複した seq を持つ 2 つの ConversationTurn が生まれる。turn_count を先に進めておけば、
+    /// 同じ失敗パターンは「turn_count だけ進んで対応する ConversationTurn が存在しない seq の
+    /// 欠番」に倒れる。欠番はスレッド詳細の表示（`seq` 昇順ソート）を壊さないが、重複 seq は
+    /// 2 つの実在ターンの順序があいまいになる。欠落より重複を避ける（安全側）。
+    ///
+    /// **契約: 呼び出し時点で case が既に存在すること。** `/api/reply` の応答確定点は必ず
+    /// `evaluate()` 等で case が作成された後に到達するため通常は満たされるが、満たされない
+    /// まま呼ぶと `turn_count` だけを持つ `case_id` 属性なしの support_case ノードを書いて
+    /// しまう（`harness::mod::require_existing_case_attrs` が `save_conv_state` に対して防いで
+    /// いるのと同じ壊れ方）。そのため case が見つからない場合は fail closed する。
+    ///
+    /// **呼び出し元の契約**: 書き込み失敗（case 読み取り・turn_count 書き戻し・
+    /// ConversationTurn upsert のいずれも）は `Err` をそのまま返す。応答を止めない（warn ログ
+    /// のみで継続する）かどうかは呼び出し元（`api.rs::ok_reply_response`）の責務であり、ここ
+    /// では判断しない。
     #[allow(clippy::too_many_arguments)]
     pub async fn record_conversation_turn(
         &self,
@@ -661,17 +728,23 @@ impl KnowledgeStore {
         reply_kind: &str,
         audit_event_id: &str,
     ) -> Result<()> {
-        let existing = self
-            .client
-            .query_nodes(
-                schema,
-                "ConversationTurn",
-                vec![("case_id", "eq", case_id)],
-                1000,
+        let existing_case = self.load_case(schema, case_id).await?.ok_or_else(|| {
+            anyhow!(
+                "record_conversation_turn: case {case_id} not found in schema {schema}; \
+                 refusing to write a turn_count-only support_case attribute set for a case that \
+                 does not exist yet — investigate why the caller reached the reply confirmation \
+                 point without first creating the case"
             )
-            .await
-            .context("count existing conversation turns for seq assignment")?;
-        let seq = existing.len() as u32 + 1;
+        })?;
+        let seq = next_turn_seq(&existing_case);
+        self.record(
+            schema,
+            "support_case",
+            case_id,
+            merge_turn_count_attribute(&existing_case, seq),
+        )
+        .await
+        .context("advance support_case.turn_count before writing the conversation turn")?;
         let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
         let created_at = chrono::Utc::now().to_rfc3339();
         let build = build_conversation_turn_graph(
@@ -693,22 +766,24 @@ impl KnowledgeStore {
         Ok(())
     }
 
-    /// 管理 API（`admin.rs`）向け: `ConversationTurn` を `created_at` 降順で 1 ページ取得する
-    /// （Issue #31 design doc §4 のスレッド一覧）。`extra_filter` は `end_user_id` 絞り込み等の
-    /// 追加条件。`offset` は「これまでに消費した raw 件数」（次ページ取得用の内部カーソル。
-    /// `vegapunk::query_nodes_paged` と同じ offset ページング方式。Issue #31 reviewer 指摘5:
-    /// 値ベースの `created_at < cursor` フィルタは `created_at` が完全一致する境界で
-    /// エントリを取りこぼす・重複させる欠陥があったため、この codebase が既に信頼している
-    /// offset ページングに統一した）。
+    /// 管理 API（`admin.rs`）向け: `ConversationTurn` を `created_at` 降順（同値時は `turn_id`
+    /// 昇順で決定的、Issue #31 codex レビュー W2(a)）に 1 ページ取得する（design doc §4 の
+    /// スレッド一覧）。`extra_filter` は `end_user_id` 絞り込み等の追加条件。`offset` は
+    /// 「これまでに消費した raw 件数」（次ページ取得用の内部カーソル。`vegapunk::query_nodes_paged`
+    /// と同じ offset ページング方式。Issue #31 reviewer 指摘5: 値ベースの `created_at < cursor`
+    /// フィルタは `created_at` が完全一致する境界でエントリを取りこぼす・重複させる欠陥が
+    /// あったため、この codebase が既に信頼している offset ページングに統一した）。戻り値の
+    /// `total_count`（Issue #31 codex レビュー W2(b)）は `admin.rs::build_threads_page` が
+    /// 短ページ終端時の完全性突合に使う。
     pub async fn load_conversation_turns_page(
         &self,
         schema: &str,
         extra_filter: Option<(&str, &str, &str)>,
         offset: i32,
         page_size: i32,
-    ) -> Result<Vec<HashMap<String, String>>> {
+    ) -> Result<ConversationTurnsPage> {
         let filters: Vec<(&str, &str, &str)> = extra_filter.into_iter().collect();
-        Ok(self
+        let page = self
             .client
             .query_nodes_sorted(
                 schema,
@@ -720,10 +795,14 @@ impl KnowledgeStore {
                 page_size,
             )
             .await
-            .context("load conversation turns page")?
-            .into_iter()
-            .map(|n| n.attributes)
-            .collect())
+            .context("load conversation turns page")?;
+        let mut rows: Vec<HashMap<String, String>> =
+            page.nodes.into_iter().map(|n| n.attributes).collect();
+        stable_sort_by_created_at_desc_then_turn_id(&mut rows);
+        Ok(ConversationTurnsPage {
+            rows,
+            total_count: page.total_count,
+        })
     }
 
     /// 管理 API 向け: 指定 case の `ConversationTurn` を全件取得する（スレッド詳細）。
@@ -1397,6 +1476,111 @@ mod tests {
         assert_eq!(edges.len(), 1);
     }
 
+    // ---- next_turn_seq / merge_turn_count_attribute（Issue #31 codex レビュー W1: seq 採番の
+    // 1000 件超重複是正） ----
+
+    #[test]
+    fn next_turn_seq_increments_past_a_large_existing_turn_count() {
+        let existing = attrs(&[("turn_count", "1500")]);
+        assert_eq!(next_turn_seq(&existing), 1501);
+    }
+
+    #[test]
+    fn next_turn_seq_starts_at_one_when_turn_count_is_absent() {
+        let existing = attrs(&[("case_id", "case-1")]);
+        assert_eq!(next_turn_seq(&existing), 1);
+    }
+
+    #[test]
+    fn next_turn_seq_starts_at_one_when_turn_count_is_unparseable() {
+        let existing = attrs(&[("turn_count", "not-a-number")]);
+        assert_eq!(next_turn_seq(&existing), 1);
+    }
+
+    #[test]
+    fn merge_turn_count_attribute_preserves_existing_attributes() {
+        let existing = attrs(&[
+            ("case_id", "case-1"),
+            ("question", "質問"),
+            ("turn_count", "3"),
+        ]);
+        let merged: HashMap<String, String> = merge_turn_count_attribute(&existing, 4)
+            .into_iter()
+            .collect();
+        assert_eq!(merged.get("case_id"), Some(&"case-1".to_string()));
+        assert_eq!(merged.get("question"), Some(&"質問".to_string()));
+        assert_eq!(merged.get("turn_count"), Some(&"4".to_string()));
+    }
+
+    #[test]
+    fn merge_turn_count_attribute_adds_the_key_when_absent() {
+        let existing = attrs(&[("case_id", "case-1")]);
+        let merged: HashMap<String, String> = merge_turn_count_attribute(&existing, 1)
+            .into_iter()
+            .collect();
+        assert_eq!(merged.get("turn_count"), Some(&"1".to_string()));
+    }
+
+    // ---- stable_sort_by_created_at_desc_then_turn_id（Issue #31 codex レビュー W2(a)） ----
+
+    #[test]
+    fn stable_sort_breaks_ties_on_created_at_by_turn_id_ascending() {
+        let mut rows = vec![
+            attrs(&[
+                ("turn_id", "turn-b"),
+                ("created_at", "2026-08-16T00:00:00+00:00"),
+            ]),
+            attrs(&[
+                ("turn_id", "turn-a"),
+                ("created_at", "2026-08-16T00:00:00+00:00"),
+            ]),
+        ];
+        stable_sort_by_created_at_desc_then_turn_id(&mut rows);
+        assert_eq!(rows[0].get("turn_id"), Some(&"turn-a".to_string()));
+        assert_eq!(rows[1].get("turn_id"), Some(&"turn-b".to_string()));
+    }
+
+    #[test]
+    fn stable_sort_orders_distinct_created_at_descending_regardless_of_turn_id() {
+        let mut rows = vec![
+            attrs(&[
+                ("turn_id", "turn-a"),
+                ("created_at", "2026-08-16T00:00:00+00:00"),
+            ]),
+            attrs(&[
+                ("turn_id", "turn-z"),
+                ("created_at", "2026-08-16T01:00:00+00:00"),
+            ]),
+        ];
+        stable_sort_by_created_at_desc_then_turn_id(&mut rows);
+        assert_eq!(
+            rows[0].get("turn_id"),
+            Some(&"turn-z".to_string()),
+            "newer created_at first"
+        );
+        assert_eq!(rows[1].get("turn_id"), Some(&"turn-a".to_string()));
+    }
+
+    #[test]
+    fn stable_sort_is_deterministic_across_repeated_runs_with_many_ties() {
+        let mut rows: Vec<HashMap<String, String>> = (0..10)
+            .rev()
+            .map(|i| {
+                attrs(&[
+                    ("turn_id", &format!("turn-{i}")),
+                    ("created_at", "2026-08-16T00:00:00+00:00"),
+                ])
+            })
+            .collect();
+        stable_sort_by_created_at_desc_then_turn_id(&mut rows);
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r.get("turn_id").unwrap().as_str())
+            .collect();
+        let expected: Vec<String> = (0..10).map(|i| format!("turn-{i}")).collect();
+        assert_eq!(ids, expected);
+    }
+
     // ---- 検索非汚染: KnownResolution 型明示クエリのリテラル固定 ----
 
     #[test]
@@ -1549,5 +1733,100 @@ mod tests {
         let hits = search_cases_from_snapshot(&snapshot, "電源が入らない", 3, None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.case_id, "case-old");
+    }
+
+    // ---- schema/*.yml の support_case.attributes 網羅性（Issue #31 codex レビュー C1） ----
+    //
+    // `harness::mod` の support_case への書き込み箇所（`grep -n '"support_case"'
+    // server/src/harness/mod.rs` で列挙される全 8 箇所）と、この場所（`record_conversation_turn`
+    // の turn_count 書き戻し）が実際に書き込む属性キーの完全な集合。新しい属性を support_case
+    // へ書き足したら、このリストと両 schema ファイルの `support_case.attributes` を同時に
+    // 更新すること（更新を忘れると、このテストが両者の不一致を検出して落ちる）。
+    //
+    // vegapunk 側が未宣言属性の書き込みを拒否しうる（C1: end_user_id が未宣言のまま本番投入
+    // されていた）ため、「書き込みキー ⊆ schema 宣言キー」を固定する。
+    fn written_support_case_attribute_keys() -> std::collections::HashSet<String> {
+        [
+            "case_id",
+            "request_id",
+            "actor",
+            "actor_email",
+            "question",
+            "product_key",
+            "created_at",
+            "end_user_id",
+            "last_request_id",
+            "last_decision",
+            "last_kr_id",
+            "last_evidence_keys",
+            "last_evidence_kind",
+            "clarify_turns",
+            "awaiting_time_pref",
+            "time_pref_false_count",
+            "preferred_contact_time",
+            "time_pref_extraction_error_count",
+            "excluded_signals",
+            "turn_count",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// `schema_path` の `nodes.support_case.attributes` から宣言済みキー集合を取り出す。
+    /// cwd 非依存にするため呼び出し側は `CARGO_MANIFEST_DIR` 起点の絶対パスを渡すこと
+    /// （`harness::mod::production_ng_dictionary` と同じ規律）。
+    fn declared_support_case_attribute_keys(
+        schema_path: &std::path::Path,
+    ) -> std::collections::HashSet<String> {
+        let text = std::fs::read_to_string(schema_path)
+            .unwrap_or_else(|e| panic!("read schema file {schema_path:?}: {e}"));
+        let value: serde_yaml::Value = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("parse schema file {schema_path:?} as YAML: {e}"));
+        let attributes = value["nodes"]["support_case"]["attributes"]
+            .as_mapping()
+            .unwrap_or_else(|| {
+                panic!("{schema_path:?}: nodes.support_case.attributes is not a mapping")
+            });
+        attributes
+            .keys()
+            .map(|k| {
+                k.as_str()
+                    .unwrap_or_else(|| panic!("{schema_path:?}: non-string attribute key"))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cs_schema_yml_declares_every_support_case_attribute_that_code_writes() {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../schema/cs-schema.yml"
+        ));
+        let declared = declared_support_case_attribute_keys(path);
+        let written = written_support_case_attribute_keys();
+        let missing: Vec<&String> = written.difference(&declared).collect();
+        assert!(
+            missing.is_empty(),
+            "schema/cs-schema.yml support_case.attributes is missing keys that code writes: \
+             {missing:?}"
+        );
+    }
+
+    #[test]
+    fn cs_support_yml_declares_every_support_case_attribute_that_code_writes() {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../schema/cs-support.yml"
+        ));
+        let declared = declared_support_case_attribute_keys(path);
+        let written = written_support_case_attribute_keys();
+        let missing: Vec<&String> = written.difference(&declared).collect();
+        assert!(
+            missing.is_empty(),
+            "schema/cs-support.yml support_case.attributes is missing keys that code writes: \
+             {missing:?}"
+        );
     }
 }

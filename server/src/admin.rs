@@ -269,8 +269,10 @@ fn encode_cursor(offset: i32) -> String {
 }
 
 /// cursor を decode し、内部フィルタに使う raw offset を取り出す。壊れた/空/負の cursor は
-/// `None`（「cursor 無し」として扱い、先頭（offset 0）から返す。クライアントの不正な cursor で
-/// 500 にしない）。
+/// `None`。「cursor 未指定」と「cursor 指定はあるが不正」の区別は呼び出し元
+/// （[`resolve_cursor_offset`]）の責務（Issue #31 codex レビュー W3: この関数の `None` を
+/// 呼び出し元が一律 offset 0 へフォールバックしていたため、typo 等で壊れた cursor を渡した
+/// クライアントが「1 ページ目に巻き戻った」ことに気づけなかった）。
 fn decode_cursor(cursor: &str) -> Option<i32> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -278,6 +280,26 @@ fn decode_cursor(cursor: &str) -> Option<i32> {
         .ok()?;
     let text = String::from_utf8(raw).ok()?;
     text.parse::<i32>().ok().filter(|&offset| offset >= 0)
+}
+
+/// cursor クエリパラメータから内部 offset を解決する。「未指定（`None`）」は従来どおり
+/// offset 0（先頭ページ）。「指定されているが `decode_cursor` が解釈できない」場合は
+/// `Err`（呼び出し元が 400 `invalid_request` を返す）にする（Issue #31 codex レビュー W3:
+/// 不正な cursor を黙って offset 0 へ巻き戻さない。`list_threads` / `list_user_threads` の
+/// 両方が共有する）。`Response`（`http::Response<axum::body::Body>`）は 128 バイトを超えるため
+/// `Err` 側は `Box` に包む（`clippy::result_large_err`。400 応答は非ホットパスなので box 化の
+/// コストは無視できる）。
+fn resolve_cursor_offset(cursor: Option<&str>) -> Result<i32, Box<Response>> {
+    match cursor {
+        None => Ok(0),
+        Some(raw) => decode_cursor(raw).ok_or_else(|| {
+            Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid cursor",
+            ))
+        }),
+    }
 }
 
 /// 利用状況サマリ（design doc §4）。
@@ -325,8 +347,21 @@ struct ThreadsQuery {
 
 /// 1 回の raw ページ取得を表す型。`Send` を要求するのは axum のハンドラが複数ワーカー
 /// スレッド上で実行されうるため（`fetch_page` は `.await` をまたいで別スレッドへ移りうる）。
-type PageFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<TurnRow>>> + Send + 'a>>;
+/// 戻り値は `(このラウンドで取得した TurnRow 列（フィルタ済み）, backend が実際に返した
+/// raw 行数（フィルタ前）, backend 申告の total_count)`。
+///
+/// `TurnRow` 列と raw 行数を分けているのは、`TurnRow::from_attrs` が `case_id` / `turn_id` /
+/// `created_at` のいずれかを欠く不完全な行を `None` にして落とすため（欠落は集約結果には
+/// 影響しないが、offset の前進量や `total_count` との突合は backend が実際に返した行数を
+/// 基準にしないと、不完全な行が 1 件混入しただけで無関係な `total_count` 突合が失敗する
+/// （Issue #31 reviewer 指摘: フィルタ後件数と raw 件数の混同）。
+///
+/// `total_count` は `query_nodes_sorted` の `QueryNodesResponse.total_count` をそのまま運ぶ
+/// （Issue #31 codex レビュー W2(b): 旧実装はこれを握り潰しており、短ページ終端の判定が
+/// backend 側の実件数と突合されていなかった）。
+type PageFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<(Vec<TurnRow>, usize, i64)>> + Send + 'a>,
+>;
 
 /// スレッド一覧・ユーザー別一覧の共通ページング処理（テスト容易性のため raw ページ取得を
 /// `fetch_page` として注入する）。`limit`（distinct case 数）に届く、または取得元が尽きるまで
@@ -334,9 +369,9 @@ type PageFuture<'a> =
 /// `fetch_thread_page` は実 vegapunk 呼び出し（`KnowledgeStore::load_conversation_turns_page`）
 /// を渡す薄いラッパー。テストはネットワーク無しの決定論的フェイクを渡せる。
 ///
-/// ループを抜けた理由（`source_exhausted`: 最後の内部フェッチの返却件数が
-/// `THREADS_FETCH_PAGE_SIZE` 未満だったか）を `paginate_summaries` へ引き渡し、cursor の発行
-/// 条件をそれに基づかせる。「distinct case 数が `limit` にちょうど一致した」「ラウンド上限
+/// ループを抜けた理由（`source_exhausted`: 最後の内部フェッチで backend が返した raw 行数
+/// （フィルタ前）が `THREADS_FETCH_PAGE_SIZE` 未満だったか）を `paginate_summaries` へ引き渡し、
+/// cursor の発行条件をそれに基づかせる。「distinct case 数が `limit` にちょうど一致した」「ラウンド上限
 /// （`MAX_INTERNAL_FETCH_ROUNDS`）を使い切った」のいずれも取得元はまだ尽きていないため、
 /// `source_exhausted = false` のまま cursor を発行し、後続データを黙って落とさない（Issue #31
 /// reviewer 指摘: 修正前はこの2ケースで `next_cursor = None` を返し、境界以降のスレッドが
@@ -351,18 +386,51 @@ async fn build_threads_page<'a>(
     let mut offset = initial_offset;
     let mut source_exhausted = false;
     for _ in 0..MAX_INTERNAL_FETCH_ROUNDS {
-        let rows = fetch_page(offset, THREADS_FETCH_PAGE_SIZE).await?;
-        let returned_count = rows.len();
-        source_exhausted = returned_count < THREADS_FETCH_PAGE_SIZE as usize;
+        let (rows, raw_row_count, total_count) =
+            fetch_page(offset, THREADS_FETCH_PAGE_SIZE).await?;
+        // offset の前進・終端判定・total_count 突合は、backend が実際に返した raw 行数
+        // （`raw_row_count`、フィルタ前）を基準にする。`rows`（フィルタ後）の件数を使うと、
+        // `TurnRow::from_attrs` が不完全な行を1件でも落としただけで、この後の total_count
+        // 突合が実際には正しいページングを「不整合」と誤判定して bail する
+        // （Issue #31 reviewer 指摘: フィルタ後件数と raw 件数の混同）。
+        source_exhausted = raw_row_count < THREADS_FETCH_PAGE_SIZE as usize;
+        // Issue #31 codex レビュー W2(b): 短ページで終端と判定したのに、backend 申告の
+        // total_count が実際にここまで消費した raw 件数に届いていない場合、pagination が
+        // 不完全（取りこぼしている）可能性がある。`query_nodes_paged`
+        // （`vegapunk.rs:945` の `pagination_is_complete`）と同じ設計思想で fail closed する。
+        // 比較は `<`（不足のみ bail）であり `!=` ではない: `consumed > total_count` は
+        // truncation を意味しない（例えば呼び出し側の想定と backend の total_count の意味論が
+        // 食い違うだけのケース）ので、不要な 500 を避けるため bail の対象にしない。
+        // `total_count` が非正（backend 未申告）の場合は突合をスキップし、従来どおり短ページ
+        // 終端の判定だけに委ねる。
+        if source_exhausted && total_count > 0 {
+            let consumed = offset as i64 + raw_row_count as i64;
+            if consumed < total_count {
+                tracing::error!(
+                    offset,
+                    raw_row_count,
+                    total_count,
+                    "admin api: build_threads_page reached a short page but offset + \
+                     raw_row_count does not reach the backend-reported total_count; \
+                     conversation turn pagination is inconsistent, refusing to return a \
+                     possibly truncated thread list"
+                );
+                anyhow::bail!(
+                    "conversation turn pagination inconsistency: offset({offset}) + \
+                     raw_row_count({raw_row_count}) = {consumed} < backend \
+                     total_count({total_count})"
+                );
+            }
+        }
         collected.extend(rows);
         let distinct = collected
             .iter()
             .map(|r| r.case_id.as_str())
             .collect::<HashSet<_>>()
             .len();
-        let next_offset_if_continuing = offset + returned_count as i32;
+        let next_offset_if_continuing = offset + raw_row_count as i32;
         match next_internal_offset(
-            returned_count,
+            raw_row_count,
             THREADS_FETCH_PAGE_SIZE as usize,
             distinct,
             limit,
@@ -415,10 +483,12 @@ async fn fetch_thread_page(
     let schema = state.schema.as_str();
     build_threads_page(limit, initial_offset, move |offset, page_size| {
         Box::pin(async move {
-            let attrs_list = store
+            let page = store
                 .load_conversation_turns_page(schema, base_filter, offset, page_size)
                 .await?;
-            Ok(attrs_list.iter().filter_map(TurnRow::from_attrs).collect())
+            let raw_row_count = page.rows.len();
+            let rows = page.rows.iter().filter_map(TurnRow::from_attrs).collect();
+            Ok((rows, raw_row_count, page.total_count))
         })
     })
     .await
@@ -455,7 +525,10 @@ async fn list_threads(
         return error_response(StatusCode::FORBIDDEN, "forbidden", err.to_string());
     }
     let limit = resolved_limit(query.limit);
-    let offset = query.cursor.as_deref().and_then(decode_cursor).unwrap_or(0);
+    let offset = match resolve_cursor_offset(query.cursor.as_deref()) {
+        Ok(offset) => offset,
+        Err(response) => return *response,
+    };
     match fetch_thread_page(&state, None, limit, offset).await {
         Ok(page) => (StatusCode::OK, Json(page)).into_response(),
         Err(err) => {
@@ -495,7 +568,10 @@ async fn list_user_threads(
         return error_response(StatusCode::FORBIDDEN, "forbidden", err.to_string());
     }
     let limit = resolved_limit(query.limit);
-    let offset = query.cursor.as_deref().and_then(decode_cursor).unwrap_or(0);
+    let offset = match resolve_cursor_offset(query.cursor.as_deref()) {
+        Ok(offset) => offset,
+        Err(response) => return *response,
+    };
     let base_filter = ("end_user_id", "eq", end_user_id.as_str());
     match fetch_thread_page(&state, Some(base_filter), limit, offset).await {
         Ok(page) => (StatusCode::OK, Json(page)).into_response(),
@@ -696,6 +772,18 @@ fn default_correction_rationale_text(case_id: &str, turn_id: &str) -> String {
     format!("管理画面からの訂正登録（case: {case_id}, turn: {turn_id}）")
 }
 
+/// `turns`（case の ConversationTurn 属性 map 列、`load_conversation_turns_for_case` の戻り値）
+/// の中に `turn_id` が実在するかを判定する純関数（Issue #31 codex レビュー W4）。
+/// `create_correction` は登録前にこれで case_id/turn_id の組み合わせを検証する。旧実装は
+/// この検証を一切行わず、存在しない case_id/turn_id でも `origin`（`case:{id}:turn:{id}`）に
+/// そのまま埋め込んで KR を登録していた（監査可能性が損なわれる: origin を辿っても存在しない
+/// ターンを指す）。
+fn turn_exists_in_case(turns: &[HashMap<String, String>], turn_id: &str) -> bool {
+    turns
+        .iter()
+        .any(|attrs| attrs.get("turn_id").map(String::as_str) == Some(turn_id))
+}
+
 /// `POST /admin/api/corrections`（design doc §4）。既存 `add_known_resolution`（MCP tool）と
 /// 同じ harness 入口（`Harness::register_known_resolution`）を、ログイン中の Google identity の
 /// actor で呼ぶ。`origin` は `case:{case_id}:turn:{turn_id}`（既存の `escalation:{id}` /
@@ -731,6 +819,54 @@ async fn create_correction(
             return error_response(StatusCode::FORBIDDEN, "forbidden", err.to_string());
         }
     };
+
+    // Issue #31 codex レビュー W4: case_id/turn_id の実在確認。register_known_resolution は
+    // これを検証しないため、存在しない組み合わせでもそのまま KR 登録へ進んでしまっていた。
+    // `get_thread` と同じ型スコープクエリ（`load_conversation_turns_for_case`）で当該 case の
+    // ターン列を取得し、turn_id がその中に実在することを検証してから先へ進む。
+    let store = match state.harness.store() {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::error!(
+                error = ?err,
+                "admin api: create_correction knowledge store unavailable"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "failed to register the correction; see server logs",
+            );
+        }
+    };
+    let turns = match store
+        .load_conversation_turns_for_case(&state.schema, &req.case_id)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                error = ?err,
+                schema = %state.schema,
+                case_id = %req.case_id,
+                "admin api: create_correction load_conversation_turns_for_case failed"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "failed to register the correction; see server logs",
+            );
+        }
+    };
+    if !turn_exists_in_case(&turns, &req.turn_id) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!(
+                "turn_id={} not found under case_id={}",
+                req.turn_id, req.case_id
+            ),
+        );
+    }
 
     let rationale_text = req
         .rationale_text
@@ -1524,11 +1660,15 @@ mod tests {
                 Box::pin(async move {
                     let start = o.max(0) as usize;
                     let end = (start + page_size as usize).min(source.len());
-                    Ok(if start >= source.len() {
+                    let rows = if start >= source.len() {
                         Vec::new()
                     } else {
                         source[start..end].to_vec()
-                    })
+                    };
+                    // フィルタなしのフェイクなので raw_row_count == rows.len()。total_count は
+                    // このテストの対象外（-1 = backend 未申告として突合をスキップ）。
+                    let raw_row_count = rows.len();
+                    Ok((rows, raw_row_count, -1i64))
                 })
             })
             .await
@@ -1581,11 +1721,38 @@ mod tests {
             Box::pin(async move {
                 let start = offset.max(0) as usize;
                 let end = (start + page_size as usize).min(source.len());
-                Ok(if start >= source.len() {
+                let rows = if start >= source.len() {
                     Vec::new()
                 } else {
                     source[start..end].to_vec()
-                })
+                };
+                // フィルタなしのフェイクなので raw_row_count == rows.len()。total_count は
+                // このテストの対象外（-1 = backend 未申告として突合をスキップ）。
+                let raw_row_count = rows.len();
+                Ok((rows, raw_row_count, -1i64))
+            })
+        }
+    }
+
+    /// [`slice_fetcher`] と同じスライス挙動だが、`total_count` に `source.len()` をそのまま
+    /// 申告する版。total_count 突合（`consumed < total_count` の場合のみ fail closed）を
+    /// 実際に有効化した状態での複数ラウンド pagination を検証するために使う。
+    fn slice_fetcher_with_total_count(
+        source: std::sync::Arc<Vec<TurnRow>>,
+    ) -> impl FnMut(i32, i32) -> PageFuture<'static> {
+        let total_count = source.len() as i64;
+        move |offset, page_size| {
+            let source = source.clone();
+            Box::pin(async move {
+                let start = offset.max(0) as usize;
+                let end = (start + page_size as usize).min(source.len());
+                let rows = if start >= source.len() {
+                    Vec::new()
+                } else {
+                    source[start..end].to_vec()
+                };
+                let raw_row_count = rows.len();
+                Ok((rows, raw_row_count, total_count))
             })
         }
     }
@@ -1747,7 +1914,7 @@ mod tests {
         let page_size = THREADS_FETCH_PAGE_SIZE as usize;
         let fetch_page = |offset: i32, requested: i32| -> PageFuture<'static> {
             Box::pin(async move {
-                Ok((0..requested as usize)
+                let rows: Vec<TurnRow> = (0..requested as usize)
                     .map(|i| {
                         row(
                             "case-solo",
@@ -1759,7 +1926,10 @@ mod tests {
                             None,
                         )
                     })
-                    .collect())
+                    .collect();
+                let raw_row_count = rows.len();
+                // total_count はこのテストの対象外（-1 = backend 未申告として突合をスキップ）。
+                Ok((rows, raw_row_count, -1i64))
             })
         };
         let page = build_threads_page(limit, 0, fetch_page)
@@ -1776,6 +1946,196 @@ mod tests {
             (MAX_INTERNAL_FETCH_ROUNDS * page_size) as i32,
             "offset must have advanced by page_size on every one of the MAX_INTERNAL_FETCH_ROUNDS rounds"
         );
+    }
+
+    // ---- build_threads_page: total_count 突合による fail closed（Issue #31 codex レビュー
+    // W2(b)、raw/フィルタ後の混同修正） ----
+
+    #[tokio::test]
+    async fn build_threads_page_fails_closed_when_total_count_exceeds_raw_row_count_on_a_short_page(
+    ) {
+        // 短ページで終端と判定したのに、backend 申告の total_count が offset + raw_row_count
+        // に届かない（＝不足方向、ここでは実際には 1 件しか返っていないのに 99 件あると申告
+        // する）場合、取りこぼしの可能性があるため fail closed する。`consumed < total_count`
+        // のときだけ bail する非対称性のうち「不足」側を確認するテスト（超過側は
+        // `build_threads_page_does_not_fail_closed_when_raw_row_count_exceeds_total_count` で
+        // 別途確認する）。
+        let dataset = vec![row(
+            "case-a",
+            "t1",
+            1,
+            "2026-08-16T00:00:00+00:00",
+            "q",
+            "answer",
+            None,
+        )];
+        let fetch_page = move |_offset: i32, _page_size: i32| -> PageFuture<'static> {
+            let rows = dataset.clone();
+            let raw_row_count = rows.len();
+            Box::pin(async move { Ok((rows, raw_row_count, 99i64)) })
+        };
+        let err = build_threads_page(10, 0, fetch_page)
+            .await
+            .expect_err("must fail closed on a total_count mismatch");
+        assert!(
+            err.to_string().contains("total_count"),
+            "error must mention total_count so operators can find the cause: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_threads_page_does_not_fail_closed_when_raw_row_count_exceeds_total_count() {
+        // `consumed > total_count`（ここでは 3 件返っているのに backend 申告の total_count が
+        // 1）は truncation を意味しない（例えば呼び出し側の想定と backend の total_count の
+        // 意味論が食い違っているだけ）ので、bail してはいけない。修正前は `consumed !=
+        // total_count` という厳密等価だったため、このケースでも不要な 500 になっていた。
+        let dataset = vec![
+            row(
+                "case-a",
+                "t1",
+                1,
+                "2026-08-16T00:00:00+00:00",
+                "q",
+                "answer",
+                None,
+            ),
+            row(
+                "case-b",
+                "t2",
+                1,
+                "2026-08-16T00:01:00+00:00",
+                "q",
+                "answer",
+                None,
+            ),
+            row(
+                "case-c",
+                "t3",
+                1,
+                "2026-08-16T00:02:00+00:00",
+                "q",
+                "answer",
+                None,
+            ),
+        ];
+        let fetch_page = move |_offset: i32, _page_size: i32| -> PageFuture<'static> {
+            let rows = dataset.clone();
+            let raw_row_count = rows.len();
+            Box::pin(async move { Ok((rows, raw_row_count, 1i64)) })
+        };
+        let page = build_threads_page(10, 0, fetch_page)
+            .await
+            .expect("consumed > total_count must not be treated as truncation");
+        assert_eq!(page.threads.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn build_threads_page_skips_the_total_count_check_when_backend_does_not_report_it() {
+        // total_count が非正（backend 未申告）の場合は突合をスキップし、従来どおり短ページ
+        // 終端の判定だけに委ねる。
+        let dataset = vec![row(
+            "case-a",
+            "t1",
+            1,
+            "2026-08-16T00:00:00+00:00",
+            "q",
+            "answer",
+            None,
+        )];
+        let fetch_page = move |_offset: i32, _page_size: i32| -> PageFuture<'static> {
+            let rows = dataset.clone();
+            let raw_row_count = rows.len();
+            Box::pin(async move { Ok((rows, raw_row_count, -1i64)) })
+        };
+        let page = build_threads_page(10, 0, fetch_page)
+            .await
+            .expect("total_count <= 0 must skip the consistency check");
+        assert_eq!(page.threads.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_threads_page_does_not_fail_closed_when_a_row_is_dropped_by_from_attrs_filtering()
+    {
+        // backend がこのラウンドで raw 3 件を返すが、そのうち 1 件は case_id が欠けており
+        // `TurnRow::from_attrs` が `None` にして落とす（= `fetch_thread_page` が実際に行って
+        // いるフィルタと同じ形）。フィルタ後の件数（2 件）ではなく raw 件数（3 件）を
+        // total_count 突合と offset 前進の基準にするので、不完全な行の混入だけでは bail
+        // しない（Issue #31 reviewer 指摘: フィルタ後件数と raw 件数の混同）。
+        let attrs_rows: Vec<HashMap<String, String>> = vec![
+            [
+                ("case_id", "case-a"),
+                ("turn_id", "t1"),
+                ("created_at", "2026-08-16T00:00:00+00:00"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            // case_id が欠落 → TurnRow::from_attrs は None を返し、from_attrs 経由の集計から
+            // 落ちる。raw_row_count には含める。
+            [
+                ("turn_id", "t2"),
+                ("created_at", "2026-08-16T00:01:00+00:00"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            [
+                ("case_id", "case-b"),
+                ("turn_id", "t3"),
+                ("created_at", "2026-08-16T00:02:00+00:00"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ];
+        let fetch_page = move |_offset: i32, _page_size: i32| -> PageFuture<'static> {
+            let raw_row_count = attrs_rows.len();
+            let rows: Vec<TurnRow> = attrs_rows.iter().filter_map(TurnRow::from_attrs).collect();
+            // backend 申告の total_count は raw 件数 (3) と一致させる: この突合が
+            // raw_row_count 基準であることを検証したいので、フィルタ後件数 (2) とは
+            // 意図的に食い違わせている。
+            Box::pin(async move { Ok((rows, raw_row_count, 3i64)) })
+        };
+        let page = build_threads_page(10, 0, fetch_page)
+            .await
+            .expect("an incomplete row filtered out by from_attrs must not trigger a bail");
+        assert_eq!(
+            page.threads.len(),
+            2,
+            "only the 2 complete rows become threads; the incomplete row is silently dropped, \
+             not counted as missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_threads_page_across_multiple_rounds_matches_raw_total_count() {
+        // 複数ラウンド（200 + 50 = 250 件）にまたがる pagination で、各ラウンドの
+        // raw_row_count の累積が backend 申告の total_count と一致すれば bail しない。
+        // 1 ラウンド目は THREADS_FETCH_PAGE_SIZE ちょうど（200 件）返すため exhausted 判定は
+        // されず、2 ラウンド目で残り 50 件（page_size 未満）を返して初めて exhausted になり、
+        // そこで total_count 突合が働く。
+        let total = THREADS_FETCH_PAGE_SIZE as usize + 50;
+        let dataset = std::sync::Arc::new(
+            (0..total)
+                .map(|i| {
+                    row(
+                        &format!("case-{i}"),
+                        &format!("t{i}"),
+                        1,
+                        "2026-08-16T00:00:00+00:00",
+                        "q",
+                        "answer",
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let limit = total; // 1 ページで全件 distinct case として回収する。
+        let page = build_threads_page(limit, 0, slice_fetcher_with_total_count(dataset))
+            .await
+            .expect("raw_row_count accumulated across rounds must match total_count");
+        assert_eq!(page.threads.len(), total);
+        assert_eq!(page.next_cursor, None, "the source is exhausted");
     }
 
     // ---- resolved_days（Critical指摘3: stats/summary の panic 経路） ----
@@ -1840,11 +2200,18 @@ mod tests {
     }
 
     /// `harness::mod` の `register_known_resolution_reaches_infra_step_when_admission_passes`
-    /// と同じ立証パターン: `test_admin_state()` は `knowledge: None` なので実際に vegapunk へ
-    /// 繋がる 200 をここでは確認できない。しかし admission に拒否されれば 400 (Admission) に
-    /// なるはずなので、500 (Infra) まで到達すること自体が「admission を通過した」ことの証拠に
-    /// なる。修正前は admin correction 経路が `manual_section_keys` を常に空で呼ぶため、
-    /// `rationale_text` 省略時は必ず 400 になっていた（Critical指摘4）。
+    /// と同じ立証パターンだったが、Issue #31 codex レビュー W4 で `create_correction` が
+    /// `register_known_resolution` を呼ぶ前に case_id/turn_id 実在確認（`state.harness.store()`
+    /// → `load_conversation_turns_for_case`）を追加したため、意味が変わっている点に注意:
+    /// `test_admin_state()` は `knowledge: None` なので、この実在確認自体が
+    /// `state.harness.store()` の時点で即 500 になる（admission ロジックへは到達しない）。
+    /// そのため今の 500 は「admission を通過した証拠」ではなく「turn 実在確認の I/O 層
+    /// （knowledge store）に到達した証拠」に後退している。`rationale_text` の既定値補完が
+    /// admission を通す（`manual_section_keys` 空でも 400 にならない）という本来の主張は
+    /// `harness::mod::register_known_resolution_reaches_infra_step_when_admission_passes`
+    /// （knowledge 非依存の経路）と `default_correction_rationale_text_includes_case_and_turn_ids`
+    /// （純関数テスト）が別途担保する。ここで維持しているのは「rationale_text の有無に
+    /// 関わらず 500 になり、400 に化けない」という配線レベルの回帰防止のみ。
     async fn assert_correction_reaches_infra_step(rationale_text: Option<String>) {
         let state = test_admin_state_with_lexicon(
             r#"{"signals":[{"signal":"mold","class":"hazard","surface_forms":["カビ"]}]}"#,
@@ -1866,18 +2233,52 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
-            "must reach the infra step (500, knowledge: None), not an admission-level 400"
+            "must reach an infra step (500, knowledge: None), not an admission-level 400"
         );
     }
 
     #[tokio::test]
-    async fn create_correction_without_rationale_text_still_passes_admission() {
+    async fn create_correction_without_rationale_text_reaches_an_infra_step_not_a_400() {
         assert_correction_reaches_infra_step(None).await;
     }
 
     #[tokio::test]
-    async fn create_correction_with_explicit_rationale_text_passes_admission() {
+    async fn create_correction_with_explicit_rationale_text_reaches_an_infra_step() {
         assert_correction_reaches_infra_step(Some("明示的な理由".to_string())).await;
+    }
+
+    // ---- turn_exists_in_case（Issue #31 codex レビュー W4: case_id/turn_id 実在確認） ----
+    //
+    // `create_correction` ハンドラ全体を HTTP レベルで「存在しない組み合わせ→400」
+    // 「実在する組み合わせ→次のステップへ進む」まで検証するには、`load_conversation_turns_for_case`
+    // が実データを返す knowledge store が要る。`test_admin_state()` は `knowledge: None` で
+    // 常に store 取得の時点で 500 になるため（`assert_correction_reaches_infra_step` 参照）、
+    // このケースは判定そのもの（純関数）を直接検証する。`create_correction` 側は
+    // `turn_exists_in_case` の戻り値で早期 return するだけの薄い配線であることをコードで
+    // 確認できる（このファイルの `create_correction` 実装を参照）。
+
+    fn turn_attrs(turn_id: &str) -> HashMap<String, String> {
+        [("turn_id", turn_id), ("case_id", "case-1")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn turn_exists_in_case_true_when_turn_id_matches_a_row() {
+        let turns = vec![turn_attrs("turn-1"), turn_attrs("turn-2")];
+        assert!(turn_exists_in_case(&turns, "turn-2"));
+    }
+
+    #[test]
+    fn turn_exists_in_case_false_when_turn_id_is_absent() {
+        let turns = vec![turn_attrs("turn-1")];
+        assert!(!turn_exists_in_case(&turns, "turn-99"));
+    }
+
+    #[test]
+    fn turn_exists_in_case_false_when_case_has_no_turns() {
+        assert!(!turn_exists_in_case(&[], "turn-1"));
     }
 
     // ---- list_threads / list_user_threads / stats_summary: begin を通過することの証拠
@@ -1933,6 +2334,66 @@ mod tests {
             response.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "stats_summary must reach the infra step (500), not stop at scope resolution (403)"
+        );
+    }
+
+    // ---- resolve_cursor_offset / list_threads / list_user_threads: 不正な cursor の 400
+    // （Issue #31 codex レビュー W3） ----
+
+    #[test]
+    fn resolve_cursor_offset_returns_zero_when_cursor_is_absent() {
+        assert_eq!(resolve_cursor_offset(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_cursor_offset_passes_through_a_valid_cursor() {
+        let cursor = encode_cursor(42);
+        assert_eq!(resolve_cursor_offset(Some(&cursor)).unwrap(), 42);
+    }
+
+    #[test]
+    fn resolve_cursor_offset_rejects_an_undecodable_cursor_instead_of_rewinding_to_zero() {
+        let response = resolve_cursor_offset(Some("not valid base64!!"))
+            .expect_err("an undecodable cursor must not silently resolve to offset 0");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_threads_rejects_an_invalid_cursor_with_400() {
+        let state = test_admin_state();
+        let response = list_threads(
+            State(state),
+            Extension(supervisor_identity()),
+            Query(ThreadsQuery {
+                limit: None,
+                cursor: Some("not valid base64!!".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an undecodable cursor must not silently rewind to offset 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_user_threads_rejects_an_invalid_cursor_with_400() {
+        let state = test_admin_state();
+        let response = list_user_threads(
+            State(state),
+            Extension(supervisor_identity()),
+            Path("eu-1".to_string()),
+            Query(ThreadsQuery {
+                limit: None,
+                cursor: Some("not valid base64!!".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an undecodable cursor must not silently rewind to offset 0"
         );
     }
 }

@@ -731,11 +731,13 @@ mod tests {
         // **下限そのものを固定する。** filler の長さだけを assert すると、上限を 1,200 等へ
         // 下げる変更が緑のまま通り、実記事では手順の途中切れが復活する（テスト名が
         // "late material survives" なので守られていると誤読される）。
-        assert!(
-            MAX_EXCERPT_CHARS >= 2_500,
-            "excerpts must be long enough to hold a whole procedure section; the real article's \
-             reset steps start at 1,048 chars and run on from there"
-        );
+        const {
+            assert!(
+                MAX_EXCERPT_CHARS >= 2_500,
+                "excerpts must be long enough to hold a whole procedure section; the real \
+                 article's reset steps start at 1,048 chars and run on from there"
+            );
+        }
 
         // 実記事と同じ位置関係を再現する: 手順が 1,048 文字目から始まり、そこから
         // さらに続く（手順が丸ごと入ることを見る。冒頭だけ入って末尾が落ちるのは不可）。

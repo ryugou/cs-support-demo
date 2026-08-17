@@ -547,6 +547,13 @@ fn service_principal() -> VerifiedIdentity {
     }
 }
 
+/// `ok_reply_response` が `record_conversation_turn` の完了を待つ上限。この定数を独立させて
+/// いるのは、直前に別関数のための doc コメント段落を置くと rustdoc がその段落をこの定数の
+/// 説明として扱ってしまうため（Issue #31 reviewer 指摘 W-3: 旧配置では
+/// [`build_reply_response`] の 6 箇所統一ラッパーという説明がこの定数の doc として誤って
+/// 表示されていた）。定数の直前は空行のみとし、doc コメント段落を隣接させない。
+const CONVERSATION_TURN_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `reply_text` を [`crate::harness::prompt_input::to_plain_text`] で正規化した `ReplyResponse`
 /// を組み立てる（Issue #27: design doc §2「`/api/reply` の応答確定点でコードによるプレーン
 /// テキスト正規化を必ず通す」）。純粋関数として独立させているのは、`Response`（axum 型）の
@@ -568,7 +575,23 @@ fn build_reply_response(reply_text: String, case_id: String) -> ReplyResponse {
 ///
 /// 2026-08-16 admin dashboard design doc §2・§3: 正規化直後に `ConversationTurn` の書き切りを
 /// 行う（応答確定点そのもの）。**書き込み失敗は応答を止めない**（warn ログのみで継続する。
-/// ターン欠落は許容し、`audit_event_id` を使えば監査ログとの突合で検出できる）。
+/// ターン欠落は許容し、`audit_event_id` を使えば監査ログとの突合で検出できる。両方の warn ログに
+/// `audit_event_id` フィールドを含めているのはこの突合を実現するため）。
+///
+/// **Issue #31 codex レビュー C2、および一次レビューでの差し戻し**: `record_conversation_turn`
+/// は vegapunk gRPC を経由するため `GrpcLimits::default().timeout_secs`（120 秒、`vegapunk.rs`）
+/// まで応答をブロックしうる。これに対して一時 `tokio::spawn` で fire-and-forget にしたが、これは
+/// 別の契約違反を生んだ: `KnowledgeStore::record_conversation_turn` は support_case ノードの
+/// read-merge-write（`turn_count` だけ差し替えて全属性を再送）を行うため、この書き込みを
+/// リクエストの寿命から完全に切り離すと、read してから write するまでの間に後続リクエストの
+/// `save_conv_state` が割り込んだ場合、その書き込みを丸ごと巻き戻す
+/// （`harness::mod::Harness::save_conv_state` の doc コメントが明文化している lost update 契約と
+/// 同じ危険）。そのため切り離さず、**上限（[`CONVERSATION_TURN_WRITE_TIMEOUT`]、5 秒）付きで
+/// await する**。これで「応答を返す前に turn 書き込みが完了している」という happens-before が
+/// 保たれたまま、120 秒ブロックしうるという本来の C2 指摘も解消する。上限で打ち切った場合は
+/// ターン欠落として許容するが、vegapunk 側では書き込みが継続し得るため、切り捨てた側の
+/// クライアント（この関数）から見て「本当に書けなかった」とは限らない点に注意（残存リスクとして
+/// warn ログに残す）。
 #[allow(clippy::too_many_arguments)]
 async fn ok_reply_response(
     state: &ApiState,
@@ -581,9 +604,9 @@ async fn ok_reply_response(
     case_id: String,
 ) -> Response {
     let response = build_reply_response(reply_text, case_id);
-    if let Err(err) = state
-        .harness
-        .record_conversation_turn(
+    match tokio::time::timeout(
+        CONVERSATION_TURN_WRITE_TIMEOUT,
+        state.harness.record_conversation_turn(
             ctx,
             &response.case_id,
             end_user_id,
@@ -591,17 +614,36 @@ async fn ok_reply_response(
             &response.reply_text,
             reply_kind,
             audit_event_id,
-        )
-        .await
+        ),
+    )
+    .await
     {
-        tracing::warn!(
-            error = ?err,
-            case_id = %response.case_id,
-            reply_kind,
-            "answer api: failed to record a ConversationTurn; continuing without blocking the \
-             reply (2026-08-16 admin dashboard design doc §2: turn loss is tolerated, audit \
-             correlation still works via audit_event_id)"
-        );
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = ?err,
+                case_id = %response.case_id,
+                reply_kind,
+                audit_event_id = %audit_event_id,
+                "answer api: failed to record a ConversationTurn; continuing without blocking \
+                 the reply (2026-08-16 admin dashboard design doc §2: turn loss is tolerated, \
+                 audit correlation still works via audit_event_id)"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                case_id = %response.case_id,
+                reply_kind,
+                timeout_secs = CONVERSATION_TURN_WRITE_TIMEOUT.as_secs(),
+                audit_event_id = %audit_event_id,
+                "answer api: gave up waiting for a ConversationTurn write at the timeout; \
+                 returning the reply anyway. the write is not detached (support_case's \
+                 read-merge-write would otherwise clobber a concurrent request's write — see \
+                 harness::mod::Harness::save_conv_state's lost-update contract), so it may still \
+                 be committed on the backend after this point; turn loss is tolerated \
+                 (2026-08-16 admin dashboard design doc §2)"
+            );
+        }
     }
     (StatusCode::OK, Json(response)).into_response()
 }
@@ -2386,6 +2428,82 @@ mod tests {
         );
     }
 
+    /// 一次レビューでの差し戻し（Issue #31 codex レビュー C2 の再修正）: `record_conversation_turn`
+    /// の gRPC 呼び出しが `CONVERSATION_TURN_WRITE_TIMEOUT` を超えて遅延しても、
+    /// `ok_reply_response` がその上限で待つのを諦めて応答を返すことの直接証拠。
+    ///
+    /// 「accept しない」（bind はするが `accept()` を一切呼ばない）TCP リスナーへ向けた
+    /// `VegapunkClient` を使うと、gRPC の h2 ハンドシェイクが進まないまま `GrpcLimits.timeout_secs`
+    /// まで応答しない（＝「遅延」を模擬できる）。ここでは `GrpcLimits.timeout_secs` を
+    /// `CONVERSATION_TURN_WRITE_TIMEOUT` より十分大きく（60 秒）設定し、応答が「gRPC の timeout」
+    /// ではなく「こちらの `CONVERSATION_TURN_WRITE_TIMEOUT`」で打ち切られたことを、経過時間の
+    /// 上下両方の境界で区別する。
+    ///
+    /// 実時間で待つ（`start_paused` によるバーチャルタイムは不採用）: このテストが遅延させたい
+    /// 対象は tokio のタイマーではなく、accept しない TCP リスナーへの実ソケット接続であり、
+    /// I/O ドライバに実オブジェクトが登録された状態ではポーズ済みクロックの自動前進が働かない
+    /// （`tokio::time::pause` のドキュメントが明記する制約）ため、素直に実時間で
+    /// `CONVERSATION_TURN_WRITE_TIMEOUT`（5 秒）分待つ。実測はこのテスト単体で約 5〜6 秒。
+    #[tokio::test]
+    async fn ok_reply_response_gives_up_on_a_stalled_conversation_turn_write_at_the_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read local addr");
+        // listener を drop すると接続が即座に reset され「遅延」を再現できなくなるため、
+        // テストの終わりまで保持する（accept は一度も呼ばない）。
+        let _listener = listener;
+
+        // CONVERSATION_TURN_WRITE_TIMEOUT (5s) より十分大きくする。これにより、応答が返る
+        // タイミングが「gRPC の timeout」ではなく「こちらの上限」で決まっていることを、
+        // elapsed の上限側の assert で区別できる。
+        const GRPC_TIMEOUT_SECS: u64 = 60;
+        let limits = crate::vegapunk::GrpcLimits {
+            timeout_secs: GRPC_TIMEOUT_SECS,
+            ..Default::default()
+        };
+        let client = crate::vegapunk::VegapunkClient::connect_lazy_with_limits(
+            &format!("http://{addr}"),
+            "",
+            limits,
+        )
+        .expect("lazy connect never touches the network");
+        let knowledge = crate::harness::knowledge::KnowledgeStore::new(Arc::new(client));
+        let state = test_api_state_with_harness(
+            "correct-key",
+            test_harness_with_knowledge(Some(knowledge)),
+        );
+        let ctx = test_request_context(&state);
+
+        let start = std::time::Instant::now();
+        let response = ok_reply_response(
+            &state,
+            &ctx,
+            "answer",
+            "質問文",
+            "audit-slow",
+            None,
+            "回答文です。".to_string(),
+            "case-slow".to_string(),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed >= CONVERSATION_TURN_WRITE_TIMEOUT,
+            "ok_reply_response must wait at least CONVERSATION_TURN_WRITE_TIMEOUT before giving \
+             up on a stalled write; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(GRPC_TIMEOUT_SECS),
+            "ok_reply_response must give up at CONVERSATION_TURN_WRITE_TIMEOUT rather than \
+             waiting for the much longer gRPC timeout ({GRPC_TIMEOUT_SECS}s); took {elapsed:?} \
+             (a regression back to an un-timed-out blocking await would show up as \
+             ~{GRPC_TIMEOUT_SECS}s here)"
+        );
+    }
+
     // ---- /api/reply ルーティング ----
     //
     // 401（認証）/ 400（入力検証・JSON 不正）/ 404（未知 project）はいずれも
@@ -2410,6 +2528,17 @@ mod tests {
     /// 埋め込んだ状態で構築する（Issue #28 §3.1 は evaluate() より前の全リクエストで動くため、
     /// `None` のままだと質問側ゲートの本体（型番検出→定型応答/フォールスルー）を一切検証できない）。
     fn test_harness() -> Harness {
+        test_harness_with_knowledge(None)
+    }
+
+    /// [`test_harness`] の `knowledge` を差し替えられる版。`ok_reply_response` が
+    /// `CONVERSATION_TURN_WRITE_TIMEOUT` で打ち切ることの検証（Issue #31 codex レビュー C2）
+    /// には、gRPC 呼び出しが実際に遅延する `KnowledgeStore` が要る（`knowledge: None` は
+    /// 同期的に即 `Err` を返すため「応答が `CONVERSATION_TURN_WRITE_TIMEOUT` で打ち切られる」
+    /// ことを再現できない）。
+    fn test_harness_with_knowledge(
+        knowledge: Option<crate::harness::knowledge::KnowledgeStore>,
+    ) -> Harness {
         let dir = std::env::temp_dir().join(format!("api-test-harness-{}", uuid::Uuid::new_v4()));
         let lexicon = Arc::new(
             crate::harness::signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap(),
@@ -2429,7 +2558,7 @@ mod tests {
             worm: Arc::new(
                 crate::harness::audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap(),
             ),
-            knowledge: None,
+            knowledge,
             thresholds: crate::harness::decision::Thresholds {
                 low: 0.6,
                 mid: 0.8,
@@ -2459,6 +2588,12 @@ mod tests {
     }
 
     fn test_api_state(api_key: &str) -> ApiState {
+        test_api_state_with_harness(api_key, test_harness())
+    }
+
+    /// [`test_api_state`] の `harness` を差し替えられる版（Issue #31 codex レビュー C2 の
+    /// テストが、`knowledge: Some(..)` を持つ `Harness` を注入するために使う）。
+    fn test_api_state_with_harness(api_key: &str, harness: Harness) -> ApiState {
         let toml = r#"
 bind_addr = "127.0.0.1:3443"
 vegapunk_endpoint = "http://vegapunk.invalid:6840"
@@ -2478,7 +2613,7 @@ fallback_reply_text = "担当者が確認のうえご連絡します"
         .expect("lazy connect never touches the network");
         ApiState {
             config: Arc::new(config),
-            harness: Arc::new(test_harness()),
+            harness: Arc::new(harness),
             tools: ToolService::new(vegapunk),
             api_key: api_key.to_string(),
         }
@@ -2701,19 +2836,28 @@ fallback_reply_text = "担当者が確認のうえご連絡します"
     /// 必ず失敗し warn ログへ落ちる（`ok_reply_response` の doc コメント）。その warn の
     /// `reply_kind` フィールドを直接観測することで、他の分岐と取り違えていないことを
     /// vegapunk 無しで確認できる。
+    ///
+    /// `ok_reply_response` は `record_conversation_turn` を `CONVERSATION_TURN_WRITE_TIMEOUT`
+    /// 付きで await してから応答を返す（Issue #31 codex レビュー C2 の一次レビューでの
+    /// 差し戻しにより、fire-and-forget な `tokio::spawn` から現在の await-with-timeout へ
+    /// 変更済み）。そのため warn ログは応答が返る時点で既に書かれており、`tokio::spawn` 時代に
+    /// 必要だった `yield_now` によるスケジューラへの明示的な実行機会付与は不要。
     #[tokio::test]
     async fn reply_route_out_of_scope_model_records_the_out_of_scope_reply_kind() {
         // tracing capture 機構本体（グローバル subscriber の 1 回インストール + スレッド
         // ローカルバッファ）は `test_support` を参照。このテストは router の oneshot 全体を
         // capture ウィンドウに含める必要があるため、`capture_warnings` ヘルパ（同期版）では
         // なく `test_support::capture_logs_async` を直接使う。
-        let ((status, _body), log_text) = crate::test_support::capture_logs_async(oneshot_json(
-            api_router(test_api_state("correct-key")),
-            "POST",
-            "/urtect/api/reply",
-            Some("Bearer correct-key"),
-            r#"{"message":"ADC-VDB101の設定を教えてください"}"#,
-        ))
+        let ((status, _body), log_text) = crate::test_support::capture_logs_async(async {
+            oneshot_json(
+                api_router(test_api_state("correct-key")),
+                "POST",
+                "/urtect/api/reply",
+                Some("Bearer correct-key"),
+                r#"{"message":"ADC-VDB101の設定を教えてください"}"#,
+            )
+            .await
+        })
         .await;
         assert_eq!(status, StatusCode::OK);
 
