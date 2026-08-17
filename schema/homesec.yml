@@ -80,6 +80,15 @@ nodes:
       lead_offered: { type: string }
       lead_requested: { type: string }
       shown_product_cards: { type: string }
+      # 累積条件（design doc §4.2）。1 key につき値は高々 1 つ、ターンごとに全量で再評価する。
+      # reviewer 一次レビュー Critical: decide.rs の CONDITION_ATTR_KEYS / written_support_case_
+      # attribute_keys() と 3 schema ファイル全部が同じキー集合と突き合わされるため、この
+      # ファイルだけでなく cs-schema.yml / cs-support.yml にも同時に加算すること。
+      advisor_cond_housing: { type: string }
+      advisor_cond_target: { type: string }
+      advisor_cond_concern: { type: string }
+      advisor_cond_budget: { type: string }
+      advisor_cond_install: { type: string }
   ConversationTurn:
     attributes:
       turn_id: { type: string, required: true }

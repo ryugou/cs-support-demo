@@ -1776,6 +1776,14 @@ mod tests {
             "lead_offered",
             "lead_requested",
             "shown_product_cards",
+            // homesec advisor の累積条件（design doc §4.2）。advisor/decide.rs::
+            // CONDITION_ATTR_KEYS が書き込む 5 キー。3 schema ファイル全部が同じ written
+            // リストと突き合わされるため、上の 3 属性と同じ理由で 3 ファイルすべてに加算する。
+            "advisor_cond_housing",
+            "advisor_cond_target",
+            "advisor_cond_concern",
+            "advisor_cond_budget",
+            "advisor_cond_install",
         ]
         .into_iter()
         .map(str::to_string)

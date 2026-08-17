@@ -129,6 +129,14 @@ nodes:
       lead_offered: { type: string }
       lead_requested: { type: string }
       shown_product_cards: { type: string }
+      # 累積条件（design doc §4.2）。urtect（このスキーマ）では未使用。この一致テストが
+      # 全 schema ファイルを対象にするため加算のみ行う（harness/knowledge.rs::
+      # written_support_case_attribute_keys / advisor/decide.rs::CONDITION_ATTR_KEYS）。
+      advisor_cond_housing: { type: string }
+      advisor_cond_target: { type: string }
+      advisor_cond_concern: { type: string }
+      advisor_cond_budget: { type: string }
+      advisor_cond_install: { type: string }
   answer_attempt:
     attributes:
       attempt_id: { type: string, required: true }

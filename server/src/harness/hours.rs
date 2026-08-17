@@ -20,7 +20,7 @@ pub enum PrefDays {
 }
 
 /// "HH:MM" を `NaiveTime` へ parse する。
-fn parse_hm(s: &str) -> Option<NaiveTime> {
+pub(crate) fn parse_hm(s: &str) -> Option<NaiveTime> {
     NaiveTime::parse_from_str(s, "%H:%M").ok()
 }
 

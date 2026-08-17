@@ -108,9 +108,9 @@
 - Produces: case 属性 3 つの read/merge ヘルパ `pub fn parse_advisor_case_attrs(&HashMap<String,String>) -> AdvisorCaseAttrs` / `pub fn advisor_attr_updates(...) -> Vec<(String,String)>`
 
 **Steps:**
-- [ ] decide の全分岐テスト(優先順の交差ケース: emergency×lead_interest、awaiting_time_pref×out_of_domain 等)→ 実装 → PASS
-- [ ] 定型文が NG 辞書(企業定型句)に抵触しないテスト
-- [ ] `cargo test` / fmt → commit `feat(advisor): reply decision, canned replies, and lead flow (#34)`
+- [x] decide の全分岐テスト(優先順の交差ケース: emergency×lead_interest、awaiting_time_pref×out_of_domain 等)→ 実装 → PASS
+- [x] 定型文が NG 辞書(企業定型句)に抵触しないテスト
+- [x] `cargo test` / fmt → commit `feat(advisor): reply decision, canned replies, and lead flow (#34)`
 
 ### Task 5: 材料検索・KR 照合・下書き生成・出口関門・カード
 
