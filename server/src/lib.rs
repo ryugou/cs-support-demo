@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod advisor;
 pub mod api;
 pub mod config;
 pub mod corpus;

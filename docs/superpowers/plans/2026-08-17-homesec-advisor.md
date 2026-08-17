@@ -90,10 +90,10 @@
 - Produces: `pub async fn understand(llm: &AnthropicClient, message: &str, history_digest: &str, accumulated: &str) -> Result<Understanding>`(JSON 出力プロンプト + serde parse。失敗時 1 回だけ再試行、再失敗は Err)
 
 **Steps:**
-- [ ] 語彙正規化のテスト(全 key×代表値、語彙外破棄)→ 実装 → PASS
-- [ ] JSON parse のテスト(正常 / フィールド欠落 / 非 JSON)→ 実装 → PASS
-- [ ] プロンプト組み立てのスナップショット的テスト(emergency・urtect_support・lead_interest の定義文言が spec §4.1 と一致)
-- [ ] `cargo test` / fmt → commit `feat(advisor): understanding call and condition vocabulary (#34)`
+- [x] 語彙正規化のテスト(全 key×代表値、語彙外破棄)→ 実装 → PASS
+- [x] JSON parse のテスト(正常 / フィールド欠落 / 非 JSON)→ 実装 → PASS
+- [x] プロンプト組み立てのスナップショット的テスト(emergency・urtect_support・lead_interest の定義文言が spec §4.1 と一致)
+- [x] `cargo test` / fmt → commit `feat(advisor): understanding call and condition vocabulary (#34)`
 
 ### Task 4: 応答種別決定・定型文・リードフロー
 
