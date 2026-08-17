@@ -97,20 +97,25 @@ pub struct ProductView {
     pub toc: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
+// PartialEq は ingest_homesec.rs の冪等性テスト（同一入力から同一 GraphBuild が
+// 組み立てられることの検証）のために追加する。既存の GraphBuild/GraphNode/GraphEdge の
+// 用途（vegapunk への upsert 入力の一時的な組み立て）はフィールド値の等価性比較で
+// 十分に表現でき、他の呼び出し元（ingest_rules.rs / ingest_alarmcom.rs 等）は
+// 比較を行わないため既存の振る舞いには影響しない。
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraphBuild {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraphNode {
     pub id: String,
     pub node_type: String,
     pub attributes: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraphEdge {
     pub from_id: String,
     pub to_id: String,

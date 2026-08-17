@@ -63,7 +63,8 @@ RUN cargo build --release --locked \
     --bin merge_schema \
     --bin backfill_concept_keys \
     --bin line_adapter \
-    --bin homesec_advisor
+    --bin homesec_advisor \
+    --bin ingest_homesec
 
 FROM debian:bookworm-slim
 
@@ -80,6 +81,7 @@ COPY --from=builder /app/server/target/release/merge_schema /usr/local/bin/merge
 COPY --from=builder /app/server/target/release/backfill_concept_keys /usr/local/bin/backfill_concept_keys
 COPY --from=builder /app/server/target/release/line_adapter /usr/local/bin/line_adapter
 COPY --from=builder /app/server/target/release/homesec_advisor /usr/local/bin/homesec_advisor
+COPY --from=builder /app/server/target/release/ingest_homesec /usr/local/bin/ingest_homesec
 COPY server/config.gce.toml ./config.gce.toml
 COPY server/config.cloudrun.toml ./config.cloudrun.toml
 COPY server/data ./data

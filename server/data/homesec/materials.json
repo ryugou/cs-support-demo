@@ -1,0 +1,45 @@
+[
+  {
+    "material_key": "statistic:musimari-46percent",
+    "kind": "statistic",
+    "title_ja": "無締り(鍵の閉め忘れ)は侵入手段の半数近くを占める",
+    "body_ja": "警察庁「令和4年の刑法犯に関する統計資料」によれば、住宅侵入窃盗の侵入手段のうち「無締り(鍵の閉め忘れ)」が46.8%で最も多く、次いで「ガラス破り」が26.2%です。鍵をかけ忘れないことが最も基本的で効果の大きい防犯対策です。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/211/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:glass-break-26percent",
+    "kind": "statistic",
+    "title_ja": "ガラス破りは侵入手段の4分の1超",
+    "body_ja": "同じ警察庁統計(令和4年)では、住宅侵入窃盗の侵入手段のうち「ガラス破り」が26.2%を占めます。窓ガラスへの防犯フィルムや補助錠は、無締り対策に次いで重要な対策です。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/211/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "own_product:adc-v724",
+    "kind": "own_product",
+    "title_ja": "URTECT ADC-V724",
+    "body_ja": "屋外対応・夜間撮影に対応した屋外用防犯カメラです。スマートフォンから映像を確認できます。",
+    "product_key": "ADC-V724",
+    "category": "monitoring",
+    "card_description": "屋外対応・夜間撮影。スマホから映像確認"
+  },
+  {
+    "material_key": "partner_product:alsok-home-security",
+    "kind": "partner_product",
+    "title_ja": "ALSOK ホームセキュリティ(戸建て向け)",
+    "body_ja": "ALSOK(綜合警備保障)が提供する戸建て向けホームセキュリティサービスです。異常を検知すると警備員が駆けつける個人向け警備サービスで、買い上げ・レンタル・工事費用を抑えたゼロスタートなど複数の料金プランがあります。",
+    "source_url": "https://www.alsok.co.jp/person/price/",
+    "category": "intrusion",
+    "price_band": "月額4,000円台〜9,000円未満(お買い上げ〜ゼロスタートプラン、税込)",
+    "card_description": "駆けつけ対応付きの戸建て向けホームセキュリティサービス",
+    "card_match_terms": "ALSOK,ホームセキュリティ,駆けつけ"
+  },
+  {
+    "material_key": "scenario:apartment-solo-living",
+    "kind": "scenario",
+    "title_ja": "賃貸マンション・一人暮らし",
+    "body_ja": "賃貸物件のため工事不要の対策を優先する。玄関・窓の施錠強化、置き配や来客時の対応、賃貸可否を確認したうえでの防犯カメラ設置などを軸に聞き取り、条件(housing=apartment_rented)を早めに確認する。",
+    "category": "intrusion"
+  }
+]
