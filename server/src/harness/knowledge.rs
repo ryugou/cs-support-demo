@@ -1767,6 +1767,15 @@ mod tests {
             "time_pref_extraction_error_count",
             "excluded_signals",
             "turn_count",
+            // homesec advisor 固有加算（design doc `2026-08-17-homesec-advisor-design.md` §4.4）。
+            // urtect の cs-schema.yml / cs-support.yml には advisor コードは存在しないが、
+            // この一致テストは「コードが書き込むキー ⊆ schema 宣言キー」を全 schema ファイルに
+            // 対して固定する方式のため、advisor が書く 3 属性も cs-schema.yml / cs-support.yml
+            // 側に加算しておく（advisor 側の homesec.yml だけでなく、両ファイルとも一致テストの
+            // 対象になっているため）。
+            "lead_offered",
+            "lead_requested",
+            "shown_product_cards",
         ]
         .into_iter()
         .map(str::to_string)
@@ -1827,6 +1836,130 @@ mod tests {
             missing.is_empty(),
             "schema/cs-support.yml support_case.attributes is missing keys that code writes: \
              {missing:?}"
+        );
+    }
+
+    /// homesec advisor（Issue #34、`2026-08-17-homesec-advisor-design.md`）の schema。
+    /// advisor は cs-schema.yml / cs-support.yml と同じ support_case 定義を複製したうえで
+    /// lead_offered / lead_requested / shown_product_cards を持つため、同じ一致テストを
+    /// homesec.yml にも適用する（cs_schema_yml_declares_... / cs_support_yml_declares_... と
+    /// 同一パターン）。
+    #[test]
+    fn homesec_yml_declares_every_support_case_attribute_that_code_writes() {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../schema/homesec.yml"
+        ));
+        let declared = declared_support_case_attribute_keys(path);
+        let written = written_support_case_attribute_keys();
+        let missing: Vec<&String> = written.difference(&declared).collect();
+        assert!(
+            missing.is_empty(),
+            "schema/homesec.yml support_case.attributes is missing keys that code writes: \
+             {missing:?}"
+        );
+    }
+
+    // ---- schema/homesec.yml の node/edge type 網羅性（reviewer 一次レビュー指摘1・Critical）----
+    //
+    // homesec advisor 自身のパイプラインではなく、advisor にもマウントされる共有管理画面の
+    // corrections 経路（design doc `2026-08-17-homesec-advisor-design.md` §3.2、
+    // `admin.rs::create_correction` → `build_known_resolution_graph`）が書き込む node_type /
+    // edge_type が、schema/homesec.yml に宣言されていることを固定する。この経路は常に
+    // manual_schema = ManualV1（`config.homesec.toml`）かつ rationale_text が Some
+    // （`create_correction` が `unwrap_or_else(default_correction_rationale_text)` で埋めるため）
+    // で呼ばれるので、Rationale ノード / HAS_SIGNAL 辺 / BECAUSE 辺が必ず発生する。
+    //
+    // vegapunk 側が未宣言属性・型の書き込みを拒否しうる（上の C1 コメントと同じ障害クラス）
+    // ため、「書き込み型 ⊆ 宣言型」をハードコードではなく実際の `build_known_resolution_graph`
+    // 呼び出し結果で固定する。
+
+    /// `schema_path` の `nodes:` トップレベルキー集合（宣言済みノード型）。
+    /// `declared_support_case_attribute_keys` と同じパース方式（serde_yaml、cwd 非依存の
+    /// 絶対パス前提）に合わせる。
+    fn declared_node_types(schema_path: &std::path::Path) -> std::collections::HashSet<String> {
+        let text = std::fs::read_to_string(schema_path)
+            .unwrap_or_else(|e| panic!("read schema file {schema_path:?}: {e}"));
+        let value: serde_yaml::Value = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("parse schema file {schema_path:?} as YAML: {e}"));
+        let nodes = value["nodes"]
+            .as_mapping()
+            .unwrap_or_else(|| panic!("{schema_path:?}: nodes is not a mapping"));
+        nodes
+            .keys()
+            .map(|k| {
+                k.as_str()
+                    .unwrap_or_else(|| panic!("{schema_path:?}: non-string node type key"))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// `schema_path` の `edges:` トップレベルキー集合（宣言済み辺型）。
+    fn declared_edge_types(schema_path: &std::path::Path) -> std::collections::HashSet<String> {
+        let text = std::fs::read_to_string(schema_path)
+            .unwrap_or_else(|e| panic!("read schema file {schema_path:?}: {e}"));
+        let value: serde_yaml::Value = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("parse schema file {schema_path:?} as YAML: {e}"));
+        let edges = value["edges"]
+            .as_mapping()
+            .unwrap_or_else(|| panic!("{schema_path:?}: edges is not a mapping"));
+        edges
+            .keys()
+            .map(|k| {
+                k.as_str()
+                    .unwrap_or_else(|| panic!("{schema_path:?}: non-string edge type key"))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn homesec_yml_declares_every_node_and_edge_type_that_admin_corrections_write() {
+        use crate::harness::signal::Signal;
+        // admin corrections 経路と同じ入力形: signal_set 非空・rationale_text: Some(..)・
+        // manual_section_keys 空（`create_correction` は常に `&[]` を渡すため BASED_ON /
+        // ManualSection はこの経路で発生しない。指摘1の事実関係のとおり）。
+        let new_kr = NewKnownResolution {
+            signal_set: [Signal::new("sd_not_recognized")].into_iter().collect(),
+            applicability: "全モデル".to_string(),
+            answer: "回答文".to_string(),
+            origin: "manual".to_string(),
+            created_by: "sup-001".to_string(),
+            created_by_email: "sup-001@sivira.co".to_string(),
+            rationale_text: Some("判断理由".to_string()),
+            manual_section_keys: vec![],
+        };
+        let build = build_known_resolution_graph(
+            "homesec",
+            "kr-1",
+            &new_kr,
+            crate::config::ManualSchemaKind::ManualV1,
+        );
+
+        let written_node_types: std::collections::HashSet<String> =
+            build.nodes.iter().map(|n| n.node_type.clone()).collect();
+        let written_edge_types: std::collections::HashSet<String> =
+            build.edges.iter().map(|e| e.edge_type.clone()).collect();
+
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../schema/homesec.yml"
+        ));
+        let declared_nodes = declared_node_types(path);
+        let declared_edges = declared_edge_types(path);
+
+        let missing_nodes: Vec<&String> = written_node_types.difference(&declared_nodes).collect();
+        assert!(
+            missing_nodes.is_empty(),
+            "schema/homesec.yml nodes is missing node types that the shared admin corrections \
+             path (admin.rs::create_correction) writes: {missing_nodes:?}"
+        );
+        let missing_edges: Vec<&String> = written_edge_types.difference(&declared_edges).collect();
+        assert!(
+            missing_edges.is_empty(),
+            "schema/homesec.yml edges is missing edge types that the shared admin corrections \
+             path (admin.rs::create_correction) writes: {missing_edges:?}"
         );
     }
 }
