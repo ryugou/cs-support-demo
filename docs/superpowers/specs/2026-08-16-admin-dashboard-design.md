@@ -22,14 +22,14 @@
 | `turn_id` | string（upsert key） | `turn-{uuid}` |
 | `case_id` | string | 紐づく case |
 | `end_user_id` | string（任意） | 匿名化済みエンドユーザー識別子（第 4 節） |
-| `seq` | int | case 内の通し番号（1 起点） |
+| `seq` | int | case 内の通し番号（1 起点）。support_case 属性 `turn_count`（後述）を read-merge-write して算出する（`turn_count` 未設定時は 0 件として扱う） |
 | `created_at` | string（RFC3339 UTC） | サーバ時刻 |
 | `question` | string | 顧客メッセージ（そのまま） |
 | `reply_text` | string | 実際に返した最終応答文（プレーンテキスト正規化後） |
 | `reply_kind` | string | `answer` / `clarify` / `escalation` / `out_of_scope` / `time_pref` / `fallback` |
 | `audit_event_id` | string | 監査との突合キー |
 
-辺: `case -HAS_TURN-> ConversationTurn`。case ノードに属性 `end_user_id`（任意、初回提供時に設定）を加算。
+辺: `case -HAS_TURN-> ConversationTurn`。case ノードに属性 `end_user_id`（任意、初回提供時に設定）と `turn_count`（int、直近発行 seq。ConversationTurn を書くたびに read-merge-write で加算。`query_nodes` の固定 limit=1000 に依存した旧採番方式は 1000 件超の会話で seq が重複する欠陥があり撤去した）を加算。書き込み順序は turn_count → ConversationTurn（逆順だと turn_count の書き戻し失敗時に同じ seq が再採番され重複しうるため、欠番の方を選ぶ）。
 
 **書き込み規則**: `/api/reply` の応答確定点（プレーンテキスト正規化の直後）で書く。**書き込み失敗は応答を止めない**（warn ログ + 応答優先。ターン欠落は許容し、監査ログとの突合で検出可能）。ターンは書き切りで、UpsertNodes 全置換問題の対象外。
 
@@ -37,6 +37,12 @@
 - `ConversationTurn` に埋め込みベクトルを作らない
 - manual 検索・KR 検索の対象ノード型に含まれないことをテストで固定（「ターンが `search_manual` の結果に決して現れない」テスト）
 - コミュニティ検出対象は vegapunk サーバ側 `community.target_node_types`（明示列挙）であり、新型は列挙に無いため対象外（先方への依頼不要）
+
+**並行性の契約**: `seq` の採番（`support_case.turn_count` の read-merge-write）は、`/api/reply` の呼び出し側直列化契約（会話フロー design doc §6「並行更新の制約」: LINE アダプタがユーザー単位に処理を直列化しており、同一 case への並行リクエストは実運用で発生しない）に依存する。API を直接呼ぶ別クライアントを追加する場合は呼び出し側での直列化が前提（conv state と同じ契約）。
+
+**Accepted Risk（一覧ページングの同時刻境界）**: vegapunk のソート指定は単一キー（`created_at`）のみで、第二キー（`turn_id`）はページ取得後のローカル適用に限られる。同一 `created_at` の行がページ境界をまたぐ場合、理論上ページ間の重複・欠落が起きうる。created_at はナノ秒精度で衝突が稀であること、管理画面の一覧という用途であることから受容する（vegapunk が複合キーソートに対応したら解消する）。
+
+**制限**: corrections の case-turn 帰属検証は case あたり先頭 1,000 ターンまでを照合する。セッション TTL 60 分の運用で 1 case が 1,000 ターンへ到達することは想定しない（到達した場合、後半ターンへの訂正は 400 になる）。
 
 **保持期間**: 無制限に増えるため、retention（例: 180 日で削除）は将来項目として記録する（本件スコープ外）。
 
