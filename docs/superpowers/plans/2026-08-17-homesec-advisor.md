@@ -126,12 +126,12 @@
 - Produces: `pub struct ProductCard { material_key, title, description, image_url: Option<String>, button_text, button_message }` / `pub fn select_cards(final_text: &str, injected: &[AdvisorMaterial], shown_csv: &str, images_dir_public: &str) -> Vec<ProductCard>`(spec §7.2: card_description 保有材料のみ、match_terms 照合、own 優先、3 件上限、画像は存在するファイルのみ URL 化)
 
 **Steps:**
-- [ ] AdvisorMaterial parse テスト(必須欠落・CSV match_terms)→ 実装 → PASS
-- [ ] URL / 型番 / NG 各関門の違反 → fallback 差し替えテスト → 実装 → PASS
-- [ ] select_cards テスト(合致 / 非合致 / own 優先 / 再表示抑止 / 画像なし)→ 実装 → PASS
-- [ ] KR 照合: conditions を SignalSet に写して `match_known_resolution` を呼び、ヒット時は材料先頭に注入するテスト → 実装 → PASS
-- [ ] 検索非汚染: gather_materials が `advisor_material` / KR 以外(ConversationTurn / support_case)を材料として返さないことの固定テスト(spec 不変条件 6)
-- [ ] `cargo test` / fmt → commit `feat(advisor): materials, grounded drafting, gates, and cards (#34)`
+- [x] AdvisorMaterial parse テスト(必須欠落・CSV match_terms)→ 実装 → PASS
+- [x] URL / 型番 / NG 各関門の違反 → fallback 差し替えテスト → 実装 → PASS
+- [x] select_cards テスト(合致 / 非合致 / own 優先 / 再表示抑止 / 画像なし)→ 実装 → PASS
+- [x] KR 照合: conditions を SignalSet に写して `match_known_resolution` を呼び、ヒット時は材料先頭に注入するテスト → 実装 → PASS
+- [x] 検索非汚染: gather_materials が `advisor_material` / KR 以外(ConversationTurn / support_case)を材料として返さないことの固定テスト(spec 不変条件 6)
+- [x] `cargo test` / fmt → commit `feat(advisor): materials, grounded drafting, gates, and cards (#34)`
 
 ### Task 6: homesec_advisor バイナリと /homesec/api/reply
 

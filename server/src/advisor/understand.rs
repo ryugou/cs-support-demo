@@ -28,6 +28,21 @@ pub enum ConditionKey {
     Install,
 }
 
+impl ConditionKey {
+    /// design doc §4.2 のキー名(語彙表そのもの)。`materials::conditions_to_signal_set` が
+    /// advisor の known_resolution signal 表現(`"{key}:{value}"`)を組み立てる際の正本として
+    /// 使う。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConditionKey::Housing => "housing",
+            ConditionKey::Target => "target",
+            ConditionKey::Concern => "concern",
+            ConditionKey::Budget => "budget",
+            ConditionKey::Install => "install",
+        }
+    }
+}
+
 /// LLM Call #1(理解)の出力型(design doc §4.1)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Understanding {
@@ -326,6 +341,17 @@ async fn try_understand_once(
 mod tests {
     use super::*;
     use crate::test_support::capture_logs;
+
+    // --- ConditionKey::as_str ---
+
+    #[test]
+    fn condition_key_as_str_matches_the_design_doc_vocabulary_key_names() {
+        assert_eq!(ConditionKey::Housing.as_str(), "housing");
+        assert_eq!(ConditionKey::Target.as_str(), "target");
+        assert_eq!(ConditionKey::Concern.as_str(), "concern");
+        assert_eq!(ConditionKey::Budget.as_str(), "budget");
+        assert_eq!(ConditionKey::Install.as_str(), "install");
+    }
 
     // --- normalize_condition: 5 key × 代表値 ---
 
