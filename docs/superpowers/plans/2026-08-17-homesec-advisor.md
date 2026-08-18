@@ -176,11 +176,11 @@
 - Modify: `docs/superpowers/specs/2026-08-17-homesec-advisor-dialogue-examples.md`(仮置き統計値を投入値と一致させる)
 
 **Steps:**
-- [ ] statistic: 警察庁「住まいる防犯110番」等の公開ページを WebFetch で実照会し、数値と `source_url` を突合してから記載する(**未照会の数値・URL を書くことを禁止**。照会できなかった項目は入れない)
-- [ ] own_product: 既存 `server/data/urtect/products.json` と urtect マニュアルの記載範囲で提案文・card_description を書く(仕様の創作禁止。根拠が無い属性は書かない)
-- [ ] partner_product: カテゴリ主体(価格は価格帯)。`source_url` は公式サイトを WebFetch で存在確認
-- [ ] `ingest_homesec` のバリデーションが全件 PASS すること(`cargo run --bin ingest_homesec -- --validate-only` 相当のモードを Task 2 に含めておく)
-- [ ] commit `feat(advisor): curated homesec materials (#34)`
+- [x] statistic: 警察庁「住まいる防犯110番」等の公開ページを WebFetch で実照会し、数値と `source_url` を突合してから記載する(**未照会の数値・URL を書くことを禁止**。照会できなかった項目は入れない)
+- [x] own_product: 既存 `server/data/urtect/products.json` と urtect マニュアルの記載範囲で提案文・card_description を書く(仕様の創作禁止。根拠が無い属性は書かない)
+- [x] partner_product: カテゴリ主体(価格は価格帯)。`source_url` は公式サイトを WebFetch で存在確認
+- [x] `ingest_homesec` のバリデーションが全件 PASS すること(`cargo run --bin ingest_homesec -- --validate-only` 相当のモードを Task 2 に含めておく)
+- [x] commit `feat(advisor): curated homesec materials (#34)`
 
 ### Task 9: CI 配線と運用ドキュメント
 
