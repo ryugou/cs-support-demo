@@ -65,7 +65,7 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
 - 会話状態: `support_case` ノードの read-merge-write(homesec schema 上)。聞き返し予算 `clarify_turns`(上限 3)を流用
 - 時間帯受付(time_pref)・営業時間(hours): **担当者連絡のリード獲得に使う**。解釈・状態機械(受付モード、2 回連続不成立で解除、営業時間外は即時にその場で案内)は既存実装のまま、文言だけ営業連絡用に差し替える。営業時間の既定は平日 10:00〜18:00 JST(config)
 - ターン永続化: `ConversationTurn` を homesec schema へ書き切り(応答優先・5 秒上限・失敗 warn)。`end_user_id` は LINE userId の SHA-256 先頭 32 字(アダプタ既存実装のまま)
-- 管理画面: threads / thread 詳細 / users / stats / corrections の 5 endpoint を advisor にもマウントする。corrections は既存 add_known_resolution 入口で homesec schema に登録し、advisor パイプラインの KR 照合(第 6 節)で次回から効く。リード(第 4.4 節)はスレッド詳細の case メタ(`lead_requested` / `preferred_contact_time`)で確認する
+- 管理画面: threads / thread 詳細 / users / stats / corrections の 5 endpoint を advisor にもマウントする。corrections は既存 add_known_resolution 入口で homesec schema に登録し、advisor パイプラインの KR 照合(第 6 節)で次回から効く。リード(第 4.4 節)はスレッド詳細の case メタ(`lead_requested` / `preferred_contact_time`)で確認する。**認可は CS(urtect)と同じ `require_google_auth` を流用するため、CLAUDE.md の「Project Routing and Auth」節が記す actor 突合の欠如(Google 認証さえ通れば任意アカウントが supervisor 相当になる)がそのまま適用される。** homesec ではこれにより顧客の相談内容(会話ログ・リード)が同じ露出面に載る。デモの受容リスクとして扱い、actor 突合の実装が入るまでアクセス制御としては不十分と認識すること
 - 出口関門: `to_plain_text`、継続会話の挨拶抑制(CONTINUATION_OPENER_RULE)、Markdown 禁止(MARKDOWN_BAN_RULE)を流用
 - 使わない共有モジュール: エスカレーション応答(CS の受付番号・折返し文言) — advisor に人間サポートエスカレーションは無い。人間が関与するのは営業リード(第 4.4 節)のみ
 
@@ -155,7 +155,7 @@ LLM Call #1 が失敗(タイムアウト・パース不能)した場合は 1 回
 
 ### 4.4 リード獲得フロー
 
-1. LLM Call #2 のプロンプト規則: 導入意欲が見えたら応答末尾で担当者連絡を 1 文で提案する。ただし case の `lead_offered == true` なら提案しない(1 会話 1 回)。提案文を出したターンで `lead_offered = true` を書き戻す
+1. LLM Call #2 のプロンプト規則: `lead_offered == false` の間、導入意欲が見えたら応答末尾に固定文言「担当者から詳しくご案内できます」を含む 1 文で担当者連絡を提案してよい(言い換えを禁止し、この文言をそのまま使うようプロンプトで指示する)。コードは生成された最終応答文(出口関門通過後)にこの固定文言が含まれるかを文字列照合し、含まれていれば `lead_offered = true` を書き戻す。フォールバック定型文(`fallback`)が返ったターンは判定対象にしない。**受容リスク**: LLM がこの文言を使わず言い換えた場合、コードは提案を検知できず `lead_offered` は false のまま残る(次ターン以降も提案規則が注入され続け、まれに複数ターンにわたって提案文言が出うる)。デモでは、常に最初の対象ターンで `lead_offered` を焼き切り提案が実質発生しなくなる設計より、この文字列照合方式を優先する
 2. 顧客が応じたら(`lead_interest == true`)、時間帯受付モード ON。営業時間外の希望には即時その場で伝えて代替を聞く(既存 hours 実装)
 3. 時間帯が確定したら `lead_requested = true` と `preferred_contact_time` を case へ書き戻し、`lead` 定型(「◯◯に担当者からご連絡しますね」+ 継続誘導)を返す
 4. 担当者はリードを管理画面のスレッド詳細(case メタ)で確認する。デモでは通知連携(メール・Slack 等)は行わない
@@ -240,8 +240,10 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 | --- | --- |
 | LLM Call #1 失敗(再試行 1 回込み) | `fallback` 定型を返す |
 | LLM Call #2 失敗 | `fallback` 定型を返す |
-| vegapunk 検索失敗 | warn ログ。材料ゼロで Call #2 を実行(接地規則により事実主張なしの一般助言になる)。応答は止めない。製品カードは添付しない(own_product 材料を引けないため) |
-| 会話状態・ターン書き込み失敗 | warn ログ。応答優先(現行 CS と同じ)。`shown_product_cards` の書き戻し失敗は同一カードの再表示として現れる(許容) |
+| vegapunk 検索失敗(材料検索・known_resolution 読み取り) | warn ログ。材料ゼロで Call #2 を実行(接地規則により事実主張なしの一般助言になる)。応答は止めない。製品カードは添付しない(own_product 材料を引けないため) |
+| support_case の書き込み失敗 | 500 を返す(fail closed)。会話状態の正本を失うため応答を継続しない |
+| ConversationTurn の書き込み失敗・5 秒タイムアウト | warn ログ。応答優先(現行 CS の `CONVERSATION_TURN_WRITE_TIMEOUT` と同じ)。`shown_product_cards` の書き戻し失敗は同一カードの再表示として現れる(許容) |
+| 同一 `case_id` への並行リクエスト | vegapunk に CAS が無く、support_case の read-merge-write はプロセス内外を問わず排他制御しない。`clarify_turns` の取りこぼし・カードの二重表示・担当者連絡提案の二重発生・`turn_count` の重複採番が起こりうる。デモでは受容する(LINE の 1 ユーザーが同時に複数発話を送る頻度は低いと想定。恒久対処は case 単位のロックまたは vegapunk 側の CAS が要る) |
 | ingest 途中失敗 | 冪等 upsert のため再実行で収束。部分投入状態でも検索は動作する |
 
 ## 9. 不変条件
@@ -251,7 +253,7 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 3. 応答内の URL は注入材料の `source_url` のみ、ADC- 型番は URTECT 7 型番のみ。カードは今回注入した製品材料からのみ組み立て、カード画像は advisor 自ホストの同梱画像のみ
 4. Markdown 記法を含む応答を顧客へ返さない
 5. `emergency == true` のターンは、他のどの応答種別よりも `safety` 定型を優先する
-6. 担当者連絡の提案は 1 会話につき 1 回まで(`lead_offered`)
+6. 担当者連絡の提案は 1 会話につき 1 回までを目標とする(`lead_offered`、第 4.4 節 1)。検知は生成文への固定文言の文字列照合であり、LLM が言い換えた場合は保証できない(第 4.4 節記載の受容リスク)
 7. `ConversationTurn` / `support_case` が材料検索の結果に現れない(検索非汚染)
 8. 顧客メッセージ・会話履歴は Anthropic API へ送信される(現行 CS と同じ運用留意)
 

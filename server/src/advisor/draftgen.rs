@@ -39,6 +39,28 @@ pub const URTECT_MODELS: [&str; 7] = [
     "ADC-VC827P",
 ];
 
+/// design doc §4.4 手順1 のリード提案文を、生成後に決定論で検出するためのマーカー。
+/// `build_advisor_system_prompt` が注入するリード提案規則の文言(下記)と必ず同期させること
+/// (`lead_offer_marker_is_contained_in_the_lead_solicitation_rule` テストが固定する)。
+/// `api.rs` の `should_burn_lead_offered` が、この文字列を含むかどうかで「このターンで実際に
+/// リード提案文が出たか」を決定論的に判定する(reviewer 指摘 Critical 1: 従来は
+/// `draft_with_materials` を呼んだターンなら LLM が実際に提案したかに関わらず無条件で
+/// `lead_offered = true` を焼いており、能動的リード獲得経路が実質常に発火しなくなっていた)。
+///
+/// マーカーは提案文そのものを完全一致に近い形で含む長さにしてある(広い語 "担当者" を
+/// マーカーにしていた旧版は、codex レビュー2巡目で誤検知が実測された):
+/// - 「担当者に連絡する必要はありません」のような**否定文**で「担当者」が出る
+///   (提案していないのに `lead_offered` が焼かれ、以後リード提案の機会を永久に失う)
+/// - design doc §5.2 の `partner_product` 材料には警備会社サービスが含まれる。
+///   「警備会社の担当者が駆けつけます」のような他社サービスの説明文で「担当者」が出る
+///   (同上)
+///
+/// この文字列照合方式である以上、LLM が指示に反してこの一文を言い換えた場合は検知漏れになり、
+/// 同一会話で2回提案されうる(design doc §9 不変条件6 違反)。恒久対処は `draft_advisor_reply`
+/// の戻り値を構造化して「提案文を挿入したか」を型で返すことだが、それは draftgen の契約変更を
+/// 伴うため別スコープとする。
+pub const LEAD_OFFER_MARKER: &str = "担当者から詳しくご案内できます";
+
 /// LLM Call #2(下書き生成)の生成トークン上限。300〜500 字程度の日本語返信本文が入る値。
 /// `understand::UNDERSTAND_MAX_TOKENS`(構造化 JSON 専用、600)より本文そのものが長いため、
 /// それより大きい値にする。
@@ -137,8 +159,10 @@ pub fn build_advisor_system_prompt(
     if !lead_offered {
         p.push_str(
             "\nリード提案規則:\n\
-             - 導入・購入の意欲が読み取れたら、応答の末尾で「担当者から詳しくご案内できます」\
-             という趣旨を1文だけ提案してよい(1会話につき1回まで。今回はまだ提案していない)。\n",
+             - 導入・購入の意欲が読み取れたら、応答の末尾で提案を1文だけ加えてよい\
+             (1会話につき1回まで。今回はまだ提案していない)。提案する場合は、必ず\
+             「担当者から詳しくご案内できます。」という一文をそのまま使うこと。\
+             言い換えないこと。\n",
         );
     }
     p.push_str(
@@ -547,6 +571,18 @@ mod tests {
         for model in URTECT_MODELS {
             assert!(p.contains(model), "missing {model} in: {p}");
         }
+    }
+
+    #[test]
+    fn lead_offer_marker_is_contained_in_the_lead_solicitation_rule() {
+        // api.rs::should_burn_lead_offered が LEAD_OFFER_MARKER の文字列照合で「実際に
+        // リード提案文が出たか」を判定する。この定数がプロンプト文言と drift すると、
+        // 判定が常に false のままになり、リード獲得経路が発火しなくなる(reviewer 指摘 C1)。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(
+            p.contains(LEAD_OFFER_MARKER),
+            "LEAD_OFFER_MARKER must stay in sync with the lead solicitation rule text: {p}"
+        );
     }
 
     #[test]

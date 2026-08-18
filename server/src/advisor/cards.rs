@@ -9,10 +9,15 @@
 
 use crate::advisor::materials::AdvisorMaterial;
 use crate::harness::knowledge::csv_list;
+use serde::Serialize;
 use std::path::Path;
 
 /// design doc §3.3 の `product_cards` 1 件。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` を derive する(Task 6): フィールド名は design doc §3.3 の JSON 例
+/// (`material_key` / `title` / `description` / `image_url` / `button_text` /
+/// `button_message`)と完全一致しているため `#[serde(rename = ...)]` は不要。
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProductCard {
     pub material_key: String,
     pub title: String,

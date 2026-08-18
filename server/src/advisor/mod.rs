@@ -1,3 +1,4 @@
+pub mod api;
 pub mod canned;
 pub mod cards;
 pub mod decide;

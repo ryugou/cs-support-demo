@@ -146,10 +146,10 @@
 - Produces: bin main = config ロード(`--config config.homesec.toml`)、起動 fail-closed(`CS_SUPPORT_ANSWER_API_KEY` / `CS_SUPPORT_PUBLIC_DOMAIN` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID` / fallback 文言 / business hours 検証。**署名鍵と CLIENT_SECRET は要求しない**)、router = healthz/livez + advisor api + `/{project}/admin/api`(admin_router + require_google_auth)+ `/admin`(staticui)+ `/static/products`(ServeDir on `AdvisorConfig.images_dir`)
 
 **Steps:**
-- [ ] staticui.rs 抽出 → 既存テスト無変更 PASS 確認 → commit `refactor: extract static ui router for reuse (#34)`
-- [ ] handler テスト(401 / 400 / 200 + cards)→ 実装 → PASS
-- [ ] bin main の起動チェックテスト(env 欠落で Err)→ 実装 → PASS
-- [ ] `cargo test` / fmt → commit `feat(advisor): homesec advisor service binary (#34)`
+- [x] staticui.rs 抽出 → 既存テスト無変更 PASS 確認 → commit `refactor: extract static ui router for reuse (#34)`
+- [x] handler テスト(401 / 400 / 200 + cards)→ 実装 → PASS
+- [x] bin main の起動チェックテスト(env 欠落で Err)→ 実装 → PASS
+- [x] `cargo test` / fmt → commit `feat(advisor): homesec advisor service binary (#34)`
 
 ### Task 7: line_adapter のカルーセル描画 + admin-ui バッジ
 
