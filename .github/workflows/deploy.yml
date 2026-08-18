@@ -45,8 +45,8 @@ env:
   CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID: ${{ vars.CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID }}
   # CI が同一イメージ tag へ更新する対象。ここが唯一の正本で、CLAUDE.md の記述は
   # この 2 行に追従させる。リソースを増やしたらここに足す。
-  RUN_SERVICES: "cs-support-mcp cs-support-line homesec-advisor homesec-line"
-  RUN_JOBS: "ingest-products ingest-rules ingest-urtect ingest-alarmcom merge-schema verify-alarmcom backfill-concept-keys ingest-homesec"
+  RUN_SERVICES: "cs-support-mcp cs-support-line"
+  RUN_JOBS: "ingest-products ingest-rules ingest-urtect ingest-alarmcom merge-schema verify-alarmcom backfill-concept-keys"
 
 jobs:
   build-deploy:
