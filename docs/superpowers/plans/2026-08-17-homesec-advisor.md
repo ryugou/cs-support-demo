@@ -163,11 +163,11 @@
 - Produces: 契約 = spec §3.3 の `product_cards`。フィールド欠落(CS 経路)は完全に従来挙動
 
 **Steps:**
-- [ ] parse テスト(cards あり / なし)→ 実装 → PASS
-- [ ] carousel payload テスト(文字数切り詰め・画像なし)→ 実装 → PASS
-- [ ] 既存 line_adapter テストが無変更 PASS であること確認
-- [ ] admin-ui: バッジ追加 + `npm --prefix admin-ui run build` 成功確認
-- [ ] `cargo test` / fmt → commit `feat(advisor): line carousel rendering and admin badges (#34)`
+- [x] parse テスト(cards あり / なし)→ 実装 → PASS
+- [x] carousel payload テスト(文字数切り詰め・画像なし)→ 実装 → PASS
+- [x] 既存 line_adapter テストが無変更 PASS であること確認
+- [x] admin-ui: バッジ追加 + `npm --prefix admin-ui run build` 成功確認
+- [x] `cargo test` / fmt → commit `feat(advisor): line carousel rendering and admin badges (#34)`
 
 ### Task 8: データキュレーション(materials.json 本番分)
 
