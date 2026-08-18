@@ -541,6 +541,18 @@ MCP tool 呼び出しは claude.ai のカスタムコネクタ経由で行う。
 - `cs-support-line` の必須 env（未設定・空文字は起動失敗。design doc §6）: `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `CS_ANSWER_API_URL`（`https://cs-support-mcp-235108918288.asia-northeast1.run.app/urtect/api/reply`）/ `CS_ANSWER_API_KEY`。任意 env: `CS_LINE_FALLBACK_TEXT` / `CS_LINE_NONTEXT_TEXT`（既定値は design doc §6）
 - LINE Developers console の webhook URL に `https://<cs-support-line の URL>/line/webhook` を設定する
 
+### ホームセキュリティアドバイザ（homesec、Issue #34）
+
+URTECT CS とは別系統のアドバイザ AI デモ。設計の正本は `docs/superpowers/specs/2026-08-17-homesec-advisor-design.md`（会話期待値は同日付の dialogue-examples）。同一イメージから起動する 2 service + 1 job で構成し、現行 CS のコード経路は共有モジュール以外変更しない。
+
+- `homesec-advisor` service: バイナリ `/usr/local/bin/homesec_advisor`、config `server/config.homesec.toml`、VPC connector 必要。**OAuth AS・署名鍵・CLIENT_SECRET を持たない**（管理画面認証は GIS の Bearer 検証のみ）。env: `CS_SUPPORT_PUBLIC_DOMAIN` / `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID`（平文）。Secret 注入: `CS_SUPPORT_ANSWER_API_KEY` ← `homesec-answer-api-key`、`CS_SUPPORT_LLM_API_KEY` / `VEGAPUNK_BEARER_TOKEN` ← 既存 secret 共用
+- `homesec-line` service: `line_adapter` の別インスタンス、`--max-instances=1`、VPC 不要。env: `CS_ANSWER_API_URL=https://homesec-advisor-235108918288.asia-northeast1.run.app/homesec/api/reply`。Secret 注入: `CS_ANSWER_API_KEY` ← `homesec-answer-api-key`、`LINE_CHANNEL_SECRET` ← `homesec-line-channel-secret`、`LINE_CHANNEL_ACCESS_TOKEN` ← `homesec-line-channel-access-token`（**version 2 を明示指定**。v1 は誤登録のため disabled）
+- LINE webhook URL: `https://homesec-line-235108918288.asia-northeast1.run.app/line/webhook`（LINE Developers console 登録済み）
+- `ingest-homesec` job: `server/data/homesec/materials.json`（image 内が正本）を vegapunk schema `homesec` へ冪等投入。**CI の `auto-ingest` は `ingest-rules` しか実行しないため、materials.json を変更したらマージ・デプロイ後に `gcloud run jobs execute ingest-homesec --project sivira-cs-support --region asia-northeast1 --wait` を手動実行すること**（未実行だと旧材料のまま応答する）
+- 管理画面: `https://homesec-advisor-235108918288.asia-northeast1.run.app/admin/`（Google Console の承認済み JavaScript 生成元へこの origin の登録が必要）。認可は CS と同じ actor 突合欠如がそのまま適用される（spec §3.2 の受容リスク）
+- 製品カード画像: `server/data/homesec/images/{型番小文字}.jpg`（無い型番は画像なしカードで動作する）
+- 新 service / job を CI（`RUN_SERVICES` / `RUN_JOBS`）へ足す前に `gcloud run services create` / `jobs create` で実体を作る（未作成のままマージすると CI が NOT_FOUND でデプロイ経路全体が止まる）
+
 ## 旧構成（参考、Cloud Run へ移行済み）
 
 本番は GCE VM `llm-memory` 上の既存 `llm-memory-extention` stack（Caddy 同居、`cs-support-136-110-78-245.nip.io`）から、上記 Cloud Run 構成へ移行済み。GCE 版のサービス定義・Caddyfile 差分・デプロイ手順の詳細は git 履歴（このファイルの旧版）を参照すること。VM `llm-memory` 自体は他サービスと共用で存在し続けているが、`cs-support-mcp` はもう乗っていない。

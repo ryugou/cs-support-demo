@@ -189,8 +189,8 @@
 - Modify: `CLAUDE.md`(homesec 構成・secret・「service/job を gcloud create してから CI に足す」手順・製品画像の置き場)
 
 **Steps:**
-- [ ] deploy.yml 変更(github-actions-optimize スキルの規約に従う。ループ構造は既存のまま)
-- [ ] CLAUDE.md へ運用手順を追記
+- [x] deploy.yml 変更(github-actions-optimize スキルの規約に従う。ループ構造は既存のまま)
+- [x] CLAUDE.md へ運用手順を追記
 - [ ] commit `ci(advisor): wire homesec services and job into deploy (#34)`
 - [ ] **注意**: この PR のマージは、Fable が `gcloud run services create` / `jobs create` で実体を作った後(未作成のままマージすると CI が NOT_FOUND で全停止)
 
