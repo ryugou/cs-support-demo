@@ -115,6 +115,7 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
   "emergency": false,
   "urtect_support": false,
   "lead_interest": false,
+  "product_intent": true,
   "summary_ja": "賃貸マンションで玄関の防犯を強化したい",
   "conditions": [
     {"key": "housing", "value": "apartment_rented"},
@@ -126,6 +127,7 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
 - `emergency`: 侵入進行中・身の危険・ストーカー被害の切迫のみ true
 - `urtect_support`: 既に URTECT 製品を所有しており、その操作・不具合の個別サポートを求めている場合のみ true(導入検討・比較は false)
 - `lead_interest`: 担当者からの連絡・案内を望む意思が読み取れる場合のみ true(「お願いします」「話を聞きたい」等。単なる製品への興味は false)
+- `product_intent`: 発話が具体的な機器・製品(カメラ・センサー等)の導入について尋ねている、またはそれらの物品に言及している場合のみ true。悩み・状況の相談のみで物品に触れていない場合は false(第 6 節手順 6 の own_product 保証注入で使う)
 - `conditions`: 第 4.2 節の語彙へ正規化。語彙外の値は破棄し warn ログに出す(コード判定)
 
 ### 4.2 条件語彙(advisor 版 signal)
@@ -204,7 +206,7 @@ ingest CLI: `server/src/bin/ingest_homesec.rs`。schema `homesec` の作成(`adv
 3. 会話状態ロード(`support_case`。無ければ作成)
 4. LLM Call #1: 理解(第 4.1 節の型へ構造化)
 5. コード判定: `safety` / time_pref 継続 / `out_of_domain` / `handoff` / リード受付開始は定型を確定(第 4.3 節)
-6. known_resolution 照合と材料検索(homesec schema、top_k = 5。累積条件 + 相談要旨で検索)。**own_product の保証注入**: 発話が製品・機器の導入意図(カメラ・センサー等の物品への言及)を含む、または累積条件に `concern` があるターンは、検索順位に関わらず own_product 材料を別枠で注入する(`category` が合致するものを優先し、合致が無ければ全 7 件。検索が own_product を引けず接地規則が製品提案を封じる本番実害への決定論対処)
+6. known_resolution 照合と材料検索(homesec schema、top_k = 5。累積条件 + 相談要旨で検索)。**own_product の保証注入**: `understanding.product_intent == true`(第 4.1 節)、または累積条件に `concern` があるターンは、検索順位に関わらず own_product 材料を別枠で注入する(`category` が `concern` の値に合致するものを優先し、合致が無ければ全 7 件。material_key が検索結果と重複するものは除去する。検索が own_product を引けず接地規則が製品提案を封じる本番実害への決定論対処)
 7. コード判定: `clarify` か `answer` かを確定(第 4.3 節)
 8. LLM Call #2: 下書き生成。プロンプトに材料全文・累積条件・会話履歴・ペルソナ規則・接地 2 層規則・URTECT 優遇規則・リード提案規則(第 4.4 節)・安全下限・Markdown 禁止・継続会話の挨拶抑制を注入
 9. 出口関門(第 7 節)。違反時は `fallback` 定型へ差し替え(warn)
@@ -274,6 +276,9 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 
 - 応答種別決定(第 4.3 節)の全分岐(emergency 優先、time_pref モード継続、out_of_domain、handoff、リード受付開始、clarify 予算、answer)
 - リードフロー: 提案 1 回制限(`lead_offered`)、営業時間外希望の即時案内、確定時の case 書き戻しと `lead` 定型
+- 提案ファースト(第 2.1 節): `answer` モードの system prompt に、提案を前半に置く規則・追加質問 1 問までの規則・条件充足時に質問を重ねない規則・直接のおすすめ依頼で製品を名指しする規則・ヒアリングのみで終える応答を禁じる規則が含まれること
+- own_product の保証注入(第 6 節手順 6): `product_intent == true` のとき/累積条件に `concern` があるときそれぞれで注入されること、両方とも無いときは注入されないこと、`category` 合致がある場合はそれを優先すること、合致が無ければ全件注入されること、検索結果と重複する material_key が除去されること
+- 内部判断の info ログ(第 6 節末尾): 応答種別・注入した material_key 一覧・カード選定結果が info でログに出ること、顧客メッセージ本文がログに含まれないこと
 - 製品カード: 応答文と `card_match_terms` の合致判定(own / partner の両方)、own 優先の 3 件上限、`shown_product_cards`(material_key 単位)による再表示抑止、材料を引けないときは添付しない、画像なし材料がカード化できること
 - `line_adapter`: `product_cards` 非空でカルーセル送信、省略時は従来挙動(既存テスト無変更 PASS)
 - 出口関門: 材料外 URL・URTECT 外型番・保証表現・資格作業語・企業 CS 定型句の各違反で fallback に差し替わること
