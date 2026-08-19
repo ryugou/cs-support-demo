@@ -310,6 +310,10 @@ fn internal_error_response(err: &anyhow::Error, request_id: &str, step: &str) ->
 ///
 /// known_resolution 読み込みが失敗しても request を失敗させない（warn して空 Vec のまま続行、
 /// design doc §8 と同じ「材料ゼロでも Call#2 は実行する」寛容スキップ）。
+///
+/// `product_intent` は design doc §6 手順6「own_product の保証注入」のトリガー
+/// （`understanding.product_intent`。累積条件に `concern` がある場合も同様に注入する）。
+/// 検索が own_product を引けず接地規則が製品提案を封じる本番実害（背景 (b)）への決定論対処。
 #[allow(clippy::too_many_arguments)]
 async fn draft_with_materials(
     state: &AdvisorApiState,
@@ -321,6 +325,7 @@ async fn draft_with_materials(
     history_digest: &str,
     is_continuation: bool,
     lead_offered: bool,
+    product_intent: bool,
 ) -> (String, Vec<AdvisorMaterial>) {
     let resolutions = match state.harness.store() {
         Ok(store) => match store.load_known_resolutions(schema).await {
@@ -346,9 +351,14 @@ async fn draft_with_materials(
         }
     };
     let kr = materials::match_advisor_known_resolution(&resolutions, conditions);
-    let searched =
+    let (searched, own_products) =
         materials::gather_materials(&state.vegapunk, schema, search_query, conditions).await;
-    let composed = materials::compose_materials(kr, searched);
+    let mut composed = materials::compose_materials(kr, searched);
+    if materials::should_guarantee_own_products(product_intent, conditions) {
+        let concern_category = materials::concern_category(conditions);
+        let guaranteed = materials::select_own_product_materials(&own_products, concern_category);
+        composed = materials::inject_guaranteed_own_products(composed, guaranteed);
+    }
     let text = draftgen::draft_advisor_reply(
         &state.llm,
         mode,
@@ -571,6 +581,7 @@ async fn advisor_reply_handler(
                             &history_digest,
                             is_continuation,
                             advisor_attrs.lead_offered,
+                            understanding.product_intent,
                         )
                         .await;
                         if should_burn_lead_offered(advisor_attrs.lead_offered, &text) {
@@ -594,6 +605,7 @@ async fn advisor_reply_handler(
                             &history_digest,
                             is_continuation,
                             advisor_attrs.lead_offered,
+                            understanding.product_intent,
                         )
                         .await;
                         if should_burn_lead_offered(advisor_attrs.lead_offered, &text) {
@@ -646,6 +658,17 @@ async fn advisor_reply_handler(
             append_shown_product_cards(&advisor_attrs.shown_product_cards, &new_keys);
         Some(selected_cards)
     };
+
+    // design doc §6 末尾: 内部判断の info ログ(顧客メッセージ本文・応答本文は出さない)。
+    // `selected_cards` は非空の場合 `product_cards` へ move 済みのため、カードの material_key
+    // は `product_cards` 側から読む。
+    log_turn_decision(
+        &ctx.request_id,
+        &case_id,
+        reply_kind,
+        &materials_used,
+        product_cards.as_deref(),
+    );
 
     // 手順10: support_case への書き込み(1 回だけ)。
     let now = chrono::Utc::now().to_rfc3339();
@@ -712,6 +735,37 @@ async fn advisor_reply_handler(
         }),
     )
         .into_response()
+}
+
+/// design doc §6 末尾「内部判断の info ログ」本体。`advisor_reply_handler` から切り出した
+/// テスト可能な純関数(reviewer 指摘 Critical 1: このログは「顧客メッセージ本文・応答本文を
+/// 一切出さない」プライバシー特性を持つが、ハンドラ内にインラインで書かれている限り
+/// `capture_logs` で固定できず、将来の編集で本文を引数に足す変更が無警告で入りうる状態
+/// だった)。
+///
+/// ログに載せるのは request_id / case_id / action_kind(応答種別)/ material_keys(注入した
+/// 材料の `{kind}:{material_key}`)/ card_keys(選定したカードの material_key)の5つのみ。
+/// `materials_used` の `body_ja` / `title_ja`、`message` / 応答本文は一切渡さない・出さない。
+fn log_turn_decision(
+    request_id: &str,
+    case_id: &str,
+    reply_kind: &str,
+    materials_used: &[AdvisorMaterial],
+    product_cards: Option<&[ProductCard]>,
+) {
+    tracing::info!(
+        request_id = %request_id,
+        case_id = %case_id,
+        action_kind = reply_kind,
+        material_keys = ?materials_used
+            .iter()
+            .map(|m| format!("{}:{}", m.kind, m.material_key))
+            .collect::<Vec<String>>(),
+        card_keys = ?product_cards
+            .map(|cards| cards.iter().map(|c| c.material_key.clone()).collect::<Vec<String>>())
+            .unwrap_or_default(),
+        "homesec advisor turn decision"
+    );
 }
 
 #[cfg(test)]
@@ -1242,6 +1296,100 @@ mod tests {
             !map.contains_key("advisor_cond_target"),
             "unset condition keys must not be written (decide::accumulated_condition_updates \
              contract)"
+        );
+    }
+
+    // ---- log_turn_decision (design doc §6 末尾・§11 テスト一覧「内部判断の info ログ」) ----
+
+    fn material_fixture(kind: &str, material_key: &str) -> AdvisorMaterial {
+        AdvisorMaterial {
+            material_key: material_key.to_string(),
+            kind: kind.to_string(),
+            title_ja: "タイトル".to_string(),
+            body_ja: "本文".to_string(),
+            source_url: None,
+            category: None,
+            product_key: None,
+            price_band: None,
+            card_description: None,
+            card_match_terms: None,
+        }
+    }
+
+    #[test]
+    fn log_turn_decision_emits_info_with_action_kind_and_material_and_card_keys() {
+        // design doc §11: 「応答種別・注入した material_key 一覧・カード選定結果が info で
+        // ログに出ること」を固定する。
+        let materials = vec![material_fixture("own_product", "own_product:adc-v724")];
+        let cards = vec![sample_card()];
+        let expected_material_key = format!("{}:{}", materials[0].kind, materials[0].material_key);
+
+        let (_, logs) = crate::test_support::capture_logs(|| {
+            log_turn_decision("req-1", "case-1", "answer", &materials, Some(&cards));
+        });
+
+        assert!(logs.contains("INFO"), "logs: {logs}");
+        assert!(
+            logs.contains("homesec advisor turn decision"),
+            "logs: {logs}"
+        );
+        assert!(logs.contains("request_id"), "logs: {logs}");
+        assert!(logs.contains("req-1"), "logs: {logs}");
+        assert!(logs.contains("case-1"), "logs: {logs}");
+        assert!(
+            logs.contains("action_kind=answer") || logs.contains("action_kind=\"answer\""),
+            "action_kind must be the reply_kind passed in: {logs}"
+        );
+        assert!(
+            logs.contains(&expected_material_key),
+            "material_keys must use the `{{kind}}:{{material_key}}` format: {logs}"
+        );
+        assert!(
+            logs.contains(&sample_card().material_key),
+            "card_keys must include the selected card's material_key: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_turn_decision_never_includes_customer_facing_material_text() {
+        // design doc §11: 「顧客メッセージ本文がログに含まれないこと」。ここでは同じ懸念を
+        // 材料側(顧客に見せる文章そのもの)にも広げ、body_ja / title_ja が出ないことを
+        // 一意なマーカーで固定する。
+        let mut material = material_fixture("statistic", "statistic:musimari");
+        material.title_ja = "ログに出てはいけない材料タイトルマーカー".to_string();
+        material.body_ja = "ログに出てはいけない材料本文マーカー".to_string();
+
+        let (_, logs) = crate::test_support::capture_logs(|| {
+            log_turn_decision("req-1", "case-1", "answer", &[material], None);
+        });
+
+        assert!(
+            !logs.contains("ログに出てはいけない材料本文マーカー"),
+            "logs: {logs}"
+        );
+        assert!(
+            !logs.contains("ログに出てはいけない材料タイトルマーカー"),
+            "logs: {logs}"
+        );
+    }
+
+    #[test]
+    fn log_turn_decision_handles_no_product_cards_without_panicking() {
+        // design doc §11: 「`product_cards` が `None` のとき `card_keys` が空表記になること
+        // (panic せず出力されること)」。fallback ターン等(手順9で select_cards 自体を
+        // 呼ばない経路)が該当する。
+        let (_, logs) = crate::test_support::capture_logs(|| {
+            log_turn_decision("req-1", "case-1", "fallback", &[], None);
+        });
+
+        assert!(logs.contains("INFO"), "logs: {logs}");
+        assert!(
+            logs.contains("card_keys=[]"),
+            "card_keys must render as an empty list when product_cards is None: {logs}"
+        );
+        assert!(
+            logs.contains("material_keys=[]"),
+            "material_keys must render as an empty list when materials_used is empty: {logs}"
         );
     }
 

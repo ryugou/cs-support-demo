@@ -1014,7 +1014,7 @@ mod tests {
         ));
     }
 
-    /// `f` の実行中に出た WARN 以上のログを文字列で返す。
+    /// `f` の実行中に出た WARN / ERROR のログだけを文字列で返す。
     ///
     /// **切り詰めの観測を構造体のフィールドで代用しない**のは、S-3 が求めているのが
     /// 「運用者がログだけで切り詰めに気付けること」そのものだからである。値で観測すると、
@@ -1025,8 +1025,16 @@ mod tests {
     /// 使わないテストが先に無介入で同じコールサイトを叩くと tracing-core の interest cache
     /// が「無効」に確定してしまい手遅れになる問題があったため廃止した（詳細は
     /// `test_support` の doc コメント）。
+    ///
+    /// subscriber 自体は INFO 以上を拾う（design doc §11 の内部判断 info ログを他所で
+    /// assert するため）。このヘルパーは `test_support::filter_warn_and_error_lines` で
+    /// WARN / ERROR の行だけへ絞ることで、`logs.is_empty()` が引き続き「警告が出ていない」
+    /// を意味し続けるようにする（2026-08-19、Issue #34 codex レビュー指摘: レベルを INFO へ
+    /// 下げた際にこのフィルタが無く、`logs.is_empty()` の意味が「INFO 以上のログが一切
+    /// 出ていない」へ静かに変わっていた）。
     fn capture_warnings(f: impl FnOnce()) -> String {
-        crate::test_support::capture_logs(f).1
+        let logs = crate::test_support::capture_logs(f).1;
+        crate::test_support::filter_warn_and_error_lines(&logs)
     }
 
     #[test]

@@ -50,6 +50,7 @@ pub struct Understanding {
     pub emergency: bool,
     pub urtect_support: bool,
     pub lead_interest: bool,
+    pub product_intent: bool,
     pub summary_ja: String,
     pub conditions: Vec<(ConditionKey, String)>,
 }
@@ -158,6 +159,7 @@ fn parse_understanding_response(text: &str) -> anyhow::Result<Understanding> {
         emergency: bool,
         urtect_support: bool,
         lead_interest: bool,
+        product_intent: bool,
         summary_ja: String,
         conditions: Vec<RawCondition>,
     }
@@ -182,6 +184,7 @@ fn parse_understanding_response(text: &str) -> anyhow::Result<Understanding> {
         emergency: parsed.emergency,
         urtect_support: parsed.urtect_support,
         lead_interest: parsed.lead_interest,
+        product_intent: parsed.product_intent,
         summary_ja: parsed.summary_ja,
         conditions,
     })
@@ -244,8 +247,8 @@ fn build_understand_prompt(
          \n\
          出力スキーマ:\n\
          {\"in_domain\": bool, \"emergency\": bool, \"urtect_support\": bool, \
-         \"lead_interest\": bool, \"summary_ja\": string, \"conditions\": \
-         [{\"key\": string, \"value\": string}, ...]}\n\
+         \"lead_interest\": bool, \"product_intent\": bool, \"summary_ja\": string, \
+         \"conditions\": [{\"key\": string, \"value\": string}, ...]}\n\
          \n\
          各フィールドの判定基準:\n\
          - in_domain: 発話がホームセキュリティ相談(防犯・見守り・防災の機器選定や不安の\
@@ -256,6 +259,9 @@ fn build_understand_prompt(
          求めている場合のみ true とする。導入検討・比較は false。\n\
          - lead_interest: 担当者からの連絡・案内を望む意思が読み取れる場合のみ true とする\
          (「お願いします」「話を聞きたい」等)。単なる製品への興味は false。\n\
+         - product_intent: 具体的な機器・製品(カメラ・センサー等)の導入について尋ねている、\
+         またはそれらの物品に言及している場合のみ true とする。悩み・状況の相談のみで物品に\
+         触れていない場合は false。\n\
          - summary_ja: 相談内容を日本語 1〜2 文で要約する。\n\
          - conditions: 発話から読み取れる条件を、次の語彙表の key/value の組み合わせでのみ\
          返す。語彙表に無い key・value は出力しないこと。\n\
@@ -444,6 +450,7 @@ mod tests {
             "emergency": false,
             "urtect_support": false,
             "lead_interest": false,
+            "product_intent": true,
             "summary_ja": "賃貸マンションで玄関の防犯を強化したい",
             "conditions": [
                 {"key": "housing", "value": "apartment_rented"},
@@ -457,6 +464,7 @@ mod tests {
         assert!(!understanding.emergency);
         assert!(!understanding.urtect_support);
         assert!(!understanding.lead_interest);
+        assert!(understanding.product_intent);
         assert_eq!(
             understanding.summary_ja,
             "賃貸マンションで玄関の防犯を強化したい"
@@ -485,6 +493,7 @@ mod tests {
             "emergency": false,
             "urtect_support": false,
             "lead_interest": false,
+            "product_intent": false,
             "summary_ja": "テスト",
             "conditions": [
                 {"key": "concern", "value": "monitoring"},
@@ -526,6 +535,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_understanding_rejects_missing_product_intent_field() {
+        // product_intent も他の bool フィールドと同じく #[serde(default)] を付けない必須
+        // フィールド(design doc §4.1)。欠落を既定値で穴埋めして進めない。
+        let text = r#"{
+            "in_domain": true,
+            "emergency": false,
+            "urtect_support": false,
+            "lead_interest": false,
+            "summary_ja": "テスト",
+            "conditions": []
+        }"#;
+        assert!(
+            parse_understanding_response(text).is_err(),
+            "a missing required field (product_intent) must be a parse error, not silently \
+             defaulted"
+        );
+    }
+
+    #[test]
+    fn parse_understanding_accepts_product_intent_false() {
+        let text = r#"{
+            "in_domain": true,
+            "emergency": false,
+            "urtect_support": false,
+            "lead_interest": false,
+            "product_intent": false,
+            "summary_ja": "悩み相談のみで物品への言及は無い",
+            "conditions": []
+        }"#;
+        let understanding =
+            parse_understanding_response(text).expect("well-formed json must parse");
+        assert!(!understanding.product_intent);
+    }
+
+    #[test]
     fn parse_understanding_rejects_non_json_text() {
         assert!(parse_understanding_response("not json at all").is_err());
     }
@@ -534,6 +578,7 @@ mod tests {
     fn parse_understanding_strips_markdown_json_fence() {
         let text = "```json\n{\"in_domain\": false, \"emergency\": false, \
                      \"urtect_support\": false, \"lead_interest\": false, \
+                     \"product_intent\": false, \
                      \"summary_ja\": \"ホームセキュリティと無関係\", \"conditions\": []}\n```";
         let understanding =
             parse_understanding_response(text).expect("fenced json must still parse");
@@ -564,6 +609,19 @@ mod tests {
         let (system, _) = build_understand_prompt("発話", "履歴", "累積");
         assert!(
             system.contains("担当者からの連絡"),
+            "system prompt: {system}"
+        );
+    }
+
+    #[test]
+    fn prompt_defines_product_intent_as_concrete_device_mention_only() {
+        // design doc §4.1: own_product 保証注入(§6 手順6)のトリガーに使うフィールド。
+        // 悩み相談だけの発話(物品への言及なし)は false に倒す判定基準を system prompt に
+        // 明記していることを固定する。
+        let (system, _) = build_understand_prompt("発話", "履歴", "累積");
+        assert!(system.contains("product_intent"), "system prompt: {system}");
+        assert!(
+            system.contains("具体的な機器・製品"),
             "system prompt: {system}"
         );
     }

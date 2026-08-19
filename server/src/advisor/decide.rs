@@ -607,6 +607,7 @@ mod tests {
             emergency: false,
             urtect_support: false,
             lead_interest: false,
+            product_intent: false,
             summary_ja: "テスト用の要約".to_string(),
             conditions: Vec::new(),
         }
