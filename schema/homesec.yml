@@ -1,0 +1,113 @@
+name: homesec
+version: 1
+min_compatible: 1
+description: "HomeSec advisor demo schema for security consultation materials and conversation state."
+
+nodes:
+  advisor_material:
+    attributes:
+      material_key: { type: string, required: true }
+      kind: { type: string, required: true }
+      title_ja: { type: string, required: true }
+      body_ja: { type: string, required: true }
+      source_url: { type: string }
+      category: { type: string }
+      product_key: { type: string }
+      price_band: { type: string }
+      card_description: { type: string }
+      card_match_terms: { type: string }
+  KnownResolution:
+    attributes:
+      kr_id: { type: string, required: true }
+      answer_text: { type: string, required: true }
+      applicability: { type: string }
+      grade: { type: string }
+      status: { type: string }
+      source_authority: { type: string }
+      approval_count: { type: int }
+      rejection_count: { type: int }
+      approver_set: { type: string }
+      origin: { type: string }
+      created_by: { type: string }
+      created_by_email: { type: string }
+      verified_at: { type: string }
+      error_axis: { type: string }
+      root_cause: { type: string }
+      owner: { type: string }
+      binding: { type: string }
+      direction: { type: string }
+      route: { type: string }
+      registration_trigger: { type: string }
+      knowledge_class: { type: string }
+      outcome_ref: { type: string }
+      search_text_ja: { type: string }
+  Signal:
+    attributes:
+      value: { type: string, required: true }
+  # advisor 自身のパイプラインではなく、advisor にもマウントされる管理画面の
+  # 共有 admin corrections 経路（design doc §3.2、`admin.rs::create_correction` →
+  # `harness/knowledge.rs::build_known_resolution_graph`）が書く。この経路は常に
+  # manual_schema = ManualV1 かつ rationale_text が Some のため、BECAUSE → Rationale が
+  # 必ず発生する（cs-support.yml と同一定義）。
+  Rationale:
+    attributes:
+      rationale_id: { type: string, required: true }
+      text: { type: string, required: true }
+  support_case:
+    attributes:
+      case_id: { type: string, required: true }
+      request_id: { type: string }
+      actor: { type: string }
+      actor_email: { type: string }
+      question: { type: string }
+      product_key: { type: string }
+      created_at: { type: string }
+      last_request_id: { type: string }
+      last_decision: { type: string }
+      last_kr_id: { type: string }
+      last_evidence_keys: { type: string }
+      last_evidence_kind: { type: string }
+      clarify_turns: { type: int }
+      awaiting_time_pref: { type: string }
+      time_pref_false_count: { type: int }
+      preferred_contact_time: { type: string }
+      time_pref_extraction_error_count: { type: int }
+      excluded_signals: { type: string }
+      end_user_id: { type: string }
+      turn_count: { type: int }
+      # advisor 固有加算（design doc §4.4）。bool 相当だが既存 awaiting_time_pref と同じく
+      # 実体は "true"/"false" 文字列として書き込まれるため type は string にする。
+      lead_offered: { type: string }
+      lead_requested: { type: string }
+      shown_product_cards: { type: string }
+      # 累積条件（design doc §4.2）。1 key につき値は高々 1 つ、ターンごとに全量で再評価する。
+      # reviewer 一次レビュー Critical: decide.rs の CONDITION_ATTR_KEYS / written_support_case_
+      # attribute_keys() と 3 schema ファイル全部が同じキー集合と突き合わされるため、この
+      # ファイルだけでなく cs-schema.yml / cs-support.yml にも同時に加算すること。
+      advisor_cond_housing: { type: string }
+      advisor_cond_target: { type: string }
+      advisor_cond_concern: { type: string }
+      advisor_cond_budget: { type: string }
+      advisor_cond_install: { type: string }
+  ConversationTurn:
+    attributes:
+      turn_id: { type: string, required: true }
+      case_id: { type: string, required: true }
+      end_user_id: { type: string }
+      seq: { type: int, required: true }
+      created_at: { type: string, required: true }
+      question: { type: string, required: true }
+      reply_text: { type: string, required: true }
+      reply_kind: { type: string, required: true }
+      audit_event_id: { type: string, required: true }
+
+edges:
+  HAS_TURN: { from: support_case, to: ConversationTurn }
+  # 上の Rationale 型と同じ理由（共有 admin corrections 経路が書く。cs-support.yml と同一定義）。
+  HAS_SIGNAL: { from: [KnownResolution, support_case], to: Signal }
+  BECAUSE: { from: KnownResolution, to: Rationale }
+
+traceable_pairs:
+  - claim: KnownResolution
+    evidence: Rationale
+    edge: BECAUSE

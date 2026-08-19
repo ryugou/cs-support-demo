@@ -1,0 +1,38 @@
+# HomeSec advisor Cloud Run 構成。design doc `2026-08-17-homesec-advisor-design.md` §10。
+# bind_addr / vegapunk_endpoint は BIND_ADDR / VEGAPUNK_ENDPOINT の env で上書きされる
+# (server/src/config.rs::AppConfig::load)。認証は Google OAuth 一本。advisor は
+# MCP endpoint・OAuth AS・署名鍵を持たない(design doc 不変条件 2)。
+bind_addr = "0.0.0.0:8080"
+vegapunk_endpoint = "http://10.10.0.2:6840"
+admin_static_dir = "admin-ui/browser"
+
+[[projects]]
+project_id = "homesec"
+schema = "homesec"
+manual_schema = "manual_v1"
+
+# [harness] は AppConfig 共通の必須セクション。advisor パイプライン(Task 3 以降)は
+# 専用の [advisor] セクションのみを読み、この節の値には依存しない。既定値のままでよい。
+[harness]
+audit_log_path = "/data/audit/audit.jsonl"
+search_improvement_queue_path = "/data/audit/search-improvement-queue.jsonl"
+
+[llm]
+enabled = true
+max_tokens = 600
+
+[api]
+enabled = true
+clarify_max_turns = 3
+
+[api.business_hours]
+days = "mon-fri"
+start = "10:00"
+end = "18:00"
+tz = "Asia/Tokyo"
+
+# advisor 固有設定(design doc §4.3 手順4、§5.2、§7.2)。
+[advisor]
+handoff_contact_text = "URTECT製品の操作や不具合は、URTECT公式LINEアカウントで詳しくサポートしています。"
+images_dir = "data/homesec/images"
+ng_dictionary_path = "data/homesec/ng.json"

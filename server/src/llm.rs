@@ -257,6 +257,45 @@ impl AnthropicClient {
             truncated,
         })
     }
+
+    /// 汎用テキスト補完(JSON 出力を期待する呼び出し向け)。`draft_reply` と同じ HTTP 経路・
+    /// エラーハンドリング・truncated 検知をそのまま使い、`ReplyDraft` の `truncated` フラグ
+    /// だけ呼び出し側へ返さない薄いラッパー。truncated な出力は大抵 JSON として parse に失敗する
+    /// ため、呼び出し側(`advisor::understand`)の retry-on-failure が自然にカバーする。
+    ///
+    /// **`draft_reply` の truncated warn(上記)は remediation を
+    /// `"harness.customer_reply_draft_max_tokens"` に固定でハードコードしており、この経路には
+    /// 当てはまらない**(`prompt_input.rs` の `apply_draft_gate_or_fallback` が既に文書化して
+    /// いる落とし穴そのもの: 「将来別の max_tokens 設定で駆動される経路からこの関数を呼ぶ場合は、
+    /// 運用者に誤った設定値を案内しないよう setting も引数化すること」)。`complete_text` の
+    /// 呼び出し元(例: `advisor::understand::UNDERSTAND_MAX_TOKENS`)はそれぞれ独自の定数で
+    /// `max_tokens` を決めており、`harness.customer_reply_draft_max_tokens` を上げても一切
+    /// 変わらない。`draft_reply` 側のシグネチャは既存呼び出し元を壊さないため変更せず、ここで
+    /// この経路向けの補正 warn を追加で出す。
+    pub(crate) async fn complete_text(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        max_tokens: u32,
+        route: &str,
+    ) -> Result<String> {
+        let draft = self
+            .draft_reply(system_prompt, user_message, max_tokens, route)
+            .await?;
+        if draft.truncated {
+            tracing::warn!(
+                route,
+                max_tokens,
+                draft_chars = draft.text.chars().count(),
+                "complete_text output was truncated by max_tokens; the truncated warn just \
+                 emitted by draft_reply names harness.customer_reply_draft_max_tokens, but that \
+                 setting does not drive this route. The max_tokens limit for this call came from \
+                 the caller's own constant (e.g. advisor::understand::UNDERSTAND_MAX_TOKENS); \
+                 raise that constant instead if this recurs"
+            );
+        }
+        Ok(draft.text)
+    }
 }
 
 /// env `CS_SUPPORT_LLM_API_KEY` → `api_key_file` の順に鍵を解決する。

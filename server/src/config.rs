@@ -49,6 +49,22 @@ pub struct AppConfig {
     /// 同じ「相対は config_dir 基準」方針に揃える）。
     #[serde(default = "default_admin_static_dir")]
     pub admin_static_dir: String,
+    /// homesec advisor（Issue #34）固有設定。CS（urtect）の config には `[advisor]`
+    /// セクションが無いため常に `None`（`ProjectConfig.bearer_token` と同じく、
+    /// serde は `Option<T>` フィールドを欠落時 `None` として自動的に扱うため
+    /// `#[serde(default)]` は不要）。design doc `2026-08-17-homesec-advisor-design.md` §10。
+    pub advisor: Option<AdvisorConfig>,
+}
+
+/// homesec advisor 固有設定（design doc §4.3 手順4、§5.2、§7.2）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdvisorConfig {
+    /// URTECT 製品の個別サポート相談を検知したときの案内定型文（design doc §4.3 手順4）。
+    pub handoff_contact_text: String,
+    /// 製品カード画像の同梱ディレクトリ（`/static/products/` で配信、design doc §5.2）。
+    pub images_dir: String,
+    /// advisor 固有 NG 辞書のパス（design doc §7.1）。
+    pub ng_dictionary_path: String,
 }
 
 fn default_admin_static_dir() -> String {
@@ -524,6 +540,73 @@ schema = "s"
 "#;
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.admin_static_dir, "../admin-ui/dist/admin-ui/browser");
+    }
+
+    #[test]
+    fn advisor_config_defaults_to_none_when_section_is_absent() {
+        // CS 用 config には [advisor] セクションが無い。既存 CS の config に advisor が
+        // 影響しないことの固定テスト（design doc `2026-08-17-homesec-advisor-design.md` §10、
+        // plan `2026-08-17-homesec-advisor.md` Task 1）。
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.advisor.is_none());
+    }
+
+    #[test]
+    fn advisor_config_parses_section() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+[advisor]
+handoff_contact_text = "URTECT製品の操作や不具合は、URTECT公式LINEアカウントで詳しくサポートしています。"
+images_dir = "data/homesec/images"
+ng_dictionary_path = "data/homesec/ng.json"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        let advisor = cfg.advisor.expect("[advisor] section must parse to Some");
+        assert_eq!(
+            advisor.handoff_contact_text,
+            "URTECT製品の操作や不具合は、URTECT公式LINEアカウントで詳しくサポートしています。"
+        );
+        assert_eq!(advisor.images_dir, "data/homesec/images");
+        assert_eq!(advisor.ng_dictionary_path, "data/homesec/ng.json");
+    }
+
+    #[test]
+    fn config_homesec_toml_loads_and_declares_advisor_section() {
+        // 実ファイルを読む統合テスト（plan `2026-08-17-homesec-advisor.md` Task 1 Step 5）。
+        // CI・本番デプロイが実際に読む config.homesec.toml がパース可能で、[advisor] の
+        // 3 キーが期待どおりに読めることを固定する。
+        let path =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.homesec.toml"));
+        let cfg = AppConfig::load(path).expect("config.homesec.toml must parse");
+        assert_eq!(cfg.projects.len(), 1);
+        assert_eq!(cfg.projects[0].project_id, "homesec");
+        assert_eq!(cfg.projects[0].schema, "homesec");
+        assert!(matches!(
+            cfg.projects[0].manual_schema,
+            ManualSchemaKind::ManualV1
+        ));
+        let advisor = cfg
+            .advisor
+            .expect("config.homesec.toml must declare [advisor]");
+        assert_eq!(
+            advisor.handoff_contact_text,
+            "URTECT製品の操作や不具合は、URTECT公式LINEアカウントで詳しくサポートしています。"
+        );
+        assert_eq!(advisor.images_dir, "data/homesec/images");
+        assert_eq!(advisor.ng_dictionary_path, "data/homesec/ng.json");
+        assert!(cfg.api.enabled);
+        assert!(cfg.llm.enabled);
     }
 
     #[test]

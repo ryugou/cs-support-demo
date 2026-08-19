@@ -123,6 +123,20 @@ nodes:
       end_user_id: { type: string }
       # Issue #31 design doc §2: ConversationTurn.seq 採番用カウンタ（read-merge-write）
       turn_count: { type: int }
+      # homesec advisor 固有加算（design doc `2026-08-17-homesec-advisor-design.md` §4.4）。
+      # urtect（このスキーマ）では未使用。この一致テストが全 schema ファイルを対象にするため
+      # 加算のみ行う（harness/knowledge.rs::written_support_case_attribute_keys）。
+      lead_offered: { type: string }
+      lead_requested: { type: string }
+      shown_product_cards: { type: string }
+      # 累積条件（design doc §4.2）。urtect（このスキーマ）では未使用。この一致テストが
+      # 全 schema ファイルを対象にするため加算のみ行う（harness/knowledge.rs::
+      # written_support_case_attribute_keys / advisor/decide.rs::CONDITION_ATTR_KEYS）。
+      advisor_cond_housing: { type: string }
+      advisor_cond_target: { type: string }
+      advisor_cond_concern: { type: string }
+      advisor_cond_budget: { type: string }
+      advisor_cond_install: { type: string }
   answer_attempt:
     attributes:
       attempt_id: { type: string, required: true }

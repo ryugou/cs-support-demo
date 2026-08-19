@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod advisor;
 pub mod api;
 pub mod config;
 pub mod corpus;
@@ -14,6 +15,7 @@ pub mod project;
 pub mod proto;
 pub mod resolve;
 pub mod rmcp_server;
+pub mod staticui;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod translate;

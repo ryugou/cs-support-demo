@@ -8,7 +8,10 @@
 //! 2. テキストイベントの処理中、chat loading API で処理中アニメーションを表示する
 //!    （失敗しても warn ログのみで継続する。表示は体験改善であり必須機能ではない）
 //! 3. テキストメッセージだけを応答生成 API へ 1 回渡す
-//! 4. 返ってきた `reply_text` を LINE へ返信する
+//! 4. 返ってきた `reply_text` を LINE へ返信する（`product_cards` に有効な列が 1 件以上
+//!    あれば続けてカルーセルテンプレートを 1 通送る。カードが検証に落ちてもテキスト回答は
+//!    必ず送る。CS 経路は `product_cards` を返さないため従来どおり 1 通のまま。
+//!    `docs/superpowers/specs/2026-08-17-homesec-advisor-design.md` §3.3）
 //! 5. ユーザ単位の会話履歴・case_id をプロセス内メモリに保持する
 //!
 //! だけを行う。応答生成 API と HTTP JSON でやり取りする独立サービス（別 Cloud Run
@@ -31,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 use tower_http::trace::TraceLayer;
+use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -466,10 +470,160 @@ fn hash_line_user_id(user_id: &str) -> String {
     format!("{digest:x}").chars().take(32).collect()
 }
 
+/// `product_cards` 配列の 1 要素（design doc §3.3）。応答生成 API とはプロセス境界をまたいで
+/// HTTP JSON でやり取りするだけなので、`server` crate の `advisor::cards::ProductCard` を
+/// import せず、このファイル内に自己完結した型として持つ（モジュール doc の方針どおり）。
+///
+/// `material_key` はカルーセル組み立て時の warn ログでカードを一意に特定するために使う
+/// （[`truncate_carousel_field`] / [`build_carousel_message`]）。生成側
+/// (`server/src/advisor/cards.rs` の `ProductCard`) は常に返す必須フィールドだが、この型は
+/// HTTP JSON 越しの契約でしか結び付いていない独立サービスの型なので `Option` で受け、
+/// 欠落時は `#[serde(default)]` で `None` にする（未知フィールドを許容する既存の規律と
+/// 同じ理由: 相手側のフィールド追加・欠落でこの型のパース自体は壊さない）。
+///
+/// `title` / `description` / `button_text` / `button_message` にも `#[serde(default)]` を
+/// 付けて必須フィールド扱いを外す（fail-open 是正）。素の `String`（必須）のままだと、
+/// 応答生成 API がこの 4 つのうち 1 つでも欠いたカードを `product_cards` に 1 件でも含めて
+/// 返した瞬間、`AnswerApiResponse` **全体**のデシリアライズが失敗する。その結果
+/// `call_answer_api` が `None` を返し、`assemble_reply` がフォールバック文に倒れて、同じ
+/// レスポンスに載っていたはずの `reply_text`（本来届くテキスト回答）と `case_id`（会話継続性）
+/// までカード 1 件の欠陥に道連れにされる（モジュール doc 冒頭の不変条件違反）。
+///
+/// `Option<String>` ではなく `#[serde(default)]` 付き `String`（欠落時は空文字）を選ぶ理由:
+/// 空文字と欠落を区別しても得るものが無い。`build_carousel_message` の既存の検証は
+/// 「trim 後に空なら列をスキップ（description/button_text/button_message）または `title`
+/// キーを省略」であり、空文字と欠落を最初から同一に扱っているため。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct CardPayload {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    image_url: Option<String>,
+    #[serde(default)]
+    button_text: String,
+    #[serde(default)]
+    button_message: String,
+    #[serde(default)]
+    material_key: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AnswerApiResponse {
     reply_text: String,
     case_id: String,
+    /// advisor 経路のみ返す（design doc §3.3、加算フィールド）。CS 経路（`/urtect/api/reply`）
+    /// はこのフィールドを返さないため、`#[serde(default)]` を明示して欠落時は必ず `None` に
+    /// なるようにする。ここを外すと必須フィールド扱いになり、CS 経路のレスポンスが
+    /// パース失敗 → `assemble_reply` がフォールバック文に倒れる、という後方互換の破壊になる。
+    ///
+    /// `deserialize_with = "deserialize_product_cards"` を付ける理由（codex レビュー Critical
+    /// 是正）: `#[serde(default)]` は「フィールドが**欠落**している」場合にしか効かない。
+    /// 配列の要素が**存在するが型が違う**場合（例: `"description": 123`）は通常の serde 型
+    /// エラーとして伝播し、`Vec<CardPayload>` の deserialize 自体が失敗する。derive された
+    /// デフォルト実装のままだと、`product_cards` 配列内の 1 要素の型不一致だけで
+    /// `AnswerApiResponse` **全体**の `serde_json::from_str` が失敗し、`reply_text` /
+    /// `case_id` までカード 1 件の欠陥に道連れにされる（モジュール doc 冒頭の不変条件違反、
+    /// 上の `CardPayload` doc comment が防ごうとしていたのと同じ障害モードが「フィールド
+    /// 欠落」以外の経路で再発する）。`deserialize_product_cards` は配列を
+    /// `Vec<serde_json::Value>` として受けてから要素ごとに `CardPayload` への変換を試み、
+    /// 失敗した要素だけを warn ログに残して落とす。
+    #[serde(default, deserialize_with = "deserialize_product_cards")]
+    product_cards: Option<Vec<CardPayload>>,
+}
+
+/// JSON の型名を人間可読な形で返す（[`deserialize_product_cards`] の警告ログ専用）。値
+/// そのもの（本文・URL 等）はログへ出さない規律を保ちながら、`product_cards` フィールドが
+/// 期待と異なる形だったことだけを運用者が判別できるようにする。
+fn json_value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        // 唯一の呼び出し元 `deserialize_product_cards` では `null` は
+        // `Option<serde_json::Value>` の `None` 分岐で先に処理されるため、この関数へ `null`
+        // が渡ることは現状の呼び出し経路からは無い（到達不能）。それでも消さないのは
+        // `match` を全パターン網羅のまま保つため（将来 `Value` を直接受け取る呼び出し元が
+        // 増えても分岐漏れにならない）。
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// [`AnswerApiResponse::product_cards`] 用のカスタムデシリアライザ。`#[serde(default)]` は
+/// フィールド欠落時にしか働かないため、それ以外の想定外の形（フィールド自体が配列でない値、
+/// 配列内の要素単位の型不一致）を個別に吸収してから `Vec<CardPayload>` を組み立てる。
+///
+/// - フィールド自体が欠落している場合はこの関数は呼ばれず、`#[serde(default)]` により
+///   `None` になる（既存の CS 経路後方互換テストが固定する挙動）。
+/// - フィールドが `null` の場合は `Option<Value>` の `None` 分岐に落ちるため `None` を返す。
+/// - フィールドが配列でも `null` でもない場合（文字列・オブジェクト・数値・真偽値）は、
+///   型エラーとして `AnswerApiResponse` 全体のパースを失敗させず、JSON の型名だけを
+///   `tracing::warn!` に記録して `None` を返す。ここを配列限定のデシリアライザ
+///   （`Option<Vec<Value>>`）のままにすると、フィールド自体の型不一致は `?` でそのまま
+///   伝播し、要素単位の寛容パースを入れた意味が別経路で失われる（`reply_text` / `case_id`
+///   まで道連れにする）。
+/// - フィールドが配列の場合、要素が 1 つでも `CardPayload` への変換に失敗したら、その要素
+///   だけを `tracing::warn!` に記録して結果から除外する。配列全体は失敗させない。
+/// - 全要素が失敗しても `Some(vec![])` を返す（`None` にはしない。フィールド自体は JSON 上に
+///   存在していたため、「カードが1件も無かった」と「フィールドが最初から無かった」を区別する）。
+fn deserialize_product_cards<'de, D>(deserializer: D) -> Result<Option<Vec<CardPayload>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let values = match value {
+        serde_json::Value::Array(values) => values,
+        other => {
+            tracing::warn!(
+                actual_type = json_value_type_name(&other),
+                "line webhook: product_cards is present but is not a JSON array (or null); \
+                 treating it as absent so the rest of the answer api response (reply_text/ \
+                 case_id) still parses"
+            );
+            return Ok(None);
+        }
+    };
+    Ok(Some(
+        values
+            .into_iter()
+            .enumerate()
+            .filter_map(|(card_index, value)| {
+                // material_key はカード識別子であり、運用者がどのカードで失敗したかを
+                // 特定するための一次情報として [`material_key_for_log`] 経由でログへ残す
+                // （上限を超える場合は切り詰める。理由は [`MATERIAL_KEY_LOG_MAX_CHARS`] の
+                // doc comment を参照）。description 等のカード本文の全文はログへ出さない。
+                // 直後の `error = %err` には serde が報告する型不一致の実値（例:
+                // `invalid type: integer \`123\`, expected a string` のような数値・真偽値等の
+                // スカラー）が含まれうる。これは応答生成 API 側のどのフィールドがどう壊れて
+                // いるかを特定するための一次情報であり、値を完全に伏せると診断能力が落ちる
+                // （顧客の入力本文がそのまま乗る経路ではない点に留意しつつ、含めている）。
+                let material_key = value
+                    .get("material_key")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                match serde_json::from_value::<CardPayload>(value) {
+                    Ok(card) => Some(card),
+                    Err(err) => {
+                        tracing::warn!(
+                            card_index,
+                            material_key = material_key_for_log(material_key.as_deref()),
+                            error = %err,
+                            "line webhook: a product card failed to deserialize (field type \
+                             mismatch or otherwise malformed); dropping only this card so the \
+                             rest of the answer api response (reply_text/case_id and any other \
+                             valid cards) still parses"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect(),
+    ))
 }
 
 /// webhook イベント 1 件をどう扱うかの振り分け結果（design doc §6 手順 2）。
@@ -606,6 +760,404 @@ fn truncate_chars(text: &str, max: usize) -> String {
 /// [`MAX_LINE_REPLY_CHARS`] で切り詰める。
 fn truncate_for_line(text: &str) -> String {
     truncate_chars(text, MAX_LINE_REPLY_CHARS)
+}
+
+/// ログへ記録する `material_key` の文字数上限。
+///
+/// `material_key` は応答生成 API（別プロセス）から HTTP JSON 越しに届く未検証の文字列であり、
+/// 生成側の契約（識別子であり短い、という前提）が退行または侵害によって崩れた場合、顧客の
+/// 問い合わせ本文や改行入りの文字列、極端に長い文字列がそのままログへ流れ込む余地がある。
+/// カードを一意に特定する識別子としての用途にはこの長さで十分であり、切り詰めてもログの
+/// 実用上の価値は失われない。
+const MATERIAL_KEY_LOG_MAX_CHARS: usize = 64;
+
+/// `material_key` をログへ記録する前に整形する（[`truncate_chars`] を再利用し、バイト境界
+/// ではなく文字数で数える規律を他のログ用切り詰めと揃える）。`material_key` が無い場合は
+/// `"<none>"` を返す。`material_key` を warn ログへ出す全ての箇所がこの関数を経由する。
+fn material_key_for_log(material_key: Option<&str>) -> String {
+    match material_key {
+        Some(key) => truncate_chars(key, MATERIAL_KEY_LOG_MAX_CHARS),
+        None => "<none>".to_string(),
+    }
+}
+
+// ---- product_cards → LINE カルーセルテンプレート（design doc §3.3） ----
+
+/// LINE カルーセルテンプレートの `altText`。LINE Messaging API の template メッセージは
+/// `altText`（1〜400 字、通知・非対応クライアントでの代替表示に使われる）が必須だが、
+/// design doc に文言の指定は無いため、オーケストレーターの spec が指定した固定値を使う。
+const CAROUSEL_ALT_TEXT: &str = "おすすめの製品をご案内します";
+
+/// カルーセル 1 カラムの `title` の文字数上限（LINE Messaging API の carousel template
+/// 仕様）。
+const CAROUSEL_TITLE_MAX_CHARS: usize = 40;
+
+/// カルーセル 1 カラムの `text` の文字数上限（LINE Messaging API の carousel template
+/// 仕様）。
+///
+/// LINE 側の仕様では、画像もタイトルも設定されていない列だけ 120 字まで許容される。
+/// `build_carousel_message` が組み立てる列は、タイトル・画像の有無がカードごとに異なりうる
+/// （`title` が空なら `"title"` キー自体を省略し、`image_url` が無効・欠落なら
+/// `thumbnailImageUrl` を出さない）ため、列ごとに理論上の上限が 60〜120 の間で変わりうる。
+/// 列の状態に応じて上限を動的に切り替える実装は複雑さに見合わないため、タイトル・画像の
+/// 有無に関わらず、保守的に常にこの値（60）へ制限する。60 はどの状態の列であっても安全側の
+/// 値であり、動的化しなくても LINE Reply API の 400 を招かない。
+const CAROUSEL_TEXT_MAX_CHARS: usize = 60;
+
+/// カルーセルの最大列数（LINE Messaging API の carousel template 仕様）。
+const CAROUSEL_MAX_COLUMNS: usize = 10;
+
+/// message action の `label`（= [`CardPayload::button_text`]）の文字数上限
+/// （LINE Messaging API の template message 仕様）。
+const CAROUSEL_BUTTON_LABEL_MAX_CHARS: usize = 20;
+
+/// message action の `text`（= [`CardPayload::button_message`]。ボタン押下時に LINE が
+/// そのまま新規メッセージとして送信する文字列）の文字数上限（LINE Messaging API の
+/// message action 仕様）。`title` / `description` / `button_text` の 3 つは既に切り詰めて
+/// いたのに、この 1 つだけ無検証で通していた（Stage 3 レビュー指摘 Warning 1: 生成側
+/// `server/src/advisor/cards.rs::to_product_card` は `format!("{}について詳しく教えて",
+/// material.title_ja)` で組み立てており、`title_ja` が長ければ 300 字を超えうる。超えると
+/// LINE Reply API が 400 を返し、同一 reply 呼び出しに載っているテキスト回答ごと全損する）。
+const CAROUSEL_ACTION_TEXT_MAX_CHARS: usize = 300;
+
+/// `thumbnailImageUrl` の文字数上限（LINE Messaging API の carousel template 仕様）。
+/// 超過した URL は [`is_plausible_https_url`] が `false` を返し、画像だけが落ちる
+/// （切り詰めない理由は同関数の doc comment を参照）。
+const CAROUSEL_IMAGE_URL_MAX_CHARS: usize = 2000;
+
+/// カルーセルのカラムフィールドを上限文字数へ切り詰める（[`truncate_chars`] を再利用し、
+/// バイト境界ではなく文字数で数える規律を [`truncate_for_line`] / [`truncate_history_text`]
+/// と揃える）。超過時は運用者が気づけるよう warn する。
+///
+/// ログにはカードの本文全文ではなく `card_index` と `material_key` で対象を特定する
+/// （以前は切り詰め前の `card_title` を全文ログへ出しており、長文が流れる上にカードを
+/// 一意に特定できる識別子にもなっていなかった）。`material_key` は [`material_key_for_log`]
+/// 経由でログへ渡す（無ければ `"<none>"`、上限を超える場合は切り詰める）。
+///
+/// `text.chars().count()`（Unicode scalar value 数）で数えている点について: LINE の文字数
+/// カウント方式はフィールドの種類によって異なり、carousel template message の `text` /
+/// `title` と message action object の `label` / `text` は grapheme cluster 単位でカウント
+/// される（UTF-16 code unit 単位が適用されるのはプレーンテキストメッセージ本文のみで、
+/// この関数が扱うカルーセル系フィールドには当てはまらない。
+/// <https://developers.line.biz/en/docs/messaging-api/text-character-count/>）。
+/// 1 つの grapheme cluster は 1 つ以上の Unicode scalar value から構成されるが、1 つの
+/// scalar value が複数の grapheme cluster にまたがることはないため、scalar value 数
+/// （`chars().count()`）は grapheme cluster 数の**上限**になる。したがって scalar value 数
+/// で上限に収まるよう切り詰めれば grapheme cluster 数は常にそれ以下になり、LINE 側の上限を
+/// 超過方向に外すことはない（安全側）。この安全側の性質がある限り、grapheme cluster 分割の
+/// 実装（`unicode-segmentation` 等の新規クレート導入）は不要と判断する。
+fn truncate_carousel_field(
+    card_index: usize,
+    material_key: Option<&str>,
+    field_name: &'static str,
+    text: &str,
+    max: usize,
+) -> String {
+    let original_chars = text.chars().count();
+    if original_chars <= max {
+        return text.to_string();
+    }
+    tracing::warn!(
+        card_index,
+        material_key = material_key_for_log(material_key),
+        field_name,
+        original_chars,
+        max_chars = max,
+        "line webhook: a product card field exceeds the carousel template's char limit; \
+         truncating before sending it to the line reply api"
+    );
+    truncate_chars(text, max)
+}
+
+/// `image_url` が LINE の `thumbnailImageUrl` として送るに値する、プレースホルダではない
+/// 絶対 https URL らしい形をしているかどうかを判定する。
+///
+/// 以前は `rest.find(['/', '?', '#'])` より前の文字列が非空かどうかしか見ておらず、authority
+/// を構文的に解釈していなかった（codex レビュー Critical 是正）。`https://:443/x.jpg`
+/// （authority が port のみで host が空）や `https://user@/x.jpg`（authority が userinfo の
+/// みで host が空）のような「区切り文字の前に何か文字はあるが host としては空」の値を妥当と
+/// 誤判定していた。`url` クレート（`server/Cargo.toml` 既存の直接依存）の `Url::parse` に
+/// authority の構文解釈を委譲し、次を検証する:
+///
+/// - URL 全体の文字数（Unicode scalar value 数）が [`CAROUSEL_IMAGE_URL_MAX_CHARS`]
+///   （LINE の `thumbnailImageUrl` の上限）以内。**超過分は切り詰めない**。他のカルーセル
+///   フィールド（[`truncate_carousel_field`]）と異なり、URL は途中で切ると別のリソースを
+///   指す壊れた URL になりうるため、切り詰めではなく「画像だけ落とす」に倒す。
+/// - URL 全体に空白文字（`char::is_whitespace`）と制御文字（`char::is_control`）を 1 つも
+///   含まない（`"https://exa mple.com/x.jpg"` のようなホスト途中の空白や、ヘッダインジェク
+///   ションの温床になりうる制御文字を弾く。`Url::parse` である程度は弾かれるが、明示チェック
+///   として残す）。
+/// - `Url::parse` に成功し、`scheme() == "https"`（`http://` は不可）。
+/// - `host_str()` が `Some` かつ非空（`https://?token=value` や
+///   `https:///static/products/x.jpg` のようにホストが欠落した値は、生成側
+///   `server/src/advisor/api.rs` の `public_host` 誤設定などで実際に作られうる。WHATWG URL
+///   仕様上 `https` は special scheme のため host 必須で、通常はここで弾かれるより先に
+///   `Url::parse` 自体が `EmptyHost` で失敗する。ここでの再チェックは防御的な belt-and-
+///   suspenders）。
+/// - port が指定されている場合の数値妥当性は `Url::parse` に委譲する
+///   （`https://example.com:invalid/x.jpg` のような非数値 port は `Url::parse` 自体が失敗する
+///   ため、追加の手書き検証は行わない）。
+/// - `https://` の直後にさらに `/`（または `\`）が続く形（例:
+///   `"https:///static/products/x.jpg"`）は `Url::parse` に渡す前に弾く。WHATWG URL の
+///   special scheme 用 authority 解析（"special authority ignore slashes state"）は `//` の
+///   直後に続く追加の `/` / `\` を読み飛ばしてから host の走査を始めるため、この形を
+///   `Url::parse` にそのまま渡すと `"static"` が host として解釈されてしまう（実測済み）。
+///   これは host が空のつもりの値（`server/src/advisor/api.rs` の `public_host` が空文字の
+///   まま `format!("https://{}{}", state.public_host, rel)` を組み立てた場合に実際に
+///   生成されうる）を「別の妥当な host を持つ URL」に取り違えることになるため、
+///   `Url::parse` の技術的な正しさより「意図された host が無い」という実質を優先し、事前に
+///   弾く。この事前チェックのスキーム判定は ASCII case-insensitive で行う（WHATWG URL の
+///   スキームは大小文字を区別しないため、`Url::parse` 自身は `HTTPS://` を通常の `https://`
+///   と同じ special scheme として扱う。事前チェック側だけ大文字小文字を区別すると、
+///   `"HTTPS:///static/products/x.jpg"` のような大文字スキームでこの事前チェックだけを
+///   迂回でき、`Url::parse` が `"static"` を host として解釈した結果をそのまま通してしまう）。
+///
+/// これらを検証せず LINE Reply API へそのまま送ると 400 が返り、テキスト回答とカルーセルは
+/// 同一の reply 呼び出しに載っているため、テキスト回答ごと全損する
+/// （モジュール doc 冒頭の不変条件）。
+fn is_plausible_https_url(url: &str) -> bool {
+    if url.chars().count() > CAROUSEL_IMAGE_URL_MAX_CHARS {
+        return false;
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let has_https_scheme_prefix = url
+        .get(.."https://".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
+    if has_https_scheme_prefix {
+        let rest = &url["https://".len()..];
+        if rest.starts_with('/') || rest.starts_with('\\') {
+            return false;
+        }
+    }
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    matches!(parsed.host_str(), Some(host) if !host.is_empty())
+}
+
+/// `product_cards`（design doc §3.3）から LINE カルーセルテンプレートメッセージを組み立てる
+/// 純関数。ネットワーク呼び出しを含まないので、フィクスチャだけでテストできる
+/// （`assemble_reply` と同じ設計方針）。
+///
+/// 応答生成 API は別プロセスであり、その出力の欠陥をそのまま LINE Reply API へ転送すると
+/// 400 が返る。テキスト回答とカルーセルは**同一の reply 呼び出し**に載っているため、400 に
+/// なるとテキスト回答も含めて**利用者に何も届かない**（replyToken は使い切りで push 再送は
+/// しない、design doc §6）。そのため Critical 2 是正として、ここで受け取った `CardPayload`
+/// を検証してから使う（fail-open: 不正な列は個別に落とし、テキスト回答は常に生かす）:
+///
+/// - `description` が空、または trim 後に空になる列は丸ごとスキップする（LINE の column
+///   `text` は必須で空文字は不正）。
+/// - `button_message` が空、または trim 後に空になる列も同様に丸ごとスキップする
+///   （message action の `text` も必須で空文字は不正。Stage 3 レビュー指摘 Warning 1）。
+/// - `button_text` が空、または trim 後に空になる列も同様に丸ごとスキップする（message
+///   action の `label` は carousel template では必須。Stage 2 レビュー指摘 Critical: 以前は
+///   description / button_message しか検証しておらず、空の label をそのまま
+///   `actions[0].label` に送ると LINE Reply API が 400 を返し、同じ reply に載る
+///   テキスト回答ごと全損していた）。
+/// - `title` が trim 後に空になる列は、列自体は残しつつ column の `"title"` キーを省略する
+///   （`title` は LINE の carousel column では任意フィールド — 公式 OpenAPI 定義
+///   `CarouselColumn.required` は `[text, actions]` のみで `title` を含まない — なので、
+///   `description` / `button_message` / `button_text` とは非対称にスキップではなくキー省略
+///   で扱う。Stage 3 レビュー指摘 Warning 2）。
+/// - `image_url` が [`is_plausible_https_url`] を満たさない列は、画像だけ落として列自体は
+///   残す（画像欠落は致命的ではないという生成側 `server/src/advisor/cards.rs` の
+///   `resolve_image_url` の方針と揃える）。`resolve_image_url` 自体はホスト名の無い相対パス
+///   `/static/products/{filename}` を返す実装だが、それは生成層内部の値であり、正常な
+///   advisor 応答では `server/src/advisor/api.rs` が完全 URL
+///   （`format!("https://{}{}", state.public_host, rel)`）へ変換してから返す。このアダプタが
+///   相対パスをそのまま受け取るのは契約違反であり、その場合も落とすのはテキスト回答ではなく
+///   画像だけにする（fail-open）。
+/// - 検証（上記の空チェック等）を先に行ってから、有効な列を先頭から [`CAROUSEL_MAX_COLUMNS`]
+///   件まで採用する。**有効な列が [`CAROUSEL_MAX_COLUMNS`] 件に達した時点でループを打ち切り、
+///   残りのカードは検証も列構築も一切行わない**（応答生成 API は別プロセスであり、その異常
+///   応答でカード数が想定を大きく超えて返ってきても、最終的に使われない分の trim・文字数
+///   計測・JSON 構築コストを払わないため）。「入力の先頭 [`CAROUSEL_MAX_COLUMNS`] 件を切り出
+///   す」のではなく「検証を通過した列が [`CAROUSEL_MAX_COLUMNS`] 件たまったら止める」という
+///   順序である点に注意（先頭 10 件が無効で 11 件目以降に有効な列がある場合、11 件目以降が
+///   採用される）。
+/// - `title` / `text` / action `label` / action `text`（button_message）はそれぞれ
+///   [`CAROUSEL_TITLE_MAX_CHARS`] / [`CAROUSEL_TEXT_MAX_CHARS`] /
+///   [`CAROUSEL_BUTTON_LABEL_MAX_CHARS`] / [`CAROUSEL_ACTION_TEXT_MAX_CHARS`] へ切り詰める
+///   （`title` は省略されなかった場合のみ）。
+///
+/// 有効な列が 1 件も残らなければ `None` を返す。呼び出し元 [`send_line_reply`] はその場合
+/// カルーセルを付けず、テキストメッセージのみを送る（カードの不正がテキスト回答の送信を
+/// 道連れにしない、が受け入れ条件）。
+fn build_carousel_message(cards: &[CardPayload]) -> Option<serde_json::Value> {
+    let total_cards = cards.len();
+
+    let mut valid_columns: Vec<serde_json::Value> =
+        Vec::with_capacity(total_cards.min(CAROUSEL_MAX_COLUMNS));
+    for (index, card) in cards.iter().enumerate() {
+        // 有効な列が上限に達したら、以降のカードは trim・文字数計測・JSON 構築を一切行わずに
+        // 打ち切る（doc comment 参照）。「入力の先頭 N 件」ではなく「検証を通過した列が N 件」
+        // で止める点が重要なので、この判定はループの先頭（各カードの検証より前）で行う。
+        if valid_columns.len() >= CAROUSEL_MAX_COLUMNS {
+            tracing::warn!(
+                valid_columns = valid_columns.len(),
+                max_columns = CAROUSEL_MAX_COLUMNS,
+                unprocessed_cards = total_cards - index,
+                "line webhook: the carousel already reached the max column count; skipping \
+                 validation and column construction for the remaining product cards"
+            );
+            break;
+        }
+
+        let material_key = card.material_key.as_deref();
+
+        // 空判定と切り詰めの両方を trim 済みの値に対して行う。trim せずに元の文字列を
+        // 切り詰めると、「上限文字数ぶん以上の先頭空白の後ろに有効文字がある」入力で
+        // trim 済みなら非空なのに、切り詰め結果が空白だけになりうる（切り詰め幅が先頭の
+        // 空白部分で尽きるため）。この 3 フィールドは LINE 側で必須のため、空白だけの値を
+        // 送ると 400 を招き、同一 reply に載るテキスト回答ごと全損する。
+        let description = card.description.trim();
+        if description.is_empty() {
+            tracing::warn!(
+                card_index = index,
+                material_key = material_key_for_log(material_key),
+                "line webhook: a product card's description is empty (or whitespace-only); \
+                 dropping this column (the LINE carousel column's text is required and \
+                 cannot be empty)"
+            );
+            continue;
+        }
+
+        let button_message_trimmed = card.button_message.trim();
+        if button_message_trimmed.is_empty() {
+            tracing::warn!(
+                card_index = index,
+                material_key = material_key_for_log(material_key),
+                "line webhook: a product card's button_message is empty (or \
+                 whitespace-only); dropping this column (the LINE message action's text \
+                 is required and cannot be empty)"
+            );
+            continue;
+        }
+
+        let button_text_trimmed = card.button_text.trim();
+        if button_text_trimmed.is_empty() {
+            tracing::warn!(
+                card_index = index,
+                material_key = material_key_for_log(material_key),
+                "line webhook: a product card's button_text is empty (or whitespace-only); \
+                 dropping this column (the LINE message action's label is required and \
+                 cannot be empty)"
+            );
+            continue;
+        }
+
+        let text = truncate_carousel_field(
+            index,
+            material_key,
+            "description",
+            description,
+            CAROUSEL_TEXT_MAX_CHARS,
+        );
+        let label = truncate_carousel_field(
+            index,
+            material_key,
+            "button_text",
+            button_text_trimmed,
+            CAROUSEL_BUTTON_LABEL_MAX_CHARS,
+        );
+        let button_message = truncate_carousel_field(
+            index,
+            material_key,
+            "button_message",
+            button_message_trimmed,
+            CAROUSEL_ACTION_TEXT_MAX_CHARS,
+        );
+
+        let mut column = serde_json::json!({
+            "text": text,
+            "actions": [
+                {
+                    "type": "message",
+                    "label": label,
+                    "text": button_message,
+                }
+            ],
+        });
+
+        // `title` は LINE 側では任意フィールドだが `CardPayload.title` は必須 String
+        // なので空文字が来うる。空文字のまま `"title": ""` を送ると 400 を招くため、
+        // trim 後に空なら列は残しつつキー自体を出さない（description / button_message /
+        // button_text とは異なり、title の欠落は列として致命的ではない — text と action
+        // さえあれば列は成立する）。空判定・切り詰めともに trim 済みの値に対して行う理由は
+        // 上の description 等と同じ（先頭空白が切り詰め幅を食い潰して結果が空白だけになる
+        // のを防ぐ）。
+        let title_trimmed = card.title.trim();
+        if title_trimmed.is_empty() {
+            tracing::warn!(
+                card_index = index,
+                material_key = material_key_for_log(material_key),
+                "line webhook: a product card's title is empty (or whitespace-only); \
+                 omitting the carousel column's title key (unlike description/\
+                 button_message/button_text, a missing title does not invalidate the column)"
+            );
+        } else {
+            let title = truncate_carousel_field(
+                index,
+                material_key,
+                "title",
+                title_trimmed,
+                CAROUSEL_TITLE_MAX_CHARS,
+            );
+            column["title"] = serde_json::Value::String(title);
+        }
+
+        // `image_url` が無いカードは `thumbnailImageUrl` キー自体を出さない（`null` を
+        // 送らない）。プレースホルダ的な値（相対パス、`https://` 単体等）は画像だけ落として
+        // 列は残す（doc comment 参照）。ログには image_url の値そのものは出さない
+        // （query parameter に個人情報・トークンが紛れ込みうるため。Stage 2 レビュー指摘
+        // Warning）。
+        match &card.image_url {
+            Some(image_url) if is_plausible_https_url(image_url) => {
+                column["thumbnailImageUrl"] = serde_json::Value::String(image_url.clone());
+            }
+            Some(_) => {
+                tracing::warn!(
+                    card_index = index,
+                    material_key = material_key_for_log(material_key),
+                    "line webhook: a product card's image_url is not a plausible absolute \
+                     https URL; dropping the image but keeping the card (thumbnailImageUrl \
+                     must be an absolute https URL per the LINE Messaging API)"
+                );
+            }
+            None => {}
+        }
+
+        valid_columns.push(column);
+    }
+
+    if valid_columns.is_empty() {
+        if total_cards > 0 {
+            tracing::warn!(
+                total_cards,
+                "line webhook: no product card produced a valid carousel column; sending the \
+                 text reply without a carousel"
+            );
+        }
+        return None;
+    }
+
+    // ここで `valid_columns.len() > CAROUSEL_MAX_COLUMNS` は成立しない（ループ先頭の早期
+    // 打ち切りにより、上限に達した時点で以降のカードは列に追加されない）。truncate は不要。
+    debug_assert!(valid_columns.len() <= CAROUSEL_MAX_COLUMNS);
+
+    Some(serde_json::json!({
+        "type": "template",
+        "altText": CAROUSEL_ALT_TEXT,
+        "template": {
+            "type": "carousel",
+            "columns": valid_columns,
+        },
+    }))
 }
 
 /// ログに出す reply_token の先頭文字数（Stage 2 レビュー指摘）。
@@ -758,7 +1310,8 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             Ok(())
         }
         RoutedEvent::NonText { reply_token } => {
-            send_line_reply(state, &reply_token, &state.nontext_text)
+            // 画像・スタンプ等は応答生成 API を呼ばないため product_cards は存在しない。
+            send_line_reply(state, &reply_token, &state.nontext_text, None)
                 .await
                 // F2 / Stage 2 レビュー指摘: reply_token は全文ではなく先頭 8 文字+長さのみ
                 // ログへ残す（返信対象を一意に特定できる値を必要以上に全文残さない方針へ変更。
@@ -792,6 +1345,12 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             let api_response = call_answer_api(state, &user_id, &text, case_id, &history).await;
             let (reply_text, update) =
                 assemble_reply(api_response.as_ref(), &text, &state.fallback_text);
+            // design doc §3.3: advisor 経路の 200 応答にのみ乗る加算フィールド。CS 経路は
+            // 常に `None`（`AnswerApiResponse::product_cards` の doc comment 参照）なので、
+            // 非 200・タイムアウト時（`api_response` が `None`）も自然に `None` へ倒れる。
+            let cards = api_response
+                .as_ref()
+                .and_then(|r| r.product_cards.as_deref());
 
             // design doc §6 手順4 / handle_event の doc comment 参照: 応答生成 API が 200 を
             // 返した時点（= update が Some）で、LINE への返信を試みる前に case_id と
@@ -801,7 +1360,7 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
                 update.assistant_text
             });
 
-            let reply_result = send_line_reply(state, &reply_token, &reply_text)
+            let reply_result = send_line_reply(state, &reply_token, &reply_text, cards)
                 .await
                 // F2: どのユーザ/イベントの返信が失敗したか webhook_handler の error ログで
                 // 分かるようにする。reply_token は全文ではなく先頭 8 文字+長さのみ
@@ -921,7 +1480,7 @@ async fn call_answer_api(
                 user_id,
                 error = ?err,
                 "line webhook: answer api returned 200 but the body failed to parse as the \
-                 expected {{reply_text, case_id}} shape"
+                 expected {{reply_text, case_id, product_cards?}} shape"
             );
             None
         }
@@ -931,10 +1490,38 @@ async fn call_answer_api(
 /// LINE Reply API（`POST https://api.line.me/v2/bot/message/reply`）を 1 回呼ぶ
 /// （design doc §6）。失敗時は呼び出し元（`handle_event` 経由 `webhook_handler`）が
 /// error ログを出す（design doc §6: 「push 再送は行わない」）。
-async fn send_line_reply(state: &AppState, reply_token: &str, text: &str) -> Result<()> {
+///
+/// `cards` が `Some` で、かつ [`build_carousel_message`] が有効な列を 1 件以上生成できた
+/// ときだけ、テキストメッセージに続けてカルーセルテンプレートを 2 件目として送る
+/// （design doc §3.3）。LINE Reply API は 1 回の呼び出しの `messages` 配列（最大 5 件）に
+/// 複数メッセージを積める仕様なので、追加の API 呼び出しは不要。
+/// `cards` が `None`・空配列・または全カードがバリデーションで落ちて有効な列が 0 件のとき
+/// （CS 経路、advisor でもカードが無い/不正な応答）は `messages` が 1 要素の配列になり、
+/// これは変更前と完全に同一の JSON になる（既存の呼び出し元・テストの後方互換。カードの
+/// 不正がテキスト回答の送信を道連れにしない、という Critical 2 対応でもある）。
+async fn send_line_reply(
+    state: &AppState,
+    reply_token: &str,
+    text: &str,
+    cards: Option<&[CardPayload]>,
+) -> Result<()> {
+    let mut messages = vec![serde_json::json!({"type": "text", "text": truncate_for_line(text)})];
+    // 実際に積んだカルーセルの列数（積まなければ 0）。カード起因の 400（不正な値が
+    // 検証をすり抜けた場合）と、従来からあるテキスト単独送信の 400 とをログだけで
+    // 切り分けられるようにするため、非 success 応答のログ・エラー文脈に必ず含める。
+    let mut carousel_columns: usize = 0;
+    if let Some(cards) = cards {
+        if let Some(carousel) = build_carousel_message(cards) {
+            carousel_columns = carousel["template"]["columns"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0);
+            messages.push(carousel);
+        }
+    }
     let payload = serde_json::json!({
         "replyToken": reply_token,
-        "messages": [{"type": "text", "text": truncate_for_line(text)}],
+        "messages": messages,
     });
     let body = serde_json::to_vec(&payload).context("serialize line reply api request body")?;
 
@@ -953,22 +1540,25 @@ async fn send_line_reply(state: &AppState, reply_token: &str, text: &str) -> Res
 
     let status = response.status();
     if !status.is_success() {
-        // Stage 2 レビュー指摘: 本文読み取り自体が失敗した場合（コネクション切断等）を
-        // 空文字列へ握りつぶさず、読み取り失敗の事実をログとエラーメッセージの両方に残す。
-        // 空文字列のままだと「LINE が空のエラーボディを返した」のか「読み取りに失敗した」
-        // のか運用者が区別できない。
+        // 本文読み取り自体が失敗した場合（コネクション切断等）を空文字列へ握りつぶさず、
+        // 読み取り失敗の事実をログとエラーメッセージの両方に残す。空文字列のままだと
+        // 「LINE が空のエラーボディを返した」のか「読み取りに失敗した」のか運用者が
+        // 区別できない。
         let body_text = match response.text().await {
             Ok(text) => text,
             Err(err) => {
                 tracing::warn!(
                     error = ?err,
                     %status,
+                    carousel_columns,
                     "line webhook: failed to read the line reply api's non-success response body"
                 );
                 "<failed to read response body>".to_string()
             }
         };
-        anyhow::bail!("line reply api returned {status}: {body_text}");
+        anyhow::bail!(
+            "line reply api returned {status} (carousel_columns={carousel_columns}): {body_text}"
+        );
     }
     Ok(())
 }
@@ -1822,6 +2412,7 @@ mod tests {
         let resp = AnswerApiResponse {
             reply_text: "こちらが回答です".to_string(),
             case_id: "case-99".to_string(),
+            product_cards: None,
         };
         let (text, update) = assemble_reply(Some(&resp), "質問です", "フォールバック文");
         assert_eq!(text, "こちらが回答です");
@@ -1838,6 +2429,1276 @@ mod tests {
         assert!(
             update.is_none(),
             "a failed (or non-200/timeout) api call must not request a session update"
+        );
+    }
+
+    // ---- AnswerApiResponse::product_cards（design doc §3.3: advisor 経路の加算フィールド） ----
+
+    #[test]
+    fn answer_api_response_parses_product_cards_when_present() {
+        let json = r#"{
+            "reply_text": "こちらがおすすめです",
+            "case_id": "case-77",
+            "product_cards": [
+                {
+                    "material_key": "own_product:adc-v724",
+                    "title": "URTECT ADC-V724",
+                    "description": "屋外対応・夜間撮影。スマホから映像確認",
+                    "image_url": "https://advisor.example/static/products/adc-v724.jpg",
+                    "button_text": "この製品について聞く",
+                    "button_message": "ADC-V724について詳しく教えて",
+                    "future_field": "x"
+                },
+                {
+                    "title": "汎用センサーライト",
+                    "description": "人感センサーで自動点灯するカテゴリ製品",
+                    "button_text": "詳しく聞く",
+                    "button_message": "センサーライトについて詳しく教えて"
+                }
+            ]
+        }"#;
+
+        let resp: AnswerApiResponse =
+            serde_json::from_str(json).expect("a well-formed advisor response must parse");
+        let cards = resp
+            .product_cards
+            .expect("product_cards must be Some when the field is present in the JSON");
+
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].title, "URTECT ADC-V724");
+        assert_eq!(
+            cards[0].description,
+            "屋外対応・夜間撮影。スマホから映像確認"
+        );
+        assert_eq!(
+            cards[0].image_url.as_deref(),
+            Some("https://advisor.example/static/products/adc-v724.jpg")
+        );
+        assert_eq!(cards[0].button_text, "この製品について聞く");
+        assert_eq!(cards[0].button_message, "ADC-V724について詳しく教えて");
+        // material_key は `CardPayload` の実フィールド（未知フィールドではない）。ここで
+        // 正しく取り込まれることを固定する。
+        assert_eq!(
+            cards[0].material_key.as_deref(),
+            Some("own_product:adc-v724")
+        );
+        // 1 件目には `CardPayload` に存在しないフィールド `future_field` を含めている。
+        // 上の assert 群が全て通ること自体が、未知フィールドがあってもパースが失敗しない
+        // ことの固定になる。
+
+        // 2 件目: image_url を欠いたカード（design doc §3.3: 「無い列は画像なしで成立する」）。
+        assert_eq!(cards[1].image_url, None);
+    }
+
+    #[test]
+    fn answer_api_response_product_cards_defaults_to_none_when_absent() {
+        // CS 経路（`/urtect/api/reply`）が実際に返す形（product_cards を一切含まない）。
+        // ここが崩れると CS の line_adapter 経路が壊れる（後方互換の直接的な固定）。
+        let json = r#"{"reply_text":"こちらが回答です","case_id":"case-abc"}"#;
+
+        let resp: AnswerApiResponse =
+            serde_json::from_str(json).expect("a CS-shaped response (no product_cards) must parse");
+
+        assert_eq!(
+            resp.product_cards, None,
+            "product_cards must default to None when the field is absent from the JSON"
+        );
+    }
+
+    #[test]
+    fn answer_api_response_parses_and_drops_the_card_when_description_is_missing() {
+        // Critical 是正: `description` を欠くカードが 1 件でも混ざると、以前は
+        // `AnswerApiResponse` 全体のデシリアライズが失敗し、本来届くはずだった reply_text と
+        // case_id ごと失われていた（`CardPayload` の必須 String フィールドのせい）。
+        // `#[serde(default)]` により、欠落は空文字にフォールバックしてパース自体は成功する。
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-88",
+            "product_cards": [
+                {
+                    "title": "タイトルのみ",
+                    "button_text": "詳しく聞く",
+                    "button_message": "詳しく教えて"
+                }
+            ]
+        }"#;
+
+        let resp: AnswerApiResponse = serde_json::from_str(json).expect(
+            "a card missing a required field must not fail the whole response parse (fail-open)",
+        );
+        assert_eq!(resp.reply_text, "こちらが回答です");
+        assert_eq!(resp.case_id, "case-88");
+
+        let cards = resp
+            .product_cards
+            .expect("product_cards must still be Some even with a defective card inside");
+        assert_eq!(
+            cards[0].description, "",
+            "a missing description must default to an empty string, not fail the parse"
+        );
+
+        // 空文字の description は build_carousel_message の既存検証でこの列自体を落とす
+        // （fail-open は「カードだけ失う」で止まり、テキスト回答は影響を受けない）。
+        assert_eq!(
+            build_carousel_message(&cards),
+            None,
+            "a card whose description defaulted to empty must be dropped, leaving no carousel"
+        );
+    }
+
+    // ---- codex レビュー Critical 1 是正: カード「型不一致」は「フィールド欠落」と異なり
+    // #[serde(default)] では救えない（欠落時のみ default が適用される。値が存在するが型が
+    // 違う場合は通常の serde エラーとして伝播する）。product_cards 配列は要素単位で寛容に
+    // パースし、型不一致の要素だけを落として reply_text/case_id を道連れにしない。 ----
+
+    #[test]
+    fn answer_api_response_drops_only_the_type_mismatched_card_and_keeps_the_rest() {
+        // 1 件目は description が数値（本来 string）で型不一致。以前はこれだけで
+        // AnswerApiResponse 全体の serde_json::from_str が失敗し、reply_text/case_id ごと
+        // 失われていた。
+        let json = r#"{
+            "reply_text": "こちらがおすすめです",
+            "case_id": "case-99",
+            "product_cards": [
+                {
+                    "title": "型不一致カード",
+                    "description": 123,
+                    "button_text": "詳しく聞く",
+                    "button_message": "詳しく教えて"
+                },
+                {
+                    "title": "正常カード",
+                    "description": "正しい説明文",
+                    "button_text": "詳しく聞く",
+                    "button_message": "詳しく教えて"
+                }
+            ]
+        }"#;
+
+        let resp: AnswerApiResponse = serde_json::from_str(json).expect(
+            "a type-mismatched card must not fail the whole response parse (fail-open at the \
+             per-card level, not just per-missing-field)",
+        );
+        assert_eq!(resp.reply_text, "こちらがおすすめです");
+        assert_eq!(resp.case_id, "case-99");
+
+        let cards = resp
+            .product_cards
+            .expect("product_cards must be Some: the field itself was present in the JSON");
+        assert_eq!(
+            cards.len(),
+            1,
+            "the type-mismatched card must be dropped, leaving only the well-formed one"
+        );
+        assert_eq!(cards[0].title, "正常カード");
+    }
+
+    #[test]
+    fn answer_api_response_product_cards_becomes_empty_vec_when_all_cards_are_type_mismatched() {
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-100",
+            "product_cards": [
+                { "description": 1 },
+                { "description": true }
+            ]
+        }"#;
+
+        let resp: AnswerApiResponse = serde_json::from_str(json)
+            .expect("the response must parse even if every card fails to deserialize");
+        assert_eq!(resp.reply_text, "こちらが回答です");
+        assert_eq!(resp.case_id, "case-100");
+        assert_eq!(
+            resp.product_cards,
+            Some(Vec::new()),
+            "product_cards must be Some(vec![]), not None: the field was present in the JSON, \
+             it just had no salvageable elements"
+        );
+    }
+
+    #[test]
+    fn answer_api_response_keeps_all_cards_when_all_are_well_formed() {
+        // 回帰確認: 型不一致耐性を入れても、正常なカードのみの場合は従来どおり全件残る。
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-101",
+            "product_cards": [
+                {
+                    "title": "カード1",
+                    "description": "説明1",
+                    "button_text": "詳しく聞く",
+                    "button_message": "詳しく教えて"
+                },
+                {
+                    "title": "カード2",
+                    "description": "説明2",
+                    "button_text": "詳しく聞く",
+                    "button_message": "詳しく教えて"
+                }
+            ]
+        }"#;
+
+        let resp: AnswerApiResponse =
+            serde_json::from_str(json).expect("a well-formed advisor response must parse");
+        let cards = resp.product_cards.expect("product_cards must be Some");
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].title, "カード1");
+        assert_eq!(cards[1].title, "カード2");
+    }
+
+    // ---- product_cards フィールド自体が配列でない場合、AnswerApiResponse 全体のパースを
+    // 失敗させない。要素単位の型不一致とは異なるバグ経路: フィールド自体が非配列だと
+    // `Option::<Vec<Value>>::deserialize` は要素をひとつも見る前に型エラーを返すため、
+    // 要素単位の寛容パースが効かない。 ----
+
+    #[test]
+    fn answer_api_response_product_cards_becomes_none_when_field_is_a_string() {
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-200",
+            "product_cards": "oops"
+        }"#;
+
+        let resp: AnswerApiResponse = serde_json::from_str(json).expect(
+            "a non-array product_cards field must not fail the whole response parse \
+             (fail-open at the field level, not just the element level)",
+        );
+        assert_eq!(resp.reply_text, "こちらが回答です");
+        assert_eq!(resp.case_id, "case-200");
+        assert_eq!(
+            resp.product_cards, None,
+            "a string product_cards field must be treated as absent"
+        );
+    }
+
+    #[test]
+    fn answer_api_response_product_cards_becomes_none_when_field_is_an_object() {
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-201",
+            "product_cards": {"not": "an array"}
+        }"#;
+
+        let resp: AnswerApiResponse = serde_json::from_str(json)
+            .expect("an object product_cards field must not fail the whole response parse");
+        assert_eq!(resp.reply_text, "こちらが回答です");
+        assert_eq!(resp.case_id, "case-201");
+        assert_eq!(
+            resp.product_cards, None,
+            "an object product_cards field must be treated as absent"
+        );
+    }
+
+    #[test]
+    fn answer_api_response_product_cards_becomes_none_when_field_is_a_number() {
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-202",
+            "product_cards": 123
+        }"#;
+
+        let resp: AnswerApiResponse = serde_json::from_str(json)
+            .expect("a number product_cards field must not fail the whole response parse");
+        assert_eq!(resp.reply_text, "こちらが回答です");
+        assert_eq!(resp.case_id, "case-202");
+        assert_eq!(
+            resp.product_cards, None,
+            "a number product_cards field must be treated as absent"
+        );
+    }
+
+    #[test]
+    fn answer_api_response_product_cards_becomes_none_when_field_is_a_boolean() {
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-203",
+            "product_cards": true
+        }"#;
+
+        let resp: AnswerApiResponse = serde_json::from_str(json)
+            .expect("a boolean product_cards field must not fail the whole response parse");
+        assert_eq!(resp.reply_text, "こちらが回答です");
+        assert_eq!(resp.case_id, "case-203");
+        assert_eq!(
+            resp.product_cards, None,
+            "a boolean product_cards field must be treated as absent"
+        );
+    }
+
+    // ---- build_carousel_message（design doc §3.3: LINE カルーセルテンプレートの組み立て） ----
+
+    /// テスト用の `CardPayload` を組み立てる。`title` / `description` / `image_url` 以外は
+    /// テストの関心事ではないため固定値にする（`material_key` は `None` 固定 — ログへの
+    /// 反映は目視確認の対象であり、この単体テスト群の assert 対象ではない）。
+    fn sample_card(title: &str, description: &str, image_url: Option<&str>) -> CardPayload {
+        CardPayload {
+            title: title.to_string(),
+            description: description.to_string(),
+            image_url: image_url.map(str::to_string),
+            button_text: "この製品について聞く".to_string(),
+            button_message: "詳しく教えて".to_string(),
+            material_key: None,
+        }
+    }
+
+    #[test]
+    fn build_carousel_message_sets_type_alt_text_and_carousel_template_type() {
+        let message = build_carousel_message(&[sample_card("タイトル", "説明", None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        assert_eq!(message["type"], "template");
+        assert_eq!(message["altText"], CAROUSEL_ALT_TEXT);
+        assert_eq!(message["template"]["type"], "carousel");
+    }
+
+    #[test]
+    fn build_carousel_message_action_uses_button_text_and_button_message() {
+        let message = build_carousel_message(&[sample_card("タイトル", "説明", None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        let action = &message["template"]["columns"][0]["actions"][0];
+        assert_eq!(action["type"], "message");
+        assert_eq!(action["label"], "この製品について聞く");
+        assert_eq!(action["text"], "詳しく教えて");
+    }
+
+    #[test]
+    fn build_carousel_message_truncates_title_over_40_chars() {
+        let long_title = "あ".repeat(CAROUSEL_TITLE_MAX_CHARS + 5);
+        let message = build_carousel_message(&[sample_card(&long_title, "説明", None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        let title = message["template"]["columns"][0]["title"]
+            .as_str()
+            .expect("title must be a string");
+        assert_eq!(title.chars().count(), CAROUSEL_TITLE_MAX_CHARS);
+    }
+
+    #[test]
+    fn build_carousel_message_does_not_truncate_title_at_exactly_40_chars() {
+        let title = "あ".repeat(CAROUSEL_TITLE_MAX_CHARS);
+        let message = build_carousel_message(&[sample_card(&title, "説明", None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        assert_eq!(message["template"]["columns"][0]["title"], title);
+    }
+
+    #[test]
+    fn build_carousel_message_truncates_text_over_60_chars_when_image_present() {
+        let long_description = "い".repeat(CAROUSEL_TEXT_MAX_CHARS + 10);
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            &long_description,
+            Some("https://advisor.example/static/products/x.jpg"),
+        )])
+        .expect("a card with a non-empty description must produce a carousel");
+        let text = message["template"]["columns"][0]["text"]
+            .as_str()
+            .expect("text must be a string");
+        assert_eq!(text.chars().count(), CAROUSEL_TEXT_MAX_CHARS);
+    }
+
+    #[test]
+    fn build_carousel_message_truncates_text_over_60_chars_when_image_absent() {
+        // Critical 1 是正の固定テスト: `build_carousel_message` は column に `title` を
+        // 必須で常に設定するため、LINE 側の「画像もタイトルも無い場合のみ120字」という
+        // 例外はこのアダプタでは絶対に成立しない。画像の有無に関わらず実効上限は常に60。
+        // （旧テスト `build_carousel_message_truncates_text_over_120_chars_when_image_absent`
+        // は誤った120字上限を固定してしまっていたため、この内容に書き換える。）
+        let long_description = "う".repeat(CAROUSEL_TEXT_MAX_CHARS + 10);
+        let message = build_carousel_message(&[sample_card("タイトル", &long_description, None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        let text = message["template"]["columns"][0]["text"]
+            .as_str()
+            .expect("text must be a string");
+        assert_eq!(text.chars().count(), CAROUSEL_TEXT_MAX_CHARS);
+    }
+
+    #[test]
+    fn build_carousel_message_does_not_truncate_description_at_exactly_60_chars() {
+        let description = "い".repeat(CAROUSEL_TEXT_MAX_CHARS);
+        let message = build_carousel_message(&[sample_card("タイトル", &description, None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        assert_eq!(message["template"]["columns"][0]["text"], description);
+    }
+
+    #[test]
+    fn build_carousel_message_truncates_button_text_over_20_chars() {
+        let mut card = sample_card("タイトル", "説明", None);
+        card.button_text = "あ".repeat(CAROUSEL_BUTTON_LABEL_MAX_CHARS + 5);
+        let message = build_carousel_message(&[card])
+            .expect("a card with a non-empty description must produce a carousel");
+        let label = message["template"]["columns"][0]["actions"][0]["label"]
+            .as_str()
+            .expect("label must be a string");
+        assert_eq!(label.chars().count(), CAROUSEL_BUTTON_LABEL_MAX_CHARS);
+    }
+
+    #[test]
+    fn build_carousel_message_omits_thumbnail_image_url_key_when_image_absent() {
+        let message = build_carousel_message(&[sample_card("タイトル", "説明", None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "the key itself must be absent (not null) when image_url is None: {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_includes_thumbnail_image_url_when_image_present() {
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("https://advisor.example/static/products/x.jpg"),
+        )])
+        .expect("a card with a non-empty description must produce a carousel");
+        assert_eq!(
+            message["template"]["columns"][0]["thumbnailImageUrl"],
+            "https://advisor.example/static/products/x.jpg"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_image_url_is_relative() {
+        // Critical 2 是正: 生成側 `server/src/advisor/cards.rs::resolve_image_url` はホスト名の
+        // 無い相対パス（`/static/products/{filename}`）を返す実装だが、それは生成層内部の値
+        // であり、正常な advisor 応答では `server/src/advisor/api.rs` が完全 URL へ変換して
+        // から返す。このアダプタが相対パスをそのまま受け取るのは契約違反であり、その場合も
+        // 落とすのは画像だけで列は残す。相対パスを `thumbnailImageUrl` に載せると LINE Reply
+        // API が 400 を返し、同じ reply に載るテキスト回答ごと全損するため、この防御は残す。
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("/static/products/adc-v724.jpg"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "a relative image_url must not be forwarded as thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_a_column_whose_description_is_empty() {
+        let cards = vec![
+            sample_card("有効", "説明あり", None),
+            sample_card("無効", "", None),
+        ];
+        let message = build_carousel_message(&cards).expect("at least one valid card remains");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(
+            columns.len(),
+            1,
+            "the empty-description card must be dropped"
+        );
+        assert_eq!(columns[0]["title"], "有効");
+    }
+
+    #[test]
+    fn build_carousel_message_drops_a_column_whose_description_is_whitespace_only() {
+        let cards = vec![
+            sample_card("有効", "説明あり", None),
+            sample_card("無効", "   ", None),
+        ];
+        let message = build_carousel_message(&cards).expect("at least one valid card remains");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(
+            columns.len(),
+            1,
+            "a whitespace-only description must be treated the same as empty"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_returns_none_when_every_card_is_invalid() {
+        let cards = vec![
+            sample_card("無効1", "", None),
+            sample_card("無効2", "   ", None),
+        ];
+        assert_eq!(
+            build_carousel_message(&cards),
+            None,
+            "no valid column must mean no carousel at all, so a card-side defect never \
+             blocks the text reply"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_builds_one_column_per_card_up_to_three() {
+        let cards = vec![
+            sample_card("製品A", "説明A", Some("https://advisor.example/a.jpg")),
+            sample_card("製品B", "説明B", None),
+            sample_card("製品C", "説明C", Some("https://advisor.example/c.jpg")),
+        ];
+        let message =
+            build_carousel_message(&cards).expect("all cards are valid and must produce columns");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0]["title"], "製品A");
+        assert_eq!(columns[1]["title"], "製品B");
+        assert_eq!(columns[2]["title"], "製品C");
+    }
+
+    #[test]
+    fn build_carousel_message_limits_columns_to_ten() {
+        let cards: Vec<CardPayload> = (0..12)
+            .map(|i| sample_card(&format!("製品{i}"), &format!("説明{i}"), None))
+            .collect();
+        let message =
+            build_carousel_message(&cards).expect("valid cards remain after the column limit");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(columns.len(), CAROUSEL_MAX_COLUMNS);
+    }
+
+    #[test]
+    fn build_carousel_message_stops_collecting_once_the_column_limit_is_reached() {
+        // 有効な列が CAROUSEL_MAX_COLUMNS 件に達したら、以降のカードは検証も列構築も行わずに
+        // ループを打ち切る（全件を検証・構築してから truncate すると、応答生成 API の異常応答
+        // で配列が想定外に巨大化した場合に無駄なコストを払うため）。この打ち切りが列の中身に
+        // 影響しないこと（11件目・12件目のカードがどのキーの値としても現れないこと）を固定する。
+        let cards: Vec<CardPayload> = (0..12)
+            .map(|i| sample_card(&format!("製品{i}"), &format!("説明{i}"), None))
+            .collect();
+        let message =
+            build_carousel_message(&cards).expect("valid cards remain after the column limit");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        let titles: Vec<&str> = columns
+            .iter()
+            .map(|column| column["title"].as_str().expect("title must be a string"))
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "製品0", "製品1", "製品2", "製品3", "製品4", "製品5", "製品6", "製品7", "製品8",
+                "製品9",
+            ],
+            "only the first 10 valid cards may appear; the 11th and 12th cards must not be \
+             processed at all once the column limit is reached"
+        );
+    }
+
+    // ---- Stage 3 レビュー Warning 1: action の `text`（button_message）の切り詰め ----
+
+    #[test]
+    fn build_carousel_message_truncates_button_message_over_300_chars() {
+        let mut card = sample_card("タイトル", "説明", None);
+        card.button_message = "え".repeat(CAROUSEL_ACTION_TEXT_MAX_CHARS + 5);
+        let message = build_carousel_message(&[card])
+            .expect("a card with a non-empty description must produce a carousel");
+        let action_text = message["template"]["columns"][0]["actions"][0]["text"]
+            .as_str()
+            .expect("action text must be a string");
+        assert_eq!(action_text.chars().count(), CAROUSEL_ACTION_TEXT_MAX_CHARS);
+    }
+
+    #[test]
+    fn build_carousel_message_does_not_truncate_button_message_at_exactly_300_chars() {
+        let mut card = sample_card("タイトル", "説明", None);
+        card.button_message = "え".repeat(CAROUSEL_ACTION_TEXT_MAX_CHARS);
+        let message = build_carousel_message(&[card.clone()])
+            .expect("a card with a non-empty description must produce a carousel");
+        assert_eq!(
+            message["template"]["columns"][0]["actions"][0]["text"],
+            card.button_message
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_a_column_whose_button_message_is_empty() {
+        let mut invalid = sample_card("無効", "説明あり", None);
+        invalid.button_message = String::new();
+        let cards = vec![sample_card("有効", "説明あり", None), invalid];
+        let message = build_carousel_message(&cards).expect("at least one valid card remains");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(
+            columns.len(),
+            1,
+            "the empty-button_message card must be dropped"
+        );
+        assert_eq!(columns[0]["title"], "有効");
+    }
+
+    #[test]
+    fn build_carousel_message_drops_a_column_whose_button_message_is_whitespace_only() {
+        let mut invalid = sample_card("無効", "説明あり", None);
+        invalid.button_message = "   ".to_string();
+        let cards = vec![sample_card("有効", "説明あり", None), invalid];
+        let message = build_carousel_message(&cards).expect("at least one valid card remains");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(
+            columns.len(),
+            1,
+            "a whitespace-only button_message must be treated the same as empty"
+        );
+    }
+
+    // ---- Stage 2 レビュー指摘 Critical: action の `label`（button_text）の空文字検証 ----
+
+    #[test]
+    fn build_carousel_message_drops_a_column_whose_button_text_is_empty() {
+        let mut invalid = sample_card("無効", "説明あり", None);
+        invalid.button_text = String::new();
+        let cards = vec![sample_card("有効", "説明あり", None), invalid];
+        let message = build_carousel_message(&cards).expect("at least one valid card remains");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(
+            columns.len(),
+            1,
+            "the empty-button_text card must be dropped"
+        );
+        assert_eq!(columns[0]["title"], "有効");
+    }
+
+    #[test]
+    fn build_carousel_message_drops_a_column_whose_button_text_is_whitespace_only() {
+        let mut invalid = sample_card("無効", "説明あり", None);
+        invalid.button_text = "   ".to_string();
+        let cards = vec![sample_card("有効", "説明あり", None), invalid];
+        let message = build_carousel_message(&cards).expect("at least one valid card remains");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(
+            columns.len(),
+            1,
+            "a whitespace-only button_text must be treated the same as empty"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_returns_none_when_every_card_has_empty_button_text() {
+        let mut invalid1 = sample_card("無効1", "説明あり", None);
+        invalid1.button_text = String::new();
+        let mut invalid2 = sample_card("無効2", "説明あり", None);
+        invalid2.button_text = "   ".to_string();
+        assert_eq!(
+            build_carousel_message(&[invalid1, invalid2]),
+            None,
+            "no valid column must mean no carousel at all, even when the only defect is an \
+             empty button_text"
+        );
+    }
+
+    // ---- Stage 2 レビュー指摘 Warning: image_url の妥当性検証を https:// prefix 判定より \
+    // 強くする ----
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_scheme_only() {
+        let message = build_carousel_message(&[sample_card("タイトル", "説明", Some("https://"))])
+            .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "a bare \"https://\" with no host must not be forwarded as thumbnailImageUrl: \
+             {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_whitespace_follows_scheme() {
+        let message =
+            build_carousel_message(&[sample_card("タイトル", "説明", Some("https:// invalid"))])
+                .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "whitespace immediately after the https:// scheme must not be forwarded as \
+             thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    // ---- reviewer 指摘: is_plausible_https_url の検証強化
+    // （ホスト欠落・ホスト内空白・制御文字・文字数上限） ----
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_host_is_missing() {
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("https://?token=value"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "a URL whose query string immediately follows the scheme (no host) must not be \
+             forwarded as thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_host_is_empty() {
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("https:///static/products/x.jpg"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "a URL with an empty host (triple slash) must not be forwarded as \
+             thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_whitespace_is_mid_host() {
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("https://exa mple.com/x.jpg"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "whitespace inside the host (not just right after the scheme) must not be \
+             forwarded as thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_url_contains_a_control_char() {
+        let url = "https://advisor.example/static/products/x\n.jpg";
+        let message = build_carousel_message(&[sample_card("タイトル", "説明", Some(url))])
+            .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "a control character anywhere in the URL must not be forwarded as \
+             thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_url_exceeds_max_chars() {
+        // 切り詰めではなく画像を丸ごと落とす（途中で切ると別のリソースを指す壊れた URL に
+        // なりうるため）。 is_plausible_https_url の doc comment 参照。
+        let prefix = "https://advisor.example/";
+        let padding = "x".repeat(CAROUSEL_IMAGE_URL_MAX_CHARS + 1 - prefix.chars().count());
+        let url = format!("{prefix}{padding}");
+        assert_eq!(
+            url.chars().count(),
+            CAROUSEL_IMAGE_URL_MAX_CHARS + 1,
+            "test setup: url must be exactly one char over the LINE thumbnailImageUrl limit"
+        );
+
+        let message = build_carousel_message(&[sample_card("タイトル", "説明", Some(&url))])
+            .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "a URL over the LINE thumbnailImageUrl 2,000 char limit must not be forwarded \
+             (and must not be truncated either): {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_includes_thumbnail_image_url_when_url_is_exactly_at_max_chars() {
+        let prefix = "https://advisor.example/";
+        let padding = "x".repeat(CAROUSEL_IMAGE_URL_MAX_CHARS - prefix.chars().count());
+        let url = format!("{prefix}{padding}");
+        assert_eq!(
+            url.chars().count(),
+            CAROUSEL_IMAGE_URL_MAX_CHARS,
+            "test setup: url must be exactly at the LINE thumbnailImageUrl limit"
+        );
+
+        let message = build_carousel_message(&[sample_card("タイトル", "説明", Some(&url))])
+            .expect("the card itself must survive");
+        assert_eq!(
+            message["template"]["columns"][0]["thumbnailImageUrl"], url,
+            "a URL at exactly the 2,000 char limit must still be forwarded (boundary must not \
+             be dropped)"
+        );
+    }
+
+    // ---- codex レビュー Critical 2 是正: is_plausible_https_url の host 検証がまだ不完全
+    // （`rest.find(['/', '?', '#'])` より前が非空かどうかしか見ておらず、authority の
+    // userinfo・port だけの authority を素通りさせていた）。`url` クレートの Url::parse に
+    // 委譲し、host が実在することと port が妥当な数値であることを検証する。 ----
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_host_is_only_a_port() {
+        // authority が `:443` のみ。host 部分は空文字で、旧実装の
+        // `rest.find(['/', '?', '#'])` はコロンの位置を区切りとして扱わないため
+        // `":443"` を非空とみなして通過させていた。
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("https://:443/image.jpg"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "an authority consisting only of a port (no host) must not be forwarded as \
+             thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_only_userinfo_is_present() {
+        // authority が `user@` のみで host が空。旧実装は `@` の後ろから `/` までを host 扱い
+        // していないため、これも非空文字列として素通りしていた。
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("https://user@/image.jpg"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "an authority consisting only of userinfo (no host) must not be forwarded as \
+             thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_port_is_not_numeric() {
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("https://example.com:invalid/image.jpg"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "a non-numeric port must not be forwarded as thumbnailImageUrl: {column:?}"
+        );
+    }
+
+    // ---- Stage 2 レビュー指摘 Warning: 検証を先に行ってから最大列数を採用する ----
+
+    #[test]
+    fn build_carousel_message_keeps_a_valid_card_beyond_the_first_ten_when_earlier_cards_are_invalid(
+    ) {
+        // 以前は検証前に入力の先頭 CAROUSEL_MAX_COLUMNS 件を切り出していたため、
+        // 「先頭10件が無効・11件目以降に有効な列がある」場合に本来採用できたはずの列を
+        // 取りこぼしていた。検証(空チェック等)を先に行い、有効な列を最大
+        // CAROUSEL_MAX_COLUMNS 件まで採用する順序であることを固定する。
+        let mut cards: Vec<CardPayload> = (0..CAROUSEL_MAX_COLUMNS)
+            .map(|i| sample_card(&format!("無効{i}"), "", None))
+            .collect();
+        cards.push(sample_card("十一件目", "説明あり", None));
+
+        let message = build_carousel_message(&cards)
+            .expect("the only valid card (the 11th) must still produce a carousel");
+        let columns = message["template"]["columns"]
+            .as_array()
+            .expect("columns must be a JSON array");
+        assert_eq!(
+            columns.len(),
+            1,
+            "only the 11th card is valid; it must not be dropped just because it is beyond \
+             the first CAROUSEL_MAX_COLUMNS positions"
+        );
+        assert_eq!(columns[0]["title"], "十一件目");
+    }
+
+    // ---- Stage 3 レビュー Warning 2: title が空のときキー自体を省略する ----
+
+    #[test]
+    fn build_carousel_message_omits_title_key_when_title_is_empty() {
+        let message = build_carousel_message(&[sample_card("", "説明", None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("title"),
+            "the title key itself must be absent (not an empty string) when title is empty: \
+             {column:?}"
+        );
+        // title 欠落は列自体を無効にしない: text と action は通常どおり残る。
+        assert_eq!(column["text"], "説明");
+        assert_eq!(column["actions"][0]["label"], "この製品について聞く");
+    }
+
+    #[test]
+    fn build_carousel_message_omits_title_key_when_title_is_whitespace_only() {
+        let message = build_carousel_message(&[sample_card("   ", "説明", None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("title"),
+            "a whitespace-only title must be treated the same as empty: {column:?}"
+        );
+    }
+
+    // ---- Critical 2 是正: 検証(空チェック)は行うが切り詰めは元の(trim していない)文字列に
+    // 対して行っていたため、「上限文字数ぶん以上の先頭空白の後ろに有効文字がある」入力で、
+    // 検証は通る（trim 後は非空）のに切り詰め結果が空白だけになりうる欠陥があった。trim
+    // 済みの値で検証・切り詰めの両方を行うことを固定する。 ----
+
+    #[test]
+    fn build_carousel_message_keeps_description_non_blank_when_leading_whitespace_fills_the_limit()
+    {
+        let description = " ".repeat(CAROUSEL_TEXT_MAX_CHARS) + "有効な説明";
+        let message = build_carousel_message(&[sample_card("タイトル", &description, None)])
+            .expect("a description that is non-empty after trimming must produce a carousel");
+        let text = message["template"]["columns"][0]["text"]
+            .as_str()
+            .expect("text must be a string");
+        assert!(
+            !text.trim().is_empty(),
+            "truncating a description whose first CAROUSEL_TEXT_MAX_CHARS chars are \
+             whitespace must not leave a whitespace-only text (the LINE column's text is \
+             required): {text:?}"
+        );
+        assert_eq!(text, "有効な説明");
+    }
+
+    #[test]
+    fn build_carousel_message_keeps_button_text_non_blank_when_leading_whitespace_fills_the_limit()
+    {
+        let mut card = sample_card("タイトル", "説明", None);
+        card.button_text = " ".repeat(CAROUSEL_BUTTON_LABEL_MAX_CHARS) + "有効";
+        let message = build_carousel_message(&[card])
+            .expect("a button_text that is non-empty after trimming must produce a carousel");
+        let label = message["template"]["columns"][0]["actions"][0]["label"]
+            .as_str()
+            .expect("label must be a string");
+        assert!(
+            !label.trim().is_empty(),
+            "truncating a button_text whose first CAROUSEL_BUTTON_LABEL_MAX_CHARS chars are \
+             whitespace must not leave a whitespace-only label (the LINE message action's \
+             label is required): {label:?}"
+        );
+        assert_eq!(label, "有効");
+    }
+
+    #[test]
+    fn build_carousel_message_keeps_button_message_non_blank_when_leading_whitespace_fills_the_limit(
+    ) {
+        let mut card = sample_card("タイトル", "説明", None);
+        card.button_message = " ".repeat(CAROUSEL_ACTION_TEXT_MAX_CHARS) + "有効なメッセージ";
+        let message = build_carousel_message(&[card])
+            .expect("a button_message that is non-empty after trimming must produce a carousel");
+        let action_text = message["template"]["columns"][0]["actions"][0]["text"]
+            .as_str()
+            .expect("action text must be a string");
+        assert!(
+            !action_text.trim().is_empty(),
+            "truncating a button_message whose first CAROUSEL_ACTION_TEXT_MAX_CHARS chars are \
+             whitespace must not leave a whitespace-only action text (the LINE message \
+             action's text is required): {action_text:?}"
+        );
+        assert_eq!(action_text, "有効なメッセージ");
+    }
+
+    #[test]
+    fn build_carousel_message_keeps_title_non_blank_when_leading_whitespace_fills_the_limit() {
+        let title = " ".repeat(CAROUSEL_TITLE_MAX_CHARS) + "有効なタイトル";
+        let message = build_carousel_message(&[sample_card(&title, "説明", None)])
+            .expect("a card with a non-empty description must produce a carousel");
+        let title_value = message["template"]["columns"][0]["title"]
+            .as_str()
+            .expect("title must be present and a string (the trimmed title is non-empty)");
+        assert!(
+            !title_value.trim().is_empty(),
+            "truncating a title whose first CAROUSEL_TITLE_MAX_CHARS chars are whitespace \
+             must not leave a whitespace-only title: {title_value:?}"
+        );
+        assert_eq!(title_value, "有効なタイトル");
+    }
+
+    // ---- スキーム判定は ASCII case-insensitive にする: 事前チェック（追加スラッシュによる
+    // ホスト欠落の検出）が小文字リテラルの strip_prefix だけだと、大文字スキームでこの事前
+    // チェックだけを迂回でき、Url::parse が host を誤って解釈した結果をそのまま通してしまう
+    // ----
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_scheme_is_uppercase() {
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("HTTPS:///static/products/x.jpg"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "an uppercase HTTPS scheme must not bypass the extra-slash (missing host) check: \
+             {column:?}"
+        );
+    }
+
+    #[test]
+    fn build_carousel_message_drops_thumbnail_image_url_when_scheme_is_mixed_case() {
+        let message = build_carousel_message(&[sample_card(
+            "タイトル",
+            "説明",
+            Some("HtTpS:///static/products/x.jpg"),
+        )])
+        .expect("the card itself must survive; only the image is dropped");
+        let column = message["template"]["columns"][0]
+            .as_object()
+            .expect("column must be a JSON object");
+        assert!(
+            !column.contains_key("thumbnailImageUrl"),
+            "a mixed-case HTTPS scheme must not bypass the extra-slash (missing host) check: \
+             {column:?}"
+        );
+    }
+
+    // ---- send_line_reply（`messages` 配列への carousel 追加。既存の単一メッセージ経路は
+    // 完全に温存する） ----
+
+    /// [`send_line_reply`] が実際に送るリクエストボディを記録するモックハンドラ
+    /// （`loading_capture_handler` と同じ設計方針: ハンドラ内で panic させず、
+    /// `Arc<Mutex<..>>` に記録してから呼び出し元がロック解放後に assert する）。
+    #[derive(Debug, Default, Clone)]
+    struct CapturedLineReplyBody {
+        calls: u32,
+        body: Option<serde_json::Value>,
+    }
+
+    async fn line_reply_capture_handler(
+        State(captured): State<Arc<Mutex<CapturedLineReplyBody>>>,
+        body: Bytes,
+    ) -> StatusCode {
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+        let mut captured = captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        captured.calls += 1;
+        captured.body = parsed;
+        StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn send_line_reply_sends_a_single_text_message_when_cards_are_none() {
+        let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
+        let router = Router::new()
+            .route("/reply", post(line_reply_capture_handler))
+            .with_state(captured.clone());
+        let line_base = spawn_http_mock(router).await;
+        let state = test_app_state(
+            "http://127.0.0.1:1/reply".to_string(),
+            format!("{line_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+
+        send_line_reply(&state, "rt1", "本文です", None)
+            .await
+            .expect("send_line_reply must succeed against a 200 mock");
+
+        let captured = captured.lock().unwrap().clone();
+        let messages = captured.body.as_ref().unwrap()["messages"]
+            .as_array()
+            .expect("messages must be a JSON array");
+        assert_eq!(
+            messages.len(),
+            1,
+            "cards=None must produce exactly the same single-message payload as before this \
+             change (CS route backward compatibility)"
+        );
+        assert_eq!(messages[0]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn send_line_reply_sends_a_single_text_message_when_cards_are_empty() {
+        let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
+        let router = Router::new()
+            .route("/reply", post(line_reply_capture_handler))
+            .with_state(captured.clone());
+        let line_base = spawn_http_mock(router).await;
+        let state = test_app_state(
+            "http://127.0.0.1:1/reply".to_string(),
+            format!("{line_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+
+        send_line_reply(&state, "rt1", "本文です", Some(&[]))
+            .await
+            .expect("send_line_reply must succeed against a 200 mock");
+
+        let captured = captured.lock().unwrap().clone();
+        let messages = captured.body.as_ref().unwrap()["messages"]
+            .as_array()
+            .expect("messages must be a JSON array");
+        assert_eq!(
+            messages.len(),
+            1,
+            "an empty (non-None) cards slice must not add a carousel message either"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_line_reply_appends_a_carousel_message_when_cards_are_present() {
+        let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
+        let router = Router::new()
+            .route("/reply", post(line_reply_capture_handler))
+            .with_state(captured.clone());
+        let line_base = spawn_http_mock(router).await;
+        let state = test_app_state(
+            "http://127.0.0.1:1/reply".to_string(),
+            format!("{line_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+        let cards = vec![sample_card("製品A", "説明A", None)];
+
+        send_line_reply(&state, "rt1", "本文です", Some(&cards))
+            .await
+            .expect("send_line_reply must succeed against a 200 mock");
+
+        let captured = captured.lock().unwrap().clone();
+        let body = captured.body.as_ref().unwrap();
+        let messages = body["messages"]
+            .as_array()
+            .expect("messages must be a JSON array");
+        assert_eq!(
+            messages.len(),
+            2,
+            "a non-empty cards slice must append the carousel as a second message, after the \
+             text message"
+        );
+        assert_eq!(messages[0]["type"], "text");
+        assert_eq!(messages[1]["type"], "template");
+        assert_eq!(body["replyToken"], "rt1");
+    }
+
+    #[tokio::test]
+    async fn send_line_reply_sends_a_single_text_message_when_all_cards_are_invalid() {
+        // Critical 2: 応答生成 API が壊れたカード（ここでは空文字の description）を返して
+        // も、テキスト回答の送信を道連れにしてはならない。
+        let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
+        let router = Router::new()
+            .route("/reply", post(line_reply_capture_handler))
+            .with_state(captured.clone());
+        let line_base = spawn_http_mock(router).await;
+        let state = test_app_state(
+            "http://127.0.0.1:1/reply".to_string(),
+            format!("{line_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+        let cards = vec![sample_card("無効", "", None)];
+
+        send_line_reply(&state, "rt1", "本文です", Some(&cards))
+            .await
+            .expect("send_line_reply must succeed against a 200 mock");
+
+        let captured = captured.lock().unwrap().clone();
+        let messages = captured.body.as_ref().unwrap()["messages"]
+            .as_array()
+            .expect("messages must be a JSON array");
+        assert_eq!(
+            messages.len(),
+            1,
+            "when every card fails validation, the text reply must still be sent alone \
+             (a card-side defect must never take the text reply down with it)"
+        );
+        assert_eq!(messages[0]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn send_line_reply_sends_a_single_text_message_when_all_cards_have_empty_button_text() {
+        // Stage 2 レビュー指摘 Critical: button_text（label）の空文字も description /
+        // button_message と同じく、テキスト回答の送信を道連れにしてはならない。
+        let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
+        let router = Router::new()
+            .route("/reply", post(line_reply_capture_handler))
+            .with_state(captured.clone());
+        let line_base = spawn_http_mock(router).await;
+        let state = test_app_state(
+            "http://127.0.0.1:1/reply".to_string(),
+            format!("{line_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+        let mut invalid = sample_card("無効", "説明あり", None);
+        invalid.button_text = "   ".to_string();
+
+        send_line_reply(&state, "rt1", "本文です", Some(&[invalid]))
+            .await
+            .expect("send_line_reply must succeed against a 200 mock");
+
+        let captured = captured.lock().unwrap().clone();
+        let messages = captured.body.as_ref().unwrap()["messages"]
+            .as_array()
+            .expect("messages must be a JSON array");
+        assert_eq!(
+            messages.len(),
+            1,
+            "an empty button_text must drop the only column, and once no column remains the \
+             text reply must still be sent alone"
+        );
+        assert_eq!(messages[0]["type"], "text");
+    }
+
+    // ---- non-success 応答時のエラー文脈にカルーセルの列数を含める（カード起因の 400 と、
+    // 従来からあるテキスト単独送信の 400 とをログだけで切り分けられるようにするため） ----
+
+    #[tokio::test]
+    async fn send_line_reply_error_includes_the_carousel_column_count_on_failure() {
+        let line_fail_base = spawn_http_mock(
+            Router::new().route("/reply", post(|| async { StatusCode::BAD_REQUEST })),
+        )
+        .await;
+        let state = test_app_state(
+            "http://127.0.0.1:1/reply".to_string(),
+            format!("{line_fail_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+        let cards = vec![
+            sample_card("製品A", "説明A", None),
+            sample_card("製品B", "説明B", None),
+        ];
+
+        let err = send_line_reply(&state, "rt1", "本文です", Some(&cards))
+            .await
+            .expect_err("a non-success line reply api response must be an Err");
+
+        assert!(
+            err.to_string().contains("carousel_columns=2"),
+            "the error must report how many carousel columns were attached, so a card-side \
+             defect (400 while carousel_columns > 0) can be told apart from a text-only \
+             failure (400 while carousel_columns == 0) from logs alone: {err}"
         );
     }
 
@@ -2055,6 +3916,146 @@ mod tests {
              fails: the answer api's 200 is what makes assemble_reply return Some(update) (and \
              thus a customer-turn save) in the first place, so a failure must leave the session \
              exactly as it was before this event"
+        );
+    }
+
+    // ---- handle_event が deserialize_product_cards / build_carousel_message /
+    // send_line_reply を実際に配線していることの確認。この 3 つはそれぞれ個別に手厚く
+    // テストされているが、この配線自体を通すテストが無いと、handle_event 側の 1 行
+    // （`api_response.as_ref().and_then(|r| r.product_cards.as_deref())`）を壊しても
+    // 他のテストは 1 件も落ちない。故障モードは「本番でカルーセルが一度も出ない、警告
+    // ログも出ない」というサイレント故障になる。 ----
+
+    /// 応答生成 API のモック: `product_cards` を含む 200 を返す（advisor 経路の形）。
+    /// `answer_api_ok_handler`（CS 経路の形、`product_cards` 無し）は変更しない。
+    async fn answer_api_ok_handler_with_cards() -> impl axum::response::IntoResponse {
+        axum::Json(serde_json::json!({
+            "reply_text": "こちらが回答です",
+            "case_id": "case-abc",
+            "product_cards": [
+                {
+                    "title": "製品A",
+                    "description": "説明A",
+                    "button_text": "詳しく聞く",
+                    "button_message": "詳しく教えて"
+                }
+            ]
+        }))
+    }
+
+    #[tokio::test]
+    async fn handle_event_appends_a_carousel_message_when_the_answer_api_returns_product_cards() {
+        let answer_api_base =
+            spawn_http_mock(Router::new().route("/reply", post(answer_api_ok_handler_with_cards)))
+                .await;
+        let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
+        let line_router = Router::new()
+            .route("/reply", post(line_reply_capture_handler))
+            .with_state(captured.clone());
+        let line_base = spawn_http_mock(line_router).await;
+
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+        let event = text_webhook_event("u1", "rt1", "おすすめは？");
+
+        handle_event(&state, &event)
+            .await
+            .expect("handle_event must succeed when the answer api returns product_cards");
+
+        let captured = captured.lock().unwrap().clone();
+        assert_eq!(
+            captured.calls, 1,
+            "handle_event must call the line reply api exactly once per event; a second call \
+             would mean the carousel got sent as its own (unauthorized, since replyToken is \
+             single-use) reply attempt instead of riding along in the first"
+        );
+        let body = captured.body.as_ref().unwrap();
+        assert_eq!(
+            body["replyToken"], "rt1",
+            "the reply must be addressed to this event's replyToken"
+        );
+        let messages = body["messages"]
+            .as_array()
+            .expect("messages must be a JSON array");
+        assert_eq!(
+            messages.len(),
+            2,
+            "handle_event must wire product_cards from the answer api response through to a \
+             second (template) message in the same line reply call; deserialize_product_cards \
+             and build_carousel_message being individually correct does not guarantee \
+             handle_event actually calls them with the right value"
+        );
+        assert_eq!(messages[0]["type"], "text");
+        assert_eq!(
+            messages[0]["text"], "こちらが回答です",
+            "the text message must carry the answer api's reply_text verbatim, not be \
+             replaced or blanked by the product_cards wiring"
+        );
+        assert_eq!(messages[1]["type"], "template");
+        assert_eq!(messages[1]["template"]["type"], "carousel");
+        let columns = messages[1]["template"]["columns"]
+            .as_array()
+            .expect("template.columns must be a JSON array");
+        assert_eq!(
+            columns.len(),
+            1,
+            "the mock answer api returned exactly one product card, so exactly one column \
+             must reach the line reply api"
+        );
+        assert_eq!(columns[0]["text"], "説明A");
+        assert_eq!(columns[0]["actions"][0]["label"], "詳しく聞く");
+        assert_eq!(columns[0]["actions"][0]["text"], "詳しく教えて");
+    }
+
+    #[tokio::test]
+    async fn handle_event_sends_a_single_message_when_the_answer_api_response_has_no_product_cards()
+    {
+        let answer_api_base =
+            spawn_http_mock(Router::new().route("/reply", post(answer_api_ok_handler))).await;
+        let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
+        let line_router = Router::new()
+            .route("/reply", post(line_reply_capture_handler))
+            .with_state(captured.clone());
+        let line_base = spawn_http_mock(line_router).await;
+
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+        let event = text_webhook_event("u1", "rt1", "こんにちは");
+
+        handle_event(&state, &event).await.expect(
+            "handle_event must succeed for a CS-shaped (no product_cards) answer api response",
+        );
+
+        let captured = captured.lock().unwrap().clone();
+        assert_eq!(
+            captured.calls, 1,
+            "handle_event must call the line reply api exactly once per event even on the \
+             CS-shaped (no product_cards) path"
+        );
+        let body = captured.body.as_ref().unwrap();
+        assert_eq!(
+            body["replyToken"], "rt1",
+            "the reply must be addressed to this event's replyToken"
+        );
+        let messages = body["messages"]
+            .as_array()
+            .expect("messages must be a JSON array");
+        assert_eq!(
+            messages.len(),
+            1,
+            "a CS-shaped answer api response (no product_cards field) must still produce \
+             exactly one message, unchanged by the product_cards wiring added to handle_event"
+        );
+        assert_eq!(messages[0]["type"], "text");
+        assert_eq!(
+            messages[0]["text"], "こちらが回答です",
+            "the single message must carry the answer api's reply_text verbatim"
         );
     }
 
@@ -2541,6 +4542,26 @@ mod tests {
         let long = "あ".repeat(MAX_LINE_REPLY_CHARS + 100);
         let truncated = truncate_for_line(&long);
         assert_eq!(truncated.chars().count(), MAX_LINE_REPLY_CHARS);
+    }
+
+    // ---- material_key_for_log（外部プロセス由来の material_key をログへ流す前の上限切り詰め） ----
+
+    #[test]
+    fn material_key_for_log_truncates_past_the_limit_but_not_at_it() {
+        let at_limit = "k".repeat(MATERIAL_KEY_LOG_MAX_CHARS);
+        assert_eq!(
+            material_key_for_log(Some(&at_limit)),
+            at_limit,
+            "exactly at the limit must not be truncated"
+        );
+
+        let over_limit = "k".repeat(MATERIAL_KEY_LOG_MAX_CHARS + 1);
+        let truncated = material_key_for_log(Some(&over_limit));
+        assert_eq!(
+            truncated.chars().count(),
+            MATERIAL_KEY_LOG_MAX_CHARS,
+            "one char over the limit must be truncated down to the limit: {truncated}"
+        );
     }
 
     // ---- validate_answer_api_url（Stage 2 レビュー指摘: 平文外部送信を起動時に拒否） ----

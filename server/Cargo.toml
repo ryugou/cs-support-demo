@@ -92,3 +92,11 @@ path = "src/bin/merge_schema.rs"
 [[bin]]
 name = "line_adapter"
 path = "src/bin/line_adapter.rs"
+
+[[bin]]
+name = "homesec_advisor"
+path = "src/bin/homesec_advisor.rs"
+
+[[bin]]
+name = "ingest_homesec"
+path = "src/bin/ingest_homesec.rs"

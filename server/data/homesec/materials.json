@@ -1,0 +1,438 @@
+[
+  {
+    "material_key": "statistic:mujimari-shinnyu-46-8",
+    "kind": "statistic",
+    "title_ja": "住宅侵入窃盗の侵入方法は「無締り」が最多(令和4年)",
+    "body_ja": "警察庁「令和4年の刑法犯に関する統計資料」によれば、住宅侵入窃盗の侵入方法のうち「無締り」(鍵の閉め忘れ・未施錠)が46.8%で最多、次いで「ガラス破り」が26.2%、「施錠開け」が8.0%です(住宅全体の集計)。鍵をかけ忘れないことが最も基本的で効果の大きい対策です。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/211/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:glass-break-26-2",
+    "kind": "statistic",
+    "title_ja": "ガラス破りは侵入方法の4分の1超(令和4年)",
+    "body_ja": "警察庁「令和4年の刑法犯に関する統計資料」によれば、住宅侵入窃盗の侵入方法のうち「ガラス破り」が26.2%を占め、「無締り」46.8%に次いで2位です。窓ガラスへの補助錠や防犯フィルムは、施錠の徹底に次いで重要な対策です。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/211/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:jutaku-hassei-6wari",
+    "kind": "statistic",
+    "title_ja": "侵入窃盗の発生場所は住宅がおよそ6割で最多(平成30年)",
+    "body_ja": "警察庁「住まいる防犯110番『侵入窃盗の発生場所別認知件数』(平成30年)」を出典とする防犯啓発資料によれば、侵入窃盗の発生場所のうち「住宅」がおよそ6割ともっとも多く、内訳は一戸建て住宅42.5%、共同住宅(3階建て以下)11.9%、共同住宅(4階建て以上)4.1%です。",
+    "source_url": "https://www.city.inzai.lg.jp/cmsfiles/contents/0000011/11228/shinnyu.pdf",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:ikkodate-mujimari-46-5",
+    "kind": "statistic",
+    "title_ja": "一戸建て住宅の侵入手段は無締り46.5%・ガラス破り37.7%(平成30年)",
+    "body_ja": "警察庁「住まいる防犯110番『侵入窃盗の侵入手段』(平成30年)」を出典とする防犯啓発資料によれば、一戸建て住宅への侵入手段は「無締り」46.5%、「ガラス破り」37.7%、「ドア錠破り」2.4%、「合鍵」1.8%、「その他の施錠開け」1.7%、「戸外し」0.7%です。一戸建てでは施錠の徹底とガラス対策で大半をカバーできます。",
+    "source_url": "https://www.city.inzai.lg.jp/cmsfiles/contents/0000011/11228/shinnyu.pdf",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:akiramejikan-5fun-7wari",
+    "kind": "statistic",
+    "title_ja": "侵入に5分以上かかると約7割の侵入者があきらめる",
+    "body_ja": "(財)都市防犯研究センター「JUSRIレポート別冊No.17防犯環境設計ハンドブック」を出典とする調査によれば、侵入をあきらめる時間は「2分以内」17.1%、「2分を超え5分以内」51.4%、「5分を超え10分以内」22.9%、「10分以上」8.6%で、合わせて約7割が5分以内で侵入をあきらめています。「時間を稼ぐ」ことが防犯の基本的な考え方です。",
+    "source_url": "https://www.city.inzai.lg.jp/cmsfiles/contents/0000011/11228/shinnyu.pdf",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:shikijoake-goukagi-55-1",
+    "kind": "statistic",
+    "title_ja": "施錠していても侵入された「施錠開け」は合鍵が最多(令和元年)",
+    "body_ja": "警察庁「発生場所別・侵入口・侵入手段別空き巣・忍込み・居空き認知件数(令和元年)」を出典とする防犯啓発資料によれば、鍵をかけていたのに侵入された「施錠開け」の内訳(一戸建ての場合)は「合鍵」55.1%が最多で、「サムターン回し」3.9%、「ピッキング」0.4%と続きます。ピッキングは対策の浸透で件数が減少しています。",
+    "source_url": "https://www.city.inzai.lg.jp/cmsfiles/contents/0000011/11228/shinnyu.pdf",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:akisu-wari-2024",
+    "kind": "statistic",
+    "title_ja": "住宅侵入窃盗のうち在宅時以外を狙う「空き巣」が6割超(令和6年)",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:警察庁「令和6年の刑法犯に関する統計資料」)によれば、住宅対象の侵入窃盗のうち、留守中を狙う「空き巣」が64.7%、就寝中などを狙う「忍込み」が24%、在宅中に侵入する「居空き」が4.8%です。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/197/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:shinnyu-ninchi-2024",
+    "kind": "statistic",
+    "title_ja": "住宅対象の侵入窃盗は2024年に1日約46件のペースで発生",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:警察庁「令和6年の刑法犯に関する統計資料」)によれば、2024年の侵入窃盗認知件数は43,036件、うち住宅での発生は16,962件(全体の41.6%)で、1日あたり約46件のペースで発生しています。ピークだった2002年(338,294件)からは長期的に大きく減少していますが、依然として日常的に起きています。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/071/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:mujimari-39-1-2024",
+    "kind": "statistic",
+    "title_ja": "空き巣の侵入手口は「無締り」が39.1%で最多(令和6年)",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:警察庁「令和6年の刑法犯に関する統計資料」)によれば、住宅を対象とする「空き巣」の侵入手口のうち「無締り」が39.1%を占め最多です(空き巣に限定した割合。侵入窃盗全体の割合とは別の集計)。年による変動はありますが、施錠の徹底が最も基本的な対策であることは変わりません。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/197/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:madoguchi-genkan-shinnyuguchi",
+    "kind": "statistic",
+    "title_ja": "一戸建ては窓から、共同住宅は玄関からの侵入が多い",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:警察庁「住まいる防犯110番」)によれば、侵入口は一戸建て住宅では窓からの侵入が5割超、共同住宅では玄関(表出入口)からの侵入が半数超と、住宅形態によって狙われやすい場所が異なります。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/197/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:hasseijikantai-akisu-nusumikomi",
+    "kind": "statistic",
+    "title_ja": "空き巣は日中10〜16時台、忍込みは深夜2〜4時台に多発",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:警察庁「令和6年の犯罪」)によれば、空き巣は朝8時から夜22時の間、特に日中10時〜16時頃に多発する一方、就寝中を狙う忍込みは深夜22時から早朝6時、特に2時〜4時台に多発します。日中の在宅時間が短い家庭ほど注意が必要です。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/1034/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:hasseiyoubi-kinyoubi",
+    "kind": "statistic",
+    "title_ja": "空き巣の発生は金曜日が最多(令和6年)",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:警察庁「犯罪統計書 令和6年の犯罪」)によれば、令和6年の空き巣の発生件数は金曜日が853件で最多となっており、平日は土日より発生件数が多い傾向があります。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/1034/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:hasseitsukibetsu-10-11gatsu",
+    "kind": "statistic",
+    "title_ja": "侵入窃盗は10月・11月に増える傾向(令和3年)",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:法務省「令和4年版犯罪白書」令和3年データ)によれば、侵入窃盗の月別発生件数は10月が1,720件、11月が1,621件ともっとも多く、次いで3月1,596件、8月1,520件となっています。季節の変わり目や長期休暇の前後は注意が必要です。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/1034/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:cpmark-teikoujikan-5fun",
+    "kind": "statistic",
+    "title_ja": "CPマークは「侵入に5分以上耐える」建物部品の証",
+    "body_ja": "5団体防犯建物部品普及促進協議会によれば、CP(Crime Prevention)マークは防犯性能試験に合格した建物部品のみに使用が認められる表示で、「抵抗時間が5分間以上であることが確認された」ことが基準です。これは、侵入を「2分以内」であきらめる侵入者が17.1%、「2分を超え5分以内」であきらめる侵入者が51.4%、合わせて約7割が5分以内であきらめるという調査結果に基づいています。窓の補助錠や防犯フィルムを選ぶ際の目安になります。CP製品は侵入を完全に防ぐものではないことも明記されています。",
+    "source_url": "https://www.bouhan-cp.jp/cp_about.html",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:cpmokuroku-heisei16",
+    "kind": "statistic",
+    "title_ja": "CP部品目録は平成16年に官民合同会議が公表",
+    "body_ja": "公益財団法人全国防犯協会連合会によれば、「防犯性能の高い建物部品目録」は平成16年10月1日に官民合同会議が公表したもので、ドア・ガラス・錠・サッシなど、CPマークが付いた建物部品の最新情報を紹介しています。",
+    "source_url": "https://www.bohan.or.jp/sumai/index.html",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:kasaikeihouki-secchi-84-3",
+    "kind": "statistic",
+    "title_ja": "住宅用火災警報器の全国設置率は84.3%(令和5年)",
+    "body_ja": "総務省消防庁「令和5年版消防白書」によれば、住宅用火災警報器の設置率は令和5年6月1日時点で84.3%、市町村条例に定める設置場所すべてに設置されている「条例適合率」は67.2%です。",
+    "source_url": "https://www.fdma.go.jp/publication/hakusho/r5/point/1/68410.html",
+    "category": "fire_disaster"
+  },
+  {
+    "material_key": "statistic:jutakukasai-shishasu-972",
+    "kind": "statistic",
+    "title_ja": "住宅火災の死者数は年間972人(令和4年)",
+    "body_ja": "総務省消防庁「令和5年版消防白書」によれば、令和4年中の住宅火災件数は1万783件(前年比540件増)、死者数は972人(前年比6人増)でした。住宅用火災警報器は火災の早期発見と逃げ遅れの防止に役立ちます。",
+    "source_url": "https://www.fdma.go.jp/publication/hakusho/r5/point/1/68410.html",
+    "category": "fire_disaster"
+  },
+  {
+    "material_key": "statistic:koureisha-hitorigurashi-zouka",
+    "kind": "statistic",
+    "title_ja": "65歳以上の一人暮らしは今後さらに増える見込み",
+    "body_ja": "内閣府「令和6年版高齢社会白書」によれば、65歳以上の一人暮らしの割合は昭和55年時点で男性4.3%・女性11.2%でしたが、令和2年には男性15.0%・女性22.1%まで上昇し、令和32年には男性26.1%・女性29.3%になると見込まれています。離れて暮らす家族の見守りニーズは今後も高まると考えられます。",
+    "source_url": "https://www8.cao.go.jp/kourei/whitepaper/w-2024/html/zenbun/s1_1_3.html",
+    "category": "monitoring"
+  },
+  {
+    "material_key": "statistic:65sai-setai-50-6",
+    "kind": "statistic",
+    "title_ja": "65歳以上の家族がいる世帯は全世帯の半数超(令和4年)",
+    "body_ja": "内閣府「令和6年版高齢社会白書」によれば、令和4年時点で65歳以上の者がいる世帯は2,747万4千世帯で、全世帯(5,431万世帯)の50.6%を占めます。世帯構造は「夫婦のみ」「単独世帯」がそれぞれ約3割を占めるまで変化しています。",
+    "source_url": "https://www8.cao.go.jp/kourei/whitepaper/w-2024/html/zenbun/s1_1_3.html",
+    "category": "monitoring"
+  },
+  {
+    "material_key": "statistic:stalker-soudan-19843",
+    "kind": "statistic",
+    "title_ja": "ストーカー事案の相談等件数は年間約2万件で高水準(令和5年)",
+    "body_ja": "警察庁「令和5年におけるストーカー事案、配偶者からの暴力事案等、児童虐待事案等への対応状況について」によれば、令和5年のストーカー事案の相談等件数は19,843件(前年比+712件、+3.7%)で、依然として高い水準で推移しています。",
+    "source_url": "https://www.npa.go.jp/bureau/safetylife/stalker/R5_STDVRPCAkouhousiryou_syuusei.pdf",
+    "category": "stalking"
+  },
+  {
+    "material_key": "statistic:stalker-kinshimeirei-1963",
+    "kind": "statistic",
+    "title_ja": "ストーカー規制法の禁止命令等は令和5年に過去最多の1,963件",
+    "body_ja": "警察庁「令和5年におけるストーカー事案、配偶者からの暴力事案等、児童虐待事案等への対応状況について」によれば、ストーカー規制法に基づく禁止命令等は令和5年に1,963件(前年比+219件、+12.6%)で、法施行後の最多を更新しました。一方で警告は1,534件(前年比-334件)と減少しています。不安を感じたら早めの相談が重要です。",
+    "source_url": "https://www.npa.go.jp/bureau/safetylife/stalker/R5_STDVRPCAkouhousiryou_syuusei.pdf",
+    "category": "stalking"
+  },
+  {
+    "material_key": "statistic:takuhai-uketori-tayouka-31",
+    "kind": "statistic",
+    "title_ja": "宅配便の「多様な受取方法」の利用率は約31%まで拡大",
+    "body_ja": "国土交通省の調査によれば、宅配便の「多様な受取方法」(置き配・宅配ロッカー・コンビニ受取等)の利用率は令和8年4月時点で約31.0%で、令和7年10月の29.9%、令和7年2月の25.6%から着実に増加しています。国は2030年度までに50%程度への引き上げを目標としています。",
+    "source_url": "https://www.mlit.go.jp/report/press/tokatsu01_hh_001025.html",
+    "category": "package_theft"
+  },
+  {
+    "material_key": "statistic:takuhai-saihaitatsu-7-6",
+    "kind": "statistic",
+    "title_ja": "宅配便の再配達率は約7.6%まで低下",
+    "body_ja": "国土交通省の調査によれば、令和8年4月の宅配便再配達率は約7.6%(都市部8.5%、都市部近郊7.2%、地方6.0%)で、令和7年10月の約8.3%から改善しています。置き配などの活用が再配達削減に寄与している一方、荷物が玄関先に置かれている時間ができるため、盗難対策もあわせて検討する必要があります。",
+    "source_url": "https://www.mlit.go.jp/report/press/tokatsu01_hh_001025.html",
+    "category": "package_theft"
+  },
+  {
+    "material_key": "statistic:goutou-hasseijikantai",
+    "kind": "statistic",
+    "title_ja": "強盗は深夜22時〜4時台の被害が全体の約3割(令和6年)",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:警察庁「犯罪統計書 令和6年の犯罪」)によれば、強盗の発生時間帯は22時〜4時頃が全体の約3割を占め、発生曜日は日曜日が224件で最多です。夜間の来訪者対応やインターホン越しの応対が重要です。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/1034/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "statistic:goukagi-4kaidate-kyoujuu",
+    "kind": "statistic",
+    "title_ja": "4階建て以上の共同住宅でも合鍵による侵入が起きている(令和6年)",
+    "body_ja": "ALSOK「HOME ALSOK研究所」(出典:警察庁「令和6年の刑法犯に関する統計資料」)によれば、令和6年の合鍵による住宅侵入は全体で812件、うち4階建て以上の共同住宅が332件を占めます。「高層階だから安心」とは言えず、鍵の管理や交換も検討する価値があります。",
+    "source_url": "https://www.alsok.co.jp/person/recommend/071/",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "own_product:adc-v523",
+    "kind": "own_product",
+    "title_ja": "URTECT ADC-V523",
+    "body_ja": "屋内設置用の据え置き型カメラです。赤外線により約4.6m(15ft)先までの夜間撮影に対応し、スマートフォンの専用アプリから外出先でも映像を確認できます。人・動物・車両を見分けて通知する検知機能にも対応しています。工事不要でコンセントに挿すだけで使えるため、賃貸住宅でも導入しやすい製品です。",
+    "product_key": "ADC-V523",
+    "category": "monitoring",
+    "card_description": "屋内設置・夜間も撮影対応。スマホから映像確認",
+    "card_match_terms": "ADC-V523,屋内カメラ,見守りカメラ"
+  },
+  {
+    "material_key": "own_product:adc-v523x",
+    "kind": "own_product",
+    "title_ja": "URTECT ADC-V523X",
+    "body_ja": "ADC-V523の後継にあたる屋内設置用カメラです(Alarm.comの公式資料ではV523とV523Xは同一の製品ファミリーとして案内されています)。同じく赤外線による夜間撮影とスマートフォンからの映像確認に対応し、無線LAN(Wi-Fi)・有線LAN(Ethernet)のどちらでも接続できます。",
+    "product_key": "ADC-V523X",
+    "category": "monitoring",
+    "card_description": "屋内設置・夜間も撮影対応。ADC-V523の後継機",
+    "card_match_terms": "ADC-V523X,屋内カメラ,見守りカメラ"
+  },
+  {
+    "material_key": "own_product:adc-v724",
+    "kind": "own_product",
+    "title_ja": "URTECT ADC-V724",
+    "body_ja": "屋外対応・夜間撮影に対応した屋外用防犯カメラです。IP66相当の防水・防塵性能があり、雨風にさらされる玄関先や駐車場にも設置できます。動きを検知するとスマートフォンに通知が届き、内蔵マイク・スピーカーで来訪者と会話することもできます。",
+    "product_key": "ADC-V724",
+    "category": "intrusion",
+    "card_description": "屋外対応・夜間撮影。スマホから映像確認",
+    "card_match_terms": "ADC-V724,屋外カメラ,防犯カメラ"
+  },
+  {
+    "material_key": "own_product:adc-v724x",
+    "kind": "own_product",
+    "title_ja": "URTECT ADC-V724X",
+    "body_ja": "ADC-V724と同一の製品ファミリーとして案内されている屋外用防犯カメラです。防水・防塵(IP66)性能と赤外線による夜間撮影(約15m)に対応し、動きを検知するとスマートフォンに通知が届きます。双方向音声にも対応しています。",
+    "product_key": "ADC-V724X",
+    "category": "intrusion",
+    "card_description": "屋外対応・夜間撮影。ADC-V724と同一ファミリー",
+    "card_match_terms": "ADC-V724X,屋外カメラ,防犯カメラ",
+    "source_url": "https://answers.alarm.com/Partner/Installation_and_Troubleshooting/Video_Devices/1080p_Outdoor_Wi-Fi_Camera_with_Two-Way_Audio_ADC-V724_724X"
+  },
+  {
+    "material_key": "own_product:adc-vc729p",
+    "kind": "own_product",
+    "title_ja": "URTECT ADC-VC729P",
+    "body_ja": "大光量LEDライトを内蔵した屋外用フラッドライトカメラです。動きを検知すると最大2灯のライトが点灯し、映像はスマートフォンやパソコンからいつでも確認できます。ライトの点灯方法(常時点灯・点滅・赤青ライト等)は複数の設定から選べ、侵入者への抑止効果を高めます。",
+    "product_key": "ADC-VC729P",
+    "category": "intrusion",
+    "card_description": "屋外・大光量ライト付き防犯カメラ",
+    "card_match_terms": "ADC-VC729P,フラッドライト,屋外カメラ,防犯カメラ"
+  },
+  {
+    "material_key": "own_product:adc-vc727p",
+    "kind": "own_product",
+    "title_ja": "URTECT ADC-VC727P",
+    "body_ja": "屋内・屋外どちらにも設置できる小型の防犯カメラです。赤外線による夜間撮影(約15m先まで)に対応し、LANケーブル1本で電源と通信をまかなうPoE給電のため、配線をすっきりまとめられます。映像はスマートフォンの専用アプリから確認できます。",
+    "product_key": "ADC-VC727P",
+    "category": "intrusion",
+    "card_description": "屋内外対応・PoE給電の小型防犯カメラ",
+    "card_match_terms": "ADC-VC727P,PoEカメラ,屋外カメラ,防犯カメラ"
+  },
+  {
+    "material_key": "own_product:adc-vc827p",
+    "kind": "own_product",
+    "title_ja": "URTECT ADC-VC827P",
+    "body_ja": "屋内・屋外どちらにも設置できるドーム型の防犯カメラです。赤外線による夜間撮影(約30m先まで)に対応し、LANケーブル1本で電源と通信をまかなうPoE給電です。いたずらや衝撃に強い堅牢な筐体で、映像はスマートフォンの専用アプリから確認できます。",
+    "product_key": "ADC-VC827P",
+    "category": "intrusion",
+    "card_description": "屋内外対応・耐衝撃ドーム型防犯カメラ",
+    "card_match_terms": "ADC-VC827P,ドームカメラ,屋外カメラ,防犯カメラ"
+  },
+  {
+    "material_key": "partner_product:alsok-home-security",
+    "kind": "partner_product",
+    "title_ja": "ALSOK ホームセキュリティ(戸建て・マンション向け)",
+    "body_ja": "ALSOK(綜合警備保障)が提供する駆けつけ型ホームセキュリティサービスです。異常を検知すると警備員が駆けつけます。戸建て向け「HOME ALSOK Connect」はお買い上げプラン月額4,070円、レンタルプラン月額7,865円、初期費用0円の「ゼロスタートプラン」月額8,668円です。マンション向け「HOME ALSOKアパート・マンションプラン」はお買い上げ月額3,300円、レンタル月額6,105円、ゼロスタート月額6,754円です(いずれも税込)。",
+    "source_url": "https://www.alsok.co.jp/person/price/",
+    "category": "intrusion",
+    "price_band": "月額3,300円〜8,668円程度(プラン・住宅形態による、税込)",
+    "card_description": "駆けつけ対応のホームセキュリティサービス",
+    "card_match_terms": "ALSOK,ホームセキュリティ,駆けつけ"
+  },
+  {
+    "material_key": "partner_product:secom-home-security",
+    "kind": "partner_product",
+    "title_ja": "セコム・ホームセキュリティ(戸建て・マンション向け)",
+    "body_ja": "セコムが提供する駆けつけ型ホームセキュリティサービスです。防犯・火災監視・非常通報に対応します。戸建て向け「セコム・ホームセキュリティNEO」はレンタルプラン月額7,700円(税込8,470円)、お買い取りプラン月額4,700円(税込5,170円)です。マンション向け「スマートNEO」はレンタル月額5,000円(税込5,500円)、お買い取り月額3,200円(税込3,520円)です。",
+    "source_url": "https://www.secom.co.jp/homesecurity/price/",
+    "category": "intrusion",
+    "price_band": "月額3,520円〜8,470円程度(プラン・住宅形態による、税込)",
+    "card_description": "駆けつけ対応のホームセキュリティサービス",
+    "card_match_terms": "セコム,SECOM,ホームセキュリティ,駆けつけ"
+  },
+  {
+    "material_key": "partner_product:alsok-mimamori-support",
+    "kind": "partner_product",
+    "title_ja": "HOME ALSOK みまもりサポート",
+    "body_ja": "離れて暮らす高齢の家族の見守りに特化したALSOKのサービスです。体調が悪いときに緊急ボタンを押すと警備員が駆けつけ、看護師資格を持つスタッフへの相談ボタンもあります。お買い上げプラン月額1,870円、レンタルプラン月額2,838円、初期費用0円の「ゼロスタートプラン」月額3,069円です(いずれも税込)。緊急以外の駆けつけは1回7,700円の出動料金がかかります。",
+    "source_url": "https://www.alsok.co.jp/person/mimamori/",
+    "category": "monitoring",
+    "price_band": "月額1,870円〜3,069円程度(プランによる、税込)",
+    "card_description": "緊急ボタンで警備員が駆けつける見守りサービス",
+    "card_match_terms": "ALSOK,みまもりサポート,見守り,駆けつけ"
+  },
+  {
+    "material_key": "partner_product:sesame-smart-lock",
+    "kind": "partner_product",
+    "title_ja": "セサミ スマートロック",
+    "body_ja": "CANDY HOUSEが提供するスマートロックです。既存のドアの鍵(サムターン)に取り付け、スマートフォンからの解錠・施錠や、スマホが近づくと自動解錠する機能に対応します。工事不要で、必要な工具はすべて同梱されています。電池寿命は約500日で、残量が減るとスマホに通知が届きます。価格はセール価格で14,800円(税込16,280円)です。",
+    "source_url": "https://jp.candyhouse.co/products/sesame",
+    "category": "intrusion",
+    "price_band": "1万円台程度(税込)",
+    "card_description": "工事不要・スマホで解錠できるスマートロック",
+    "card_match_terms": "セサミ,SESAME,スマートロック,鍵"
+  },
+  {
+    "material_key": "partner_product:musashi-sensor-light",
+    "kind": "partner_product",
+    "title_ja": "ムサシ(RITEX) 屋外用センサーライト",
+    "body_ja": "センサーライト国内大手ムサシが展開する屋外用LEDセンサーライトです。コンセント式・ソーラー式・乾電池式・充電式から設置場所に合わせて選べます。マルチアーム式(1灯〜3灯)は9,240円〜17,380円程度、ガーデンソーラーライトは10,549円〜19,690円程度です(いずれも参考価格)。人の動きを感知して点灯し、暗がりでの侵入者への抑止効果が期待できます。",
+    "source_url": "https://musashi.inc/products/category/led-lights/sensor-lights/out-of-house/",
+    "category": "intrusion",
+    "price_band": "9,000円台〜2万円程度(電源方式・灯数による)",
+    "card_description": "人の動きを感知して点灯する屋外センサーライト",
+    "card_match_terms": "センサーライト,人感センサー,ムサシ,RITEX"
+  },
+  {
+    "material_key": "partner_product:elpa-window-alarm",
+    "kind": "partner_product",
+    "title_ja": "ELPA 窓ピタッアラーム(開閉検知アラーム)",
+    "body_ja": "朝日電器(ELPA)が展開する窓・ドア用の開閉検知アラームです。窓やドアが開くと約90dBの大音量アラームが約25秒間鳴り続け、侵入者への警告になります。厚さ8mmの薄型設計で窓の開閉の妨げになりにくく、付属の両面テープで貼るだけで設置でき、工事は不要です。2個セットで3,278円(税込3,605円)です。",
+    "source_url": "https://www.elpadirect.jp/products/4901087226375/",
+    "category": "intrusion",
+    "price_band": "3,000円台(2個セット、税込)",
+    "card_description": "貼るだけの窓・ドア用開閉検知アラーム",
+    "card_match_terms": "窓センサー,開閉アラーム,ELPA,エルパ"
+  },
+  {
+    "material_key": "partner_product:switchbot-contact-sensor",
+    "kind": "partner_product",
+    "title_ja": "SwitchBot 開閉センサー",
+    "body_ja": "SwitchBotが展開するIoT型の開閉センサーです。ドアや窓に取り付けたセンサーが開閉を検知し、スマートフォンへ通知します。Alexa・Google Homeなどスマートホーム機器との連携にも対応します。電池式(単4形電池2本)で工事は不要です。価格は数千円台です。",
+    "source_url": "https://item.rakuten.co.jp/switchbot/10000030/",
+    "category": "intrusion",
+    "price_band": "数千円台",
+    "card_description": "開閉をスマホに通知するIoTセンサー",
+    "card_match_terms": "開閉センサー,SwitchBot,スイッチボット,窓センサー"
+  },
+  {
+    "material_key": "partner_product:3m-cp-film",
+    "kind": "partner_product",
+    "title_ja": "3M 窓ガラス用防犯フィルム(CPマーク認定)",
+    "body_ja": "3Mが展開する窓ガラス用の防犯フィルムで、CPマーク認定品です。CPマーク取得には、フィルムの厚みが350マイクロメートル以上であること、日本ウインドウ・フィルム工業会が指定する接着剤を使うこと、防犯フィルム施工技能者(国家検定技能士)による施工であることが要件です。防犯性能を発揮させるため、窓ガラス全面に貼る「全面貼り」が必要です。価格は窓のサイズ・枚数・施工店により異なります。",
+    "source_url": "https://www.3mcompany.jp/3M/ja_JP/building-window-solutions-jp/scotchtint-window-film/crimeprevention/",
+    "category": "intrusion",
+    "card_description": "CPマーク認定の窓ガラス用防犯フィルム",
+    "card_match_terms": "防犯フィルム,CPマーク,3M,ガラス"
+  },
+  {
+    "material_key": "partner_product:hairenu-window-lock",
+    "kind": "partner_product",
+    "title_ja": "はいれーぬ 窓用補助錠",
+    "body_ja": "日本ロックサービスが扱う窓用の後付け補助錠「はいれーぬ」です。既存の鍵と併用して窓の防犯性を高めます。ネジ止めタイプで工事は不要、ドライバーで簡単に設置できます。二重ステンレス構造で、レールに沿ってスライドさせて使う仕組みです。価格は2,500円(税抜、税込2,750円)です。",
+    "source_url": "https://e-store.lock.co.jp/shopdetail/000000000177/",
+    "category": "intrusion",
+    "price_band": "2,000円台(税込2,750円)",
+    "card_description": "後付けできるネジ止め式の窓用補助錠",
+    "card_match_terms": "補助錠,窓,はいれーぬ"
+  },
+  {
+    "material_key": "partner_product:nasta-box-soft",
+    "kind": "partner_product",
+    "title_ja": "ナスタボックスソフト(簡易宅配ボックス)",
+    "body_ja": "集合住宅向け宅配ボックスの大手ナスタが展開する、折りたたみ式の簡易宅配ボックスです。ワイヤーで固定するだけで工事不要、届いたその日から使えます。使わないときは約5cmまで折りたたんで収納できます。撥水生地で荷物を雨から守ります。Sサイズ6,600円(税込)、Lサイズ7,700円(税込)です。",
+    "source_url": "https://www.nasta.co.jp/product/delivery-box/box-soft/",
+    "category": "package_theft",
+    "price_band": "6,600円〜7,700円程度(サイズによる、税込)",
+    "card_description": "工事不要・折りたたみ式の簡易宅配ボックス",
+    "card_match_terms": "宅配ボックス,置き配,ナスタ"
+  },
+  {
+    "material_key": "partner_product:panasonic-kemuritouban",
+    "kind": "partner_product",
+    "title_ja": "パナソニック けむり当番(ワイヤレス連動型 住宅用火災警報器)",
+    "body_ja": "パナソニックの住宅用火災警報器「けむり当番」ワイヤレス連動型です。親器1台に子器を最大14台まで連動でき、どこか1か所で煙を感知すると家中の警報器が一斉に鳴ります。専用リチウム電池1本で約10年動作し、電池切れ・故障・交換時期などのメンテナンス情報はAiSEG3経由でスマートフォンでも確認できます。価格は機種により異なります。",
+    "source_url": "https://panasonic.jp/bosai/feature/fire-alarm/wireless2020.html",
+    "category": "fire_disaster",
+    "card_description": "家中で連動して鳴るワイヤレス火災警報器",
+    "card_match_terms": "火災警報器,けむり当番,パナソニック,火災"
+  },
+  {
+    "material_key": "partner_product:zojirushi-mimamori",
+    "kind": "partner_product",
+    "title_ja": "象印 みまもりほっとライン",
+    "body_ja": "象印マホービンが提供する見守りサービスで、専用の電気ポット(iポット)の使用状況を離れて暮らす家族にメールで知らせます。カメラを使わない生活リズム型の見守りで、機器の操作が苦手な方にも負担がありません。初期費用5,500円(税込)、利用料は月額3,300円(税込、ポット1台につき)で、最初の1か月は利用料が無料です。",
+    "source_url": "https://www.zojirushi.co.jp/syohin/pot_kettle/mimamori/product/",
+    "category": "monitoring",
+    "price_band": "月額3,300円(税込、初期費用5,500円)",
+    "card_description": "ポットの使用状況で家族を見守るサービス",
+    "card_match_terms": "みまもりほっとライン,象印,見守り,ポット"
+  },
+  {
+    "material_key": "scenario:chintai-hitorigurashi",
+    "kind": "scenario",
+    "title_ja": "賃貸マンション・アパートの一人暮らし",
+    "body_ja": "聞くべき条件: housing(賃貸か持ち家か、集合住宅か戸建てか)、install(工事の可否。賃貸は基本的にno_constructionを想定)、concern(侵入不安か置き配盗難か等)。提案の骨格: 工事不要・原状回復可能な対策を優先する。無締り防止の徹底、窓の補助錠(貼るだけ・ネジ止めだけのタイプ)、窓の開閉検知アラーム、置き型の室内カメラ(URTECT ADC-V523等)の順で提案する。1階や低層階なら窓対策を重点的に、宅配の盗難が心配なら簡易宅配ボックスや置き配以外の受取方法も選択肢に入れる。",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "scenario:kodate-kazoku",
+    "kind": "scenario",
+    "title_ja": "戸建てファミリー世帯",
+    "body_ja": "聞くべき条件: concern(侵入不安の具体的なきっかけ。近隣被害・ガラス破りへの不安等)、install(補助錠や防犯フィルムの施工可否)、budget(センサーライトやカメラにかけられる予算感)。提案の骨格: 一戸建ては窓からの侵入が最多という統計を根拠に、全窓の施錠徹底→補助錠→CPマーク認定の防犯フィルム→センサーライト→屋外カメラ(URTECT ADC-V724等)の順で防犯対策を積み上げる提案をする。価格は断定せず価格帯と公式サイトでの確認を案内する。",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "scenario:koureisha-mimamori",
+    "kind": "scenario",
+    "title_ja": "離れて暮らす高齢の親の見守り",
+    "body_ja": "聞くべき条件: target(parent_home)、concern(体調面の心配か防犯面の心配か)、親本人が機器の操作を得意とするか。提案の骨格: 「監視」ではなく「安心の共有」であることを伝え、本人の同意を前提にする。機械の操作が苦手なら操作不要のカメラ(URTECT ADC-V523等)、カメラに抵抗があれば映像を伴わない生活リズム型の見守りサービス(象印みまもりほっとライン等)、駆けつけ対応が必要なら見守りサービス(ALSOKみまもりサポート等)を状況に応じて提案する。",
+    "category": "monitoring"
+  },
+  {
+    "material_key": "scenario:kisei-akiya",
+    "kind": "scenario",
+    "title_ja": "帰省・長期不在で家を空ける",
+    "body_ja": "聞くべき条件: target(vacant_home)、不在期間の長さ、concern(侵入不安が中心)。提案の骨格: 「留守だと悟らせない」ことを軸に、新聞・郵便の配達停止、タイマー照明、SNS投稿を控える等の無料でできる対策をまず案内し、そのうえで外出先から映像を確認できるカメラ(URTECT ADC-V523・ADC-V724等)を提案する。通知を受け取った際は無理をせず110番へつなぐ案内も添える。",
+    "category": "intrusion"
+  },
+  {
+    "material_key": "scenario:takuhai-okihai",
+    "kind": "scenario",
+    "title_ja": "置き配・宅配の盗難対策",
+    "body_ja": "聞くべき条件: housing(戸建てか集合住宅か。集合住宅は管理規約の確認が必要)、concern(package_theft)、install(宅配ボックス設置や玄関先カメラの設置可否)。提案の骨格: まず持ち去りは窃盗であることと被害届・警察相談専用電話#9110の案内を行う。戸建ては簡易宅配ボックス(ナスタボックスソフト等)、集合住宅は管理組合への確認を前提にした簡易宅配ボックスやコンビニ受取・宅配ロッカーへの切り替えを提案する。共用部を映すカメラは近隣のプライバシーに配慮し、自宅玄関前だけが映る角度に限定するよう案内する。",
+    "category": "package_theft"
+  }
+]
