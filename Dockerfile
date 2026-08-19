@@ -84,6 +84,7 @@ COPY --from=builder /app/server/target/release/homesec_advisor /usr/local/bin/ho
 COPY --from=builder /app/server/target/release/ingest_homesec /usr/local/bin/ingest_homesec
 COPY server/config.gce.toml ./config.gce.toml
 COPY server/config.cloudrun.toml ./config.cloudrun.toml
+COPY server/config.homesec.toml ./config.homesec.toml
 COPY server/data ./data
 COPY schema /app/schema
 # 管理 SPA の静的ビルド成果物のみを同梱する（admin-ui-builder ステージの node_modules は
