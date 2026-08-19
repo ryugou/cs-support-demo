@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use cs_support_mcp::{
-    admin::{admin_router, AdminState},
+    admin::{admin_router, mount_admin_api, AdminState},
     advisor::api::{advisor_api_router, AdvisorApiState},
     config::AppConfig,
     harness::{egress::NgDictionary, Harness},
@@ -47,6 +47,21 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let config = Arc::new(AppConfig::load(&args.config)?);
+
+    // project 0 件の fail-closed 起動検査(main.rs 由来、codex レビュー指摘)。
+    //
+    // `mount_admin_api` はエイリアス mount 条件を `project_count == 1`、警告を `> 1` でしか
+    // 判定しておらず、0 件はどちらにも該当しない。0 件のまま起動すると admin API
+    // (`/{project_id}/admin/api` およびそのエイリアス)は一切登録されない一方、`/admin` の SPA
+    // フォールバックだけは無条件に mount されるため、設定不備が `200 text/html` として
+    // 隠蔽され、運用者はログを見ない限り気づけない。
+    if config.projects.is_empty() {
+        anyhow::bail!(
+            "config has no [[projects]] entries; add at least one [[projects]] section \
+             (project_id, schema, manual_schema) to {} before starting the server",
+            args.config.display()
+        );
+    }
 
     // fail-closed 起動検査(main.rs 54-84行と同じ規律)。
     //
@@ -154,6 +169,27 @@ async fn main() -> Result<()> {
 
     let mut app = cs_support_mcp::health::health_router();
 
+    // admin-ui（Issue #34）は `apiBase` をビルド時に `/admin/api`(project 非依存)で
+    // ハードコードしている。project が 2 件以上だと、この 1 パスがどの project を指すか
+    // 一意に決まらないため `mount_admin_api`（下のループ内）はエイリアスを mount しない。
+    // homesec_advisor は OAuth AS を持たないため main.rs の C5 warn（RFC 8707 `resource`
+    // 必須化）に相当するものは存在しない。ここで揃えるのは、あくまで main.rs の
+    // admin/api エイリアス無効化 warn と同じ流儀（config を触った時点で運用者が気づけるよう
+    // 起動時に 1 回警告する）だけである。
+    if config.projects.len() > 1 {
+        tracing::warn!(
+            project_count = config.projects.len(),
+            "more than one project is configured, so the /admin/api convenience alias (used by \
+             the bundled admin dashboard's build-time-fixed apiBase) is disabled; requests to \
+             /admin/api/* will NOT be rejected, they will silently fall through to the /admin \
+             SPA fallback (200 text/html) and the admin UI will fail to parse it as JSON; there \
+             is currently no working admin UI for a multi-project deployment — fixing this \
+             requires either a per-project build with a project-scoped apiBase or a runtime \
+             apiBase resolution mechanism, neither of which exists today (see the project-routing \
+             notes in CLAUDE.md)"
+        );
+    }
+
     // `/{project_id}/admin/api`(GIS + require_google_auth で保護)。project は実質 1 件だが、
     // main.rs と同じ「複数 project を想定したループ」の形で書く。
     for project in config.projects.iter() {
@@ -179,11 +215,22 @@ async fn main() -> Result<()> {
             auth_state,
             cs_support_mcp::oauth::middleware::require_google_auth,
         ));
-        let admin_path = format!("/{}/admin/api", project.project_id);
-        app = app.nest_service(&admin_path, admin_guarded);
+        app = mount_admin_api(
+            app,
+            &project.project_id,
+            config.projects.len(),
+            admin_guarded,
+        );
     }
 
-    // `/admin` の静的配信(認証なし。design doc: アプリシェルに秘密は含まれない)。
+    // `/admin` の静的配信(認証なし。design doc: アプリシェルに秘密は含まれない)。project が
+    // ちょうど 1 件のときは、上のループで project 非依存の `/admin/api` エイリアス
+    // （`admin::mount_admin_api`、Issue #34）も mount 済みで、それはこの `/admin` の直下
+    // （`/admin/api`）に重なる。ここで `/admin` を `nest_service` してもエイリアスが SPA
+    // フォールバックに飲み込まれないのは、axum(matchit) が登録順によらずより具体的な
+    // 静的セグメント（`/admin/api/...`）をワイルドカード（`/admin/...`）より優先するという
+    // 実装依存の優先順位のおかげ。契約とテストは `admin::mount_admin_api` の doc コメントと
+    // `admin::tests::mount_admin_api_tests` を参照。
     let admin_static_dir =
         staticui::resolve_admin_static_dir(&config_dir, &config.admin_static_dir);
     app = app.nest_service("/admin", staticui::admin_static_router(&admin_static_dir));

@@ -61,6 +61,55 @@ pub fn admin_router(state: AdminState) -> Router {
         .with_state(state)
 }
 
+/// `/{project_id}/admin/api` を mount し、project がちょうど 1 件のときだけ、同じ router を
+/// `/admin/api` にもエイリアスとして mount する（Issue #34）。
+///
+/// 背景: admin-ui（`admin-ui/`）は `apiBase` をビルド時にハードコードしており、
+/// project 非依存の `/admin/api` を叩く。project が 1 件しかない現行のデプロイ構成
+/// （`cs-support-mcp` = urtect 1 件、`homesec-advisor` = homesec 1 件）では、この
+/// エイリアスにより同じビルド成果物を両方の service で使い回せる。project が 2 件以上に
+/// なった時点で `/admin/api` は「どの project を指すか」が一意に決まらなくなるため
+/// mount しない（呼び出し元が project 数に応じて `tracing::warn!` を出す。ここではルーティング
+/// の組み立てだけを担い、ロギングの責務は main.rs / homesec_advisor.rs 側に残す）。
+///
+/// `admin_guarded` は呼び出し元が `admin_router(admin_state).layer(require_google_auth ...)`
+/// まで組み立て済みの router を渡す（`axum::Router` は `Clone` なので、project 固有パスと
+/// エイリアスの両方に同じ認証済み router を使い回せる。`AdminState` を作り直して
+/// `admin_router()` を二重に呼ぶ必要はない）。
+///
+/// mount 順序についての既知の罠（`admin::tests::mount_admin_api_tests` で実測済み）:
+/// `/admin`（SPA フォールバック、ワイルドカードで配下すべてを飲み込む）と
+/// `/admin/api`（このエイリアス、リテラルパス）はパスとして重なるが、axum(matchit) は
+/// 登録順によらず、より具体的な静的セグメントを持つ経路（`/admin/api/...`）を
+/// ワイルドカード経路（`/admin/...`）より優先する。この登録順非依存は
+/// `admin_api_alias_reaches_auth_middleware_not_spa_fallback`（`mount_admin_api` → `/admin`
+/// の順）と `admin_api_alias_still_reaches_auth_middleware_when_admin_spa_mounted_first`
+/// （逆順）の両方が同じ結論（401、SPA の 200 に飲み込まれない）で固定している。
+///
+/// ただし「`require_google_auth` に到達する（401 を返す）」という観測だけでは、エイリアスが
+/// `admin_router` の実ルートへ正しく解決されていることの証拠にはならない
+/// （`require_google_auth` は nest 先 router の fallback にも適用されるため、prefix strip が
+/// 誤っていて未知パス扱いになっていても 401 は返る）。この点は
+/// `admin_api_alias_resolves_to_the_real_admin_router_route` /
+/// `project_scoped_admin_api_resolves_to_the_real_admin_router_route` が、認証レイヤを
+/// 外した `admin_router` を直接 mount し「実ルートは 404 にならない」「未知パスは 404 に
+/// なる」の対比で別途固定している。逆方向（エイリアスが SPA の通常経路を奪っていないこと）は
+/// `admin_spa_index_still_serves_after_alias_mount` /
+/// `admin_spa_serves_paths_that_merely_prefix_match_the_alias_segment` が固定する。
+pub fn mount_admin_api(
+    app: Router,
+    project_id: &str,
+    project_count: usize,
+    admin_guarded: Router,
+) -> Router {
+    let admin_path = format!("/{project_id}/admin/api");
+    let mut app = app.nest_service(&admin_path, admin_guarded.clone());
+    if project_count == 1 {
+        app = app.nest_service("/admin/api", admin_guarded);
+    }
+    app
+}
+
 // ---------------------------------------------------------------------------
 // ConversationTurn の内部表現と純関数（テスト容易性のため network I/O から分離）
 // ---------------------------------------------------------------------------
@@ -2395,5 +2444,293 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "an undecodable cursor must not silently rewind to offset 0"
         );
+    }
+
+    // ---- mount_admin_api（Issue #34: /admin/api の単一 project エイリアス） ----
+    //
+    // `main.rs` / `homesec_advisor.rs` が実際に組み立てるのと同じ router 構成
+    // （`admin_router()` + `require_google_auth` レイヤ + `staticui::admin_static_router()`）で
+    // 「既知の罠」（`/admin` の SPA フォールバックが `/admin/api` を飲み込みうる、逆に
+    // エイリアスが SPA を飲み込んでいないか、mount 順序に依存していないか、エイリアスが
+    // `admin_router` の実ルートへ正しく解決されているか）を実測する。フェイクの router では
+    // 代用しない（spec 要求）。
+    //
+    // レビュー指摘（Warning）: 「401 が返る」だけでは実ルート解決の証拠にならない。
+    // `require_google_auth` レイヤは nest 先 router の fallback にも適用されるため、存在
+    // しないパス（例: `/admin/api/definitely-not-a-route`）でも 401 が返る。仮に
+    // `mount_admin_api` が誤って `nest_service("/admin", admin_guarded)` していても
+    // （prefix strip 後が `/api/threads` になり実ルート `/threads` に一致しなくても）、
+    // fallback 経由で 401 が返るため「401 が返ること」だけを固定するテストは通ってしまう。
+    // `admin_api_alias_resolves_to_the_real_admin_router_route` 系のテストは、認証レイヤを
+    // 外した `admin_router` を直接 mount し、「実ルートは 404 にならない」「未知パスは 404 に
+    // なる」の対比で実ルート解決そのものを固定する。
+    mod mount_admin_api_tests {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::fs;
+        use tower::ServiceExt; // for `oneshot`
+
+        // project ループ内で main.rs / homesec_advisor.rs が組み立てるのと同じ形の
+        // `admin_guarded`（`require_google_auth` 済み）router が必要なテストは、親 `tests`
+        // モジュールの `guarded_test_router()`（1573行目付近）を `use super::*;` 経由でそのまま
+        // 使う。ここに同一内容の複製を持たない（認証配線のフィクスチャが 2 箇所に分裂して
+        // drift するのを防ぐ、レビュー指摘）。
+
+        /// ビルド成果物相当のダミー `index.html` を置いた一時ディレクトリ
+        /// （`staticui::admin_static_router_tests::temp_static_dir` と同じ流儀）。
+        fn temp_static_dir() -> std::path::PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("admin-api-alias-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).expect("create temp static dir");
+            fs::write(dir.join("index.html"), "<html>app shell</html>").expect("write index.html");
+            dir
+        }
+
+        /// `main.rs` の配線順（project ループ内で `mount_admin_api` → ループを抜けたあとに
+        /// `/admin` の SPA 静的配信）をそのまま再現する。
+        async fn build_full_app(project_count: usize) -> Router {
+            let app = Router::new();
+            let app = mount_admin_api(app, "urtect", project_count, guarded_test_router().await);
+            app.nest_service(
+                "/admin",
+                crate::staticui::admin_static_router(&temp_static_dir()),
+            )
+        }
+
+        async fn status_for(app: Router, method: &str, uri: &str) -> StatusCode {
+            response_for(app, method, uri).await.status()
+        }
+
+        /// `status_for` のヘッダも見たい版（1-c: SPA が `text/html` を返しているかの確認に使う）。
+        async fn response_for(
+            app: Router,
+            method: &str,
+            uri: &str,
+        ) -> axum::response::Response<Body> {
+            app.oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router must not error on a plain request")
+        }
+
+        /// `build_full_app` の mount 順序を逆にしたもの（1-d: `/admin` の SPA を先に mount し、
+        /// そのあとで `mount_admin_api` を呼ぶ）。`mount_admin_api` の doc コメント（64-90行目
+        /// 付近）は「`/admin` を先に mount しても後に mount しても、`/admin/api/...` は
+        /// `require_google_auth` に到達する」と登録順非依存を明言しているが、`build_full_app`
+        /// は一方の順序しか検証していなかった（レビュー指摘）。
+        async fn build_full_app_reordered(project_count: usize) -> Router {
+            let app = Router::new().nest_service(
+                "/admin",
+                crate::staticui::admin_static_router(&temp_static_dir()),
+            );
+            mount_admin_api(app, "urtect", project_count, guarded_test_router().await)
+        }
+
+        /// 既知の罠の実測固定（spec 必須テスト1）: project 1 件のとき、無認証の
+        /// `GET /admin/api/threads` は `/admin` の SPA フォールバック（200 + text/html）に
+        /// 飲み込まれず、`require_google_auth` の 401 に到達する。
+        #[tokio::test]
+        async fn admin_api_alias_reaches_auth_middleware_not_spa_fallback() {
+            let status = status_for(build_full_app(1).await, "GET", "/admin/api/threads").await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "must reach require_google_auth (401), not the /admin SPA fallback (200)"
+            );
+        }
+
+        /// 既存の project 固有パスも、エイリアス追加後に壊れていない（同じ full app 内で）。
+        #[tokio::test]
+        async fn project_scoped_admin_api_still_reaches_auth_middleware_alongside_alias() {
+            let status =
+                status_for(build_full_app(1).await, "GET", "/urtect/admin/api/threads").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        /// spec 必須テスト2（有効側）: project 1 件のときエイリアスは mount されている
+        /// （`mount_admin_api` の出力単体で、`/admin` フォールバックの有無に関係なく確認する）。
+        #[tokio::test]
+        async fn admin_api_alias_is_mounted_when_exactly_one_project_is_configured() {
+            let app = mount_admin_api(Router::new(), "urtect", 1, guarded_test_router().await);
+            let status = status_for(app, "GET", "/admin/api/threads").await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "alias must be mounted and reach require_google_auth"
+            );
+        }
+
+        /// spec 必須テスト2（無効側）: project が 2 件以上のときエイリアスは mount しない。
+        /// `/admin` フォールバックを重ねずに確認するため、ここでは 404
+        /// （＝ルーティングに一切乗っていない）で「マウントされていないこと」自体を固定する。
+        #[tokio::test]
+        async fn admin_api_alias_is_not_mounted_when_multiple_projects_are_configured() {
+            let app = mount_admin_api(Router::new(), "urtect", 2, guarded_test_router().await);
+            let status = status_for(app, "GET", "/admin/api/threads").await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "alias must not be mounted when 2+ projects are configured"
+            );
+        }
+
+        /// project が 2 件以上のとき、project 固有パスの mount 自体は引き続き行われる
+        /// （エイリアスだけを無効化する。project 固有経路まで巻き込まない）。
+        #[tokio::test]
+        async fn project_scoped_admin_api_is_still_mounted_when_multiple_projects_are_configured() {
+            let app = mount_admin_api(Router::new(), "urtect", 2, guarded_test_router().await);
+            let status = status_for(app, "GET", "/urtect/admin/api/threads").await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        /// project が 2 件以上のとき、full app 構成では `/admin/api/threads` は
+        /// （エイリアスが無いため）`/admin` の SPA フォールバックへ委譲され 200 になる
+        /// （「マウントされていない」ことの、本番配線に近い形での裏取り）。
+        #[tokio::test]
+        async fn admin_api_alias_falls_through_to_spa_when_multiple_projects_are_configured() {
+            let status = status_for(build_full_app(2).await, "GET", "/admin/api/threads").await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "without the alias mount, /admin/api/threads must fall through to the /admin SPA fallback"
+            );
+        }
+
+        // ---- 1-b: エイリアスが admin_router の実ルートへ解決されていることの固定 ----
+        //
+        // ここでは `require_google_auth` レイヤを**掛けない** `admin_router(test_admin_state())`
+        // を直接 `mount_admin_api` に渡す。認証レイヤ経由の 401 は fallback にも掛かるため
+        // 「実ルートに解決されているか」を区別できない（上のモジュール冒頭コメント参照）。
+        // 認証なしでハンドラの手前まで到達させることで、prefix strip 後のパスが
+        // `admin_router` の実ルート（`/threads` 等）に一致するかどうかだけを見る。
+        //
+        // `test_admin_state()` は `knowledge: None`（1517行目付近のコメント）なので、実ルート
+        // `/threads` に解決された場合、`list_threads` ハンドラの手前、
+        // `Extension<VerifiedIdentity>` の抽出（本来は `require_google_auth` が挿入する拡張）で
+        // 失敗し 500 になる（axum 0.8 の `MissingExtension` rejection は
+        // `#[status = INTERNAL_SERVER_ERROR]` で定義されている。実行して実測済み）。
+        // 500 という具体値そのものが今回固定したい不変条件ではない
+        // （`require_google_auth` を掛けた本番構成では 401 になる）。固定したいのは
+        // 「実ルートに解決されると 404 にならない」「未知パスは 404 になる」という対比なので、
+        // 実在ルートの主張は `assert_ne!(.., NOT_FOUND)` で行い、実測した具体値（500）は
+        // 副次的な回帰検知として `assert_eq!` でも固定する。
+        fn unguarded_admin_router() -> Router {
+            admin_router(test_admin_state())
+        }
+
+        #[tokio::test]
+        async fn admin_api_alias_resolves_to_the_real_admin_router_route() {
+            let app = mount_admin_api(Router::new(), "urtect", 1, unguarded_admin_router());
+
+            let real = status_for(app.clone(), "GET", "/admin/api/threads").await;
+            assert_ne!(
+                real,
+                StatusCode::NOT_FOUND,
+                "/admin/api/threads must resolve to admin_router's real /threads route, not 404"
+            );
+            assert_eq!(
+                real,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "measured value: with no auth layer, /threads resolves but then fails to extract \
+                 Extension<VerifiedIdentity> (axum's MissingExtension rejection is 500); a 401 \
+                 here would mean this test accidentally exercised require_google_auth instead of \
+                 route resolution"
+            );
+
+            let fake = status_for(app, "GET", "/admin/api/no-such-route").await;
+            assert_eq!(
+                fake,
+                StatusCode::NOT_FOUND,
+                "control case: a path that does not exist under admin_router must 404"
+            );
+        }
+
+        #[tokio::test]
+        async fn project_scoped_admin_api_resolves_to_the_real_admin_router_route() {
+            let app = mount_admin_api(Router::new(), "urtect", 1, unguarded_admin_router());
+
+            let real = status_for(app.clone(), "GET", "/urtect/admin/api/threads").await;
+            assert_ne!(
+                real,
+                StatusCode::NOT_FOUND,
+                "/urtect/admin/api/threads must resolve to admin_router's real /threads route"
+            );
+            assert_eq!(
+                real,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "measured value, same reasoning as admin_api_alias_resolves_to_the_real_admin_router_route"
+            );
+
+            let fake = status_for(app, "GET", "/urtect/admin/api/no-such-route").await;
+            assert_eq!(
+                fake,
+                StatusCode::NOT_FOUND,
+                "control case: project-scoped path equivalence must also 404 on unknown routes"
+            );
+        }
+
+        // ---- 1-c: エイリアスが SPA を潰していないことの固定（逆方向） ----
+        //
+        // 既存テストは「SPA が /admin/api を飲み込まないこと」だけを見ており、逆方向
+        // （エイリアスが SPA の通常経路まで奪っていないこと）を検証していなかった
+        // （レビュー指摘）。
+
+        #[tokio::test]
+        async fn admin_spa_index_still_serves_after_alias_mount() {
+            let response = response_for(build_full_app(1).await, "GET", "/admin/").await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "/admin/ must still serve the SPA shell"
+            );
+            let content_type = response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .expect("SPA response must carry a Content-Type header")
+                .to_str()
+                .expect("Content-Type must be valid ASCII");
+            assert!(
+                content_type.starts_with("text/html"),
+                "expected a text/html Content-Type, got {content_type:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn admin_spa_serves_paths_that_merely_prefix_match_the_alias_segment() {
+            // "/admin/apix" shares the literal prefix "/admin/api" character-for-character but is
+            // a different path *segment* ("apix", not "api"). It must fall through to the /admin
+            // SPA wildcard, not be mistaken for the /admin/api alias.
+            let status = status_for(build_full_app(1).await, "GET", "/admin/apix").await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "/admin/apix is a distinct path segment from the /admin/api alias and must fall \
+                 through to the SPA fallback"
+            );
+        }
+
+        // ---- 1-d: mount 順序の逆順でも同じ結果になることの固定 ----
+
+        #[tokio::test]
+        async fn admin_api_alias_still_reaches_auth_middleware_when_admin_spa_mounted_first() {
+            let status = status_for(
+                build_full_app_reordered(1).await,
+                "GET",
+                "/admin/api/threads",
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "mounting /admin (SPA) before mount_admin_api must not change the outcome: \
+                 /admin/api/threads must still reach require_google_auth (401), not the SPA's 200"
+            );
+        }
     }
 }

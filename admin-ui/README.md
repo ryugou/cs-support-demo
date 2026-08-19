@@ -41,9 +41,9 @@ Console 発行済みの実際の client_id で `environment.prod.ts` を一時�
 3. ブラウザで `https://127.0.0.1:3443/admin/` を開く。
 
 `ng serve`（`npm start`、ポート 4200）は **proxy 設定（`proxyConfig`）を持たない。**
-`environment.ts` の `apiBase`（`/sivira-cs-demo/admin/api`）はサーバ側のパスであり、
+`environment.ts` の `apiBase`（`/admin/api`）はサーバ側のパスであり、
 `ng serve` 単体では到達できない（同一オリジンに `server` プロセスが存在しないため、
-`GET http://localhost:4200/sivira-cs-demo/admin/api/...` は 404 になる）。API を叩く動作
+`GET http://localhost:4200/admin/api/...` は 404 になる）。API を叩く動作
 確認は、上記の本番相当ビルドを `server` から配信させる形で行うこと。`ng serve` は
 テンプレート・スタイルの見た目確認にのみ使う。
 
