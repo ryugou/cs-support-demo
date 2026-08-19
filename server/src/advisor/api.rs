@@ -744,7 +744,8 @@ async fn advisor_reply_handler(
 /// だった)。
 ///
 /// ログに載せるのは request_id / case_id / action_kind(応答種別)/ material_keys(注入した
-/// 材料の `{kind}:{material_key}`)/ card_keys(選定したカードの material_key)の5つのみ。
+/// 材料の material_key。`{kind}:{slug}` 形式で kind を含む)/ card_keys(選定したカードの
+/// material_key)の5つのみ。
 /// `materials_used` の `body_ja` / `title_ja`、`message` / 応答本文は一切渡さない・出さない。
 fn log_turn_decision(
     request_id: &str,
@@ -759,7 +760,7 @@ fn log_turn_decision(
         action_kind = reply_kind,
         material_keys = ?materials_used
             .iter()
-            .map(|m| format!("{}:{}", m.kind, m.material_key))
+            .map(|m| m.material_key.clone())
             .collect::<Vec<String>>(),
         card_keys = ?product_cards
             .map(|cards| cards.iter().map(|c| c.material_key.clone()).collect::<Vec<String>>())
@@ -1322,7 +1323,9 @@ mod tests {
         // ログに出ること」を固定する。
         let materials = vec![material_fixture("own_product", "own_product:adc-v724")];
         let cards = vec![sample_card()];
-        let expected_material_key = format!("{}:{}", materials[0].kind, materials[0].material_key);
+        // material_key は `{kind}:{slug}` 形式で kind を既に含むため、そのまま出る
+        // (kind を重ねて `own_product:own_product:...` にならない)ことを固定する。
+        let expected_material_key = materials[0].material_key.clone();
 
         let (_, logs) = crate::test_support::capture_logs(|| {
             log_turn_decision("req-1", "case-1", "answer", &materials, Some(&cards));
@@ -1342,7 +1345,11 @@ mod tests {
         );
         assert!(
             logs.contains(&expected_material_key),
-            "material_keys must use the `{{kind}}:{{material_key}}` format: {logs}"
+            "material_keys must log the material_key as-is (already kind-prefixed): {logs}"
+        );
+        assert!(
+            !logs.contains("own_product:own_product:"),
+            "material_keys must not duplicate the kind prefix: {logs}"
         );
         assert!(
             logs.contains(&sample_card().material_key),
