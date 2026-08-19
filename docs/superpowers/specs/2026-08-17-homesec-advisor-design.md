@@ -26,6 +26,7 @@
 - 自社製品は「当社の」ではなく「URTECT の」と呼ぶ(ブランドは明示しつつ、口調は専属アドバイザー)
 - 初回ターンは軽い挨拶(「こんにちは!」程度)、継続会話では挨拶しない(既存 CONTINUATION_OPENER_RULE を流用)
 - 締めは相談の継続を誘う一言。毎ターンの定型クロージング(「他にご不明な点が〜」)はしない
+- **提案ファースト**: `answer` のターンは、その時点で分かっている条件でできる具体的な提案を必ず応答の前半に置く。追加の質問は 1 ターンに最大 1 問とし、提案の後に添える。条件が既に足りている話題に質問を重ねない。製品のおすすめを直接聞かれたターンでは、材料にある製品を必ず名指しで提案する(不明な条件は「賃貸なら〜」のように仮定を明示して提案する)。ヒアリングだけで終わる応答を返さない(本番で「質問攻めで話が進まない」という実害が出たための規則)
 
 ### 2.2 接地 2 層
 
@@ -203,7 +204,7 @@ ingest CLI: `server/src/bin/ingest_homesec.rs`。schema `homesec` の作成(`adv
 3. 会話状態ロード(`support_case`。無ければ作成)
 4. LLM Call #1: 理解(第 4.1 節の型へ構造化)
 5. コード判定: `safety` / time_pref 継続 / `out_of_domain` / `handoff` / リード受付開始は定型を確定(第 4.3 節)
-6. known_resolution 照合と材料検索(homesec schema、top_k = 5。累積条件 + 相談要旨で検索)
+6. known_resolution 照合と材料検索(homesec schema、top_k = 5。累積条件 + 相談要旨で検索)。**own_product の保証注入**: 発話が製品・機器の導入意図(カメラ・センサー等の物品への言及)を含む、または累積条件に `concern` があるターンは、検索順位に関わらず own_product 材料を別枠で注入する(`category` が合致するものを優先し、合致が無ければ全 7 件。検索が own_product を引けず接地規則が製品提案を封じる本番実害への決定論対処)
 7. コード判定: `clarify` か `answer` かを確定(第 4.3 節)
 8. LLM Call #2: 下書き生成。プロンプトに材料全文・累積条件・会話履歴・ペルソナ規則・接地 2 層規則・URTECT 優遇規則・リード提案規則(第 4.4 節)・安全下限・Markdown 禁止・継続会話の挨拶抑制を注入
 9. 出口関門(第 7 節)。違反時は `fallback` 定型へ差し替え(warn)
@@ -211,6 +212,8 @@ ingest CLI: `server/src/bin/ingest_homesec.rs`。schema `homesec` の作成(`adv
 11. 条件・`clarify_turns`・リード関連属性を `support_case` へ書き戻し、`ConversationTurn` を永続化(5 秒上限・応答優先)して返却
 
 LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応答(safety / out_of_domain / handoff / time_pref / lead / fallback)のターンは Call #2 を行わない。
+
+**内部判断の info ログ**: 応答種別(decide 結果)・注入した material_key 一覧・カード選定結果を毎ターン info でログに出す(本番会話の内部判断を運用者が追えるようにする。プロンプト・材料の PDCA はこのログとターン永続化を計器にする)。
 
 ## 7. 出口関門(advisor 固有分 + 共有分)
 
