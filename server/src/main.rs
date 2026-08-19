@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     if config.projects.is_empty() {
         anyhow::bail!(
             "config has no [[projects]] entries; add at least one [[projects]] section \
-             (project_id, schema, manual_schema) to {} before starting the server",
+             (required: project_id, schema) to {} before starting the server",
             args.config.display()
         );
     }
