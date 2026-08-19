@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-/// `config.admin_static_dir` を実パスへ解決する純関数。絶対パスはそのまま使い、相対パスは
+/// config ファイル起点の相対パスを実パスへ解決する純関数。絶対パスはそのまま使い、相対パスは
 /// `config_dir`（`args.config.parent()`、main() 冒頭で計算済み）基準で解決する。
+/// `admin_static_dir` のほか、`homesec_advisor` の `ng_dictionary_path` / `images_dir` の
+/// 解決にも使う（関数名は初出の用途由来で、実態は汎用のパス解決）。
 ///
 /// `harness/mod.rs::Harness::build` 内の `resolve_path` クロージャと同じロジック
 /// （相対パスは config ファイルの置き場所基準、絶対パスはそのまま）。共有関数への切り出しは
