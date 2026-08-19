@@ -327,7 +327,7 @@ async fn draft_with_materials(
             Ok(list) => list,
             Err(err) => {
                 tracing::warn!(
-                    error = %err,
+                    error = %format!("{err:#}"),
                     schema,
                     "homesec advisor: load_known_resolutions failed; continuing without a KR \
                      match (design doc §8 degrade-not-block policy)"
@@ -337,7 +337,7 @@ async fn draft_with_materials(
         },
         Err(err) => {
             tracing::warn!(
-                error = %err,
+                error = %format!("{err:#}"),
                 schema,
                 "homesec advisor: knowledge store unavailable while loading known resolutions; \
                  continuing without a KR match"
