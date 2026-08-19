@@ -38,6 +38,18 @@ async fn main() -> Result<()> {
     // 両方が同じ `AppConfig` を共有するため。以降の `config.xxx` 参照は `Arc<AppConfig>` の
     // `Deref` でそのまま動く（型を変えても呼び出し側の書き換えは不要）。
     let config = Arc::new(AppConfig::load(&args.config)?);
+    // project 0 件の fail-closed 起動検査。`mount_admin_api` はエイリアス mount 条件を
+    // `project_count == 1`、警告を `> 1` でしか判定しておらず、0 件はどちらにも該当しない
+    // （codex レビュー指摘）。0 件のまま起動すると `/{project_id}/mcp` も admin API も
+    // 一切登録されない一方、`/admin` の SPA フォールバックだけは無条件に mount されるため、
+    // 設定不備が `200 text/html` として隠蔽され、運用者はログを見ない限り気づけない。
+    if config.projects.is_empty() {
+        anyhow::bail!(
+            "config has no [[projects]] entries; add at least one [[projects]] section \
+             (required: project_id, schema) to {} before starting the server",
+            args.config.display()
+        );
+    }
     // 応答生成 API（/api/reply）の fail-closed 起動検査。有効化されているのに
     // env 未設定・空文字だと、認証チェックが実質無効な（誰も鍵を持てない＝誰も
     // 通らない、または将来の実装ミスで誰でも通る）ルートを公開してしまう。
@@ -219,6 +231,30 @@ async fn main() -> Result<()> {
         );
     }
 
+    // admin-ui（Issue #34）は `apiBase` をビルド時に `/admin/api`（project 非依存）で
+    // ハードコードしている。project が 2 件以上だと、この 1 パスがどの project を指すか
+    // 一意に決まらないため `mount_admin_api`（下の project ループ内）はエイリアスを
+    // mount しない。この状態でも `/admin/api/...` へのリクエストは 401/404 にはならず、
+    // `/admin` の SPA フォールバックへ落ちて `200 text/html` を返す（実測済み）。同梱の
+    // admin-ui はビルド時固定の `apiBase` しか持たないため、運用者がこの警告を見た時点で
+    // 選べる復旧手段は無い（project ごとに異なる `apiBase` を焼いた別ビルドを用意するか、
+    // ランタイムで `apiBase` を解決する仕組みを実装する必要があるが、いずれも現状未実装）。
+    // 上の C5 warn と同じ流儀で、config を触った時点で運用者が気づけるよう起動時に 1 回
+    // 警告する。
+    if config.projects.len() > 1 {
+        tracing::warn!(
+            project_count = config.projects.len(),
+            "more than one project is configured, so the /admin/api convenience alias (used by \
+             the bundled admin dashboard's build-time-fixed apiBase) is disabled; requests to \
+             /admin/api/* will NOT be rejected, they will silently fall through to the /admin \
+             SPA fallback (200 text/html) and the admin UI will fail to parse it as JSON; there \
+             is currently no working admin UI for a multi-project deployment — fixing this \
+             requires either a per-project build with a project-scoped apiBase or a runtime \
+             apiBase resolution mechanism, neither of which exists today (see the project-routing \
+             notes in CLAUDE.md)"
+        );
+    }
+
     let auth_server = Arc::new(cs_support_mcp::oauth::authserver::AuthServerState::new(
         cs_support_mcp::oauth::authserver::AuthServerConfig::new(
             public_host.clone(),
@@ -267,8 +303,12 @@ async fn main() -> Result<()> {
                 cs_support_mcp::oauth::middleware::require_google_auth,
             ),
         );
-        let admin_path = format!("/{}/admin/api", project.project_id);
-        app = app.nest_service(&admin_path, admin_guarded);
+        app = cs_support_mcp::admin::mount_admin_api(
+            app,
+            &project.project_id,
+            config.projects.len(),
+            admin_guarded,
+        );
 
         let mcp = StreamableHttpService::new(
             move || {
@@ -295,9 +335,18 @@ async fn main() -> Result<()> {
 
     // `/admin` の静的配信（admin dashboard design doc §5）。ビルド成果物（`index.html` を含む）を
     // Docker イメージへ同梱し `ServeDir` で配信する。`/admin` 配下の未知パスは SPA フォールバックとして
-    // `index.html` を返す。**認証ミドルウェアは掛けない**（design doc: アプリシェルに秘密は含まれず、
-    // データはすべて認証必須の `/{project_id}/admin/api` からのみ取得する。あちらは project ループ内で
-    // `require_google_auth` を掛けて別経路として生きているので、ここは衝突しない）。
+    // `index.html` を返す。**認証ミドルウェアは掛けない**（design doc: アプリシェルに秘密は含まれない）。
+    // データは認証必須の `/{project_id}/admin/api` から取得する（project ループ内で
+    // `require_google_auth` を掛けて登録済み）。project がちょうど 1 件のときは、加えて
+    // project 非依存の `/admin/api` エイリアス（`admin::mount_admin_api`、Issue #34）も
+    // project ループ内で mount 済みで、**そちらはこの `/admin` の直下（`/admin/api`）に重なる**
+    // （project 固有パスとは違い、衝突しない別経路ではない）。ここで `/admin` を
+    // `nest_service` してもエイリアスが SPA フォールバックに飲み込まれないのは、axum(matchit)
+    // が登録順によらずより具体的な静的セグメント（`/admin/api/...`）をワイルドカード
+    // （`/admin/...`）より優先するという実装依存の優先順位のおかげであり、この関数を編集する
+    // ときはその前提を崩さないこと。契約は `admin::mount_admin_api` の doc コメントと
+    // `admin::tests::mount_admin_api_tests`（登録順の両方向・実ルート解決・SPA 非侵食を実測）
+    // を参照。
     let admin_static_dir =
         cs_support_mcp::staticui::resolve_admin_static_dir(&config_dir, &config.admin_static_dir);
     app = app.nest_service(

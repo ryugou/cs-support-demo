@@ -9,5 +9,5 @@
 export const environment = {
   production: false,
   googleClientId: '__CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID__',
-  apiBase: '/sivira-cs-demo/admin/api',
+  apiBase: '/admin/api',
 };

@@ -222,6 +222,7 @@ cs-support-mcp/
 - 本番 Cloud Run の project 定義は `urtect` の 1 件のみ（`server/config.cloudrun.toml`）。レガシーの `sivira-cs-demo` は露出面を最小化するため外した。`allowed_schemas` は config 全 project の複製で解決されるため（`server/src/harness/authn.rs`）、**project を追加するとその schema も既存の全 Google 利用者へ自動的に公開される**。テナント分離を成立させる認可境界が無い間は、project を安易に増やさないこと。
 - **警告: アクセストークンに project 束縛は無い。** 自前トークンを廃止した結果、クライアントが持つのは Google 発行のトークンであり、こちらの project_id を載せる余地が無い。したがって **ある project 向けに取得したトークンは、このサーバの全 project の endpoint で通る**。旧実装が持っていた `aud` 完全一致の境界は失われている。RFC 8707 の `resource` は `/oauth/authorize` と `/oauth/token` で「設定済み project を指しているか」の入力検証にしか使っていない（`server/src/oauth/authserver.rs` の `resolve_resource`）。
 - **project を 2 件目以降に増やすと、OAuth の挙動が破壊的に変わる。** `/oauth/authorize` は project が 1 件のときだけ `resource` 省略を許す。2 件以上になると **`resource` が必須**になり、送らないクライアントは `invalid_target` で拒否される（起動時に `tracing::warn!` で 1 回警告する）。ただし上記のとおり `resource` を送っても**テナント分離にはならない**ので、project を増やす前に認可境界そのものを設計し直すこと。
+- **project を 2 件目以降に増やすと、同梱の管理画面（admin-ui）が動かなくなる（Issue #34）。** admin-ui は `apiBase` をビルド時に project 非依存の `/admin/api` で固定している。`admin::mount_admin_api`（`server/src/admin.rs`、`main.rs` / `homesec_advisor.rs` の両方が呼ぶ）は project がちょうど 1 件のときだけこの `/admin/api` を `/{project_id}/admin/api` のエイリアスとして mount する。2 件以上では mount せず起動時に `tracing::warn!` を 1 回出すが、`/admin/api/*` へのリクエストは 401/404 にはならず `/admin` の SPA フォールバックへ落ちて `200 text/html` を返す（admin-ui 側は JSON パースエラーになる）。project ごとに異なる `apiBase` を焼いた別ビルドか、ランタイムで `apiBase` を解決する仕組みが無い限り、現状は復旧手段が無い。
 - mapping は 1 件でも、将来別 schema を引ける構造にする。
 
 ## Ingest

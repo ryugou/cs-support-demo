@@ -9,5 +9,5 @@
 export const environment = {
   production: true,
   googleClientId: '__CS_SUPPORT_GOOGLE_OAUTH_CLIENT_ID__',
-  apiBase: '/urtect/admin/api',
+  apiBase: '/admin/api',
 };
