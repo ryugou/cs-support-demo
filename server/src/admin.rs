@@ -566,7 +566,7 @@ async fn list_threads(
         .begin(&identity, &state.schema, state.manual_schema)
     {
         tracing::warn!(
-            error = ?err,
+            error = %format!("{err:#}"),
             sub = %identity.sub,
             schema = %state.schema,
             "admin api: list_threads scope resolution failed"
@@ -581,7 +581,7 @@ async fn list_threads(
     match fetch_thread_page(&state, None, limit, offset).await {
         Ok(page) => (StatusCode::OK, Json(page)).into_response(),
         Err(err) => {
-            tracing::error!(error = ?err, schema = %state.schema, "admin api: list_threads failed");
+            tracing::error!(error = %format!("{err:#}"), schema = %state.schema, "admin api: list_threads failed");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -609,7 +609,7 @@ async fn list_user_threads(
         .begin(&identity, &state.schema, state.manual_schema)
     {
         tracing::warn!(
-            error = ?err,
+            error = %format!("{err:#}"),
             sub = %identity.sub,
             schema = %state.schema,
             "admin api: list_user_threads scope resolution failed"
@@ -626,7 +626,7 @@ async fn list_user_threads(
         Ok(page) => (StatusCode::OK, Json(page)).into_response(),
         Err(err) => {
             tracing::error!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 schema = %state.schema,
                 end_user_id,
                 "admin api: list_user_threads failed"
@@ -691,7 +691,7 @@ async fn get_thread(
         Ok(ctx) => ctx,
         Err(err) => {
             tracing::warn!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 sub = %identity.sub,
                 schema = %state.schema,
                 "admin api: get_thread scope resolution failed"
@@ -703,7 +703,7 @@ async fn get_thread(
     let store = match state.harness.store() {
         Ok(store) => store,
         Err(err) => {
-            tracing::error!(error = ?err, "admin api: get_thread knowledge store unavailable");
+            tracing::error!(error = %format!("{err:#}"), "admin api: get_thread knowledge store unavailable");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -718,7 +718,7 @@ async fn get_thread(
         Ok(v) => v,
         Err(err) => {
             tracing::error!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 schema = %state.schema,
                 case_id,
                 "admin api: get_thread load_conversation_turns_for_case failed"
@@ -748,7 +748,7 @@ async fn get_thread(
         Ok(conv) => conv,
         Err(err) => {
             tracing::error!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 schema = %state.schema,
                 case_id,
                 "admin api: get_thread load_conv_state failed"
@@ -764,7 +764,7 @@ async fn get_thread(
         Ok(s) => s,
         Err(err) => {
             tracing::error!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 schema = %state.schema,
                 case_id,
                 "admin api: get_thread load_case_signals failed"
@@ -860,7 +860,7 @@ async fn create_correction(
         Ok(ctx) => ctx,
         Err(err) => {
             tracing::warn!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 sub = %identity.sub,
                 schema = %state.schema,
                 "admin api: create_correction scope resolution failed"
@@ -877,7 +877,7 @@ async fn create_correction(
         Ok(store) => store,
         Err(err) => {
             tracing::error!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 "admin api: create_correction knowledge store unavailable"
             );
             return error_response(
@@ -894,7 +894,7 @@ async fn create_correction(
         Ok(v) => v,
         Err(err) => {
             tracing::error!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 schema = %state.schema,
                 case_id = %req.case_id,
                 "admin api: create_correction load_conversation_turns_for_case failed"
@@ -949,7 +949,7 @@ async fn create_correction(
         }
         Err(RegisterKnownResolutionError::Infra(err)) => {
             tracing::error!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 schema = %state.schema,
                 case_id = %req.case_id,
                 turn_id = %req.turn_id,
@@ -1001,7 +1001,7 @@ async fn stats_summary(
         .begin(&identity, &state.schema, state.manual_schema)
     {
         tracing::warn!(
-            error = ?err,
+            error = %format!("{err:#}"),
             sub = %identity.sub,
             schema = %state.schema,
             "admin api: stats_summary scope resolution failed"
@@ -1016,7 +1016,7 @@ async fn stats_summary(
     let store = match state.harness.store() {
         Ok(store) => store,
         Err(err) => {
-            tracing::error!(error = ?err, "admin api: stats_summary knowledge store unavailable");
+            tracing::error!(error = %format!("{err:#}"), "admin api: stats_summary knowledge store unavailable");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
@@ -1035,7 +1035,7 @@ async fn stats_summary(
         }
         Err(err) => {
             tracing::error!(
-                error = ?err,
+                error = %format!("{err:#}"),
                 schema = %state.schema,
                 days,
                 "admin api: stats_summary load_conversation_turns_since failed"

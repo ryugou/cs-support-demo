@@ -13,6 +13,17 @@ pub fn harness_node_id(schema: &str, kind: &str, key: &str) -> String {
     format!("{}{kind}:{key}", schema_generation_prefix(schema))
 }
 
+/// signal 読み書き経路（`KnowledgeStore::load_case_signals` と
+/// `KnowledgeStore::append_case_signals`）が共有する support_case ノード id ヘルパ
+/// （Issue #39 レビュー残課題3）。この 2 箇所が個別に
+/// `harness_node_id(schema, "support_case", case_id)` を書いていたため、片方だけ kind 文字列
+/// "support_case" がずれても検出できなかった。読みと書きの対をこのヘルパへ統一することで、
+/// signal 経路内の id 組み立てのずれが構造的に起き得ないようにする（signal 以外の経路には
+/// 直接組み立てが残っており、全体の唯一箇所ではない）。
+fn case_signal_node_id(schema: &str, case_id: &str) -> String {
+    harness_node_id(schema, "support_case", case_id)
+}
+
 pub(crate) fn csv_list(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -41,9 +52,34 @@ pub(crate) fn signals_to_csv(signals: &SignalSet) -> String {
 
 /// graph_snapshot に渡す上限。到達＝切り詰めの可能性があり、HAS_SIGNAL 辺の欠落は
 /// 照合の誤判定（fail open）につながるため、到達時はエラーにする（fail closed）。
-// TODO: bind to vegapunk traversal API — snapshot 全取得でなく
-// KnownResolution/support_case -> HAS_SIGNAL -> Signal の隣接取得に置き換える。
+// TODO: bind to vegapunk traversal API — LegacySection の graph_snapshot 依存を撤去する
+// （Issue #39 で traversal 化したのは `KnowledgeStore::load_case_signals`（admin
+// `GET /admin/api/threads/{case_id}` 経路、1 経路）と `KnowledgeStore::load_known_resolutions`
+// （homesec `/api/reply` の `draft_with_materials`、MCP tool `search_known_resolutions`、
+// MCP tool `record_answer_outcome` 経由の `recompute_grade` の 3 経路）の計 4 経路のみ。
+// ManualV1 の `evaluate()`（`harness/mod.rs` の `case_signals_from_snapshot` /
+// `load_known_resolutions_with` 呼び出し）は今回のスコープ外で、`corpus.live_corpus` が
+// 返す非 truncate の snapshot 形状データに依存したまま。LegacySection は sivira-cs-demo
+// 専用・本番外のため snapshot 依存のまま残置している）。
 const SNAPSHOT_MAX_NODES: i32 = 5000;
+
+/// `traverse_neighbors_paged` に渡す 1 ページの上限（backend 上限、`corpus.rs::PAGE_SIZE` と
+/// 同じ値）。support_case / KnownResolution 1 件あたりの HAS_SIGNAL 辺は数件〜数十件程度の
+/// 想定で、この値を超えても `traverse_neighbors_paged` 自体がページングして全件取り切る
+/// （欠落しない。1000 は backend 側の1リクエストあたり上限）。
+const SIGNAL_TRAVERSE_PAGE_SIZE: i32 = 1000;
+
+/// `signals_from_traverse` が辿る先のノード種別（Signal ノードのみ）。呼び出し元
+/// （`load_case_signals` / `load_known_resolutions`）が値を選ぶ余地を無くし、
+/// production で "Signal" を書く場所をこの1箇所に固定するための定数（Issue #39
+/// レビュー W1/W2）。
+const SIGNAL_NODE_TYPE: &str = "Signal";
+/// `signals_from_traverse` が辿る辺種別。理由は `SIGNAL_NODE_TYPE` と同じ。
+const SIGNAL_EDGE_TYPE: &str = "HAS_SIGNAL";
+/// `signals_from_traverse` が辿る辺の向き。`append_case_signals` が
+/// `from_id: case_node_id, to_id: signal_node_id` で書くため、起点（case / KnownResolution）
+/// から見て "outgoing" が正しい。理由は `SIGNAL_NODE_TYPE` と同じ。
+const SIGNAL_TRAVERSE_DIRECTION: &str = "outgoing";
 
 fn guard_snapshot_complete(
     snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
@@ -87,6 +123,66 @@ fn signal_value_index(
                 .map(|v| (n.node_id.clone(), v.clone()))
         })
         .collect()
+}
+
+/// `traverse_neighbors_paged(schema, "Signal", "HAS_SIGNAL", ...)` の結果から `SignalSet` を
+/// 組み立てる純関数（`signal_value_index` の traversal 版・Issue #39）。呼び出し元が
+/// node_type="Signal" 指定で問い合わせている前提だが、backend が `neighbor_node_type` を
+/// 正しく honor する保証にコスト0で備えるため、`signal_value_index`（snapshot 版）と同じ
+/// `node_type == "Signal"` フィルタをここでも掛ける（レビュー Suggestion 1）。各
+/// `NodeResult` は Signal ノードで `attributes.get("value")` が signal 文字列を持つ想定。
+/// value 属性が欠けている `NodeResult` は黙って捨てる（`signal_value_index` と同じ欠損
+/// データの扱いに揃える）。
+fn signal_set_from_node_results(results: &[crate::proto::graphrag::NodeResult]) -> SignalSet {
+    results
+        .iter()
+        .filter(|n| n.node_type == SIGNAL_NODE_TYPE)
+        .filter_map(|n| n.attributes.get("value").map(|v| Signal::new(v.as_str())))
+        .collect()
+}
+
+/// `signals_from_traverse` の `fetch` が返す future の型（`admin.rs::PageFuture` と同じ規律。
+/// borrow した引数を跨いで await する必要があるため、素の `impl Future` を返すジェネリック
+/// `Fut` 型パラメータでは各呼び出しごとに異なる借用ライフタイムを表現できず、`Box<dyn Future>`
+/// で型を固定してライフタイムだけを変えられるようにする）。
+type SignalTraverseFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<Vec<crate::proto::graphrag::NodeResult>>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// `fetch`（実際は `VegapunkClient::traverse_neighbors_paged`）を注入できる形にした signal
+/// traversal の内部ロジック（Issue #39）。`admin.rs::build_threads_page` / `PageFuture` と
+/// 同じ規律で、実ネットワーク呼び出しをする薄いラッパー（`KnowledgeStore::load_case_signals` /
+/// `load_known_resolutions`）とテスト可能な内部ロジックを分離する。
+///
+/// `node_type` / `edge_type` / `direction` / `page_size` は呼び出し元から受け取らず、
+/// `SIGNAL_NODE_TYPE` / `SIGNAL_EDGE_TYPE` / `SIGNAL_TRAVERSE_DIRECTION` /
+/// `SIGNAL_TRAVERSE_PAGE_SIZE` をこの関数の内部でのみ使う（レビュー W1/W2）。以前は
+/// これら4値を呼び出し元が引数で渡していたため、テストが「自分で渡した値をフェイクが
+/// 受け取ったこと」を assert するだけの同語反復になっていた。固定値化したことで、
+/// テストがフェイクへ渡る値を検証すれば、それがそのままこの関数内部の定数の検証になる。
+/// `fetch` を `FnOnce` にしているのは、現状の呼び出し元がいずれも 1 起点・1 回だけ呼ぶため。
+async fn signals_from_traverse<'a, F>(
+    schema: &'a str,
+    source_node_id: &'a str,
+    fetch: F,
+) -> Result<SignalSet>
+where
+    F: FnOnce(&'a str, &'a str, &'a str, &'a str, &'a str, i32) -> SignalTraverseFuture<'a>,
+{
+    let results = fetch(
+        schema,
+        SIGNAL_NODE_TYPE,
+        SIGNAL_EDGE_TYPE,
+        SIGNAL_TRAVERSE_DIRECTION,
+        source_node_id,
+        SIGNAL_TRAVERSE_PAGE_SIZE,
+    )
+    .await?;
+    Ok(signal_set_from_node_results(&results))
 }
 
 /// 過去事例を取得済み snapshot から検索する（追加 RPC なし。evaluate の hot path 用）。
@@ -490,6 +586,49 @@ pub fn build_answer_evidence_graph(
     }
 }
 
+/// `query_nodes(KnownResolution)` の結果と、KR node_id → SignalSet の索引から
+/// `KnownResolution` を組み立てる純関数（Issue #39）。`kr_signals` の作り方（snapshot 由来の
+/// `load_known_resolutions_with` / traversal 由来の `load_known_resolutions`）に依存しない
+/// 共通のマッピングロジックとして両者から呼ばれる。
+fn known_resolutions_from_nodes(
+    kr_nodes: Vec<crate::proto::graphrag::NodeResult>,
+    mut kr_signals: HashMap<String, SignalSet>,
+) -> Result<Vec<KnownResolution>> {
+    kr_nodes
+        .into_iter()
+        .map(|node| {
+            let attrs = &node.attributes;
+            let get = |key: &str| attrs.get(key).cloned().unwrap_or_default();
+            Ok(KnownResolution {
+                id: attrs
+                    .get("kr_id")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("KnownResolution missing kr_id"))?,
+                signal_set: kr_signals.remove(&node.node_id).unwrap_or_default(),
+                applicability: get("applicability"),
+                answer: get("answer_text"),
+                source_authority: match get("source_authority").as_str() {
+                    "non_authoritative" => SourceAuthority::NonAuthoritative,
+                    _ => SourceAuthority::Authoritative,
+                },
+                root_cause: match get("root_cause").as_str() {
+                    "retrieval_miss" => RootCause::RetrievalMiss,
+                    _ => RootCause::KnowledgeError,
+                },
+                grade: Grade::parse_label(&get("grade")),
+                approval_count: get("approval_count").parse().unwrap_or(0),
+                rejection_count: get("rejection_count").parse().unwrap_or(0),
+                approver_set: csv_list(&get("approver_set")),
+                origin: get("origin"),
+                binding: parse_binding(attrs.get("binding")),
+                registration_trigger: get("registration_trigger"),
+                knowledge_class: get("knowledge_class"),
+                outcome_ref: csv_list(&get("outcome_ref")),
+            })
+        })
+        .collect()
+}
+
 /// PunkRecord（vegapunk）を材料ストアとして読み書きする層。判定は載せない（I4）。
 pub struct KnowledgeStore {
     client: Arc<VegapunkClient>,
@@ -535,23 +674,102 @@ impl KnowledgeStore {
         Ok(snapshot)
     }
 
-    /// KnownResolution を Signal ノード経由で復元する（HAS_SIGNAL 辺の走査）。
-    pub async fn load_known_resolutions(&self, schema: &str) -> Result<Vec<KnownResolution>> {
-        let snapshot = self.fetch_snapshot(schema).await?;
-        self.load_known_resolutions_with(schema, &snapshot).await
+    /// `KIND_KNOWN_RESOLUTION` ノードを一括取得する共通ヘルパ（W3）。`query_nodes` の
+    /// limit=1000 はページング未実装のためのサイレント切り詰め上限であり、
+    /// `load_known_resolutions` / `load_known_resolutions_with` の両方がこの上限を持っていた
+    /// （2箇所に増殖していた）。ここに集約し、上限ちょうどに達したときだけ warn する。
+    /// ページング化自体は今回のスコープ外（KR 件数が現状小さく実害なしとレビュー済み）。
+    async fn query_known_resolution_nodes(
+        &self,
+        schema: &str,
+    ) -> Result<Vec<crate::proto::graphrag::NodeResult>> {
+        const KNOWN_RESOLUTION_QUERY_LIMIT: i32 = 1000;
+        let nodes = self
+            .client
+            .query_nodes(
+                schema,
+                KIND_KNOWN_RESOLUTION,
+                Vec::new(),
+                KNOWN_RESOLUTION_QUERY_LIMIT,
+            )
+            .await
+            .context("load known resolutions")?;
+        if nodes.len() == KNOWN_RESOLUTION_QUERY_LIMIT as usize {
+            tracing::warn!(
+                schema,
+                count = nodes.len(),
+                "load_known_resolutions: query_nodes hit the {KNOWN_RESOLUTION_QUERY_LIMIT}-node \
+                 limit for KnownResolution; results may be silently truncated (pagination not \
+                 yet implemented)"
+            );
+        }
+        Ok(nodes)
     }
 
-    /// 取得済み snapshot を使う変種（evaluate の hot path 用）。
+    /// `self.client.traverse_neighbors_paged` を呼ぶ唯一の箇所（Issue #39 レビュー残課題3）。
+    /// `load_case_signals`（case ノード起点）と `load_known_resolutions`（KR ノード起点）が
+    /// 個別に同一内容のクロージャを持っており、どちらのクロージャ自体もテストを経由していな
+    /// かった（既存テストは `signals_from_traverse` へ直接フェイクを渡していた）。ここへ
+    /// 集約し、両呼び出し元をこのメソッド経由に統一する。
+    async fn signals_of(&self, schema: &str, source_node_id: &str) -> Result<SignalSet> {
+        signals_from_traverse(
+            schema,
+            source_node_id,
+            |schema, node_type, edge_type, direction, source_node_id, page_size| {
+                Box::pin(self.client.traverse_neighbors_paged(
+                    schema,
+                    node_type,
+                    edge_type,
+                    direction,
+                    source_node_id,
+                    page_size,
+                ))
+            },
+        )
+        .await
+    }
+
+    /// KnownResolution を Signal ノード経由で復元する（HAS_SIGNAL 辺の走査）。
+    ///
+    /// Issue #39: 旧実装は `fetch_snapshot` で schema 全体を取得していたため、本番規模の
+    /// schema では `guard_snapshot_complete` の fail closed に引っかかり、呼び出し元
+    /// （`advisor::api::draft_with_materials` は warn ログを出して空 `Vec` に縮退、
+    /// `rmcp_server.rs` の MCP tool `search_known_resolutions` はエラーをそのまま返す）の
+    /// KR 照合がサイレントに常時失敗していた。KR ノードごとに `HAS_SIGNAL` 辺を 1-hop
+    /// traversal する実装へ置き換え、snapshot 取得を経路から外す。
+    pub async fn load_known_resolutions(&self, schema: &str) -> Result<Vec<KnownResolution>> {
+        let kr_nodes = self.query_known_resolution_nodes(schema).await?;
+        if kr_nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // KR ノードごとに逐次 traversal する（`corpus.rs::collect_incoming_edges` と同じ、
+        // このコードベースの既存の流儀）。並列化・別軸取得（例: HAS_SIGNAL 辺をまとめて
+        // 引く新規 RPC）は今回のスコープ外（KR 件数が現状小さく、N+1 の実害なしとレビュー
+        // 済み。件数が増えた場合の将来の検討事項として残す）。
+        let mut kr_signals: HashMap<String, SignalSet> = HashMap::new();
+        for node in &kr_nodes {
+            let signals = self
+                .signals_of(schema, &node.node_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "load known resolution signals: kr_node_id={} schema={schema}",
+                        node.node_id
+                    )
+                })?;
+            kr_signals.insert(node.node_id.clone(), signals);
+        }
+        known_resolutions_from_nodes(kr_nodes, kr_signals)
+    }
+
+    /// 取得済み snapshot を使う変種（evaluate の hot path 用、ManualV1 の `live_corpus`
+    /// または LegacySection の `fetch_snapshot` の呼び出し元が渡す snapshot を使う）。
     pub async fn load_known_resolutions_with(
         &self,
         schema: &str,
         snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
     ) -> Result<Vec<KnownResolution>> {
-        let kr_nodes = self
-            .client
-            .query_nodes(schema, KIND_KNOWN_RESOLUTION, Vec::new(), 1000)
-            .await
-            .context("load known resolutions")?;
+        let kr_nodes = self.query_known_resolution_nodes(schema).await?;
         if kr_nodes.is_empty() {
             return Ok(Vec::new());
         }
@@ -570,39 +788,7 @@ impl KnowledgeStore {
                     .insert(Signal::new(value));
             }
         }
-        kr_nodes
-            .into_iter()
-            .map(|node| {
-                let attrs = &node.attributes;
-                let get = |key: &str| attrs.get(key).cloned().unwrap_or_default();
-                Ok(KnownResolution {
-                    id: attrs
-                        .get("kr_id")
-                        .cloned()
-                        .ok_or_else(|| anyhow!("KnownResolution missing kr_id"))?,
-                    signal_set: kr_signals.remove(&node.node_id).unwrap_or_default(),
-                    applicability: get("applicability"),
-                    answer: get("answer_text"),
-                    source_authority: match get("source_authority").as_str() {
-                        "non_authoritative" => SourceAuthority::NonAuthoritative,
-                        _ => SourceAuthority::Authoritative,
-                    },
-                    root_cause: match get("root_cause").as_str() {
-                        "retrieval_miss" => RootCause::RetrievalMiss,
-                        _ => RootCause::KnowledgeError,
-                    },
-                    grade: Grade::parse_label(&get("grade")),
-                    approval_count: get("approval_count").parse().unwrap_or(0),
-                    rejection_count: get("rejection_count").parse().unwrap_or(0),
-                    approver_set: csv_list(&get("approver_set")),
-                    origin: get("origin"),
-                    binding: parse_binding(attrs.get("binding")),
-                    registration_trigger: get("registration_trigger"),
-                    knowledge_class: get("knowledge_class"),
-                    outcome_ref: csv_list(&get("outcome_ref")),
-                })
-            })
-            .collect()
+        known_resolutions_from_nodes(kr_nodes, kr_signals)
     }
 
     pub async fn insert_known_resolution(
@@ -656,9 +842,18 @@ impl KnowledgeStore {
     }
 
     /// 会話層: support_case の累積 signal 集合を HAS_SIGNAL 辺から復元する（S1-11 追記 3）。
+    ///
+    /// Issue #39: 旧実装は `fetch_snapshot`（`GetGraphSnapshot`、上限 `SNAPSHOT_MAX_NODES`）で
+    /// schema 全体を取得していた。1 case の signal を読むだけなのに schema 全体が必要という
+    /// 設計だったため、本番規模（`urtect`）ではノード数が上限を超え `guard_snapshot_complete`
+    /// の fail closed に必ず引っかかり、`GET /admin/api/threads/{case_id}` が 500 になっていた。
+    /// case ノードを起点に `HAS_SIGNAL` 辺だけを 1-hop traversal する実装へ置き換え、
+    /// snapshot 取得を経路から完全に外す。
     pub async fn load_case_signals(&self, schema: &str, case_id: &str) -> Result<SignalSet> {
-        let snapshot = self.fetch_snapshot(schema).await?;
-        Ok(case_signals_from_snapshot(schema, case_id, &snapshot))
+        let case_node_id = case_signal_node_id(schema, case_id);
+        self.signals_of(schema, &case_node_id)
+            .await
+            .with_context(|| format!("load case signals: case_id={case_id} schema={schema}"))
     }
 
     /// 会話層: 今ターンの signal を support_case に加算する（Signal ノード + HAS_SIGNAL 辺 upsert）。
@@ -671,7 +866,7 @@ impl KnowledgeStore {
         if signals.is_empty() {
             return Ok(());
         }
-        let case_node_id = harness_node_id(schema, "support_case", case_id);
+        let case_node_id = case_signal_node_id(schema, case_id);
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
         for signal in signals {
@@ -1920,6 +2115,342 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    // ---- Issue #39: load_case_signals / load_known_resolutions を snapshot 非依存にする ----
+    //
+    // 本番 `urtect` schema はノード数が `SNAPSHOT_MAX_NODES`（5000）を超えており、1 case の
+    // signal を読むためだけに `fetch_snapshot` でグラフ全体を取得する旧実装は
+    // `guard_snapshot_complete` の fail closed に必ず引っかかって 500 になっていた
+    // （`GET /admin/api/threads/{case_id}`）。case / KnownResolution ノードを起点に
+    // `HAS_SIGNAL` 辺を traversal で 1-hop だけ辿る実装に置き換える。この節はその回帰防止。
+
+    fn signal_node_result(node_id: &str, value: &str) -> crate::proto::graphrag::NodeResult {
+        crate::proto::graphrag::NodeResult {
+            node_id: node_id.to_string(),
+            node_type: "Signal".to_string(),
+            attributes: attrs(&[("value", value)]),
+        }
+    }
+
+    #[test]
+    fn signal_set_from_node_results_reads_the_value_attribute() {
+        let results = vec![
+            signal_node_result("urtect:gen1:Signal:power_failure", "power_failure"),
+            signal_node_result("urtect:gen1:Signal:smoke", "smoke"),
+        ];
+        let signals = signal_set_from_node_results(&results);
+        assert_eq!(
+            signals,
+            [Signal::new("power_failure"), Signal::new("smoke")]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn signal_set_from_node_results_ignores_missing_value_attribute() {
+        // value 属性を欠いた NodeResult は黙って捨てる（`signal_value_index` の
+        // snapshot 版と同じ欠損データの扱いに揃える）。
+        let malformed = crate::proto::graphrag::NodeResult {
+            node_id: "urtect:gen1:Signal:broken".to_string(),
+            node_type: "Signal".to_string(),
+            attributes: attrs(&[("not_value", "x")]),
+        };
+        let signals = signal_set_from_node_results(&[malformed]);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn signal_set_from_node_results_empty_input_is_empty_set() {
+        let signals = signal_set_from_node_results(&[]);
+        assert!(signals.is_empty());
+    }
+
+    /// テスト専用ヘルパ: `snapshot` から「`edge_type=="HAS_SIGNAL"` かつ
+    /// `from_id==source_node_id`」を満たす辺の `to_id` を集め、対応する `snapshot.nodes` から
+    /// `NodeResult` 相当を機械的に組み立てる。意図的に `node_type` では絞り込まない
+    /// （その絞り込みは production 側の `signal_set_from_node_results` が担う前提を
+    /// このテストで検証するため）。traversal 側の入力を手書きの別配列で用意すると、
+    /// snapshot 側フィルタ（`case_signals_from_snapshot`）だけを壊す変更を見逃すため、
+    /// 両実装の入力を同じ snapshot fixture から導出することで検出力を持たせる
+    /// （レビュー W1 後半）。本体コードには追加しない、テスト専用の関数。
+    fn derive_traverse_results_from_snapshot(
+        snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+        source_node_id: &str,
+    ) -> Vec<crate::proto::graphrag::NodeResult> {
+        let node_index: HashMap<&str, &crate::proto::graphrag::GraphNode> = snapshot
+            .nodes
+            .iter()
+            .map(|n| (n.node_id.as_str(), n))
+            .collect();
+        snapshot
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == "HAS_SIGNAL" && e.from_id == source_node_id)
+            .filter_map(|e| node_index.get(e.to_id.as_str()))
+            .map(|n| crate::proto::graphrag::NodeResult {
+                node_id: n.node_id.clone(),
+                node_type: n.node_type.clone(),
+                attributes: n.attributes.clone(),
+            })
+            .collect()
+    }
+
+    /// 等価性テスト: 1つの snapshot fixture に3種のノイズ（別 case からの HAS_SIGNAL 辺・
+    /// 対象 case からの HAS_SIGNAL 以外の辺・HAS_SIGNAL の先が Signal ではないノード）を
+    /// 混ぜ、旧実装が使っていた `case_signals_from_snapshot`（snapshot 経由）と、新しい
+    /// traversal 経由の純関数 `signal_set_from_node_results` が同じ `SignalSet` を返す
+    /// ことを固定する。traversal 側の入力は `derive_traverse_results_from_snapshot` で
+    /// 同じ fixture から機械的に導出するため、`case_signals_from_snapshot` の3フィルタ
+    /// （`edge_type=="HAS_SIGNAL"` / `from_id==case_node_id` / `node_type=="Signal"`）の
+    /// どれを壊してもこのテストが検出する（レビュー W1 後半。以前は traversal 側を
+    /// 手書きの別配列で用意しており、このいずれのフィルタが壊れても検出できなかった）。
+    #[test]
+    fn traversal_and_snapshot_paths_agree_on_the_same_case_signal_edges() {
+        use crate::proto::graphrag::{GetGraphSnapshotResponse, GraphEdge, GraphNode as ProtoNode};
+
+        let schema = "urtect";
+        let case_id = "case-1";
+        let case_node_id = harness_node_id(schema, "support_case", case_id);
+        let other_case_node_id = harness_node_id(schema, "support_case", "case-2");
+        let signal_a_id = harness_node_id(schema, "Signal", "power_failure");
+        let signal_b_id = harness_node_id(schema, "Signal", "smoke");
+        let wrong_case_signal_id =
+            harness_node_id(schema, "Signal", "should_be_excluded_wrong_case");
+        let wrong_edge_signal_id =
+            harness_node_id(schema, "Signal", "should_be_excluded_wrong_edge_type");
+        let non_signal_node_id =
+            harness_node_id(schema, "product", "should_be_excluded_non_signal_node");
+
+        let mk_node = |node_id: &str, node_type: &str, pairs: &[(&str, &str)]| ProtoNode {
+            node_id: node_id.to_string(),
+            node_type: node_type.to_string(),
+            display_text: String::new(),
+            degree: 0,
+            community: None,
+            attributes: attrs(pairs),
+        };
+
+        let snapshot = GetGraphSnapshotResponse {
+            nodes: vec![
+                mk_node(&case_node_id, "support_case", &[("case_id", case_id)]),
+                mk_node(
+                    &other_case_node_id,
+                    "support_case",
+                    &[("case_id", "case-2")],
+                ),
+                mk_node(&signal_a_id, "Signal", &[("value", "power_failure")]),
+                mk_node(&signal_b_id, "Signal", &[("value", "smoke")]),
+                mk_node(
+                    &wrong_case_signal_id,
+                    "Signal",
+                    &[("value", "should_be_excluded_wrong_case")],
+                ),
+                mk_node(
+                    &wrong_edge_signal_id,
+                    "Signal",
+                    &[("value", "should_be_excluded_wrong_edge_type")],
+                ),
+                mk_node(
+                    &non_signal_node_id,
+                    "product",
+                    &[("value", "should_be_excluded_non_signal_node")],
+                ),
+            ],
+            edges: vec![
+                GraphEdge {
+                    edge_id: String::new(),
+                    from_id: case_node_id.clone(),
+                    to_id: signal_a_id.clone(),
+                    edge_type: "HAS_SIGNAL".to_string(),
+                },
+                GraphEdge {
+                    edge_id: String::new(),
+                    from_id: case_node_id.clone(),
+                    to_id: signal_b_id.clone(),
+                    edge_type: "HAS_SIGNAL".to_string(),
+                },
+                // ノイズ1: 別 case からの HAS_SIGNAL 辺（`from_id` が対象 case ではない）。
+                GraphEdge {
+                    edge_id: String::new(),
+                    from_id: other_case_node_id,
+                    to_id: wrong_case_signal_id,
+                    edge_type: "HAS_SIGNAL".to_string(),
+                },
+                // ノイズ2: 対象 case からの辺だが HAS_SIGNAL ではない。
+                GraphEdge {
+                    edge_id: String::new(),
+                    from_id: case_node_id.clone(),
+                    to_id: wrong_edge_signal_id,
+                    edge_type: "MENTIONS".to_string(),
+                },
+                // ノイズ3: 対象 case からの HAS_SIGNAL 辺だが、先が Signal ノードではない。
+                GraphEdge {
+                    edge_id: String::new(),
+                    from_id: case_node_id.clone(),
+                    to_id: non_signal_node_id,
+                    edge_type: "HAS_SIGNAL".to_string(),
+                },
+            ],
+            truncated: false,
+            total_node_count: 7,
+        };
+
+        let expected: SignalSet = [Signal::new("power_failure"), Signal::new("smoke")]
+            .into_iter()
+            .collect();
+
+        let from_snapshot = case_signals_from_snapshot(schema, case_id, &snapshot);
+        assert_eq!(
+            from_snapshot, expected,
+            "sanity: fixture のノイズが snapshot 側の結果に混入していない"
+        );
+
+        let derived_nodes = derive_traverse_results_from_snapshot(&snapshot, &case_node_id);
+        let from_traversal = signal_set_from_node_results(&derived_nodes);
+
+        assert_eq!(from_snapshot, from_traversal);
+    }
+
+    /// 再発防止テスト: `load_case_signals` の内部注入可能関数 `signals_from_traverse` が
+    /// `GetGraphSnapshot`/`fetch_snapshot` ではなく traversal 系（`traverse_neighbors_paged`
+    /// 相当のフェイク）を呼ぶことを固定する。フェイクへ渡る node_type・edge_type・direction・
+    /// page_size は呼び出し元が渡した値ではなく `signals_from_traverse` 内部の
+    /// `SIGNAL_NODE_TYPE` / `SIGNAL_EDGE_TYPE` / `SIGNAL_TRAVERSE_DIRECTION` /
+    /// `SIGNAL_TRAVERSE_PAGE_SIZE` から来る（呼び出し側は `schema` と `source_node_id` しか
+    /// 渡せないシグネチャになった、レビュー W1/W2）。フェイク内の assert は、これら定数の
+    /// シンボルではなく期待値をリテラルで書く。定数シンボル同士の比較（
+    /// `assert_eq!(node_type, SIGNAL_NODE_TYPE)` 等）だと、production 側の定数の値を
+    /// 書き換えてもテストが参照する側も同じ定数を経由するため常に一致してしまい、値の
+    /// 変更を一切検出できない（Issue #39 レビュー残課題1）。リテラル比較にすることで、
+    /// このテストは「正しい値は何か」を自身の中で独立に主張し、production 定数の書き換えを
+    /// 検出できる。このテストのフェイクは `Result<Vec<NodeResult>>` しか返せない型を
+    /// 要求されるため、`GetGraphSnapshotResponse` はこのテストのコードパスに一切登場しない
+    /// （＝構造的に snapshot 取得が起き得ないことの保証）。
+    #[tokio::test]
+    async fn load_case_signals_calls_traverse_with_expected_arguments_not_snapshot() {
+        let case_node_id = harness_node_id("urtect", "support_case", "case-1");
+        let expected_source = case_node_id.clone();
+        let results = vec![signal_node_result(
+            &harness_node_id("urtect", "Signal", "power_failure"),
+            "power_failure",
+        )];
+
+        let signals = signals_from_traverse(
+            "urtect",
+            &case_node_id,
+            |schema, node_type, edge_type, direction, source_node_id, page_size| {
+                // フェイクは受け取った引数を検証してから、実 vegapunk 呼び出し無しで
+                // 結果を返す。「outgoing」であること（`append_case_signals` が
+                // `from_id: case_node_id, to_id: signal_node_id` で書くため、case が
+                // 辺の起点）が特に重要（"out" ではない）。
+                //
+                // 期待値はリテラルで書く（`SIGNAL_NODE_TYPE` 等の定数シンボルと比較しない）。
+                // 定数同士の比較だと、production 側の定数の値を書き換えても、その定数を
+                // 経由して読んだ側の値まで一緒に書き換わるため常に一致してしまい、
+                // 値の変更を一切検出できない再発防止テストになる（Issue #39 レビュー残課題1）。
+                assert_eq!(schema, "urtect");
+                assert_eq!(node_type, "Signal");
+                assert_eq!(edge_type, "HAS_SIGNAL");
+                assert_eq!(direction, "outgoing");
+                assert_eq!(source_node_id, expected_source);
+                assert_eq!(page_size, 1000);
+                let results = results.clone();
+                Box::pin(async move { Ok(results) })
+            },
+        )
+        .await
+        .expect("builds signal set from the fake traversal result");
+
+        assert_eq!(
+            signals,
+            [Signal::new("power_failure")].into_iter().collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_case_signals_traversal_propagates_fetch_errors() {
+        // フェイクが失敗を返した場合、`load_case_signals` 相当の呼び出し元へエラーが
+        // そのまま伝播すること（握りつぶさない）。
+        let case_node_id = harness_node_id("urtect", "support_case", "case-1");
+        let result = signals_from_traverse("urtect", &case_node_id, |_, _, _, _, _, _| {
+            Box::pin(async move { Err(anyhow!("vegapunk unavailable")) })
+        })
+        .await;
+        assert!(result.is_err());
+    }
+
+    /// 再発防止テスト: `case_signal_node_id` は `load_case_signals`（読み取り、`signals_of`
+    /// 経由）と `append_case_signals`（書き込み）の両方が case ノード id の組み立てに使う
+    /// 唯一のヘルパである（Issue #39 レビュー残課題3）。以前はこの2箇所が個別に
+    /// `harness_node_id(schema, "support_case", case_id)` を書いており、片方だけ kind 文字列
+    /// （"support_case"）がずれても検出できなかった。両呼び出し元は本テストではなく
+    /// `case_signal_node_id` を共有することで構造的に一致するが、ここでは
+    /// `case_signal_node_id` 自体が期待どおり `harness_node_id` へ委譲していることを
+    /// pin しておく（このヘルパの契約が壊れれば読み取り・書き込みの両方が同時に壊れる）。
+    #[test]
+    fn case_signal_node_id_matches_between_read_and_write_paths() {
+        let schema = "urtect";
+        let case_id = "case-1";
+        assert_eq!(
+            case_signal_node_id(schema, case_id),
+            harness_node_id(schema, "support_case", case_id)
+        );
+    }
+
+    /// 変更2の軽量テスト: KnownResolution ノード → Signal traversal → SignalSet が、
+    /// 純関数レベルで `KnownResolution.signal_set` に正しく反映されることを確認する
+    /// （`load_known_resolutions` 内の kr_signals 組み立てと同じ経路）。
+    #[test]
+    fn known_resolutions_from_nodes_reflects_traversal_derived_signal_set() {
+        let kr_node = crate::proto::graphrag::NodeResult {
+            node_id: "urtect:gen1:KnownResolution:kr-1".to_string(),
+            node_type: "KnownResolution".to_string(),
+            attributes: attrs(&[
+                ("kr_id", "kr-1"),
+                ("answer_text", "電源ケーブルをご確認ください。"),
+                ("applicability", "全モデル"),
+            ]),
+        };
+        // kr ノードごとの traverse_neighbors_paged(schema, "Signal", "HAS_SIGNAL",
+        // "outgoing", kr_node.node_id, ...) が返す想定の NodeResult 列。
+        let traverse_results = vec![signal_node_result(
+            "urtect:gen1:Signal:power_failure",
+            "power_failure",
+        )];
+        let mut kr_signals: HashMap<String, SignalSet> = HashMap::new();
+        kr_signals.insert(
+            kr_node.node_id.clone(),
+            signal_set_from_node_results(&traverse_results),
+        );
+
+        let resolutions = known_resolutions_from_nodes(vec![kr_node], kr_signals).expect("builds");
+
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(
+            resolutions[0].signal_set,
+            [Signal::new("power_failure")].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_empty_signal_set_when_kr_has_no_signal_edges() {
+        // 走査で HAS_SIGNAL 辺が 0 本だった KR（kr_signals に対応エントリが無い）は
+        // 空の SignalSet になる（既存の snapshot 版と同じ `unwrap_or_default` の挙動）。
+        let kr_node = crate::proto::graphrag::NodeResult {
+            node_id: "urtect:gen1:KnownResolution:kr-2".to_string(),
+            node_type: "KnownResolution".to_string(),
+            attributes: attrs(&[
+                ("kr_id", "kr-2"),
+                ("answer_text", "x"),
+                ("applicability", "y"),
+            ]),
+        };
+        let resolutions =
+            known_resolutions_from_nodes(vec![kr_node], HashMap::new()).expect("builds");
+        assert_eq!(resolutions.len(), 1);
+        assert!(resolutions[0].signal_set.is_empty());
     }
 
     #[test]
