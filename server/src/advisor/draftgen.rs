@@ -103,8 +103,18 @@ fn condition_vocabulary_ja(key: ConditionKey) -> &'static str {
 /// - ペルソナ規則(§2.1): 専属アドバイザーとして話す、企業 CS 定型句を使わない、
 ///   自社製品を「URTECT の」と呼ぶ
 /// - 接地2層規則・安全下限(§2.2)
-/// - URTECT 優遇規則(§2.3、7 型番の列挙)
-/// - リード提案規則(§4.4 手順1、`lead_offered == false` のときだけ注入)
+/// - 解決策の提示順序規則(§2.3): 提案は (1) お金のかからない習慣・設定 → (2) 汎用の対策\
+///   カテゴリ → (3) 製品、の順。製品の中でだけURTECTを先に挙げる(7型番の列挙)。自社製品\
+///   言及は1応答あたり最大2件。own_product材料は「使える選択肢」であり毎回言及する義務では\
+///   ない
+/// - 概念的な質問への回答規則(§2.3): 考え方と根拠で答え、製品を挟まない
+/// - 除外・限定の尊重規則(§2.3、解決策の提示順序規則・`DraftMode::Answer` の提案ファースト\
+///   規則より優先): 顧客が除外・限定した種類は提案しない。除外されていない範囲を、他社\
+///   材料を中心とした資料の範囲で答える。提案ファースト規則の「必ず名指しで提案する」も\
+///   この規則の対象(除外された種類)を除く(reviewer 指摘 Critical 1 是正、Issue #34 実害 (b))
+/// - リード提案規則(§4.4 手順1、`lead_offered == false` のときだけ注入)。§2.3 により、\
+///   価格・購入方法・設置依頼・機種の絞り込み等の明確な導入意欲シグナルが読み取れたターン\
+///   だけに限定する
 /// - [`MARKDOWN_BAN_RULE`](常時)・[`CONTINUATION_OPENER_RULE`](`is_continuation == true` のときだけ)
 /// - 資料の使い方の説明(プロンプトインジェクション対策。`harness::reply` と同じ理由づけ)
 /// - `mode` による分岐(Answer は提案指示、Clarify は 1 問だけの聞き返し指示)
@@ -156,20 +166,36 @@ pub fn build_advisor_system_prompt(
          - 防犯効果を保証する表現(「絶対に防げます」「100%安全」等)は使わない。\n\
          - 資格・工事を要する作業(分電盤・屋内配線等)の具体的な手順は案内しない。\n\
          \n\
-         URTECT優遇規則:\n\
-         - 相談条件に合致するURTECT製品があれば先に提案する。URTECTの取扱型番は次の7つ: \
-         ADC-V523 / ADC-V523X / ADC-V724 / ADC-V724X / ADC-VC729P / ADC-VC727P / \
-         ADC-VC827P。\n\
-         - 合致するURTECT製品が無ければ、資料の範囲で他社のカテゴリ・製品を紹介し、\
-         詳細確認は公式サイトへ誘導する。他社を貶めない。\n",
+         解決策の提示順序規則:\n\
+         - 通常の相談では、提案は (1) お金のかからない習慣・設定(施錠の徹底・インターホン\
+         対応の見直し等) → (2) 汎用の対策カテゴリ(補助錠・センサーライト・見守りサービス等、\
+         他社材料を含む) → (3) 製品、の順に検討する。製品だけを単独で提案しない。ただし、\
+         製品を直接尋ねられた場合はこの限りではなく、名指しで製品を提案してよい。\n\
+         - 製品を挙げる場面では、その中でだけURTECT製品を先に挙げる。URTECTの取扱型番は\
+         次の7つ: ADC-V523 / ADC-V523X / ADC-V724 / ADC-V724X / ADC-VC729P / \
+         ADC-VC727P / ADC-VC827P。合致するURTECT製品が無ければ、資料の範囲で他社の\
+         カテゴリ・製品を紹介し、詳細確認は公式サイトへ誘導する。他社を貶めない。\n\
+         - 1つの応答で自社製品(URTECT製品)に言及するのは多くても2件までにする。\n\
+         - 資料として渡されたown_product(自社製品)材料は「使える選択肢」であり、毎回\
+         言及する義務ではない。相談内容に合わなければ言及しなくてよい。\n\
+         \n\
+         概念的な質問への回答規則:\n\
+         - 「カメラは意味ある?」「防犯って何から?」のような、意味や考え方を問う概念的な\
+         質問には、考え方と根拠で答え、製品を挟まない。必要なら最後に一言だけ触れる程度に\
+         とどめる。\n\
+         \n\
+         除外・限定の尊重規則(解決策の提示順序規則・提案ファースト規則より優先):\n\
+         - 顧客が特定の種類の対策を除外・限定した場合(例:「カメラ以外で」)、その種類は\
+         提案しない。除外されていない範囲を、他社材料を中心とした資料の範囲で答える。\n",
     );
     if !lead_offered {
         p.push_str(
             "\nリード提案規則:\n\
-             - 導入・購入の意欲が読み取れたら、応答の末尾で提案を1文だけ加えてよい\
-             (1会話につき1回まで。今回はまだ提案していない)。提案する場合は、必ず\
-             「担当者から詳しくご案内できます。」という一文をそのまま使うこと。\
-             言い換えないこと。\n",
+             - 担当者連絡の提案は、価格・購入方法・設置依頼・機種の絞り込みへの言及など、\
+             明確な導入意欲が読み取れたターンだけ、応答の末尾に1文だけ加えてよい(1会話に\
+             つき1回まで。今回はまだ提案していない)。概念的な質問や初回の一般相談だけでは\
+             提案しない。提案する場合は、必ず「担当者から詳しくご案内できます。」という\
+             一文をそのまま使うこと。言い換えないこと。\n",
         );
     }
     p.push_str(
@@ -190,8 +216,9 @@ pub fn build_advisor_system_prompt(
                  - 応答の前半で、その時点で分かっている条件からできる具体的な提案を必ず書く。\n\
                  - 追加の質問をする場合は1ターンに最大1問とし、必ず提案を書いたあとに添える。\n\
                  - 条件が既に足りている話題には、重ねて質問しない。\n\
-                 - 製品のおすすめを直接聞かれた場合は、資料にある製品を必ず名指しで提案する。\
-                 条件が不明な点は「賃貸なら〜」のように仮定を明示したうえで提案する。\n\
+                 - 製品のおすすめを直接聞かれた場合は、除外・限定の尊重規則で除外された\
+                 種類を除き、資料にある製品を必ず名指しで提案する。条件が不明な点は\
+                 「賃貸なら〜」のように仮定を明示したうえで提案する。\n\
                  - 質問だけで終える応答(具体的な提案を一切書かない応答)は書かない。\n",
             );
         }
@@ -611,6 +638,62 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_states_solution_priority_order_rule() {
+        // design doc §2.3: 提案は (1) お金のかからない習慣・設定 → (2) 汎用の対策カテゴリ →
+        // (3) 製品、の順で検討する。自社製品(URTECT)言及は1応答あたり最大2件まで
+        // (本番で「営業的すぎる」実害が出たための順序規則、Issue #34)。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(p.contains("お金のかからない習慣・設定"), "{p}");
+        assert!(p.contains("汎用の対策カテゴリ"), "{p}");
+        assert!(p.contains("多くても2件"), "{p}");
+    }
+
+    #[test]
+    fn system_prompt_states_conceptual_question_rule() {
+        // design doc §2.3: 「カメラは意味ある?」のような概念的な質問には考え方と根拠で
+        // 答え、製品を挟まない(本番実害 (a) の是正、Issue #34)。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(p.contains("概念的な質問"), "{p}");
+        assert!(p.contains("製品を挟まない"), "{p}");
+    }
+
+    #[test]
+    fn system_prompt_states_exclusion_respect_rule() {
+        // design doc §2.3: 「カメラ以外で」のように顧客が除外・限定した種類は提案しない。
+        // 除外されていない範囲を他社材料中心の資料の範囲で答える(本番実害 (b) の是正、
+        // Issue #34)。
+        //
+        // reviewer 指摘 Critical 1 是正: この規則は後段の解決策の提示順序規則・提案ファースト
+        // 規則(「必ず名指しで提案する」)と同じプロンプトに同居しており、優先関係が
+        // 明示されていないと後段の強い語("必ず")に打ち消されて除外要求が無視される
+        // (実害 (b) の再現経路)。優先を明示する語をプロンプト自身に固定する。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(p.contains("除外・限定"), "{p}");
+        assert!(p.contains("カメラ以外で"), "{p}");
+        assert!(
+            p.contains("解決策の提示順序規則・提案ファースト規則より優先"),
+            "exclusion rule must state it takes priority over the later suggestion rules: {p}"
+        );
+        // Warning 1 是正: 「除外された領域は資料の範囲で答える」は字義どおりだと除外した
+        // 種類自体を資料で答えよとも読め、1文目と自己矛盾する。「除外されていない範囲」で
+        // 一意にする。
+        assert!(
+            p.contains("除外されていない範囲"),
+            "exclusion rule must unambiguously point at the non-excluded range, not the \
+             excluded one: {p}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_states_own_product_materials_are_optional() {
+        // design doc §2.3: 注入された own_product 材料は「使える選択肢」であり毎回言及する
+        // 義務ではない。相談内容に合わなければ言及しなくてよい。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(p.contains("使える選択肢"), "{p}");
+        assert!(p.contains("毎回言及する義務ではない"), "{p}");
+    }
+
+    #[test]
     fn lead_offer_marker_is_contained_in_the_lead_solicitation_rule() {
         // api.rs::should_burn_lead_offered が LEAD_OFFER_MARKER の文字列照合で「実際に
         // リード提案文が出たか」を判定する。この定数がプロンプト文言と drift すると、
@@ -635,6 +718,19 @@ mod tests {
             !already_offered.contains("担当者から詳しくご案内できます"),
             "must not double-solicit once already offered: {already_offered}"
         );
+    }
+
+    #[test]
+    fn system_prompt_lead_solicitation_rule_requires_explicit_intent_signals() {
+        // design doc §2.3: 担当者連絡の提案は、価格・購入方法・設置依頼・機種の絞り込みなど
+        // 明確な導入意欲が読み取れたターンだけ行う(概念的な質問や初回の一般相談だけでは
+        // 提案しない、Issue #34)。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(
+            p.contains("価格・購入方法・設置依頼・機種の絞り込み"),
+            "{p}"
+        );
+        assert!(p.contains("明確な導入意欲"), "{p}");
     }
 
     #[test]
@@ -790,6 +886,24 @@ mod tests {
         // design doc §11「条件が既に足りている話題に質問を重ねない規則」。codex レビュー指摘:
         // この1項目だけ他の5点と違って直接 assert されていなかった。
         assert!(p.contains("条件が既に足りている話題"), "{p}");
+    }
+
+    #[test]
+    fn system_prompt_propose_first_rule_names_products_carves_out_excluded_categories() {
+        // reviewer 指摘 Critical 1 是正(Issue #34 実害 (b)): 「防犯カメラ以外でなにか良い
+        // ものは?」のような除外要求が入ると、product_intent 判定(understand.rs)により
+        // own_product(カメラ7型番)材料が保証注入される(materials.rs
+        // `should_guarantee_own_products`)。提案ファースト規則の「製品のおすすめを直接
+        // 聞かれた場合は、資料にある製品を必ず名指しで提案する」を単独で読むと、注入された
+        // カメラ材料を名指しで提案してしまい除外要求と正面から矛盾する。この文自体に
+        // 除外の除き書きが入っていることを固定する(除外・限定の尊重規則を読まなくても、
+        // この一文だけで矛盾が読み取れないようにするため)。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(
+            p.contains("除外・限定の尊重規則で除外された種類を除き"),
+            "the 'always name a product' sentence must carve out customer-excluded \
+             categories in the same sentence: {p}"
+        );
     }
 
     #[test]
