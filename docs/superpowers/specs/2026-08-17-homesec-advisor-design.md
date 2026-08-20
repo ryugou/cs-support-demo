@@ -90,7 +90,21 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
 ```
 
 - `line_adapter` は `product_cards` が非空のとき、テキスト応答の後に LINE カルーセルテンプレートを 1 通送る。ボタンは message action(タップで `button_message` がユーザー発話として送信され、通常パイプラインに入る)のみ。postback・独自判断はアダプタに持たせない
-- カードは最大 3 件。own_product / partner_product 材料から組み立てる(第 7.2 節)。`image_url` は任意で、無い列は画像なしで成立する。他社製品の実写画像は権利上使わず、使うのは同梱の自社製品画像と自前の汎用カテゴリ画像のみ
+- カードは最大 3 件・**最少 2 件**(複数商品の提案時のみ出す比較 UI。第 7.2 節)。own_product / partner_product 材料から組み立てる。`image_url` は任意で、無い列は画像なしで成立する。他社製品の実写画像は権利上使わず、使うのは同梱の自社製品画像と自前の汎用カテゴリ画像のみ
+
+レスポンスにはもう 1 つ任意フィールド `quick_replies` を加算する(CS 側は常に省略。省略時のアダプタ挙動は従来どおり):
+
+```json
+{
+  "quick_replies": [
+    {"label": "一戸建て", "message": "一戸建てです"},
+    {"label": "マンション・アパート", "message": "マンション・アパートです"}
+  ]
+}
+```
+
+- `line_adapter` は `quick_replies` が非空のとき、送信する最後のメッセージに LINE の quick reply items(message action のみ)として付与する。上限 6 件(LINE 仕様の 13 件より狭く運用)。label は 20 字以内に切り詰め
+- 生成は**コードの決定論のみ**: `clarify` ターンは尋ねた条件キーの語彙選択肢(顧客向けラベル)、`time_pref` ターンは営業時間内の固定スロット(「平日 10-12 時」「13-15 時」「16-18 時」)。`answer` 等その他のターンでは付けない
 
 `reply_kind` の値は advisor 固有に次の 8 値とする。管理画面のバッジ表示に追加する:
 
@@ -234,8 +248,12 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 
 ### 7.2 製品カードの添付判定(決定論)
 
-1. 今回のターンで注入した own_product / partner_product 材料(`card_description` を持つもの)それぞれについて、出口関門を通過した最終応答文(正規化後)に `card_match_terms`(省略時は `title_ja` / `product_key`)のいずれかが含まれるかを文字列照合する
-2. 合致した材料のうち、case の `shown_product_cards`(material_key 単位)に未記録のものをカード化する。3 件を超えるときは own_product を優先し、残りは検索ヒット順
+カルーセルは「**複数の商品を提案したときの比較 UI**」であり、言及の装飾ではない(本番で、提案していない製品までカード化される実害が出たための規則)。
+
+1. 今回のターンで注入した own_product / partner_product 材料(`card_description` を持つもの)について、出口関門を通過した最終応答文(正規化後)との合致を判定する:
+   - **own_product**: 応答文にその**型番**(`product_key`。既存の型番検出・正規化と同じ規約)が明示されている場合のみ合致。`card_match_terms` の汎用語(「防犯カメラ」等)では合致させない
+   - **partner_product**: `card_match_terms`(省略時は `title_ja`)の文字列照合(カテゴリ語がそのまま製品の同一性であるため現行どおり)
+2. 合致した材料のうち、case の `shown_product_cards`(material_key 単位)に未記録のものをカード候補とする。**候補が 2 件以上のときだけ** `product_cards` を返す(0〜1 件のターンはカードを出さない)。3 件を超えるときは own_product を優先し、残りは検索ヒット順
 3. 送出したら `shown_product_cards` へ追記する(同じカードを同一会話で繰り返し出さない)
 4. カードの `image_url` は advisor 自ホストの `/static/products/` の同梱画像(自社製品・汎用カテゴリ)のみ。今回注入していない材料のカードは組み立てない
 
