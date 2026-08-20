@@ -16,6 +16,7 @@ use crate::advisor::cards::{self, ProductCard};
 use crate::advisor::decide::{self, AdvisorAction, AdvisorCaseAttrs};
 use crate::advisor::draftgen::{self, DraftMode};
 use crate::advisor::materials::{self, AdvisorMaterial};
+use crate::advisor::quick_replies::{self, QuickReplyItem};
 use crate::advisor::understand::{self, ConditionKey};
 use crate::api::{authorize, validate, HistoryEntry, HistoryRole, ReplyRequest};
 use crate::config::AppConfig;
@@ -82,6 +83,10 @@ pub struct AdvisorReplyResponse {
     pub case_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product_cards: Option<Vec<ProductCard>>,
+    /// `clarify` / `time_pref` ターンの選択肢(design doc §3.3 加算フィールド、Issue #34)。
+    /// CS 側は常に省略する(同上の理由)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quick_replies: Option<Vec<QuickReplyItem>>,
 }
 
 /// `/{project_id}/api/reply` の router を組み立てる。
@@ -469,15 +474,17 @@ async fn advisor_reply_handler(
     )
     .await;
 
-    let (reply_text, reply_kind, final_conditions, materials_used): (
+    let (reply_text, reply_kind, final_conditions, materials_used, quick_reply_items): (
         String,
         &'static str,
         Vec<(ConditionKey, String)>,
         Vec<AdvisorMaterial>,
+        Option<Vec<QuickReplyItem>>,
     ) = match understanding_result {
         Err(err) => {
             // design doc §4.3 末尾・§8: 理解 LLM が(内部で1回再試行しても)失敗したら
-            // fallback 定型を返す。手順5〜9はすべてスキップする。
+            // fallback 定型を返す。手順5〜9はすべてスキップする。fallback ターンは
+            // quick_replies を出さない(仕様: reply_kind="fallback"では出さない)。
             tracing::warn!(
                 error = %err,
                 request_id = %ctx.request_id,
@@ -490,6 +497,7 @@ async fn advisor_reply_handler(
                 "fallback",
                 accumulated_conditions.clone(),
                 Vec::new(),
+                None,
             )
         }
         Ok(mut understanding) => {
@@ -540,86 +548,106 @@ async fn advisor_reply_handler(
             // doc comment 参照)は match の前に一括で適用する(`apply_action_contract`)。
             // match 自体は応答文・reply_kind・materials の組み立てだけを担う。
             apply_action_contract(&action, &mut conv, &mut advisor_attrs);
-            let (text, kind, materials_list): (String, &'static str, Vec<AdvisorMaterial>) =
-                match action {
-                    AdvisorAction::Safety => {
-                        (canned::SAFETY_TEXT.to_string(), "safety", Vec::new())
+            let (text, kind, materials_list, quick_replies): (
+                String,
+                &'static str,
+                Vec<AdvisorMaterial>,
+                Option<Vec<QuickReplyItem>>,
+            ) = match action {
+                AdvisorAction::Safety => {
+                    (canned::SAFETY_TEXT.to_string(), "safety", Vec::new(), None)
+                }
+                AdvisorAction::TimePrefContinue => (
+                    canned::lead_time_pref_reask(&state.config.api.business_hours),
+                    "time_pref",
+                    Vec::new(),
+                    quick_replies::for_time_pref(),
+                ),
+                AdvisorAction::OutOfDomain => (
+                    canned::OUT_OF_DOMAIN_TEXT.to_string(),
+                    "out_of_domain",
+                    Vec::new(),
+                    None,
+                ),
+                AdvisorAction::Handoff => (
+                    canned::handoff(&state.handoff_contact_text),
+                    "handoff",
+                    Vec::new(),
+                    None,
+                ),
+                AdvisorAction::LeadSolicit => (
+                    canned::lead_solicit(&state.config.api.business_hours),
+                    "time_pref",
+                    Vec::new(),
+                    quick_replies::for_time_pref(),
+                ),
+                AdvisorAction::LeadConfirmed { slot } => {
+                    (canned::lead_confirmed(&slot), "lead", Vec::new(), None)
+                }
+                AdvisorAction::Clarify { missing } => {
+                    // design doc §6 手順6: 検索クエリは「累積条件 + 相談要旨」。
+                    // understanding.summary_ja が §4.1 の「相談要旨」そのもの。
+                    let (text, materials_list) = draft_with_materials(
+                        &state,
+                        &project.schema,
+                        DraftMode::Clarify { missing: &missing },
+                        &understanding.conditions,
+                        &understanding.summary_ja,
+                        &req.message,
+                        &history_digest,
+                        is_continuation,
+                        advisor_attrs.lead_offered,
+                        understanding.product_intent,
+                    )
+                    .await;
+                    if should_burn_lead_offered(advisor_attrs.lead_offered, &text) {
+                        advisor_attrs.lead_offered = true;
                     }
-                    AdvisorAction::TimePrefContinue => (
-                        canned::lead_time_pref_reask(&state.config.api.business_hours),
-                        "time_pref",
-                        Vec::new(),
-                    ),
-                    AdvisorAction::OutOfDomain => (
-                        canned::OUT_OF_DOMAIN_TEXT.to_string(),
-                        "out_of_domain",
-                        Vec::new(),
-                    ),
-                    AdvisorAction::Handoff => (
-                        canned::handoff(&state.handoff_contact_text),
-                        "handoff",
-                        Vec::new(),
-                    ),
-                    AdvisorAction::LeadSolicit => (
-                        canned::lead_solicit(&state.config.api.business_hours),
-                        "time_pref",
-                        Vec::new(),
-                    ),
-                    AdvisorAction::LeadConfirmed { slot } => {
-                        (canned::lead_confirmed(&slot), "lead", Vec::new())
+                    let kind = if text == canned::FALLBACK_TEXT {
+                        "fallback"
+                    } else {
+                        "clarify"
+                    };
+                    // fallback に差し替わったターンは quick_replies も出さない(仕様)。
+                    let quick_replies = if kind == "fallback" {
+                        None
+                    } else {
+                        quick_replies::for_clarify(&missing)
+                    };
+                    (text, kind, materials_list, quick_replies)
+                }
+                AdvisorAction::Answer => {
+                    let (text, materials_list) = draft_with_materials(
+                        &state,
+                        &project.schema,
+                        DraftMode::Answer,
+                        &understanding.conditions,
+                        &understanding.summary_ja,
+                        &req.message,
+                        &history_digest,
+                        is_continuation,
+                        advisor_attrs.lead_offered,
+                        understanding.product_intent,
+                    )
+                    .await;
+                    if should_burn_lead_offered(advisor_attrs.lead_offered, &text) {
+                        advisor_attrs.lead_offered = true;
                     }
-                    AdvisorAction::Clarify { missing } => {
-                        // design doc §6 手順6: 検索クエリは「累積条件 + 相談要旨」。
-                        // understanding.summary_ja が §4.1 の「相談要旨」そのもの。
-                        let (text, materials_list) = draft_with_materials(
-                            &state,
-                            &project.schema,
-                            DraftMode::Clarify { missing: &missing },
-                            &understanding.conditions,
-                            &understanding.summary_ja,
-                            &req.message,
-                            &history_digest,
-                            is_continuation,
-                            advisor_attrs.lead_offered,
-                            understanding.product_intent,
-                        )
-                        .await;
-                        if should_burn_lead_offered(advisor_attrs.lead_offered, &text) {
-                            advisor_attrs.lead_offered = true;
-                        }
-                        let kind = if text == canned::FALLBACK_TEXT {
-                            "fallback"
-                        } else {
-                            "clarify"
-                        };
-                        (text, kind, materials_list)
-                    }
-                    AdvisorAction::Answer => {
-                        let (text, materials_list) = draft_with_materials(
-                            &state,
-                            &project.schema,
-                            DraftMode::Answer,
-                            &understanding.conditions,
-                            &understanding.summary_ja,
-                            &req.message,
-                            &history_digest,
-                            is_continuation,
-                            advisor_attrs.lead_offered,
-                            understanding.product_intent,
-                        )
-                        .await;
-                        if should_burn_lead_offered(advisor_attrs.lead_offered, &text) {
-                            advisor_attrs.lead_offered = true;
-                        }
-                        let kind = if text == canned::FALLBACK_TEXT {
-                            "fallback"
-                        } else {
-                            "answer"
-                        };
-                        (text, kind, materials_list)
-                    }
-                };
-            (text, kind, understanding.conditions, materials_list)
+                    let kind = if text == canned::FALLBACK_TEXT {
+                        "fallback"
+                    } else {
+                        "answer"
+                    };
+                    (text, kind, materials_list, None)
+                }
+            };
+            (
+                text,
+                kind,
+                understanding.conditions,
+                materials_list,
+                quick_replies,
+            )
         }
     };
 
@@ -732,6 +760,7 @@ async fn advisor_reply_handler(
             reply_text: final_text,
             case_id,
             product_cards,
+            quick_replies: quick_reply_items,
         }),
     )
         .into_response()
@@ -1314,6 +1343,7 @@ mod tests {
             price_band: None,
             card_description: None,
             card_match_terms: None,
+            product_page_url: None,
         }
     }
 
@@ -1408,7 +1438,8 @@ mod tests {
             title: "URTECT ADC-V724".to_string(),
             description: "屋外対応・夜間撮影".to_string(),
             image_url: Some("https://advisor.example.com/static/products/adc-v724.jpg".to_string()),
-            button_text: "この製品について聞く".to_string(),
+            product_page_url: Some("https://example.com/products/adc-v724".to_string()),
+            button_text: "この製品について相談".to_string(),
             button_message: "ADC-V724について詳しく教えて".to_string(),
         }
     }
@@ -1419,6 +1450,7 @@ mod tests {
             reply_text: "ご提案です。".to_string(),
             case_id: "case-1".to_string(),
             product_cards: Some(vec![sample_card()]),
+            quick_replies: None,
         };
         let json = serde_json::to_value(&response).expect("must serialize");
         let cards = json
@@ -1429,7 +1461,7 @@ mod tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0]["material_key"], "own_product:adc-v724");
         assert_eq!(cards[0]["title"], "URTECT ADC-V724");
-        assert_eq!(cards[0]["button_text"], "この製品について聞く");
+        assert_eq!(cards[0]["button_text"], "この製品について相談");
     }
 
     #[test]
@@ -1438,6 +1470,7 @@ mod tests {
             reply_text: "ご質問をもう少し教えてください。".to_string(),
             case_id: "case-1".to_string(),
             product_cards: None,
+            quick_replies: None,
         };
         let json = serde_json::to_value(&response).expect("must serialize");
         assert!(
@@ -1447,6 +1480,44 @@ mod tests {
         );
         assert_eq!(json["reply_text"], "ご質問をもう少し教えてください。");
         assert_eq!(json["case_id"], "case-1");
+    }
+
+    #[test]
+    fn advisor_reply_response_serializes_quick_replies_when_present() {
+        let response = AdvisorReplyResponse {
+            reply_text: "どのようなことがご不安ですか?".to_string(),
+            case_id: "case-1".to_string(),
+            product_cards: None,
+            quick_replies: Some(vec![QuickReplyItem {
+                label: "侵入・空き巣が心配".to_string(),
+                message: "侵入や空き巣が心配です".to_string(),
+            }]),
+        };
+        let json = serde_json::to_value(&response).expect("must serialize");
+        let items = json
+            .get("quick_replies")
+            .expect("quick_replies key must be present when Some")
+            .as_array()
+            .expect("quick_replies must serialize as a JSON array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["label"], "侵入・空き巣が心配");
+        assert_eq!(items[0]["message"], "侵入や空き巣が心配です");
+    }
+
+    #[test]
+    fn advisor_reply_response_omits_quick_replies_key_when_none() {
+        let response = AdvisorReplyResponse {
+            reply_text: "ご提案です。".to_string(),
+            case_id: "case-1".to_string(),
+            product_cards: None,
+            quick_replies: None,
+        };
+        let json = serde_json::to_value(&response).expect("must serialize");
+        assert!(
+            json.get("quick_replies").is_none(),
+            "quick_replies key itself must be absent from the JSON object when None \
+             (CS 側は常に省略), got: {json}"
+        );
     }
 
     // ---- handler routing (認可・入力検証・ルーティング。LLM/vegapunk 呼び出しには到達しない) ----

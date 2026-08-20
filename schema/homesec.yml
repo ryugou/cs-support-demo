@@ -16,6 +16,7 @@ nodes:
       price_band: { type: string }
       card_description: { type: string }
       card_match_terms: { type: string }
+      product_page_url: { type: string }
   KnownResolution:
     attributes:
       kr_id: { type: string, required: true }

@@ -9,26 +9,31 @@
 
 use crate::advisor::materials::AdvisorMaterial;
 use crate::harness::knowledge::csv_list;
+use crate::harness::product_gate::extract_model_tokens;
 use serde::Serialize;
 use std::path::Path;
 
 /// design doc §3.3 の `product_cards` 1 件。
 ///
 /// `Serialize` を derive する(Task 6): フィールド名は design doc §3.3 の JSON 例
-/// (`material_key` / `title` / `description` / `image_url` / `button_text` /
-/// `button_message`)と完全一致しているため `#[serde(rename = ...)]` は不要。
+/// (`material_key` / `title` / `description` / `image_url` / `product_page_url` /
+/// `button_text` / `button_message`)と完全一致しているため `#[serde(rename = ...)]` は不要。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProductCard {
     pub material_key: String,
     pub title: String,
     pub description: String,
     pub image_url: Option<String>,
+    /// カードの「商品ページを見る」ボタン(URI action)の遷移先。無ければ
+    /// `line_adapter.rs::build_flex_message` がこのボタンを出さない(design doc §3.3)。
+    pub product_page_url: Option<String>,
     pub button_text: String,
     pub button_message: String,
 }
 
-/// カルーセルのボタン文言(固定。dialogue-examples のカルーセル注記と一致させる)。
-const BUTTON_TEXT: &str = "この製品について聞く";
+/// 「この製品について相談」ボタンの文言(固定。ユーザー指定の既定値。Issue #34
+/// カルーセル→Flex 移行に伴い旧文言「この製品について聞く」から変更)。
+const BUTTON_TEXT: &str = "この製品について相談";
 
 /// design doc §7.2 の製品カード添付判定本体。
 ///
@@ -41,8 +46,15 @@ const BUTTON_TEXT: &str = "この製品について聞く";
 ///    という前提とも食い違う。`known_resolution_to_material` により `card_description = None`
 ///    の KR 由来材料は元々ここで除外される)。
 /// 2. `final_text`(出口関門を通過した最終応答文、正規化後)に照合語が含まれるかを判定する:
-///    `card_match_terms` があればその CSV 分割語のいずれか、無ければ `title_ja` または
-///    `product_key` のいずれか(design doc §5.1「省略時は title_ja と product_key で照合する」)。
+///    `kind == "own_product"` は**型番明示のみ**(`product_key` を
+///    [`extract_model_tokens`] で正規化したトークンが `final_text` の型番トークン集合に
+///    含まれる場合だけ合致。`card_match_terms` の汎用語では合致させない — 本番実害
+///    「応答文に型番が無い own_product までカード化される」への是正、design doc §7.2 手順1)。
+///    それ以外の kind(`partner_product` 等)は従来どおり: `card_match_terms` があればその
+///    CSV 分割語のいずれか、無ければ `title_ja` または `product_key` のいずれか。design doc
+///    §5.1 の実文言は「省略時は `title_ja` で照合する」であり、`product_key` フォールバック
+///    (下記 [`matches_final_text`] 参照)は spec には無い実装側の防御的な追加(reviewer 一次
+///    レビュー Suggestion 1 是正: 以前は spec の引用がこの追加を含むかのように誤記していた)。
 /// 3. `shown_csv`(この会話で既に表示済みの material_key の CSV)に含まれる候補を除外する
 ///    (再表示抑止)。
 /// 4. `kind == "own_product"` を先に、`"partner_product"` をその後に安定ソートし、
@@ -86,10 +98,12 @@ fn kind_priority(kind: &str) -> u8 {
     }
 }
 
-/// design doc §7.2 手順1 の照合判定。`card_match_terms` があればその CSV 分割語のいずれか、
-/// 無ければ `title_ja` または `product_key` のいずれかが `final_text` に部分文字列として
-/// 含まれるかを見る。
+/// design doc §7.2 手順1 の照合判定。`own_product` とそれ以外で判定方法を分ける
+/// (本番実害是正: own_product は汎用語で合致させない)。
 fn matches_final_text(material: &AdvisorMaterial, final_text: &str) -> bool {
+    if material.kind == "own_product" {
+        return matches_own_product_by_model_token(material, final_text);
+    }
     match &material.card_match_terms {
         Some(terms) => csv_list(terms).iter().any(|term| final_text.contains(term)),
         None => {
@@ -100,6 +114,41 @@ fn matches_final_text(material: &AdvisorMaterial, final_text: &str) -> bool {
                     .is_some_and(|pk| final_text.contains(pk))
         }
     }
+}
+
+/// `own_product` の合致判定(design doc §7.2 手順1「own_product の合致は常に `product_key`
+/// の型番明示のみ」)。`card_match_terms` は一切見ない — own_product に汎用語(「防犯カメラ」等)
+/// を CSV で持たせても、それだけでは合致しない。
+///
+/// `product_gate::extract_model_tokens` を「質問側ゲート・材料選別・応答側ゲートの3箇所が
+/// 共通で使う唯一の抽出経路」の規律どおりそのまま再利用する(独自の型番正規化を持たない)。
+/// `material.product_key`(例 `"ADC-V724"`)自体を通せば正規化済みトークンが1個得られるので、
+/// それと `final_text` の型番トークン集合を突き合わせるだけでよい。
+fn matches_own_product_by_model_token(material: &AdvisorMaterial, final_text: &str) -> bool {
+    let Some(product_key) = material.product_key.as_deref() else {
+        tracing::warn!(
+            material_key = %material.material_key,
+            kind = %material.kind,
+            "advisor_material has kind=own_product but no product_key; this material can \
+             never be card-matched (own_product matching requires a model token extracted \
+             from product_key). Fix server/data/homesec/materials.json"
+        );
+        return false;
+    };
+    let Some(expected_token) = extract_model_tokens(product_key).into_iter().next() else {
+        tracing::warn!(
+            material_key = %material.material_key,
+            kind = %material.kind,
+            product_key,
+            "advisor_material's product_key does not contain a recognizable model token \
+             (extract_model_tokens returned none); this own_product material can never be \
+             card-matched. Fix server/data/homesec/materials.json"
+        );
+        return false;
+    };
+    extract_model_tokens(final_text)
+        .iter()
+        .any(|token| *token == expected_token)
 }
 
 /// [`AdvisorMaterial`] を [`ProductCard`] へ変換する(design doc §7.2 手順5)。
@@ -120,6 +169,7 @@ fn to_product_card(material: &AdvisorMaterial, images_dir: &Path) -> ProductCard
         title: material.title_ja.clone(),
         description,
         image_url: resolve_image_url(material, images_dir),
+        product_page_url: material.product_page_url.clone(),
         button_text: BUTTON_TEXT.to_string(),
         button_message: format!("{}について詳しく教えて", material.title_ja),
     }
@@ -224,7 +274,10 @@ mod tests {
             product_key: Some(product_key.to_string()),
             price_band: None,
             card_description: Some("屋外対応・夜間撮影".to_string()),
+            // 汎用語("屋外")をあえて含める: own_product はこの CSV を一切見ないことを
+            // `own_product_does_not_match_via_a_generic_card_match_term` で固定する。
             card_match_terms: Some(format!("{product_key},屋外")),
+            product_page_url: None,
         }
     }
 
@@ -240,14 +293,34 @@ mod tests {
             price_band: None,
             card_description: Some("駆けつけ対応付きサービス".to_string()),
             card_match_terms: Some("ALSOK,駆けつけ".to_string()),
+            product_page_url: None,
         }
     }
 
-    // --- 合致判定 ---
+    // --- own_product の合致判定(design doc §7.2 手順1: 型番明示のみ。本番実害是正) ---
 
     #[test]
-    fn matching_via_card_match_terms_produces_a_card() {
-        let dir = TempImagesDir::new("match-terms");
+    fn own_product_does_not_match_via_a_generic_card_match_term() {
+        // 必須テスト1: card_match_terms に汎用語("屋外")が含まれていても、final_text に
+        // 型番("ADC-V724")が無ければ own_product は合致しない。
+        let dir = TempImagesDir::new("own-product-generic-term-no-match");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let cards = select_cards(
+            "屋外でも使える防犯対策をご検討ください",
+            &[m],
+            "",
+            &dir.path,
+        );
+        assert!(
+            cards.is_empty(),
+            "own_product must never match on a generic card_match_terms word alone"
+        );
+    }
+
+    #[test]
+    fn own_product_matches_via_explicit_model_token_in_final_text() {
+        // 必須テスト2: final_text に型番が明示されていれば合致する。
+        let dir = TempImagesDir::new("own-product-model-token-match");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
         let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
         assert_eq!(cards.len(), 1);
@@ -255,33 +328,110 @@ mod tests {
     }
 
     #[test]
-    fn matching_via_title_ja_fallback_when_match_terms_is_absent() {
-        let dir = TempImagesDir::new("title-fallback");
+    fn own_product_matches_via_model_token_even_without_card_match_terms() {
+        // card_match_terms が無くても型番トークン抽出だけで合致することを固定する
+        // (card_match_terms の有無に判定が依存しない)。
+        let dir = TempImagesDir::new("own-product-model-token-no-terms");
         let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
         m.card_match_terms = None;
-        let cards = select_cards(
-            "URTECT ADC-V724のカメラをご検討ください",
-            &[m],
-            "",
-            &dir.path,
-        );
-        assert_eq!(cards.len(), 1);
-    }
-
-    #[test]
-    fn matching_via_product_key_fallback_when_match_terms_is_absent() {
-        let dir = TempImagesDir::new("product-key-fallback");
-        let mut m = own_product("own_product:adc-v724", "屋外カメラ", "ADC-V724");
-        m.card_match_terms = None;
-        // final_text は title_ja を含まないが product_key を含む。
         let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
         assert_eq!(cards.len(), 1);
     }
 
     #[test]
-    fn no_match_produces_no_card() {
-        let dir = TempImagesDir::new("no-match");
+    fn own_product_does_not_fall_back_to_title_ja_matching() {
+        // 旧実装は card_match_terms が無い場合 title_ja 部分一致にフォールバックしていたが、
+        // own_product はそのフォールバックを持たない(型番明示のみ)。final_text は title_ja を
+        // 含むが型番は含まない。
+        let dir = TempImagesDir::new("own-product-no-title-ja-fallback");
+        let mut m = own_product("own_product:adc-v724", "屋外カメラ", "ADC-V724");
+        m.card_match_terms = None;
+        let cards = select_cards("屋外カメラをご検討ください", &[m], "", &dir.path);
+        assert!(
+            cards.is_empty(),
+            "own_product must not fall back to title_ja matching"
+        );
+    }
+
+    #[test]
+    fn own_product_without_product_key_never_matches() {
+        let dir = TempImagesDir::new("own-product-no-product-key");
+        let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        m.product_key = None;
+        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        assert!(cards.is_empty());
+    }
+
+    #[test]
+    fn own_product_with_a_non_model_shaped_product_key_never_matches() {
+        // reviewer 一次レビュー Warning 4: product_key が型番形式でない(extract_model_tokens
+        // が1件もトークンを返さない)場合も、product_key が None の場合と同様に恒久的に
+        // カード化されない。final_text に product_key の生文字列を含めても
+        // own_product は型番トークン以外では合致しないため、この材料は決して選ばれない。
+        let dir = TempImagesDir::new("own-product-non-model-shaped-key");
+        let m = own_product("own_product:mystery", "謎の製品", "PLAIN-MODEL-123");
+        let cards = select_cards("PLAIN-MODEL-123がおすすめです", &[m], "", &dir.path);
+        assert!(
+            cards.is_empty(),
+            "a product_key with no extractable model token must never produce a card"
+        );
+    }
+
+    #[test]
+    fn own_product_no_match_produces_no_card() {
+        let dir = TempImagesDir::new("own-product-no-match");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let cards = select_cards("窓の防犯フィルムが有効です", &[m], "", &dir.path);
+        assert!(cards.is_empty());
+    }
+
+    // --- partner_product の合致判定(design doc §7.2 手順1: 従来どおり) ---
+
+    #[test]
+    fn partner_product_matches_via_card_match_terms() {
+        let dir = TempImagesDir::new("partner-match-terms");
+        let m = partner_product(
+            "partner_product:alsok",
+            "ALSOKホームセキュリティ",
+            "intrusion",
+        );
+        let cards = select_cards("ALSOK駆けつけがおすすめです", &[m], "", &dir.path);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].material_key, "partner_product:alsok");
+    }
+
+    #[test]
+    fn partner_product_matches_via_title_ja_fallback_when_match_terms_is_absent() {
+        let dir = TempImagesDir::new("partner-title-fallback");
+        let mut m = partner_product(
+            "partner_product:alsok",
+            "ALSOKホームセキュリティ",
+            "intrusion",
+        );
+        m.card_match_terms = None;
+        let cards = select_cards("ALSOKホームセキュリティがおすすめです", &[m], "", &dir.path);
+        assert_eq!(cards.len(), 1);
+    }
+
+    #[test]
+    fn partner_product_matches_via_product_key_fallback_when_match_terms_is_absent() {
+        let dir = TempImagesDir::new("partner-product-key-fallback");
+        let mut m = partner_product("partner_product:alsok", "駆けつけサービス", "intrusion");
+        m.card_match_terms = None;
+        m.product_key = Some("ALSOK-PLAN-A".to_string());
+        // final_text は title_ja を含まないが product_key を含む。
+        let cards = select_cards("ALSOK-PLAN-Aがおすすめです", &[m], "", &dir.path);
+        assert_eq!(cards.len(), 1);
+    }
+
+    #[test]
+    fn partner_product_no_match_produces_no_card() {
+        let dir = TempImagesDir::new("partner-no-match");
+        let m = partner_product(
+            "partner_product:alsok",
+            "ALSOKホームセキュリティ",
+            "intrusion",
+        );
         let cards = select_cards("窓の防犯フィルムが有効です", &[m], "", &dir.path);
         assert!(cards.is_empty());
     }
@@ -313,6 +463,7 @@ mod tests {
             // (design doc §7.2 手順1は候補を own_product / partner_product 限定と定めている)。
             card_description: Some("無締り対策の統計データ".to_string()),
             card_match_terms: Some("無締り".to_string()),
+            product_page_url: None,
         };
         let cards = select_cards("無締りにご注意ください", &[m], "", &dir.path);
         assert!(
@@ -335,6 +486,7 @@ mod tests {
             price_band: None,
             card_description: Some("賃貸一人暮らし向けの案内".to_string()),
             card_match_terms: Some("賃貸一人暮らし".to_string()),
+            product_page_url: None,
         };
         let cards = select_cards("賃貸一人暮らしの防犯対策です", &[m], "", &dir.path);
         assert!(
@@ -428,12 +580,17 @@ mod tests {
     #[test]
     fn image_url_is_none_when_product_key_attempts_path_traversal() {
         // Warning E: product_key はシード投入由来で現状は信頼できるが、多層防御として
-        // `../../etc/passwd` のような値が紛れ込んでも `image_url` に反映されないことを固定する。
+        // `resolve_image_url` は正規化前の生の `product_key` を使う(合致判定側の
+        // `extract_model_tokens` は正規化済みトークンしか見ない)。型番トークン抽出を通過
+        // しつつ経路混入を狙う値("ADC-V724/../../etc/passwd" のように型番の後ろへ経路混入
+        // 文字列を続けた値)が紛れ込んでも `image_url` に反映されないことを固定する。
         let dir = TempImagesDir::new("path-traversal-product-key");
-        let m = own_product("own_product:evil", "怪しい製品", "../../etc/passwd");
-        // card_match_terms は own_product() ヘルパーが product_key ベースで組むため、
-        // 素の product_key 文字列を final_text にそのまま含めれば合致判定は通る。
-        let final_text = "../../etc/passwdがおすすめです";
+        let m = own_product(
+            "own_product:evil",
+            "怪しい製品",
+            "ADC-V724/../../etc/passwd",
+        );
+        let final_text = "ADC-V724がおすすめです";
         let cards = select_cards(final_text, &[m], "", &dir.path);
         assert_eq!(
             cards.len(),
@@ -472,7 +629,46 @@ mod tests {
         let card = &cards[0];
         assert_eq!(card.title, "URTECT ADC-V724");
         assert_eq!(card.description, "屋外対応・夜間撮影");
-        assert_eq!(card.button_text, "この製品について聞く");
+        assert_eq!(card.button_text, "この製品について相談");
         assert_eq!(card.button_message, "URTECT ADC-V724について詳しく教えて");
+    }
+
+    // --- product_page_url(design doc §3.3・§5.1、Issue #34 カルーセル→Flex 移行) ---
+
+    #[test]
+    fn product_page_url_is_copied_from_the_material_when_present() {
+        let dir = TempImagesDir::new("product-page-url-present");
+        let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        m.product_page_url = Some("https://example.com/products/adc-v724".to_string());
+        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        assert_eq!(
+            cards[0].product_page_url.as_deref(),
+            Some("https://example.com/products/adc-v724")
+        );
+    }
+
+    #[test]
+    fn product_page_url_is_none_when_the_material_has_none() {
+        let dir = TempImagesDir::new("product-page-url-absent");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        assert_eq!(cards[0].product_page_url, None);
+    }
+
+    // --- 必須テスト3: カードが1件のみ合致する場合でも非空の Vec が返ること
+    // (api.rs 側の `Option<Vec<ProductCard>>` への wrap は `selected_cards.is_empty()` の
+    // 単純な if/else であり、この Vec が非空である限り `Some(vec![1件])` になる) ---
+
+    #[test]
+    fn select_cards_returns_exactly_one_card_when_only_one_material_matches() {
+        let dir = TempImagesDir::new("single-match");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        assert_eq!(
+            cards.len(),
+            1,
+            "a single matching material must yield a non-empty Vec of exactly one card, so \
+             api.rs's is_empty()-guarded Option wrap yields Some(vec![1 card]), not None"
+        );
     }
 }

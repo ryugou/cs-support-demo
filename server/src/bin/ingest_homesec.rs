@@ -60,6 +60,10 @@ struct MaterialEntry {
     card_description: Option<String>,
     #[serde(default)]
     card_match_terms: Option<String>,
+    /// カードの「商品ページを見る」ボタンの遷移先(design doc §5.1、Issue #34)。
+    /// `own_product` / `partner_product` のみ意味を持つ。
+    #[serde(default)]
+    product_page_url: Option<String>,
 }
 
 const VALID_KINDS: [&str; 4] = ["statistic", "own_product", "partner_product", "scenario"];
@@ -267,6 +271,10 @@ fn build_materials_graph(schema: &str, entries: &[MaterialEntry]) -> GraphBuild 
                     "card_match_terms".to_string(),
                     entry.card_match_terms.clone().unwrap_or_default(),
                 ),
+                (
+                    "product_page_url".to_string(),
+                    entry.product_page_url.clone().unwrap_or_default(),
+                ),
             ],
         })
         .collect();
@@ -380,6 +388,7 @@ mod tests {
             price_band: None,
             card_description: None,
             card_match_terms: None,
+            product_page_url: None,
         }
     }
 
@@ -687,6 +696,7 @@ mod tests {
         entry.category = Some("monitoring".to_string());
         entry.card_description = Some("屋外対応".to_string());
         entry.card_match_terms = Some("ADC-V724,屋外".to_string());
+        entry.product_page_url = Some("https://example.com/products/adc-v724".to_string());
         let build = build_materials_graph("homesec", std::slice::from_ref(&entry));
 
         assert_eq!(
@@ -710,6 +720,10 @@ mod tests {
         assert_eq!(attrs.get("category").unwrap(), "monitoring");
         assert_eq!(attrs.get("card_description").unwrap(), "屋外対応");
         assert_eq!(attrs.get("card_match_terms").unwrap(), "ADC-V724,屋外");
+        assert_eq!(
+            attrs.get("product_page_url").unwrap(),
+            "https://example.com/products/adc-v724"
+        );
         // 未設定の optional 属性は空文字列で埋める（vegapunk 側の属性欠落を避けるため）。
         assert_eq!(attrs.get("source_url").unwrap(), "");
         assert_eq!(attrs.get("price_band").unwrap(), "");
@@ -728,6 +742,7 @@ mod tests {
             "price_band",
             "card_description",
             "card_match_terms",
+            "product_page_url",
         ] {
             assert_eq!(
                 attrs.get(key).unwrap(),
