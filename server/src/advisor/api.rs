@@ -1439,7 +1439,7 @@ mod tests {
             description: "屋外対応・夜間撮影".to_string(),
             image_url: Some("https://advisor.example.com/static/products/adc-v724.jpg".to_string()),
             product_page_url: Some("https://example.com/products/adc-v724".to_string()),
-            button_text: "この製品について相談".to_string(),
+            button_text: "この商品について聞く".to_string(),
             button_message: "ADC-V724について詳しく教えて".to_string(),
         }
     }
@@ -1461,7 +1461,7 @@ mod tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0]["material_key"], "own_product:adc-v724");
         assert_eq!(cards[0]["title"], "URTECT ADC-V724");
-        assert_eq!(cards[0]["button_text"], "この製品について相談");
+        assert_eq!(cards[0]["button_text"], "この商品について聞く");
     }
 
     #[test]

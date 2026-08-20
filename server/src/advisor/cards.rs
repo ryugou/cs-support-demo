@@ -31,9 +31,9 @@ pub struct ProductCard {
     pub button_message: String,
 }
 
-/// 「この製品について相談」ボタンの文言(固定。ユーザー指定の既定値。Issue #34
-/// カルーセル→Flex 移行に伴い旧文言「この製品について聞く」から変更)。
-const BUTTON_TEXT: &str = "この製品について相談";
+/// 「この商品について聞く」ボタンの文言(固定。ユーザー指定の既定値。Issue #34
+/// カルーセル→Flex 移行に伴い旧文言から変更。現行文言はユーザー指定(2026-08-20))。
+const BUTTON_TEXT: &str = "この商品について聞く";
 
 /// design doc §7.2 の製品カード添付判定本体。
 ///
@@ -629,7 +629,7 @@ mod tests {
         let card = &cards[0];
         assert_eq!(card.title, "URTECT ADC-V724");
         assert_eq!(card.description, "屋外対応・夜間撮影");
-        assert_eq!(card.button_text, "この製品について相談");
+        assert_eq!(card.button_text, "この商品について聞く");
         assert_eq!(card.button_message, "URTECT ADC-V724について詳しく教えて");
     }
 
