@@ -13,11 +13,13 @@ pub fn harness_node_id(schema: &str, kind: &str, key: &str) -> String {
     format!("{}{kind}:{key}", schema_generation_prefix(schema))
 }
 
-/// support_case ノード id の唯一の組み立て箇所（Issue #39 レビュー残課題3）。
-/// `KnowledgeStore::load_case_signals`（読み取り）と `KnowledgeStore::append_case_signals`
-/// （書き込み）が個別に `harness_node_id(schema, "support_case", case_id)` を書いていたため、
-/// 片方だけ kind 文字列 "support_case" がずれても検出できなかった。両者をこのヘルパへ
-/// 統一することで、id 組み立てのずれが構造的に起き得ないようにする。
+/// signal 読み書き経路（`KnowledgeStore::load_case_signals` と
+/// `KnowledgeStore::append_case_signals`）が共有する support_case ノード id ヘルパ
+/// （Issue #39 レビュー残課題3）。この 2 箇所が個別に
+/// `harness_node_id(schema, "support_case", case_id)` を書いていたため、片方だけ kind 文字列
+/// "support_case" がずれても検出できなかった。読みと書きの対をこのヘルパへ統一することで、
+/// signal 経路内の id 組み立てのずれが構造的に起き得ないようにする（signal 以外の経路には
+/// 直接組み立てが残っており、全体の唯一箇所ではない）。
 fn case_signal_node_id(schema: &str, case_id: &str) -> String {
     harness_node_id(schema, "support_case", case_id)
 }
