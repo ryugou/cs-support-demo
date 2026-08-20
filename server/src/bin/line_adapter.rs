@@ -2729,7 +2729,7 @@ mod tests {
                     "title": "URTECT ADC-V724",
                     "description": "屋外対応・夜間撮影。スマホから映像確認",
                     "image_url": "https://advisor.example/static/products/adc-v724.jpg",
-                    "button_text": "この製品について聞く",
+                    "button_text": "この商品について聞く",
                     "button_message": "ADC-V724について詳しく教えて",
                     "future_field": "x"
                 },
@@ -2758,7 +2758,7 @@ mod tests {
             cards[0].image_url.as_deref(),
             Some("https://advisor.example/static/products/adc-v724.jpg")
         );
-        assert_eq!(cards[0].button_text, "この製品について聞く");
+        assert_eq!(cards[0].button_text, "この商品について聞く");
         assert_eq!(cards[0].button_message, "ADC-V724について詳しく教えて");
         // material_key は `CardPayload` の実フィールド（未知フィールドではない）。ここで
         // 正しく取り込まれることを固定する。

@@ -83,14 +83,14 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
       "description": "屋外対応・夜間撮影。スマホから映像確認",
       "image_url": "https://<advisor host>/static/products/adc-v724.jpg",
       "product_page_url": "https://<商品ページ URL。材料の product_page_url>",
-      "button_text": "この製品について相談",
+      "button_text": "この商品について聞く",
       "button_message": "ADC-V724について詳しく教えて"
     }
   ]
 }
 ```
 
-- `line_adapter` は `product_cards` が非空のとき、テキスト応答の後に **Flex Message** を 1 通送る(カルーセルテンプレートは廃止)。1 件なら単一バブル、2 件以上なら Flex カルーセル(バブル横並び)。バブル構成: hero 画像(`image_url` があるとき)→ 商品名 → 説明 → ボタン 2 つ: **「商品ページを見る」**(URI action、`product_page_url` があるときだけ)と **「この製品について相談」**(message action、タップで `button_message` がユーザー発話として送信)。アダプタは server が返した構造化データを Flex JSON へ写像するだけで、独自判断を持たない
+- `line_adapter` は `product_cards` が非空のとき、テキスト応答の後に **Flex Message** を 1 通送る(カルーセルテンプレートは廃止)。1 件なら単一バブル、2 件以上なら Flex カルーセル(バブル横並び)。バブル構成: hero 画像(`image_url` があるとき)→ 商品名 → 説明 → ボタン 2 つ: **「商品ページを見る」**(URI action、`product_page_url` があるときだけ)と **「この商品について聞く」**(message action、タップで `button_message` がユーザー発話として送信)。アダプタは server が返した構造化データを Flex JSON へ写像するだけで、独自判断を持たない
 - カードは最大 3 件・**1 件でも表示する**(商品を提案したターンの標準 UI。第 7.2 節)。own_product / partner_product 材料から組み立てる。`image_url` / `product_page_url` は任意で、無い場合はその要素を省いたバブルになる。他社製品の実写画像は権利上使わず、使うのは同梱の自社製品画像と自前の汎用カテゴリ画像のみ
 
 レスポンスにはもう 1 つ任意フィールド `quick_replies` を加算する(CS 側は常に省略。省略時のアダプタ挙動は従来どおり):
