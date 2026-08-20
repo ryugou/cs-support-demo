@@ -568,6 +568,7 @@ mod tests {
             price_band: None,
             card_description: None,
             card_match_terms: None,
+            product_page_url: None,
         }
     }
 

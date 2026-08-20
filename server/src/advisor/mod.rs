@@ -4,4 +4,5 @@ pub mod cards;
 pub mod decide;
 pub mod draftgen;
 pub mod materials;
+pub mod quick_replies;
 pub mod understand;

@@ -41,6 +41,10 @@ pub struct AdvisorMaterial {
     pub price_band: Option<String>,
     pub card_description: Option<String>,
     pub card_match_terms: Option<String>,
+    /// カードの「商品ページを見る」ボタンの遷移先(design doc §5.1、Issue #34 カルーセル→Flex
+    /// 移行)。`own_product` / `partner_product` のみ意味を持つ。無ければボタンを出さない
+    /// (`line_adapter.rs::build_flex_message` 側の判定)。
+    pub product_page_url: Option<String>,
 }
 
 /// 属性値を trim し、空文字列なら `None` として返す。`ingest_homesec.rs` は未設定の optional
@@ -208,6 +212,7 @@ impl AdvisorMaterial {
             price_band: trimmed_non_empty(attrs, "price_band"),
             card_description: trimmed_non_empty(attrs, "card_description"),
             card_match_terms: trimmed_non_empty(attrs, "card_match_terms"),
+            product_page_url: trimmed_non_empty(attrs, "product_page_url"),
         })
     }
 }
@@ -408,6 +413,7 @@ pub fn known_resolution_to_material(kr: &KnownResolution) -> AdvisorMaterial {
         price_band: None,
         card_description: None,
         card_match_terms: None,
+        product_page_url: None,
     }
 }
 
@@ -530,6 +536,7 @@ mod tests {
             ("price_band", ""),
             ("card_description", "屋外対応・夜間撮影。スマホから映像確認"),
             ("card_match_terms", "ADC-V724,屋外,カメラ"),
+            ("product_page_url", "https://example.com/products/adc-v724"),
         ])
     }
 
@@ -565,6 +572,33 @@ mod tests {
         a.remove("card_description");
         let material = AdvisorMaterial::from_attributes(&a).expect("must parse");
         assert_eq!(material.card_description, None);
+    }
+
+    // --- Issue #34: product_page_url(design doc §5.1、カルーセル→Flex 移行) ---
+
+    #[test]
+    fn from_attributes_parses_product_page_url_when_present() {
+        let material = AdvisorMaterial::from_attributes(&full_attrs()).expect("must parse");
+        assert_eq!(
+            material.product_page_url.as_deref(),
+            Some("https://example.com/products/adc-v724")
+        );
+    }
+
+    #[test]
+    fn from_attributes_treats_missing_product_page_url_as_none() {
+        let mut a = full_attrs();
+        a.remove("product_page_url");
+        let material = AdvisorMaterial::from_attributes(&a).expect("must parse");
+        assert_eq!(material.product_page_url, None);
+    }
+
+    #[test]
+    fn from_attributes_treats_blank_product_page_url_as_none() {
+        let mut a = full_attrs();
+        a.insert("product_page_url".to_string(), "   ".to_string());
+        let material = AdvisorMaterial::from_attributes(&a).expect("must parse");
+        assert_eq!(material.product_page_url, None);
     }
 
     #[test]
@@ -1133,6 +1167,7 @@ mod tests {
             price_band: None,
             card_description: None,
             card_match_terms: None,
+            product_page_url: None,
         }
     }
 
@@ -1243,6 +1278,7 @@ mod tests {
             price_band: None,
             card_description: Some("説明".to_string()),
             card_match_terms: None,
+            product_page_url: None,
         }
     }
 
