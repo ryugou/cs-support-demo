@@ -1729,27 +1729,43 @@ mod tests {
         Arc::new(VegapunkClient::connect_lazy("http://127.0.0.1:1", "test").expect("connect_lazy"))
     }
 
-    /// `fut` の実行中に出た WARN 以上のログを文字列で返す（`harness::reply` の
+    /// `fut` の実行中に出た WARN / ERROR のログだけを文字列で返す（`harness::reply` の
     /// `capture_warnings` の非同期版）。capture 機構本体（グローバル subscriber の 1 回
     /// インストール + スレッドローカルバッファ）は `test_support` を参照。Dispatch を
     /// 差し替える旧方式は、capture 機構を使わないテストが先に無介入で同じコールサイトを
     /// 叩くと interest cache が「無効」に確定し手遅れになる問題があったため廃止した
     /// （詳細は `test_support` の doc コメント）。`#[tokio::test]` の既定（current-thread）
     /// ランタイムで `.await` をまたいでも同じスレッド上で実行される限り有効。
+    ///
+    /// subscriber 自体は INFO 以上を拾う（design doc §11 の内部判断 info ログを他所で
+    /// assert するため）。このヘルパーは `test_support::filter_warn_and_error_lines` で
+    /// WARN / ERROR の行だけへ絞ることで、`logs.is_empty()` が引き続き「警告が出ていない」
+    /// を意味し続けるようにする（2026-08-19、Issue #34 codex レビュー指摘: レベルを INFO へ
+    /// 下げた際にこのフィルタが無く、`logs.is_empty()` の意味が「INFO 以上のログが一切
+    /// 出ていない」へ静かに変わっていた）。
     async fn capture_warnings<Fut, T>(fut: Fut) -> (T, String)
     where
         Fut: std::future::Future<Output = T>,
     {
-        crate::test_support::capture_logs_async(fut).await
+        let (result, logs) = crate::test_support::capture_logs_async(fut).await;
+        (
+            result,
+            crate::test_support::filter_warn_and_error_lines(&logs),
+        )
     }
 
     /// `capture_warnings` の同期版。`ProductAllowlist::from_models` のような同期関数（Stage1
-    /// Suggestion 4 の trim 除外 warn）を検証するために使う。
+    /// Suggestion 4 の trim 除外 warn）を検証するために使う。WARN / ERROR の行だけへ絞る点は
+    /// 上記 `capture_warnings` と同じ。
     fn capture_warnings_sync<F, T>(f: F) -> (T, String)
     where
         F: FnOnce() -> T,
     {
-        crate::test_support::capture_logs(f)
+        let (result, logs) = crate::test_support::capture_logs(f);
+        (
+            result,
+            crate::test_support::filter_warn_and_error_lines(&logs),
+        )
     }
 
     #[tokio::test]

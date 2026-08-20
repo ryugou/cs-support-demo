@@ -263,12 +263,17 @@ fn select_materials_from_hits(
 /// 結果を見る。実際の合成ロジックは [`materials_from_results`](純関数)に委譲する
 /// (Warning B 是正: 「失敗しても `Err` を伝播しない」契約はネットワーク呼び出しと同じ関数に
 /// インラインで書かれていたため、この契約自体を固定するテストが書けなかった)。
+///
+/// 戻り値は `(searched, own_products)` のタプル。`searched` は従来どおり検索ヒット由来の材料、
+/// `own_products` は schema 内の全 `own_product` 材料(design doc §6 手順6「own_product の
+/// 保証注入」用。`query_nodes` で既に取得済みの全 advisor_material から抽出するため、追加の
+/// ネットワーク呼び出しは発生しない)。
 pub async fn gather_materials(
     vp: &VegapunkClient,
     schema: &str,
     query: &str,
     conditions: &[(ConditionKey, String)],
-) -> Vec<AdvisorMaterial> {
+) -> (Vec<AdvisorMaterial>, Vec<AdvisorMaterial>) {
     let search_text = build_material_search_text(query, conditions);
     let (search_result, nodes_result) = tokio::join!(
         vp.search(schema, &search_text, MATERIAL_SEARCH_TOP_K),
@@ -288,13 +293,17 @@ pub async fn gather_materials(
 ///
 /// **この関数は絶対に `Err` を伝播しない**(design doc §8: 「vegapunk 検索失敗: warn ログ。
 /// 材料ゼロで Call#2 を実行(接地規則により事実主張なしの一般助言になる)。応答は止めない」)。
-/// どちらか一方でも失敗したら `tracing::warn!` して空 `Vec` を返す。呼び出し元(`draftgen.rs`)は
-/// 材料が空でも安全に動く前提で設計してある。
+/// どちらか一方でも失敗したら `tracing::warn!` して両方とも空 `Vec` を返す。呼び出し元
+/// (`draftgen.rs`)は材料が空でも安全に動く前提で設計してある。
+///
+/// 戻り値の2つ目の要素(`own_products`)は design doc §6 手順6「own_product の保証注入」用に、
+/// `nodes_result` から `kind == "own_product"` のものだけを [`select_materials_of_kind`] で
+/// 抽出する。
 fn materials_from_results(
     search_result: anyhow::Result<Vec<SearchResultItem>>,
     nodes_result: anyhow::Result<Vec<crate::proto::graphrag::NodeResult>>,
     schema: &str,
-) -> Vec<AdvisorMaterial> {
+) -> (Vec<AdvisorMaterial>, Vec<AdvisorMaterial>) {
     let hits = match search_result {
         Ok(hits) => hits,
         Err(error) => {
@@ -306,7 +315,7 @@ fn materials_from_results(
                  Call#2 still runs (it degrades to general advice without factual grounding, \
                  design doc §8). Response is not blocked"
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
     let nodes = match nodes_result {
@@ -320,7 +329,7 @@ fn materials_from_results(
                  materials so Call#2 still runs (it degrades to general advice without factual \
                  grounding, design doc §8). Response is not blocked"
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
 
@@ -329,7 +338,25 @@ fn materials_from_results(
         .map(|n| (n.node_id, n.attributes))
         .collect();
 
-    select_materials_from_hits(&hits, &node_attrs)
+    let searched = select_materials_from_hits(&hits, &node_attrs);
+    let own_products = select_materials_of_kind(&node_attrs, "own_product");
+    (searched, own_products)
+}
+
+/// `node_attrs`(query_nodes が返した全 advisor_material の属性 map)から `kind` が一致する
+/// 材料だけを [`AdvisorMaterial`] へ変換する。material_key の昇順でソートし、`HashMap` の
+/// 反復順序に依存しない決定論的な順序にする(design doc §6 手順6)。
+fn select_materials_of_kind(
+    node_attrs: &HashMap<String, HashMap<String, String>>,
+    kind: &str,
+) -> Vec<AdvisorMaterial> {
+    let mut materials: Vec<AdvisorMaterial> = node_attrs
+        .values()
+        .filter_map(AdvisorMaterial::from_attributes)
+        .filter(|m| m.kind == kind)
+        .collect();
+    materials.sort_by(|a, b| a.material_key.cmp(&b.material_key));
+    materials
 }
 
 /// advisor の known_resolution signal 表現の**正本**。各累積条件を `"{key}:{value}"`
@@ -408,6 +435,74 @@ pub fn compose_materials(
         }
         None => searched,
     }
+}
+
+/// own_product 保証注入(design doc §6 手順6)のトリガー判定: 理解結果が製品・機器の
+/// 導入意図を含む、または累積条件に `concern` があるとき true。
+///
+/// 検索が own_product を引けず接地規則が製品提案を封じる本番実害(背景 (b))への決定論対処。
+/// 検索順位に依存せず、この2条件のどちらかを満たせば own_product 材料を別枠で必ず注入する。
+pub fn should_guarantee_own_products(
+    product_intent: bool,
+    conditions: &[(ConditionKey, String)],
+) -> bool {
+    product_intent || conditions.iter().any(|(k, _)| *k == ConditionKey::Concern)
+}
+
+/// `concern_category` に合致する own_product を優先し、合致が無ければ全件を返す
+/// (design doc §6 手順6)。
+pub fn select_own_product_materials(
+    own_products: &[AdvisorMaterial],
+    concern_category: Option<&str>,
+) -> Vec<AdvisorMaterial> {
+    if let Some(cat) = concern_category {
+        let matched: Vec<AdvisorMaterial> = own_products
+            .iter()
+            .filter(|m| m.category.as_deref() == Some(cat))
+            .cloned()
+            .collect();
+        if !matched.is_empty() {
+            return matched;
+        }
+    }
+    own_products.to_vec()
+}
+
+/// 累積条件から own_product 保証注入の category 優先キー(design doc §6 手順6)を取り出す。
+///
+/// `decide::merge_conditions` は同一キーを上書きする実装のため、`conditions` に
+/// `ConditionKey::Concern` は最大1件しか含まれない。この前提が崩れると `.find()` が
+/// 先頭要素だけを見る現在の意味(=先頭がそのまま「唯一の」concern である)が崩れるため、
+/// ここに明記しておく。
+pub fn concern_category(conditions: &[(ConditionKey, String)]) -> Option<&str> {
+    conditions
+        .iter()
+        .find(|(k, _)| *k == ConditionKey::Concern)
+        .map(|(_, v)| v.as_str())
+}
+
+/// `guaranteed` のうち `composed` に既に存在する material_key と重複するものを除いて
+/// 末尾へ追加する(design doc §6 手順6)。`composed` 側との重複だけでなく、`guaranteed`
+/// 自身の内部で material_key が重複している場合(`guaranteed` は `node_id` をキーにした
+/// `HashMap` 由来のため、別 `node_id` が同じ `material_key` を持つと起こりうる)も1件しか
+/// 追加しない。
+///
+/// codex レビュー指摘是正: 以前は `existing_keys` を `composed` の初期状態から一度だけ
+/// 作り、push 後に更新していなかったため、`guaranteed` 内部の重複は素通りして両方とも
+/// 追加されていた。`HashSet::insert` の戻り値(新規追加なら `true`)で判定することで、
+/// 追加したキーがその場で `existing_keys` へ反映され、`guaranteed` 内部の重複も除去する。
+pub fn inject_guaranteed_own_products(
+    mut composed: Vec<AdvisorMaterial>,
+    guaranteed: Vec<AdvisorMaterial>,
+) -> Vec<AdvisorMaterial> {
+    let mut existing_keys: std::collections::HashSet<String> =
+        composed.iter().map(|m| m.material_key.clone()).collect();
+    for m in guaranteed {
+        if existing_keys.insert(m.material_key.clone()) {
+            composed.push(m);
+        }
+    }
+    composed
 }
 
 #[cfg(test)]
@@ -687,6 +782,75 @@ mod tests {
         );
     }
 
+    // --- select_materials_of_kind ---
+
+    fn own_product_attrs(material_key: &str, category: &str) -> HashMap<String, String> {
+        attrs(&[
+            ("material_key", material_key),
+            ("kind", "own_product"),
+            ("title_ja", "URTECT製品"),
+            ("body_ja", "本文"),
+            ("source_url", ""),
+            ("category", category),
+            ("product_key", ""),
+            ("price_band", ""),
+            ("card_description", ""),
+            ("card_match_terms", ""),
+        ])
+    }
+
+    #[test]
+    fn select_materials_of_kind_returns_only_the_matching_kind() {
+        let mut node_attrs = HashMap::new();
+        node_attrs.insert(
+            "id-own".to_string(),
+            own_product_attrs("own_product:adc-v724", "monitoring"),
+        );
+        node_attrs.insert(
+            "id-statistic".to_string(),
+            attrs(&[
+                ("material_key", "statistic:musimari-46percent"),
+                ("kind", "statistic"),
+                ("title_ja", "統計"),
+                ("body_ja", "本文"),
+                ("source_url", "https://example.com/a"),
+                ("category", "intrusion"),
+                ("product_key", ""),
+                ("price_band", ""),
+                ("card_description", ""),
+                ("card_match_terms", ""),
+            ]),
+        );
+
+        let materials = select_materials_of_kind(&node_attrs, "own_product");
+        assert_eq!(materials.len(), 1);
+        assert_eq!(materials[0].material_key, "own_product:adc-v724");
+    }
+
+    #[test]
+    fn select_materials_of_kind_sorts_by_material_key_ascending_deterministically() {
+        let mut node_attrs = HashMap::new();
+        node_attrs.insert(
+            "id-c".to_string(),
+            own_product_attrs("own_product:c", "intrusion"),
+        );
+        node_attrs.insert(
+            "id-a".to_string(),
+            own_product_attrs("own_product:a", "intrusion"),
+        );
+        node_attrs.insert(
+            "id-b".to_string(),
+            own_product_attrs("own_product:b", "intrusion"),
+        );
+
+        let materials = select_materials_of_kind(&node_attrs, "own_product");
+        let keys: Vec<&str> = materials.iter().map(|m| m.material_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["own_product:a", "own_product:b", "own_product:c"]
+        );
+    }
+
     // --- select_materials_from_hits ---
 
     fn hit(id: &str) -> SearchResultItem {
@@ -781,7 +945,7 @@ mod tests {
 
     #[test]
     fn materials_from_results_returns_empty_and_warns_when_search_fails() {
-        let (materials, logs) = capture_logs(|| {
+        let ((searched, own_products), logs) = capture_logs(|| {
             materials_from_results(
                 Err(anyhow::anyhow!("vegapunk search unavailable (test)")),
                 Ok(Vec::new()),
@@ -789,15 +953,16 @@ mod tests {
             )
         });
         assert!(
-            materials.is_empty(),
+            searched.is_empty(),
             "a failed search must degrade to zero materials, not propagate Err"
         );
+        assert!(own_products.is_empty());
         assert!(logs.contains("WARN"), "logs: {logs}");
     }
 
     #[test]
     fn materials_from_results_returns_empty_and_warns_when_query_nodes_fails() {
-        let (materials, logs) = capture_logs(|| {
+        let ((searched, own_products), logs) = capture_logs(|| {
             materials_from_results(
                 Ok(Vec::new()),
                 Err(anyhow::anyhow!("vegapunk query_nodes unavailable (test)")),
@@ -805,9 +970,10 @@ mod tests {
             )
         });
         assert!(
-            materials.is_empty(),
+            searched.is_empty(),
             "a failed query_nodes must degrade to zero materials, not propagate Err"
         );
+        assert!(own_products.is_empty());
         assert!(logs.contains("WARN"), "logs: {logs}");
     }
 
@@ -823,10 +989,49 @@ mod tests {
             attributes: full_attrs(),
         }];
 
-        let expected = select_materials_from_hits(&hits, &node_attrs);
-        let actual = materials_from_results(Ok(hits), Ok(nodes), "homesec");
-        assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 1);
+        let expected_searched = select_materials_from_hits(&hits, &node_attrs);
+        let (actual_searched, _actual_own_products) =
+            materials_from_results(Ok(hits), Ok(nodes), "homesec");
+        assert_eq!(actual_searched, expected_searched);
+        assert_eq!(actual_searched.len(), 1);
+    }
+
+    #[test]
+    fn materials_from_results_second_element_contains_only_own_product_kind_nodes() {
+        // Task 2b: query_nodes が返す全 advisor_material のうち kind == "own_product" の
+        // ものだけが own_products 側に入り、他 kind(statistic 等)は混ざらないことを固定する。
+        let own_id = "homesec:gen1:advisor_material:own_product:adc-v724";
+        let statistic_id = "homesec:gen1:advisor_material:statistic:musimari-46percent";
+        let statistic_attrs = attrs(&[
+            ("material_key", "statistic:musimari-46percent"),
+            ("kind", "statistic"),
+            ("title_ja", "統計"),
+            ("body_ja", "本文"),
+            ("source_url", "https://example.com/a"),
+            ("category", "intrusion"),
+            ("product_key", ""),
+            ("price_band", ""),
+            ("card_description", ""),
+            ("card_match_terms", ""),
+        ]);
+        let nodes = vec![
+            crate::proto::graphrag::NodeResult {
+                node_id: own_id.to_string(),
+                node_type: "advisor_material".to_string(),
+                attributes: full_attrs(),
+            },
+            crate::proto::graphrag::NodeResult {
+                node_id: statistic_id.to_string(),
+                node_type: "advisor_material".to_string(),
+                attributes: statistic_attrs,
+            },
+        ];
+
+        let (_searched, own_products) =
+            materials_from_results(Ok(Vec::new()), Ok(nodes), "homesec");
+        assert_eq!(own_products.len(), 1);
+        assert_eq!(own_products[0].material_key, "own_product:adc-v724");
+        assert_eq!(own_products[0].kind, "own_product");
     }
 
     // --- conditions_to_signal_set / match_advisor_known_resolution ---
@@ -970,6 +1175,156 @@ mod tests {
         assert_eq!(
             composed[0].card_description, None,
             "the KR-derived material at the front must never be a card candidate"
+        );
+    }
+
+    // --- concern_category (design doc §6 手順6。reviewer 指摘3是正: `draft_with_materials`
+    // にインラインで書かれ、ネットワーク呼び出しを含むためテスト対象外だった判断を
+    // 純関数として切り出した) ---
+
+    #[test]
+    fn concern_category_returns_the_concern_value_when_present() {
+        let conditions = vec![
+            (ConditionKey::Housing, "apartment_rented".to_string()),
+            (ConditionKey::Concern, "intrusion".to_string()),
+        ];
+        assert_eq!(concern_category(&conditions), Some("intrusion"));
+    }
+
+    #[test]
+    fn concern_category_returns_none_when_conditions_are_empty() {
+        assert_eq!(concern_category(&[]), None);
+    }
+
+    #[test]
+    fn concern_category_returns_none_when_only_non_concern_conditions_are_present() {
+        let conditions = vec![
+            (ConditionKey::Housing, "apartment_rented".to_string()),
+            (ConditionKey::Budget, "under_10k".to_string()),
+        ];
+        assert_eq!(concern_category(&conditions), None);
+    }
+
+    // --- should_guarantee_own_products (design doc §6 手順6) ---
+
+    #[test]
+    fn should_guarantee_own_products_true_when_product_intent_is_true() {
+        assert!(should_guarantee_own_products(true, &[]));
+    }
+
+    #[test]
+    fn should_guarantee_own_products_true_when_conditions_contain_concern() {
+        let conditions = vec![(ConditionKey::Concern, "intrusion".to_string())];
+        assert!(should_guarantee_own_products(false, &conditions));
+    }
+
+    #[test]
+    fn should_guarantee_own_products_false_when_neither_condition_holds() {
+        assert!(!should_guarantee_own_products(false, &[]));
+    }
+
+    #[test]
+    fn should_guarantee_own_products_false_when_conditions_present_but_no_concern() {
+        let conditions = vec![(ConditionKey::Housing, "apartment_rented".to_string())];
+        assert!(!should_guarantee_own_products(false, &conditions));
+    }
+
+    // --- select_own_product_materials (design doc §6 手順6) ---
+
+    fn own_product_material(material_key: &str, category: Option<&str>) -> AdvisorMaterial {
+        AdvisorMaterial {
+            material_key: material_key.to_string(),
+            kind: "own_product".to_string(),
+            title_ja: "URTECT製品".to_string(),
+            body_ja: "本文".to_string(),
+            source_url: None,
+            category: category.map(str::to_string),
+            product_key: None,
+            price_band: None,
+            card_description: Some("説明".to_string()),
+            card_match_terms: None,
+        }
+    }
+
+    #[test]
+    fn select_own_product_materials_prefers_matching_category_and_excludes_others() {
+        let own_products = vec![
+            own_product_material("own_product:a", Some("monitoring")),
+            own_product_material("own_product:b", Some("intrusion")),
+        ];
+        let selected = select_own_product_materials(&own_products, Some("intrusion"));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].material_key, "own_product:b");
+    }
+
+    #[test]
+    fn select_own_product_materials_returns_all_when_no_category_matches() {
+        let own_products = vec![
+            own_product_material("own_product:a", Some("monitoring")),
+            own_product_material("own_product:b", Some("package_theft")),
+        ];
+        let selected = select_own_product_materials(&own_products, Some("intrusion"));
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn select_own_product_materials_returns_all_when_concern_category_is_none() {
+        let own_products = vec![
+            own_product_material("own_product:a", Some("monitoring")),
+            own_product_material("own_product:b", Some("intrusion")),
+        ];
+        let selected = select_own_product_materials(&own_products, None);
+        assert_eq!(selected.len(), 2);
+    }
+
+    // --- inject_guaranteed_own_products (design doc §6 手順6) ---
+
+    #[test]
+    fn inject_guaranteed_own_products_appends_materials_absent_from_composed() {
+        let composed = vec![searched_material("statistic:a")];
+        let guaranteed = vec![own_product_material("own_product:adc-v724", None)];
+
+        let result = inject_guaranteed_own_products(composed, guaranteed);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].material_key, "statistic:a");
+        assert_eq!(result[1].material_key, "own_product:adc-v724");
+    }
+
+    #[test]
+    fn inject_guaranteed_own_products_deduplicates_material_keys_already_in_composed() {
+        let composed = vec![
+            searched_material("statistic:a"),
+            own_product_material("own_product:adc-v724", None),
+        ];
+        let guaranteed = vec![own_product_material("own_product:adc-v724", None)];
+
+        let result = inject_guaranteed_own_products(composed, guaranteed);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "a guaranteed material whose key already exists in composed must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn inject_guaranteed_own_products_deduplicates_a_key_that_repeats_within_guaranteed_itself() {
+        // codex レビュー指摘の回帰: `existing_keys` を初期状態から一度だけ作って push 後に
+        // 更新しないと、`guaranteed` 内部に同一 material_key が2件あった場合(別 node_id が
+        // 同じ material_key を持つケース)両方とも追加されてしまう。
+        let composed = vec![searched_material("statistic:a")];
+        let guaranteed = vec![
+            own_product_material("own_product:adc-v724", None),
+            own_product_material("own_product:adc-v724", None),
+        ];
+
+        let result = inject_guaranteed_own_products(composed, guaranteed);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "a material_key that repeats within guaranteed itself must be added only once"
         );
     }
 }
