@@ -82,15 +82,16 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
       "title": "URTECT ADC-V724",
       "description": "屋外対応・夜間撮影。スマホから映像確認",
       "image_url": "https://<advisor host>/static/products/adc-v724.jpg",
-      "button_text": "この製品について聞く",
+      "product_page_url": "https://<商品ページ URL。材料の product_page_url>",
+      "button_text": "この製品について相談",
       "button_message": "ADC-V724について詳しく教えて"
     }
   ]
 }
 ```
 
-- `line_adapter` は `product_cards` が非空のとき、テキスト応答の後に LINE カルーセルテンプレートを 1 通送る。ボタンは message action(タップで `button_message` がユーザー発話として送信され、通常パイプラインに入る)のみ。postback・独自判断はアダプタに持たせない
-- カードは最大 3 件・**最少 2 件**(複数商品の提案時のみ出す比較 UI。第 7.2 節)。own_product / partner_product 材料から組み立てる。`image_url` は任意で、無い列は画像なしで成立する。他社製品の実写画像は権利上使わず、使うのは同梱の自社製品画像と自前の汎用カテゴリ画像のみ
+- `line_adapter` は `product_cards` が非空のとき、テキスト応答の後に **Flex Message** を 1 通送る(カルーセルテンプレートは廃止)。1 件なら単一バブル、2 件以上なら Flex カルーセル(バブル横並び)。バブル構成: hero 画像(`image_url` があるとき)→ 商品名 → 説明 → ボタン 2 つ: **「商品ページを見る」**(URI action、`product_page_url` があるときだけ)と **「この製品について相談」**(message action、タップで `button_message` がユーザー発話として送信)。アダプタは server が返した構造化データを Flex JSON へ写像するだけで、独自判断を持たない
+- カードは最大 3 件・**1 件でも表示する**(商品を提案したターンの標準 UI。第 7.2 節)。own_product / partner_product 材料から組み立てる。`image_url` / `product_page_url` は任意で、無い場合はその要素を省いたバブルになる。他社製品の実写画像は権利上使わず、使うのは同梱の自社製品画像と自前の汎用カテゴリ画像のみ
 
 レスポンスにはもう 1 つ任意フィールド `quick_replies` を加算する(CS 側は常に省略。省略時のアダプタ挙動は従来どおり):
 
@@ -195,7 +196,8 @@ case 属性の加算: `lead_offered`(bool)、`lead_requested`(bool)、`shown_pro
   - `product_key` string optional(`own_product` のとき URTECT 型番)
   - `price_band` string optional(`own_product` / `partner_product`)
   - `card_description` string optional(`own_product` / `partner_product`。製品カードの 1 行説明。これを持つ材料だけがカード化対象)
-  - `card_match_terms` string optional(`own_product` / `partner_product`。応答文とのカード合致判定に使う語の CSV。省略時は `title_ja` と `product_key` で照合する)
+  - `card_match_terms` string optional(`partner_product` のカード合致判定に使う語の CSV。省略時は `title_ja` で照合する。own_product の合致は常に `product_key` の型番明示のみ)
+  - `product_page_url` string optional(`own_product` / `partner_product`。カードの「商品ページを見る」ボタンの遷移先。無い場合はボタンを出さない)
 - `support_case`、`ConversationTurn`、known_resolution 系ノード: 現行 CS と同一定義(正本: `2026-08-16-admin-dashboard-design.md` と `specs/production-cs-mcp.md`)に、第 4.4 節の case 属性 3 つを加算。検索非汚染の閉じ込めテスト(ターン・case が材料検索に現れない)を homesec にも適用する
 
 エッジは初期投入では張らない。シナリオと材料の関連は `category` 属性の一致で代替し、構造 traversal は PDCA 後の課題とする。
@@ -248,12 +250,12 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 
 ### 7.2 製品カードの添付判定(決定論)
 
-カルーセルは「**複数の商品を提案したときの比較 UI**」であり、言及の装飾ではない(本番で、提案していない製品までカード化される実害が出たための規則)。
+カードは「**このターンで提案した商品**」の提示 UI であり、言及の装飾ではない(本番で、提案していない製品までカード化される実害が出たための規則)。
 
 1. 今回のターンで注入した own_product / partner_product 材料(`card_description` を持つもの)について、出口関門を通過した最終応答文(正規化後)との合致を判定する:
    - **own_product**: 応答文にその**型番**(`product_key`。既存の型番検出・正規化と同じ規約)が明示されている場合のみ合致。`card_match_terms` の汎用語(「防犯カメラ」等)では合致させない
    - **partner_product**: `card_match_terms`(省略時は `title_ja`)の文字列照合(カテゴリ語がそのまま製品の同一性であるため現行どおり)
-2. 合致した材料のうち、case の `shown_product_cards`(material_key 単位)に未記録のものをカード候補とする。**候補が 2 件以上のときだけ** `product_cards` を返す(0〜1 件のターンはカードを出さない)。3 件を超えるときは own_product を優先し、残りは検索ヒット順
+2. 合致した材料のうち、case の `shown_product_cards`(material_key 単位)に未記録のものをカード化する。**1 件でも返す**(提案した商品は常にカードで見せる)。3 件を超えるときは own_product を優先し、残りは検索ヒット順
 3. 送出したら `shown_product_cards` へ追記する(同じカードを同一会話で繰り返し出さない)
 4. カードの `image_url` は advisor 自ホストの `/static/products/` の同梱画像(自社製品・汎用カテゴリ)のみ。今回注入していない材料のカードは組み立てない
 
