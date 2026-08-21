@@ -94,6 +94,15 @@ nodes:
       advisor_cond_concern: { type: string }
       advisor_cond_budget: { type: string }
       advisor_cond_install: { type: string }
+      # 会話のリズム改善（2026-08-21 conversation-rhythm-implementation §要件2）。
+      # この属性は homesec advisor 専用で、urtect（このスキーマ）では書き込まれない。
+      # ここに宣言するのは、3 schema ファイル（このファイル / cs-schema.yml / homesec.yml）
+      # のキー一致テスト（harness/knowledge.rs::written_support_case_attribute_keys）を
+      # 満たすためだけである。「加算のみ」はこのスキーマ変更自体が既存属性を壊さない加算的な
+      # 変更であることを指し、この属性の**値**が加算されるだけでリセットされない、という意味
+      # ではない（値は advisor/decide.rs::next_question_streak が質問系 closing で加算、
+      # proposal closing で 0 にリセットする）。
+      question_streak: { type: int }
   answer_attempt:
     attributes:
       attempt_id: { type: string, required: true }

@@ -1979,6 +1979,10 @@ mod tests {
             "advisor_cond_concern",
             "advisor_cond_budget",
             "advisor_cond_install",
+            // 会話のリズム改善（2026-08-21 conversation-rhythm-implementation §要件2）。
+            // advisor/decide.rs::next_question_streak が更新する。3 schema ファイル全部が
+            // 同じ written リストと突き合わされるため、上と同じ理由で 3 ファイルすべてに加算する。
+            "question_streak",
         ]
         .into_iter()
         .map(str::to_string)

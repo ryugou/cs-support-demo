@@ -90,6 +90,10 @@ nodes:
       advisor_cond_concern: { type: string }
       advisor_cond_budget: { type: string }
       advisor_cond_install: { type: string }
+      # 会話のリズム改善（2026-08-21 conversation-rhythm-implementation §要件2）。
+      # Call#2 のメタ closing が質問系で連続した回数。decide.rs::next_question_streak が
+      # 更新する。他 2 schema ファイルへの複製は上と同じ理由（加算のみ）。
+      question_streak: { type: int }
   ConversationTurn:
     attributes:
       turn_id: { type: string, required: true }

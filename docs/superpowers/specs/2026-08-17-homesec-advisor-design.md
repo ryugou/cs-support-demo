@@ -100,9 +100,11 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
       "title": "URTECT ADC-V724",
       "description": "屋外対応・夜間撮影。スマホから映像確認",
       "image_url": "https://<advisor host>/static/products/adc-v724.jpg",
-      "product_page_url": "https://<商品ページ URL。材料の product_page_url>",
-      "button_text": "この商品について聞く",
-      "button_message": "ADC-V724について詳しく教えて"
+      "buttons": [
+        {"kind": "uri", "label": "商品ページを見る", "url": "https://<商品ページ URL。材料の product_page_url>"},
+        {"kind": "message", "label": "詳しく聞く", "message": "URTECT ADC-V724について詳しく教えて"},
+        {"kind": "message", "label": "導入を相談する", "message": "URTECT ADC-V724の導入を相談したい"}
+      ]
     }
   ]
 }

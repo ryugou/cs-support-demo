@@ -481,18 +481,25 @@ fn hash_line_user_id(user_id: &str) -> String {
 /// 欠落時は `#[serde(default)]` で `None` にする（未知フィールドを許容する既存の規律と
 /// 同じ理由: 相手側のフィールド追加・欠落でこの型のパース自体は壊さない）。
 ///
-/// `title` / `description` / `button_text` / `button_message` にも `#[serde(default)]` を
-/// 付けて必須フィールド扱いを外す（fail-open 是正）。素の `String`（必須）のままだと、
-/// 応答生成 API がこの 4 つのうち 1 つでも欠いたカードを `product_cards` に 1 件でも含めて
-/// 返した瞬間、`AnswerApiResponse` **全体**のデシリアライズが失敗する。その結果
-/// `call_answer_api` が `None` を返し、`assemble_reply` がフォールバック文に倒れて、同じ
-/// レスポンスに載っていたはずの `reply_text`（本来届くテキスト回答）と `case_id`（会話継続性）
-/// までカード 1 件の欠陥に道連れにされる（モジュール doc 冒頭の不変条件違反）。
+/// `title` / `description` にも `#[serde(default)]` を付けて必須フィールド扱いを外す
+/// （fail-open 是正）。素の `String`（必須）のままだと、応答生成 API がこれらを欠いたカードを
+/// `product_cards` に 1 件でも含めて返した瞬間、`AnswerApiResponse` **全体**のデシリアライズが
+/// 失敗する。その結果 `call_answer_api` が `None` を返し、`assemble_reply` がフォールバック文に
+/// 倒れて、同じレスポンスに載っていたはずの `reply_text`（本来届くテキスト回答）と
+/// `case_id`（会話継続性）までカード 1 件の欠陥に道連れにされる（モジュール doc 冒頭の不変条件
+/// 違反）。`buttons` は個別の理由（[`deserialize_buttons`] の doc comment）で同じ fail-open を
+/// 別の仕組み（要素単位のカスタムデシリアライザ）で実現する。
 ///
 /// `Option<String>` ではなく `#[serde(default)]` 付き `String`（欠落時は空文字）を選ぶ理由:
 /// 空文字と欠落を区別しても得るものが無い。`build_flex_message`（[`build_flex_bubble`]）の
-/// 検証は「trim 後に空なら bubble をスキップ（button_text/button_message、または title と
-/// description の両方）」であり、空文字と欠落を最初から同一に扱っているため。
+/// 検証は「trim 後に空なら bubble をスキップ（title と description の両方が空、または
+/// buttons が空）」であり、空文字と欠落を最初から同一に扱っているため。
+///
+/// `buttons: Vec<ButtonPayload>`（2026-08-21 conversation-rhythm-implementation §要件4）は
+/// 旧 `button_text` / `button_message`（常に1つの message action しか表現できず、タップ後の
+/// 会話が行き止まりになっていた、本番実害 (c)）を置き換える。生成側
+/// `server/src/advisor/cards.rs::CardButton` と同じ JSON 表現（`{"kind":"uri",...}` /
+/// `{"kind":"message",...}`）を持つ。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct CardPayload {
     #[serde(default)]
@@ -500,17 +507,83 @@ struct CardPayload {
     #[serde(default)]
     description: String,
     image_url: Option<String>,
-    /// カードの「商品ページを見る」ボタン(URI action)の遷移先(design doc §3.3、Issue #34
-    /// カルーセル→Flex 移行)。`Option<String>` は `image_url` と同じ扱いで、欠落時は
-    /// `#[serde(default)]` 無しでも自動的に `None` になる(serde の `Option<T>` フィールドの
-    /// 既定動作)。
-    product_page_url: Option<String>,
-    #[serde(default)]
-    button_text: String,
-    #[serde(default)]
-    button_message: String,
+    /// footer に表示するボタン列（要件4）。欠落時は `#[serde(default)]` により空 Vec になり、
+    /// [`build_flex_bubble`] がそのバブルを丸ごとスキップする（「ボタンが無いカード」という
+    /// 既存の fail-soft 経路に自然に合流する）。
+    #[serde(default, deserialize_with = "deserialize_buttons")]
+    buttons: Vec<ButtonPayload>,
     #[serde(default)]
     material_key: Option<String>,
+}
+
+/// [`CardPayload::buttons`] の1件（design doc 要件4、`server/src/advisor/cards.rs::CardButton`
+/// と同じ JSON 表現）。フィールド単位の fail-open は持たない: 各 variant の `label` /
+/// `url` / `message` はすべて必須文字列のままにする。理由は [`deserialize_buttons`] が
+/// 要素単位で「デシリアライズに失敗した要素は丸ごと落とす」設計だから
+/// （[`deserialize_product_cards`] / [`deserialize_quick_replies`] と同型）— フィールド単位の
+/// `#[serde(default)]` を足すと、例えば `url` を欠いた `{"kind":"uri","label":"x"}` が
+/// 空文字列 `url` を持つ「一見有効な」`Uri` として生き残ってしまい、後段の
+/// [`is_plausible_https_url`] 検証に委ねるまで不正値を型システムが伝えなくなる（検証漏れの
+/// 温床）。要素ごと落とす方が安全側。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ButtonPayload {
+    Uri { label: String, url: String },
+    Message { label: String, message: String },
+}
+
+/// [`CardPayload::buttons`] 用のカスタムデシリアライザ。[`deserialize_product_cards`] /
+/// [`deserialize_quick_replies`] と同型の fail-open: 個々の要素の型不一致・未知の `kind` は
+/// その要素だけ warn して落とし、`buttons` 配列全体、ひいては `CardPayload`（そしてその親の
+/// `AnswerApiResponse`）全体のパース失敗には波及させない。
+///
+/// - フィールド自体が欠落している場合はこの関数は呼ばれず、`#[serde(default)]` により
+///   `Vec::new()` になる。
+/// - フィールドが `null` の場合は空 Vec を返す（このカードは buttons 空として
+///   [`build_flex_bubble`] に自然にスキップされる）。
+/// - フィールドが配列でも `null` でもない場合（文字列・オブジェクト・数値・真偽値）は、型
+///   エラーとして `CardPayload` 全体のパースを失敗させず、JSON の型名だけを `tracing::warn!`
+///   に記録して空 Vec を返す。
+/// - フィールドが配列の場合、要素が `ButtonPayload` への変換に失敗したら（未知の `kind` を
+///   含む）、その要素だけを `tracing::warn!` に記録して結果から除外する。配列全体は失敗させ
+///   ない。
+fn deserialize_buttons<'de, D>(deserializer: D) -> Result<Vec<ButtonPayload>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let values = match value {
+        serde_json::Value::Array(values) => values,
+        serde_json::Value::Null => return Ok(Vec::new()),
+        other => {
+            tracing::warn!(
+                actual_type = json_value_type_name(&other),
+                "line webhook: a product card's buttons field is present but is not a JSON \
+                 array (or null); treating it as an empty buttons list so the rest of the card \
+                 (and the rest of the answer api response) still parses"
+            );
+            return Ok(Vec::new());
+        }
+    };
+    Ok(values
+        .into_iter()
+        .enumerate()
+        .filter_map(
+            |(button_index, value)| match serde_json::from_value::<ButtonPayload>(value) {
+                Ok(button) => Some(button),
+                Err(err) => {
+                    tracing::warn!(
+                        button_index,
+                        error = %err,
+                        "line webhook: a product card's button failed to deserialize (unknown \
+                         kind, field type mismatch, or otherwise malformed); dropping only this \
+                         button so the rest of the card still parses"
+                    );
+                    None
+                }
+            },
+        )
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -888,11 +961,6 @@ fn material_key_for_log(material_key: Option<&str>) -> String {
 /// design doc に文言の指定は無いため、オーケストレーターの spec が指定した固定値を使う。
 const FLEX_ALT_TEXT: &str = "おすすめ製品のご紹介";
 
-/// 「商品ページを見る」ボタン(URI action)の固定ラベル(design doc §3.3)。ユーザー入力に
-/// 由来しない定数文字列であり、LINE の uri action label 上限(40字)を大きく下回るため
-/// 切り詰めは不要。
-const FLEX_PRODUCT_PAGE_BUTTON_LABEL: &str = "商品ページを見る";
-
 /// bubble body の `title` テキストの文字数上限。LINE Flex の text コンポーネント自体に
 /// carousel template のような厳密な文字数上限は無いが、カードが縦に間延びしないよう
 /// 従来の carousel template と同じ保守的な値を踏襲する。
@@ -908,14 +976,15 @@ const FLEX_DESCRIPTION_MAX_CHARS: usize = 60;
 /// select_cards 側の上限と同じ 3 を採用する。
 const FLEX_MAX_BUBBLES: usize = 3;
 
-/// message action の `label`（= [`CardPayload::button_text`]）の文字数上限
-/// （LINE Messaging API の message action 仕様）。
+/// button コンポーネントの action `label`（[`ButtonPayload::Uri`] / [`ButtonPayload::Message`]
+/// のどちらも)の文字数上限（LINE Messaging API の action 仕様）。[`build_footer_button`] が
+/// 両 variant に共通で適用する。
 const FLEX_BUTTON_LABEL_MAX_CHARS: usize = 20;
 
-/// message action の `text`（= [`CardPayload::button_message`]。ボタン押下時に LINE が
+/// message action の `text`（= [`ButtonPayload::Message::message`]。ボタン押下時に LINE が
 /// そのまま新規メッセージとして送信する文字列）の文字数上限（LINE Messaging API の
-/// message action 仕様）。生成側 `server/src/advisor/cards.rs::to_product_card` は
-/// `format!("{}について詳しく教えて", material.title_ja)` で組み立てており、`title_ja` が
+/// message action 仕様）。生成側 `server/src/advisor/cards.rs::build_card_buttons` は
+/// `format!("{}について詳しく教えて", material.title_ja)` 等で組み立てており、`title_ja` が
 /// 長ければ 300 字を超えうる。超えると LINE Reply API が 400 を返し、同一 reply 呼び出しに
 /// 載っているテキスト回答ごと全損する。
 const FLEX_ACTION_TEXT_MAX_CHARS: usize = 300;
@@ -1061,6 +1130,113 @@ fn is_plausible_https_url(url: &str, max_chars: usize) -> bool {
     matches!(parsed.host_str(), Some(host) if !host.is_empty())
 }
 
+/// [`CardPayload::buttons`] の1要素を footer の button コンポーネント([`serde_json::Value`])
+/// へ変換する(2026-08-21 conversation-rhythm-implementation §要件4・要件6の必須テスト:
+/// buttons 配列が footer のボタン列へ正しく写像されること)。`None` は「この要素は検証に落ちた
+/// ので丸ごと落とす」ことを表す(bubble 自体は生き残る。呼び出し元 [`build_flex_bubble`] が
+/// `footer_contents` が空になった場合にだけ bubble ごと落とす)。
+///
+/// - [`ButtonPayload::Uri`]: `url` が [`is_plausible_https_url`] を満たさなければ、その
+///   ボタンだけを落とす(URL は途中で切ると別のリソースを指す壊れた URL になりうるため、
+///   [`truncate_flex_field`] のような切り詰めではなく「要素ごと落とす」に倒す。
+///   [`is_plausible_https_url`] の doc comment と同じ判断)。`label` が trim 後に空なら
+///   同様に落とす(action の `label` は必須)。有効なら `style: "primary"` の uri action
+///   ボタンを組み立てる。
+/// - [`ButtonPayload::Message`]: `label` / `message` のどちらかが trim 後に空ならそのボタンを
+///   落とす(message action の `label`/`text` は必須で空文字は不正。旧
+///   button_text/button_message 空チェックと同じ厳しさ)。有効なら `style: "secondary"` の
+///   message action ボタンを組み立てる。
+/// - どちらの variant も `label` は [`FLEX_BUTTON_LABEL_MAX_CHARS`] へ、`Message` の
+///   `message` は [`FLEX_ACTION_TEXT_MAX_CHARS`] へ切り詰める([`truncate_flex_field`] を
+///   再利用。trim 済みの値に対して検証・切り詰めの両方を行う理由は同関数の doc comment 参照)。
+fn build_footer_button(
+    card_index: usize,
+    material_key: Option<&str>,
+    button_index: usize,
+    button: &ButtonPayload,
+) -> Option<serde_json::Value> {
+    match button {
+        ButtonPayload::Uri { label, url } => {
+            if !is_plausible_https_url(url, FLEX_URI_ACTION_MAX_CHARS) {
+                tracing::warn!(
+                    card_index,
+                    material_key = material_key_for_log(material_key),
+                    button_index,
+                    "line webhook: a uri button's url is not a plausible absolute https URL; \
+                     dropping this button but keeping the card"
+                );
+                return None;
+            }
+            let label_trimmed = label.trim();
+            if label_trimmed.is_empty() {
+                tracing::warn!(
+                    card_index,
+                    material_key = material_key_for_log(material_key),
+                    button_index,
+                    "line webhook: a uri button's label is empty (or whitespace-only); \
+                     dropping this button but keeping the card"
+                );
+                return None;
+            }
+            let label = truncate_flex_field(
+                card_index,
+                material_key,
+                "button_label",
+                label_trimmed,
+                FLEX_BUTTON_LABEL_MAX_CHARS,
+            );
+            Some(serde_json::json!({
+                "type": "button",
+                "style": "primary",
+                "action": {
+                    "type": "uri",
+                    "label": label,
+                    "uri": url,
+                },
+            }))
+        }
+        ButtonPayload::Message { label, message } => {
+            let label_trimmed = label.trim();
+            let message_trimmed = message.trim();
+            if label_trimmed.is_empty() || message_trimmed.is_empty() {
+                tracing::warn!(
+                    card_index,
+                    material_key = material_key_for_log(material_key),
+                    button_index,
+                    label_empty = label_trimmed.is_empty(),
+                    message_empty = message_trimmed.is_empty(),
+                    "line webhook: a message button's label or message is empty (or \
+                     whitespace-only); dropping this button but keeping the card"
+                );
+                return None;
+            }
+            let label = truncate_flex_field(
+                card_index,
+                material_key,
+                "button_label",
+                label_trimmed,
+                FLEX_BUTTON_LABEL_MAX_CHARS,
+            );
+            let text = truncate_flex_field(
+                card_index,
+                material_key,
+                "button_message",
+                message_trimmed,
+                FLEX_ACTION_TEXT_MAX_CHARS,
+            );
+            Some(serde_json::json!({
+                "type": "button",
+                "style": "secondary",
+                "action": {
+                    "type": "message",
+                    "label": label,
+                    "text": text,
+                },
+            }))
+        }
+    }
+}
+
 /// 1 件の `CardPayload` から Flex bubble を組み立てる。`None` は「このカードは検証に落ちた
 /// ので丸ごとスキップする」を表す(呼び出し元 [`build_flex_message`] が使う)。
 ///
@@ -1070,9 +1246,13 @@ fn is_plausible_https_url(url: &str, max_chars: usize) -> bool {
 /// 再送はしない、design doc §6）。そのため旧カルーセル実装から踏襲した fail-open 規律で
 /// `CardPayload` を検証してから使う（不正な bubble は個別に落とし、テキスト回答は常に生かす）:
 ///
-/// - `button_text` / `button_message` のどちらかが空、または trim 後に空になる bubble は
-///   丸ごとスキップする（message action の `label` / `text` は必須で空文字は不正。旧カルーセル
-///   実装の button_text/button_message 空チェックと同じ厳しさ）。
+/// - `buttons` が空(欠落含む。要素単位で検証に落ちて0件に減った場合も含む)の bubble は
+///   丸ごとスキップする(2026-08-21 conversation-rhythm-implementation §要件4。footer に
+///   ボタンが1つも無い bubble は成立しない、という旧 button_text/button_message 空チェックと
+///   同じ厳しさを、複数ボタンに一般化した形)。個々のボタンの検証は [`build_footer_button`]
+///   に委譲する: `Message` は `label`/`message` のどちらかが空なら要素ごと落とす。`Uri` は
+///   `url` が [`is_plausible_https_url`] を満たさなければ要素ごと落とす。いずれも bubble
+///   全体は道連れにしない(他のボタンが有効なら bubble は残る)。
 /// - `title` と `description` の両方が trim 後に空になる bubble も丸ごとスキップする(body
 ///   box に表示する内容が無くなるため)。どちらか一方が非空なら bubble は成立する(空の方は
 ///   単にテキスト行を出さない)。
@@ -1084,28 +1264,28 @@ fn is_plausible_https_url(url: &str, max_chars: usize) -> bool {
 ///   （`format!("https://{}{}", state.public_host, rel)`）へ変換してから返す。このアダプタが
 ///   相対パスをそのまま受け取るのは契約違反であり、その場合も落とすのはテキスト回答ではなく
 ///   画像だけにする）。
-/// - `product_page_url` が [`is_plausible_https_url`] を満たさない bubble は、「商品ページを
-///   見る」ボタンだけ落として bubble 自体は残す（design doc §3.3: 無い場合はその要素を省いた
-///   bubble になる）。
-/// - `title` / `description` / `button_text` / `button_message` はそれぞれ
-///   [`FLEX_TITLE_MAX_CHARS`] / [`FLEX_DESCRIPTION_MAX_CHARS`] /
-///   [`FLEX_BUTTON_LABEL_MAX_CHARS`] / [`FLEX_ACTION_TEXT_MAX_CHARS`] へ切り詰める。
+/// - `title` / `description` はそれぞれ [`FLEX_TITLE_MAX_CHARS`] /
+///   [`FLEX_DESCRIPTION_MAX_CHARS`] へ切り詰める。各ボタンの `label` /
+///   `message`(または `uri` action の `label`)の切り詰めは [`build_footer_button`] を参照。
 fn build_flex_bubble(index: usize, card: &CardPayload) -> Option<serde_json::Value> {
     let material_key = card.material_key.as_deref();
 
-    // 空判定と切り詰めの両方を trim 済みの値に対して行う理由は旧カルーセル実装と同じ
-    // （先頭空白が切り詰め幅を食い潰して結果が空白だけになるのを防ぐ）。
-    let button_message_trimmed = card.button_message.trim();
-    let button_text_trimmed = card.button_text.trim();
-    if button_message_trimmed.is_empty() || button_text_trimmed.is_empty() {
+    let footer_contents: Vec<serde_json::Value> = card
+        .buttons
+        .iter()
+        .enumerate()
+        .filter_map(|(button_index, button)| {
+            build_footer_button(index, material_key, button_index, button)
+        })
+        .collect();
+    if footer_contents.is_empty() {
         tracing::warn!(
             card_index = index,
             material_key = material_key_for_log(material_key),
-            button_text_empty = button_text_trimmed.is_empty(),
-            button_message_empty = button_message_trimmed.is_empty(),
-            "line webhook: a product card's button_text or button_message is empty (or \
-             whitespace-only); dropping this card (the message action's label/text are \
-             required and cannot be empty)"
+            buttons_len = card.buttons.len(),
+            "line webhook: a product card has no usable buttons (the buttons list is empty, \
+             missing, or every button failed validation); dropping this card (a flex bubble's \
+             footer requires at least one button)"
         );
         return None;
     }
@@ -1156,56 +1336,6 @@ fn build_flex_bubble(index: usize, card: &CardPayload) -> Option<serde_json::Val
             "margin": "md",
         }));
     }
-
-    let label = truncate_flex_field(
-        index,
-        material_key,
-        "button_text",
-        button_text_trimmed,
-        FLEX_BUTTON_LABEL_MAX_CHARS,
-    );
-    let button_message = truncate_flex_field(
-        index,
-        material_key,
-        "button_message",
-        button_message_trimmed,
-        FLEX_ACTION_TEXT_MAX_CHARS,
-    );
-
-    // footer: 「商品ページを見る」(uri, 有効な product_page_url があるときだけ) +
-    // 「この製品について相談」(message, 上の空チェックで非空を保証済みなので常に含める)。
-    let mut footer_contents: Vec<serde_json::Value> = Vec::with_capacity(2);
-    match &card.product_page_url {
-        Some(url) if is_plausible_https_url(url, FLEX_URI_ACTION_MAX_CHARS) => {
-            footer_contents.push(serde_json::json!({
-                "type": "button",
-                "style": "primary",
-                "action": {
-                    "type": "uri",
-                    "label": FLEX_PRODUCT_PAGE_BUTTON_LABEL,
-                    "uri": url,
-                },
-            }));
-        }
-        Some(_) => {
-            tracing::warn!(
-                card_index = index,
-                material_key = material_key_for_log(material_key),
-                "line webhook: a product card's product_page_url is not a plausible absolute \
-                 https URL; dropping the \"商品ページを見る\" button but keeping the card"
-            );
-        }
-        None => {}
-    }
-    footer_contents.push(serde_json::json!({
-        "type": "button",
-        "style": "secondary",
-        "action": {
-            "type": "message",
-            "label": label,
-            "text": button_message,
-        },
-    }));
 
     let mut bubble = serde_json::json!({
         "type": "bubble",
@@ -1758,8 +1888,10 @@ fn count_flex_bubbles(flex_message: &serde_json::Value) -> usize {
 /// quick reply の送出上限件数。LINE 仕様上の上限(13件)より狭く運用する
 /// (`server/src/advisor/quick_replies.rs::MAX_QUICK_REPLIES` と同じ値。あちらは応答生成側の
 /// 上限、こちらはアダプタ側の防御的な上限で、別プロセスの出力を信用しないという規律のもと
-/// あえて重複して持つ)。
-const QUICK_REPLY_MAX_ITEMS: usize = 6;
+/// あえて重複して持つ)。design doc `2026-08-17-homesec-advisor-design.md` §3.3 が上限4件と
+/// 定めており、2026-08-21 conversation-rhythm-implementation §要件5 により生成側が 6 → 4 へ
+/// 縮小されたため、こちらも追随する。
+const QUICK_REPLY_MAX_ITEMS: usize = 4;
 
 /// `label` の文字数上限(文字数、`chars().count()`)。応答生成側で既に切り詰め済みのはずだが、
 /// 別プロセスの出力を信用せずアダプタ側でも防御的に切り詰める。
@@ -2729,15 +2861,17 @@ mod tests {
                     "title": "URTECT ADC-V724",
                     "description": "屋外対応・夜間撮影。スマホから映像確認",
                     "image_url": "https://advisor.example/static/products/adc-v724.jpg",
-                    "button_text": "この商品について聞く",
-                    "button_message": "ADC-V724について詳しく教えて",
+                    "buttons": [
+                        {"kind": "message", "label": "この商品について聞く", "message": "ADC-V724について詳しく教えて"}
+                    ],
                     "future_field": "x"
                 },
                 {
                     "title": "汎用センサーライト",
                     "description": "人感センサーで自動点灯するカテゴリ製品",
-                    "button_text": "詳しく聞く",
-                    "button_message": "センサーライトについて詳しく教えて"
+                    "buttons": [
+                        {"kind": "message", "label": "詳しく聞く", "message": "センサーライトについて詳しく教えて"}
+                    ]
                 }
             ]
         }"#;
@@ -2758,8 +2892,13 @@ mod tests {
             cards[0].image_url.as_deref(),
             Some("https://advisor.example/static/products/adc-v724.jpg")
         );
-        assert_eq!(cards[0].button_text, "この商品について聞く");
-        assert_eq!(cards[0].button_message, "ADC-V724について詳しく教えて");
+        assert_eq!(
+            cards[0].buttons,
+            vec![ButtonPayload::Message {
+                label: "この商品について聞く".to_string(),
+                message: "ADC-V724について詳しく教えて".to_string(),
+            }]
+        );
         // material_key は `CardPayload` の実フィールド（未知フィールドではない）。ここで
         // 正しく取り込まれることを固定する。
         assert_eq!(
@@ -2772,6 +2911,84 @@ mod tests {
 
         // 2 件目: image_url を欠いたカード（design doc §3.3: 「無い列は画像なしで成立する」）。
         assert_eq!(cards[1].image_url, None);
+    }
+
+    // ---- CardPayload::buttons のデシリアライズ(2026-08-21 conversation-rhythm-implementation
+    // §要件4・必須テスト6: buttons が空(欠落含む)のときバブルがパニックせずスキップされる、
+    // の前提となる deserialize_buttons の fail-open を直接固定する) ----
+
+    #[test]
+    fn card_payload_buttons_defaults_to_empty_vec_when_the_field_is_missing() {
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-300",
+            "product_cards": [
+                { "title": "ボタン無し", "description": "説明" }
+            ]
+        }"#;
+        let resp: AnswerApiResponse = serde_json::from_str(json)
+            .expect("a card without a buttons field must still parse (fail-open)");
+        let cards = resp.product_cards.expect("product_cards must be Some");
+        assert_eq!(
+            cards[0].buttons,
+            Vec::new(),
+            "a missing buttons field must default to an empty Vec, not fail the parse"
+        );
+    }
+
+    #[test]
+    fn card_payload_buttons_drops_only_the_malformed_button_and_keeps_the_rest() {
+        // 要素単位の fail-open: 未知の kind を持つ要素は個別に落とし、buttons 配列全体、
+        // ひいては CardPayload/AnswerApiResponse 全体のパースは失敗させない
+        // (deserialize_product_cards / deserialize_quick_replies と同型)。
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-301",
+            "product_cards": [
+                {
+                    "title": "一部不正なボタン",
+                    "description": "説明",
+                    "buttons": [
+                        {"kind": "message", "label": "詳しく聞く", "message": "詳しく教えて"},
+                        {"kind": "unknown_kind", "label": "壊れたボタン"},
+                        {"kind": "uri", "label": "商品ページを見る", "url": "https://example.com/x"}
+                    ]
+                }
+            ]
+        }"#;
+        let resp: AnswerApiResponse = serde_json::from_str(json)
+            .expect("a malformed button element must not fail the whole response parse");
+        let cards = resp.product_cards.expect("product_cards must be Some");
+        assert_eq!(
+            cards[0].buttons,
+            vec![
+                ButtonPayload::Message {
+                    label: "詳しく聞く".to_string(),
+                    message: "詳しく教えて".to_string(),
+                },
+                ButtonPayload::Uri {
+                    label: "商品ページを見る".to_string(),
+                    url: "https://example.com/x".to_string(),
+                },
+            ],
+            "the unknown-kind element must be dropped, keeping the two well-formed buttons in \
+             order"
+        );
+    }
+
+    #[test]
+    fn card_payload_buttons_becomes_empty_vec_when_the_field_is_not_an_array() {
+        let json = r#"{
+            "reply_text": "こちらが回答です",
+            "case_id": "case-302",
+            "product_cards": [
+                { "title": "不正な buttons", "description": "説明", "buttons": "oops" }
+            ]
+        }"#;
+        let resp: AnswerApiResponse = serde_json::from_str(json)
+            .expect("a non-array buttons field must not fail the whole response parse");
+        let cards = resp.product_cards.expect("product_cards must be Some");
+        assert_eq!(cards[0].buttons, Vec::new());
     }
 
     #[test]
@@ -2807,8 +3024,9 @@ mod tests {
             "product_cards": [
                 {
                     "title": "タイトルのみ",
-                    "button_text": "詳しく聞く",
-                    "button_message": "詳しく教えて"
+                    "buttons": [
+                        {"kind": "message", "label": "詳しく聞く", "message": "詳しく教えて"}
+                    ]
                 }
             ]
         }"#;
@@ -2862,14 +3080,16 @@ mod tests {
                 {
                     "title": "型不一致カード",
                     "description": 123,
-                    "button_text": "詳しく聞く",
-                    "button_message": "詳しく教えて"
+                    "buttons": [
+                        {"kind": "message", "label": "詳しく聞く", "message": "詳しく教えて"}
+                    ]
                 },
                 {
                     "title": "正常カード",
                     "description": "正しい説明文",
-                    "button_text": "詳しく聞く",
-                    "button_message": "詳しく教えて"
+                    "buttons": [
+                        {"kind": "message", "label": "詳しく聞く", "message": "詳しく教えて"}
+                    ]
                 }
             ]
         }"#;
@@ -2925,14 +3145,16 @@ mod tests {
                 {
                     "title": "カード1",
                     "description": "説明1",
-                    "button_text": "詳しく聞く",
-                    "button_message": "詳しく教えて"
+                    "buttons": [
+                        {"kind": "message", "label": "詳しく聞く", "message": "詳しく教えて"}
+                    ]
                 },
                 {
                     "title": "カード2",
                     "description": "説明2",
-                    "button_text": "詳しく聞く",
-                    "button_message": "詳しく教えて"
+                    "buttons": [
+                        {"kind": "message", "label": "詳しく聞く", "message": "詳しく教えて"}
+                    ]
                 }
             ]
         }"#;
@@ -3125,17 +3347,20 @@ mod tests {
     // 組み立て。Issue #34 でカルーセルテンプレートから移行） ----
 
     /// テスト用の `CardPayload` を組み立てる。`title` / `description` / `image_url` 以外は
-    /// テストの関心事ではないため固定値にする（`material_key` は `None` 固定、
-    /// `product_page_url` も `None` 固定 — 個別に必要なテストは `.product_page_url = Some(..)`
-    /// で上書きする）。
+    /// テストの関心事ではないため固定値にする（`material_key` は `None` 固定、`buttons` は
+    /// message action 1件固定 — uri action(「商品ページを見る」相当)が個別に必要なテストは
+    /// `card.buttons.insert(0, ButtonPayload::Uri { .. })` で先頭に足す。生成側
+    /// `server/src/advisor/cards.rs::build_card_buttons` が product_page_url ありのとき
+    /// uri ボタンを先頭に置く規約と揃える）。
     fn sample_card(title: &str, description: &str, image_url: Option<&str>) -> CardPayload {
         CardPayload {
             title: title.to_string(),
             description: description.to_string(),
             image_url: image_url.map(str::to_string),
-            product_page_url: None,
-            button_text: "この製品について相談".to_string(),
-            button_message: "詳しく教えて".to_string(),
+            buttons: vec![ButtonPayload::Message {
+                label: "この製品について相談".to_string(),
+                message: "詳しく教えて".to_string(),
+            }],
             material_key: None,
         }
     }
@@ -3169,13 +3394,15 @@ mod tests {
     }
 
     #[test]
-    fn build_flex_message_footer_message_button_uses_button_text_and_button_message() {
+    fn build_flex_message_footer_message_button_maps_label_and_message_from_buttons() {
+        // 必須テスト6: buttons 配列(ButtonPayload::Message)が footer の message action ボタン
+        // へ正しく写像されること。
         let message = build_flex_message(&[sample_card("タイトル", "説明", None)])
             .expect("a valid card must produce a flex message");
         let footer_contents = message["contents"]["footer"]["contents"]
             .as_array()
             .expect("footer contents must be a JSON array");
-        // product_page_url が無いので footer には message ボタンのみ。
+        // buttons に uri ボタンを足していないので footer には message ボタンのみ。
         assert_eq!(footer_contents.len(), 1);
         let action = &footer_contents[0]["action"];
         assert_eq!(footer_contents[0]["style"], "secondary");
@@ -3198,12 +3425,30 @@ mod tests {
         assert_eq!(body_contents[1]["text"], "説明");
     }
 
-    // ---- 必須テスト4: product_page_url の有無によるボタン有無 ----
+    // ---- 必須テスト4・6: buttons 配列の uri ボタン(旧 product_page_url 相当)の有無・妥当性
+    // によるボタン有無 ----
+
+    fn uri_button(url: &str) -> ButtonPayload {
+        ButtonPayload::Uri {
+            label: "商品ページを見る".to_string(),
+            url: url.to_string(),
+        }
+    }
+
+    /// `sample_card` の既定 `buttons[0]`(message action)の label/message を差し替える。
+    /// 片方のフィールドだけを境界値に変えたいテストで、もう片方は既定値のまま保つために使う。
+    fn set_message_button(card: &mut CardPayload, label: &str, message: &str) {
+        card.buttons[0] = ButtonPayload::Message {
+            label: label.to_string(),
+            message: message.to_string(),
+        };
+    }
 
     #[test]
-    fn build_flex_message_includes_the_product_page_button_when_product_page_url_is_valid() {
+    fn build_flex_message_includes_the_uri_button_first_when_it_is_valid() {
         let mut card = sample_card("タイトル", "説明", None);
-        card.product_page_url = Some("https://example.com/products/adc-v724".to_string());
+        card.buttons
+            .insert(0, uri_button("https://example.com/products/adc-v724"));
         let message =
             build_flex_message(&[card]).expect("a valid card must produce a flex message");
         let footer_contents = message["contents"]["footer"]["contents"]
@@ -3212,7 +3457,8 @@ mod tests {
         assert_eq!(
             footer_contents.len(),
             2,
-            "the uri button must come first, followed by the message button"
+            "the uri button must come first, followed by the message button (buttons order is \
+             preserved from the payload)"
         );
         let uri_action = &footer_contents[0]["action"];
         assert_eq!(footer_contents[0]["style"], "primary");
@@ -3223,7 +3469,7 @@ mod tests {
     }
 
     #[test]
-    fn build_flex_message_omits_the_product_page_button_when_product_page_url_is_absent() {
+    fn build_flex_message_omits_the_uri_button_when_buttons_has_no_uri_entry() {
         let message = build_flex_message(&[sample_card("タイトル", "説明", None)])
             .expect("a valid card must produce a flex message");
         let footer_contents = message["contents"]["footer"]["contents"]
@@ -3237,9 +3483,9 @@ mod tests {
     }
 
     #[test]
-    fn build_flex_message_drops_the_product_page_button_but_keeps_the_card_when_url_is_invalid() {
+    fn build_flex_message_drops_the_uri_button_but_keeps_the_card_when_its_url_is_invalid() {
         let mut card = sample_card("タイトル", "説明", None);
-        card.product_page_url = Some("/relative/path".to_string());
+        card.buttons.insert(0, uri_button("/relative/path"));
         let message = build_flex_message(&[card])
             .expect("the card itself must survive; only the button is dropped");
         let footer_contents = message["contents"]["footer"]["contents"]
@@ -3248,28 +3494,28 @@ mod tests {
         assert_eq!(
             footer_contents.len(),
             1,
-            "an invalid product_page_url must not produce a uri button, but the message \
-             button must remain"
+            "an invalid uri button url must not produce a uri button, but the message button \
+             must remain"
         );
         assert_eq!(footer_contents[0]["action"]["type"], "message");
     }
 
-    // ---- reviewer 一次レビュー Warning 1 是正: product_page_url(uri action, 上限1000)と
+    // ---- reviewer 一次レビュー Warning 1 是正: uri button の `url`(uri action, 上限1000)と
     // image_url(hero, 上限2000)は独立した文字数上限を持つ。同じ長さの URL が一方では
     // 落ち、他方では採用されることを固定して、2つの上限が再び混同されないようにする。 ----
 
     #[test]
-    fn build_flex_message_drops_the_product_page_button_when_url_is_over_the_uri_action_limit() {
+    fn build_flex_message_drops_the_uri_button_when_url_is_over_the_uri_action_limit() {
         let prefix = "https://advisor.example/";
         let padding = "x".repeat(FLEX_URI_ACTION_MAX_CHARS + 1 - prefix.chars().count());
         let url = format!("{prefix}{padding}");
         assert_eq!(
             url.chars().count(),
             FLEX_URI_ACTION_MAX_CHARS + 1,
-            "test setup: product_page_url must be exactly one char over the uri action limit"
+            "test setup: url must be exactly one char over the uri action limit"
         );
         let mut card = sample_card("タイトル", "説明", None);
-        card.product_page_url = Some(url);
+        card.buttons.insert(0, uri_button(&url));
         let message = build_flex_message(&[card])
             .expect("the card itself must survive; only the button is dropped");
         let footer_contents = message["contents"]["footer"]["contents"]
@@ -3278,25 +3524,24 @@ mod tests {
         assert_eq!(
             footer_contents.len(),
             1,
-            "a product_page_url over the uri action's 1000-char limit must drop the uri \
-             button, but the message button must remain"
+            "a url over the uri action's 1000-char limit must drop the uri button, but the \
+             message button must remain"
         );
         assert_eq!(footer_contents[0]["action"]["type"], "message");
     }
 
     #[test]
-    fn build_flex_message_keeps_the_product_page_button_when_url_is_exactly_at_the_uri_action_limit(
-    ) {
+    fn build_flex_message_keeps_the_uri_button_when_url_is_exactly_at_the_uri_action_limit() {
         let prefix = "https://advisor.example/";
         let padding = "x".repeat(FLEX_URI_ACTION_MAX_CHARS - prefix.chars().count());
         let url = format!("{prefix}{padding}");
         assert_eq!(
             url.chars().count(),
             FLEX_URI_ACTION_MAX_CHARS,
-            "test setup: product_page_url must be exactly at the uri action limit"
+            "test setup: url must be exactly at the uri action limit"
         );
         let mut card = sample_card("タイトル", "説明", None);
-        card.product_page_url = Some(url.clone());
+        card.buttons.insert(0, uri_button(&url));
         let message =
             build_flex_message(&[card]).expect("a valid card must produce a flex message");
         let footer_contents = message["contents"]["footer"]["contents"]
@@ -3305,8 +3550,8 @@ mod tests {
         assert_eq!(
             footer_contents.len(),
             2,
-            "a product_page_url at exactly the uri action's 1000-char limit must still \
-             produce the uri button (boundary must not be dropped)"
+            "a url at exactly the uri action's 1000-char limit must still produce the uri \
+             button (boundary must not be dropped)"
         );
         assert_eq!(footer_contents[0]["action"]["type"], "uri");
         assert_eq!(footer_contents[0]["action"]["uri"], url);
@@ -3393,7 +3638,11 @@ mod tests {
     #[test]
     fn build_flex_message_truncates_button_text_over_20_chars() {
         let mut card = sample_card("タイトル", "説明", None);
-        card.button_text = "あ".repeat(FLEX_BUTTON_LABEL_MAX_CHARS + 5);
+        set_message_button(
+            &mut card,
+            &"あ".repeat(FLEX_BUTTON_LABEL_MAX_CHARS + 5),
+            "詳しく教えて",
+        );
         let message =
             build_flex_message(&[card]).expect("a valid card must produce a flex message");
         let label = message["contents"]["footer"]["contents"][0]["action"]["label"]
@@ -3405,7 +3654,11 @@ mod tests {
     #[test]
     fn build_flex_message_truncates_button_message_over_300_chars() {
         let mut card = sample_card("タイトル", "説明", None);
-        card.button_message = "え".repeat(FLEX_ACTION_TEXT_MAX_CHARS + 10);
+        set_message_button(
+            &mut card,
+            "この製品について相談",
+            &"え".repeat(FLEX_ACTION_TEXT_MAX_CHARS + 10),
+        );
         let message =
             build_flex_message(&[card]).expect("a valid card must produce a flex message");
         let text = message["contents"]["footer"]["contents"][0]["action"]["text"]
@@ -3417,12 +3670,13 @@ mod tests {
     #[test]
     fn build_flex_message_does_not_truncate_button_message_at_exactly_300_chars() {
         let mut card = sample_card("タイトル", "説明", None);
-        card.button_message = "え".repeat(FLEX_ACTION_TEXT_MAX_CHARS);
+        let exact_message = "え".repeat(FLEX_ACTION_TEXT_MAX_CHARS);
+        set_message_button(&mut card, "この製品について相談", &exact_message);
         let message =
             build_flex_message(&[card.clone()]).expect("a valid card must produce a flex message");
         assert_eq!(
             message["contents"]["footer"]["contents"][0]["action"]["text"],
-            card.button_message
+            exact_message
         );
     }
 
@@ -3484,7 +3738,7 @@ mod tests {
     #[test]
     fn build_flex_message_drops_a_card_whose_button_text_is_empty() {
         let mut invalid = sample_card("無効", "説明あり", None);
-        invalid.button_text = "".to_string();
+        set_message_button(&mut invalid, "", "詳しく教えて");
         let cards = vec![sample_card("有効", "説明あり", None), invalid];
         let message = build_flex_message(&cards).expect("at least one valid card remains");
         assert_eq!(
@@ -3496,10 +3750,41 @@ mod tests {
     #[test]
     fn build_flex_message_drops_a_card_whose_button_message_is_empty() {
         let mut invalid = sample_card("無効", "説明あり", None);
-        invalid.button_message = "".to_string();
+        set_message_button(&mut invalid, "この製品について相談", "");
         let cards = vec![sample_card("有効", "説明あり", None), invalid];
         let message = build_flex_message(&cards).expect("at least one valid card remains");
         assert_eq!(message["contents"]["type"], "bubble");
+    }
+
+    // reviewer 一次レビュー Major 6 是正: 作業 spec の必須テスト6「buttons が空/欠落のときに
+    // バブルがパニックせずスキップされること」は、これまで (a) デシリアライズで空 Vec になる
+    // 経路、(b) 全ボタンが要素単位の検証に落ちて footer が空になる経路、の2つでしか間接的に
+    // 検証されていなかった。ここでは `buttons` フィールドそのものを空 `Vec` にしたカードを
+    // 直接 `build_flex_message` に渡し、パニックせずスキップされることを固定する。
+
+    #[test]
+    fn build_flex_message_skips_a_card_whose_buttons_field_is_an_empty_vec() {
+        let mut buttonless = sample_card("無効", "説明あり", None);
+        buttonless.buttons = Vec::new();
+        let cards = vec![sample_card("有効", "説明あり", None), buttonless];
+        let message = build_flex_message(&cards)
+            .expect("the other card is still valid, so a flex message must still be produced");
+        assert_eq!(
+            message["contents"]["type"], "bubble",
+            "only the button-less card must be dropped, leaving a single bubble (not a carousel)"
+        );
+    }
+
+    #[test]
+    fn build_flex_message_returns_none_when_the_only_card_has_an_empty_buttons_vec() {
+        let mut buttonless = sample_card("無効", "説明あり", None);
+        buttonless.buttons = Vec::new();
+        assert_eq!(
+            build_flex_message(&[buttonless]),
+            None,
+            "a bubble with no buttons at all is not a valid flex bubble; the empty-buttons \
+             card must be skipped without panicking, leaving no bubble and thus no flex message"
+        );
     }
 
     #[test]
@@ -3540,9 +3825,9 @@ mod tests {
     #[test]
     fn build_flex_message_returns_none_when_every_card_is_invalid() {
         let mut invalid1 = sample_card("無効1", "説明あり", None);
-        invalid1.button_text = "".to_string();
+        set_message_button(&mut invalid1, "", "詳しく教えて");
         let mut invalid2 = sample_card("無効2", "説明あり", None);
-        invalid2.button_message = "   ".to_string();
+        set_message_button(&mut invalid2, "この製品について相談", "   ");
         assert_eq!(
             build_flex_message(&[invalid1, invalid2]),
             None,
@@ -3624,7 +3909,7 @@ mod tests {
         let mut cards: Vec<CardPayload> = (0..FLEX_MAX_BUBBLES)
             .map(|i| {
                 let mut invalid = sample_card(&format!("無効{i}"), "説明あり", None);
-                invalid.button_text = String::new();
+                set_message_button(&mut invalid, "", "詳しく教えて");
                 invalid
             })
             .collect();
@@ -3681,7 +3966,8 @@ mod tests {
     #[test]
     fn build_flex_message_keeps_button_text_non_blank_when_leading_whitespace_fills_the_limit() {
         let mut card = sample_card("タイトル", "説明", None);
-        card.button_text = " ".repeat(FLEX_BUTTON_LABEL_MAX_CHARS) + "有効";
+        let label = " ".repeat(FLEX_BUTTON_LABEL_MAX_CHARS) + "有効";
+        set_message_button(&mut card, &label, "詳しく教えて");
         let message = build_flex_message(&[card])
             .expect("a button_text that is non-empty after trimming must produce a flex message");
         let label = message["contents"]["footer"]["contents"][0]["action"]["label"]
@@ -3699,7 +3985,8 @@ mod tests {
     #[test]
     fn build_flex_message_keeps_button_message_non_blank_when_leading_whitespace_fills_the_limit() {
         let mut card = sample_card("タイトル", "説明", None);
-        card.button_message = " ".repeat(FLEX_ACTION_TEXT_MAX_CHARS) + "有効なメッセージ";
+        let button_message = " ".repeat(FLEX_ACTION_TEXT_MAX_CHARS) + "有効なメッセージ";
+        set_message_button(&mut card, "この製品について相談", &button_message);
         let message = build_flex_message(&[card]).expect(
             "a button_message that is non-empty after trimming must produce a flex message",
         );
@@ -4041,7 +4328,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_line_reply_sends_a_single_text_message_when_all_cards_are_invalid() {
-        // 応答生成 API が壊れたカード（ここでは空の button_text）を返しても、テキスト回答の
+        // 応答生成 API が壊れたカード（ここでは空の button label）を返しても、テキスト回答の
         // 送信を道連れにしてはならない。
         let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
         let router = Router::new()
@@ -4054,7 +4341,7 @@ mod tests {
             UNREACHABLE_LOADING_API_URL.to_string(),
         );
         let mut invalid = sample_card("無効", "説明あり", None);
-        invalid.button_text = "".to_string();
+        set_message_button(&mut invalid, "", "詳しく教えて");
         let cards = vec![invalid];
 
         send_line_reply(&state, "rt1", "本文です", Some(&cards), None)
@@ -4074,8 +4361,10 @@ mod tests {
         assert_eq!(messages[0]["type"], "text");
     }
 
+    // 必須テスト6: buttons が空(欠落含む)のとき、バブルがパニックせずスキップされ、テキスト
+    // 回答が単独で送られること。
     #[tokio::test]
-    async fn send_line_reply_sends_a_single_text_message_when_all_cards_have_empty_button_text() {
+    async fn send_line_reply_sends_a_single_text_message_when_all_cards_have_no_buttons() {
         let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
         let router = Router::new()
             .route("/reply", post(line_reply_capture_handler))
@@ -4087,11 +4376,11 @@ mod tests {
             UNREACHABLE_LOADING_API_URL.to_string(),
         );
         let mut invalid = sample_card("無効", "説明あり", None);
-        invalid.button_text = "   ".to_string();
+        invalid.buttons = Vec::new();
 
         send_line_reply(&state, "rt1", "本文です", Some(&[invalid]), None)
             .await
-            .expect("send_line_reply must succeed against a 200 mock");
+            .expect("send_line_reply must succeed against a 200 mock (must not panic)");
 
         let captured = captured.lock().unwrap().clone();
         let messages = captured.body.as_ref().unwrap()["messages"]
@@ -4100,7 +4389,7 @@ mod tests {
         assert_eq!(
             messages.len(),
             1,
-            "an empty button_text must drop the only bubble, and once no bubble remains the \
+            "an empty buttons list must drop the only bubble, and once no bubble remains the \
              text reply must still be sent alone"
         );
         assert_eq!(messages[0]["type"], "text");
@@ -4604,8 +4893,9 @@ mod tests {
                 {
                     "title": "製品A",
                     "description": "説明A",
-                    "button_text": "詳しく聞く",
-                    "button_message": "詳しく教えて"
+                    "buttons": [
+                        {"kind": "message", "label": "詳しく聞く", "message": "詳しく教えて"}
+                    ]
                 }
             ]
         }))
