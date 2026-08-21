@@ -166,6 +166,21 @@ pub fn build_advisor_system_prompt(
          - 防犯効果を保証する表現(「絶対に防げます」「100%安全」等)は使わない。\n\
          - 資格・工事を要する作業(分電盤・屋内配線等)の具体的な手順は案内しない。\n\
          \n\
+         制約との向き合い方規則:\n\
+         - 顧客の制約(ネット環境が無い・スマホを使わない・賃貸・予算等)を「対策不可能」と\
+         宣告する理由にしない。防犯・見守りの大半はネット環境なしで成立する — 施錠の徹底・\
+         補助錠・防犯フィルム・センサーライト等の物理対策、通信内蔵型の見守りサービス\
+         (家庭のネット不要)。制約の中で成立する対策から組み立てる。\n\
+         - ネット環境が前提になるのはカメラ等の通信機器だけである。顧客が遠隔での映像確認を\
+         望む場合に限り、「工事不要のホームルーターでネット環境を作る選択肢もある」と\
+         従属的に添えてよい。\n\
+         \n\
+         利用者と閲覧者の区別規則:\n\
+         - 見守り用途では、機器を設置される本人(親等)と、映像・通知を確認する相談者は\
+         別人である。本人がスマートフォンを使わないことを、相談者側で確認する構成まで\
+         不可能と誤って推論しない。これは事実関係を正しく保つための規則であり、カメラを\
+         推す理由にはしない。\n\
+         \n\
          解決策の提示順序規則:\n\
          - 通常の相談では、提案は (1) お金のかからない習慣・設定(施錠の徹底・インターホン\
          対応の見直し等) → (2) 汎用の対策カテゴリ(補助錠・センサーライト・見守りサービス等、\
@@ -175,6 +190,8 @@ pub fn build_advisor_system_prompt(
          次の7つ: ADC-V523 / ADC-V523X / ADC-V724 / ADC-V724X / ADC-VC729P / \
          ADC-VC727P / ADC-VC827P。合致するURTECT製品が無ければ、資料の範囲で他社の\
          カテゴリ・製品を紹介し、詳細確認は公式サイトへ誘導する。他社を貶めない。\n\
+         - 複数の手段が同等に成立する場面では、嘘にならない範囲でカメラ(自社製品)を\
+         優先的に挙げてよい。成立しない・明らかに劣る場面では優先しない。\n\
          - 1つの応答で自社製品(URTECT製品)に言及するのは多くても2件までにする。\n\
          - 資料として渡されたown_product(自社製品)材料は「使える選択肢」であり、毎回\
          言及する義務ではない。相談内容に合わなければ言及しなくてよい。\n\
@@ -627,6 +644,69 @@ mod tests {
         assert!(p.contains("100%安全"), "{p}");
         assert!(p.contains("分電盤"), "{p}");
         assert!(p.contains("屋内配線"), "{p}");
+    }
+
+    // --- 本番実害是正(2026-08-21): 「ネット環境が無い」等の顧客制約を「対策不可能」の
+    // 宣告理由にし、材料にある物理対策・通信内蔵型見守りサービスが未注入・未使用のまま
+    // 一般論(SDカードカメラ等)が出た事案への規則(design doc §2.2)。mode に関わらず常に
+    // 含める共通ブロックであることを Answer / Clarify 両方で固定する。 ---
+
+    #[test]
+    fn system_prompt_states_constraint_handling_rule_in_answer_mode() {
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(p.contains("「対策不可能」と宣告する理由にしない"), "{p}");
+        assert!(
+            p.contains("工事不要のホームルーターでネット環境を作る選択肢もある"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_states_user_vs_viewer_distinction_rule_in_answer_mode() {
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(p.contains("機器を設置される本人"), "{p}");
+        assert!(
+            p.contains("相談者側で確認する構成まで不可能と誤って推論しない"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_states_camera_preference_degree_rule_in_answer_mode() {
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false);
+        assert!(p.contains("複数の手段が同等に成立する場面では"), "{p}");
+        assert!(
+            p.contains("成立しない・明らかに劣る場面では優先しない"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_constraint_and_viewer_and_preference_rules_are_mode_independent() {
+        // 3規則とも mode に関わらない共通ブロック(接地2層規則・安全下限と同じ扱い)である
+        // ことを、DraftMode::Clarify でも同じ文言が現れることで固定する。
+        let missing = [ConditionKey::Concern];
+        let p = build_advisor_system_prompt(
+            &DraftMode::Clarify { missing: &missing },
+            &[],
+            false,
+            false,
+        );
+        assert!(p.contains("「対策不可能」と宣告する理由にしない"), "{p}");
+        assert!(
+            p.contains("工事不要のホームルーターでネット環境を作る選択肢もある"),
+            "{p}"
+        );
+        assert!(p.contains("機器を設置される本人"), "{p}");
+        assert!(
+            p.contains("相談者側で確認する構成まで不可能と誤って推論しない"),
+            "{p}"
+        );
+        assert!(p.contains("複数の手段が同等に成立する場面では"), "{p}");
+        assert!(
+            p.contains("成立しない・明らかに劣る場面では優先しない"),
+            "{p}"
+        );
     }
 
     #[test]
