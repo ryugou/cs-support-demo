@@ -231,6 +231,9 @@ fn build_material_search_text(query: &str, conditions: &[(ConditionKey, String)]
     parts.join(" ")
 }
 
+/// design doc §6 手順6「category 合致材料」の対象 kind(own_product を除く3種)。
+const CATEGORY_POOL_KINDS: [&str; 3] = ["statistic", "partner_product", "scenario"];
+
 /// `vp.search()` のヒットから `advisor_material` 以外(`ConversationTurn` / `support_case` 等)を
 /// 除外し、`query_nodes` の属性で [`AdvisorMaterial`] へ変換する純関数。ネットワーク呼び出しを
 /// 含まないため、`SearchResultItem` / 属性 map を手組みしたフィクスチャで検証できる。
@@ -269,16 +272,22 @@ fn select_materials_from_hits(
 /// (Warning B 是正: 「失敗しても `Err` を伝播しない」契約はネットワーク呼び出しと同じ関数に
 /// インラインで書かれていたため、この契約自体を固定するテストが書けなかった)。
 ///
-/// 戻り値は `(searched, own_products)` のタプル。`searched` は従来どおり検索ヒット由来の材料、
-/// `own_products` は schema 内の全 `own_product` 材料(design doc §6 手順6「own_product の
-/// 保証注入」用。`query_nodes` で既に取得済みの全 advisor_material から抽出するため、追加の
-/// ネットワーク呼び出しは発生しない)。
+/// 戻り値は `(searched, own_products, category_pool)` の3要素タプル。`searched` は従来どおり
+/// 検索ヒット由来の材料、`own_products` は schema 内の全 `own_product` 材料(design doc §6
+/// 手順6「own_product の保証注入」用)、`category_pool` は `own_product` を除く3種
+/// (`statistic` / `partner_product` / `scenario`)の全材料(design doc §6 手順6「category
+/// 合致材料」の入力集合)。いずれも `query_nodes` で既に取得済みの全 advisor_material から
+/// 抽出するため、追加のネットワーク呼び出しは発生しない。
 pub async fn gather_materials(
     vp: &VegapunkClient,
     schema: &str,
     query: &str,
     conditions: &[(ConditionKey, String)],
-) -> (Vec<AdvisorMaterial>, Vec<AdvisorMaterial>) {
+) -> (
+    Vec<AdvisorMaterial>,
+    Vec<AdvisorMaterial>,
+    Vec<AdvisorMaterial>,
+) {
     let search_text = build_material_search_text(query, conditions);
     let (search_result, nodes_result) = tokio::join!(
         vp.search(schema, &search_text, MATERIAL_SEARCH_TOP_K),
@@ -301,14 +310,20 @@ pub async fn gather_materials(
 /// どちらか一方でも失敗したら `tracing::warn!` して両方とも空 `Vec` を返す。呼び出し元
 /// (`draftgen.rs`)は材料が空でも安全に動く前提で設計してある。
 ///
-/// 戻り値の2つ目の要素(`own_products`)は design doc §6 手順6「own_product の保証注入」用に、
-/// `nodes_result` から `kind == "own_product"` のものだけを [`select_materials_of_kind`] で
-/// 抽出する。
+/// 戻り値の2・3つ目の要素は design doc §6 手順6 の別枠保証注入用に、`nodes_result` から
+/// kind ごとに [`select_materials_of_kind`] / [`select_materials_of_kinds`] で抽出する:
+/// `own_products` は `kind == "own_product"`(「own_product の保証注入」用)、
+/// `category_pool` は `kind` が `statistic` / `partner_product` / `scenario` のいずれか
+/// (own_product を除く。「category 合致材料」の入力集合)。
 fn materials_from_results(
     search_result: anyhow::Result<Vec<SearchResultItem>>,
     nodes_result: anyhow::Result<Vec<crate::proto::graphrag::NodeResult>>,
     schema: &str,
-) -> (Vec<AdvisorMaterial>, Vec<AdvisorMaterial>) {
+) -> (
+    Vec<AdvisorMaterial>,
+    Vec<AdvisorMaterial>,
+    Vec<AdvisorMaterial>,
+) {
     let hits = match search_result {
         Ok(hits) => hits,
         Err(error) => {
@@ -320,7 +335,7 @@ fn materials_from_results(
                  Call#2 still runs (it degrades to general advice without factual grounding, \
                  design doc §8). Response is not blocked"
             );
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
     };
     let nodes = match nodes_result {
@@ -334,7 +349,7 @@ fn materials_from_results(
                  materials so Call#2 still runs (it degrades to general advice without factual \
                  grounding, design doc §8). Response is not blocked"
             );
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
     };
 
@@ -345,20 +360,30 @@ fn materials_from_results(
 
     let searched = select_materials_from_hits(&hits, &node_attrs);
     let own_products = select_materials_of_kind(&node_attrs, "own_product");
-    (searched, own_products)
+    let category_pool = select_materials_of_kinds(&node_attrs, &CATEGORY_POOL_KINDS);
+    (searched, own_products, category_pool)
 }
 
 /// `node_attrs`(query_nodes が返した全 advisor_material の属性 map)から `kind` が一致する
-/// 材料だけを [`AdvisorMaterial`] へ変換する。material_key の昇順でソートし、`HashMap` の
-/// 反復順序に依存しない決定論的な順序にする(design doc §6 手順6)。
+/// 材料だけを [`AdvisorMaterial`] へ変換する。[`select_materials_of_kinds`] の単一 kind 版。
 fn select_materials_of_kind(
     node_attrs: &HashMap<String, HashMap<String, String>>,
     kind: &str,
 ) -> Vec<AdvisorMaterial> {
+    select_materials_of_kinds(node_attrs, &[kind])
+}
+
+/// `node_attrs`(query_nodes が返した全 advisor_material の属性 map)から `kind` が `kinds` の
+/// いずれかに一致する材料だけを [`AdvisorMaterial`] へ変換する。material_key の昇順で
+/// ソートし、`HashMap` の反復順序に依存しない決定論的な順序にする(design doc §6 手順6)。
+fn select_materials_of_kinds(
+    node_attrs: &HashMap<String, HashMap<String, String>>,
+    kinds: &[&str],
+) -> Vec<AdvisorMaterial> {
     let mut materials: Vec<AdvisorMaterial> = node_attrs
         .values()
         .filter_map(AdvisorMaterial::from_attributes)
-        .filter(|m| m.kind == kind)
+        .filter(|m| kinds.contains(&m.kind.as_str()))
         .collect();
     materials.sort_by(|a, b| a.material_key.cmp(&b.material_key));
     materials
@@ -504,6 +529,71 @@ pub fn inject_guaranteed_own_products(
     let mut existing_keys: std::collections::HashSet<String> =
         composed.iter().map(|m| m.material_key.clone()).collect();
     for m in guaranteed {
+        if existing_keys.insert(m.material_key.clone()) {
+            composed.push(m);
+        }
+    }
+    composed
+}
+
+/// 材料合成リストの総数上限(design doc §6 手順6「検索ヒットと保証注入を合わせた総数は
+/// 最大12件」)。own_product 保証注入([`inject_guaranteed_own_products`])はこの上限の
+/// 対象外(既存挙動を変更しない指示のため)で、category 合致材料の注入([`inject_category_materials`])
+/// にだけ適用する。
+const MAX_TOTAL_MATERIALS: usize = 12;
+
+/// `category_pool` の各上限(design doc §6 手順6「category 合致材料」)。kind ごとに
+/// material_key 昇順で先頭からこの件数だけ選び、この順(statistic → partner_product →
+/// scenario)で連結する。
+const CATEGORY_MATERIAL_LIMITS: [(&str, usize); 3] =
+    [("statistic", 2), ("partner_product", 2), ("scenario", 1)];
+
+/// `category_pool`(design doc §6 手順6「category 合致材料」の入力集合。own_product を除く
+/// 3種)から、累積条件の `concern` と同じ `category` を持つ材料を kind ごとの上限
+/// ([`CATEGORY_MATERIAL_LIMITS`])まで抽出する。`concern_category` が `None`(累積条件に
+/// `concern` が無い)なら、合致対象自体が無いので空 `Vec` を返す。
+///
+/// own_product 保証注入([`select_own_product_materials`])と異なり、合致が無いときの
+/// 「全件返す」フォールバックは無い(design doc §6 手順6の文言どおり、category 合致材料は
+/// 合致するものだけを注入する別枠)。
+pub fn select_category_materials(
+    category_pool: &[AdvisorMaterial],
+    concern_category: Option<&str>,
+) -> Vec<AdvisorMaterial> {
+    let Some(cat) = concern_category else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for (kind, limit) in CATEGORY_MATERIAL_LIMITS {
+        let mut matched: Vec<AdvisorMaterial> = category_pool
+            .iter()
+            .filter(|m| m.kind == kind && m.category.as_deref() == Some(cat))
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| a.material_key.cmp(&b.material_key));
+        matched.truncate(limit);
+        result.extend(matched);
+    }
+    result
+}
+
+/// `candidates` のうち `composed` に既に存在する material_key と重複するものを除いて末尾へ
+/// 追加する(design doc §6 手順6「category 合致材料」)。`composed` 側との重複だけでなく、
+/// `candidates` 自身の内部で material_key が重複している場合も1件しか追加しない(実装は
+/// [`inject_guaranteed_own_products`] と同じ `HashSet::insert` 戻り値判定パターン)。
+///
+/// 合計 [`MAX_TOTAL_MATERIALS`] 件に達した時点で、以降の `candidates` は重複判定より先に
+/// 打ち切る(design doc §6 手順6「検索ヒットと保証注入を合わせた総数は最大12件」)。
+pub fn inject_category_materials(
+    mut composed: Vec<AdvisorMaterial>,
+    candidates: Vec<AdvisorMaterial>,
+) -> Vec<AdvisorMaterial> {
+    let mut existing_keys: std::collections::HashSet<String> =
+        composed.iter().map(|m| m.material_key.clone()).collect();
+    for m in candidates {
+        if composed.len() >= MAX_TOTAL_MATERIALS {
+            break;
+        }
         if existing_keys.insert(m.material_key.clone()) {
             composed.push(m);
         }
@@ -979,7 +1069,7 @@ mod tests {
 
     #[test]
     fn materials_from_results_returns_empty_and_warns_when_search_fails() {
-        let ((searched, own_products), logs) = capture_logs(|| {
+        let ((searched, own_products, category_pool), logs) = capture_logs(|| {
             materials_from_results(
                 Err(anyhow::anyhow!("vegapunk search unavailable (test)")),
                 Ok(Vec::new()),
@@ -991,12 +1081,13 @@ mod tests {
             "a failed search must degrade to zero materials, not propagate Err"
         );
         assert!(own_products.is_empty());
+        assert!(category_pool.is_empty());
         assert!(logs.contains("WARN"), "logs: {logs}");
     }
 
     #[test]
     fn materials_from_results_returns_empty_and_warns_when_query_nodes_fails() {
-        let ((searched, own_products), logs) = capture_logs(|| {
+        let ((searched, own_products, category_pool), logs) = capture_logs(|| {
             materials_from_results(
                 Ok(Vec::new()),
                 Err(anyhow::anyhow!("vegapunk query_nodes unavailable (test)")),
@@ -1008,6 +1099,7 @@ mod tests {
             "a failed query_nodes must degrade to zero materials, not propagate Err"
         );
         assert!(own_products.is_empty());
+        assert!(category_pool.is_empty());
         assert!(logs.contains("WARN"), "logs: {logs}");
     }
 
@@ -1024,7 +1116,7 @@ mod tests {
         }];
 
         let expected_searched = select_materials_from_hits(&hits, &node_attrs);
-        let (actual_searched, _actual_own_products) =
+        let (actual_searched, _actual_own_products, _actual_category_pool) =
             materials_from_results(Ok(hits), Ok(nodes), "homesec");
         assert_eq!(actual_searched, expected_searched);
         assert_eq!(actual_searched.len(), 1);
@@ -1061,11 +1153,101 @@ mod tests {
             },
         ];
 
-        let (_searched, own_products) =
+        let (_searched, own_products, _category_pool) =
             materials_from_results(Ok(Vec::new()), Ok(nodes), "homesec");
         assert_eq!(own_products.len(), 1);
         assert_eq!(own_products[0].material_key, "own_product:adc-v724");
         assert_eq!(own_products[0].kind, "own_product");
+    }
+
+    /// タスク1: `category_pool`(3つ目の要素)には kind が statistic/partner_product/scenario
+    /// の material だけが入り、own_product は入らないことを固定する(design doc §6 手順6
+    /// 「category 合致材料」の入力集合)。
+    #[test]
+    fn materials_from_results_third_element_contains_statistic_partner_product_and_scenario_but_not_own_product(
+    ) {
+        let own_id = "homesec:gen1:advisor_material:own_product:adc-v724";
+        let statistic_id = "homesec:gen1:advisor_material:statistic:musimari-46percent";
+        let partner_id = "homesec:gen1:advisor_material:partner_product:sensor-light";
+        let scenario_id = "homesec:gen1:advisor_material:scenario:elderly-watch";
+        let statistic_attrs = attrs(&[
+            ("material_key", "statistic:musimari-46percent"),
+            ("kind", "statistic"),
+            ("title_ja", "統計"),
+            ("body_ja", "本文"),
+            ("source_url", "https://example.com/a"),
+            ("category", "intrusion"),
+            ("product_key", ""),
+            ("price_band", ""),
+            ("card_description", ""),
+            ("card_match_terms", ""),
+        ]);
+        let partner_attrs = attrs(&[
+            ("material_key", "partner_product:sensor-light"),
+            ("kind", "partner_product"),
+            ("title_ja", "センサーライト"),
+            ("body_ja", "本文"),
+            ("source_url", "https://example.com/b"),
+            ("category", "intrusion"),
+            ("product_key", ""),
+            ("price_band", ""),
+            ("card_description", ""),
+            ("card_match_terms", ""),
+        ]);
+        let scenario_attrs = attrs(&[
+            ("material_key", "scenario:elderly-watch"),
+            ("kind", "scenario"),
+            ("title_ja", "見守りの例"),
+            ("body_ja", "本文"),
+            ("source_url", ""),
+            ("category", "intrusion"),
+            ("product_key", ""),
+            ("price_band", ""),
+            ("card_description", ""),
+            ("card_match_terms", ""),
+        ]);
+        let nodes = vec![
+            crate::proto::graphrag::NodeResult {
+                node_id: own_id.to_string(),
+                node_type: "advisor_material".to_string(),
+                attributes: full_attrs(),
+            },
+            crate::proto::graphrag::NodeResult {
+                node_id: statistic_id.to_string(),
+                node_type: "advisor_material".to_string(),
+                attributes: statistic_attrs,
+            },
+            crate::proto::graphrag::NodeResult {
+                node_id: partner_id.to_string(),
+                node_type: "advisor_material".to_string(),
+                attributes: partner_attrs,
+            },
+            crate::proto::graphrag::NodeResult {
+                node_id: scenario_id.to_string(),
+                node_type: "advisor_material".to_string(),
+                attributes: scenario_attrs,
+            },
+        ];
+
+        let (_searched, _own_products, category_pool) =
+            materials_from_results(Ok(Vec::new()), Ok(nodes), "homesec");
+        let mut keys: Vec<&str> = category_pool
+            .iter()
+            .map(|m| m.material_key.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "partner_product:sensor-light",
+                "scenario:elderly-watch",
+                "statistic:musimari-46percent",
+            ]
+        );
+        assert!(
+            category_pool.iter().all(|m| m.kind != "own_product"),
+            "own_product must never appear in the category_pool: {category_pool:?}"
+        );
     }
 
     // --- conditions_to_signal_set / match_advisor_known_resolution ---
@@ -1361,6 +1543,184 @@ mod tests {
             result.len(),
             2,
             "a material_key that repeats within guaranteed itself must be added only once"
+        );
+    }
+
+    // --- select_category_materials / inject_category_materials (design doc §6 手順6
+    // 「category 合致材料」。own_product 保証注入とは別枠の kind ごとの決定論的な保証注入) ---
+
+    fn category_material(material_key: &str, kind: &str, category: &str) -> AdvisorMaterial {
+        AdvisorMaterial {
+            material_key: material_key.to_string(),
+            kind: kind.to_string(),
+            title_ja: "タイトル".to_string(),
+            body_ja: "本文".to_string(),
+            source_url: Some("https://example.com/a".to_string()),
+            category: Some(category.to_string()),
+            product_key: None,
+            price_band: None,
+            card_description: None,
+            card_match_terms: None,
+            product_page_url: None,
+        }
+    }
+
+    #[test]
+    fn select_category_materials_returns_empty_when_concern_category_is_none() {
+        let pool = vec![category_material("statistic:a", "statistic", "intrusion")];
+        assert!(select_category_materials(&pool, None).is_empty());
+    }
+
+    #[test]
+    fn select_category_materials_returns_only_matching_category_and_kind() {
+        let pool = vec![
+            category_material("statistic:a", "statistic", "intrusion"),
+            // category が違うので対象外。
+            category_material("statistic:b", "statistic", "package_theft"),
+            // kind が対象3種の範囲外なので対象外(category_pool には本来own_productは
+            // 混ざらないが、フィルタ自体が kind を見て除外できることも固定しておく)。
+            category_material("own_product:c", "own_product", "intrusion"),
+            category_material("partner_product:d", "partner_product", "intrusion"),
+        ];
+        let selected = select_category_materials(&pool, Some("intrusion"));
+        let keys: Vec<&str> = selected.iter().map(|m| m.material_key.as_str()).collect();
+        assert_eq!(keys, vec!["statistic:a", "partner_product:d"]);
+    }
+
+    #[test]
+    fn select_category_materials_limits_statistic_to_two_ascending() {
+        let pool = vec![
+            category_material("statistic:c", "statistic", "intrusion"),
+            category_material("statistic:a", "statistic", "intrusion"),
+            category_material("statistic:b", "statistic", "intrusion"),
+        ];
+        let selected = select_category_materials(&pool, Some("intrusion"));
+        let keys: Vec<&str> = selected.iter().map(|m| m.material_key.as_str()).collect();
+        assert_eq!(keys, vec!["statistic:a", "statistic:b"]);
+    }
+
+    #[test]
+    fn select_category_materials_limits_partner_product_to_two() {
+        let pool = vec![
+            category_material("partner_product:c", "partner_product", "intrusion"),
+            category_material("partner_product:a", "partner_product", "intrusion"),
+            category_material("partner_product:b", "partner_product", "intrusion"),
+        ];
+        let selected = select_category_materials(&pool, Some("intrusion"));
+        let keys: Vec<&str> = selected.iter().map(|m| m.material_key.as_str()).collect();
+        assert_eq!(keys, vec!["partner_product:a", "partner_product:b"]);
+    }
+
+    #[test]
+    fn select_category_materials_limits_scenario_to_one() {
+        let pool = vec![
+            category_material("scenario:b", "scenario", "intrusion"),
+            category_material("scenario:a", "scenario", "intrusion"),
+        ];
+        let selected = select_category_materials(&pool, Some("intrusion"));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].material_key, "scenario:a");
+    }
+
+    #[test]
+    fn select_category_materials_orders_statistic_then_partner_product_then_scenario() {
+        // design doc §6 手順6「この順(statistic → partner_product → scenario)で連結」の固定。
+        let pool = vec![
+            category_material("scenario:s", "scenario", "intrusion"),
+            category_material("partner_product:p", "partner_product", "intrusion"),
+            category_material("statistic:t", "statistic", "intrusion"),
+        ];
+        let selected = select_category_materials(&pool, Some("intrusion"));
+        let keys: Vec<&str> = selected.iter().map(|m| m.material_key.as_str()).collect();
+        assert_eq!(keys, vec!["statistic:t", "partner_product:p", "scenario:s"]);
+    }
+
+    #[test]
+    fn inject_category_materials_appends_candidates_absent_from_composed() {
+        let composed = vec![searched_material("statistic:existing")];
+        let candidates = vec![category_material(
+            "partner_product:new",
+            "partner_product",
+            "intrusion",
+        )];
+
+        let result = inject_category_materials(composed, candidates);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].material_key, "statistic:existing");
+        assert_eq!(result[1].material_key, "partner_product:new");
+    }
+
+    #[test]
+    fn inject_category_materials_deduplicates_material_keys_already_in_composed() {
+        let composed = vec![
+            searched_material("statistic:a"),
+            category_material("partner_product:existing", "partner_product", "intrusion"),
+        ];
+        let candidates = vec![category_material(
+            "partner_product:existing",
+            "partner_product",
+            "intrusion",
+        )];
+
+        let result = inject_category_materials(composed, candidates);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "a candidate whose key already exists in composed must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn inject_category_materials_deduplicates_a_key_that_repeats_within_candidates_itself() {
+        let composed = vec![searched_material("statistic:a")];
+        let candidates = vec![
+            category_material("scenario:dup", "scenario", "intrusion"),
+            category_material("scenario:dup", "scenario", "intrusion"),
+        ];
+
+        let result = inject_category_materials(composed, candidates);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "a material_key that repeats within candidates itself must be added only once"
+        );
+    }
+
+    #[test]
+    fn inject_category_materials_adds_nothing_when_composed_already_at_the_total_cap() {
+        let composed: Vec<AdvisorMaterial> = (0..12)
+            .map(|i| searched_material(&format!("statistic:existing-{i}")))
+            .collect();
+        let candidates = vec![category_material("scenario:new", "scenario", "intrusion")];
+
+        let result = inject_category_materials(composed.clone(), candidates);
+
+        assert_eq!(
+            result, composed,
+            "composed already holds MAX_TOTAL_MATERIALS (12) items; nothing more may be added"
+        );
+    }
+
+    #[test]
+    fn inject_category_materials_stops_at_the_total_cap_mid_candidates() {
+        let composed: Vec<AdvisorMaterial> = (0..10)
+            .map(|i| searched_material(&format!("statistic:existing-{i}")))
+            .collect();
+        let candidates = vec![
+            category_material("partner_product:a", "partner_product", "intrusion"),
+            category_material("partner_product:b", "partner_product", "intrusion"),
+            category_material("scenario:c", "scenario", "intrusion"),
+        ];
+
+        let result = inject_category_materials(composed, candidates);
+
+        assert_eq!(
+            result.len(),
+            12,
+            "10 existing + 3 candidates must stop at the 12-item cap, not reach 13"
         );
     }
 }

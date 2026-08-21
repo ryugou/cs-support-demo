@@ -356,14 +356,21 @@ async fn draft_with_materials(
         }
     };
     let kr = materials::match_advisor_known_resolution(&resolutions, conditions);
-    let (searched, own_products) =
+    let (searched, own_products, category_pool) =
         materials::gather_materials(&state.vegapunk, schema, search_query, conditions).await;
     let mut composed = materials::compose_materials(kr, searched);
+    let concern_category = materials::concern_category(conditions);
     if materials::should_guarantee_own_products(product_intent, conditions) {
-        let concern_category = materials::concern_category(conditions);
         let guaranteed = materials::select_own_product_materials(&own_products, concern_category);
         composed = materials::inject_guaranteed_own_products(composed, guaranteed);
     }
+    // design doc §6 手順6「category 合致材料」: own_product 保証注入のトリガー条件
+    // (product_intent / concern の有無)には依存させない。`select_category_materials` 自体が
+    // `concern_category == None` のとき空を返すことで「累積条件に concern がある限り常に
+    // 試みる」を表現する。
+    let category_candidates =
+        materials::select_category_materials(&category_pool, concern_category);
+    composed = materials::inject_category_materials(composed, category_candidates);
     let text = draftgen::draft_advisor_reply(
         &state.llm,
         mode,
