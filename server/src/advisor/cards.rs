@@ -7,45 +7,77 @@
 //! 行わない。これにより [`select_cards`] は純粋・決定論のまま保たれ、tempdir を使った
 //! ユニットテストだけで検証できる。
 
+use crate::advisor::draftgen::{ClosingKind, DraftMeta};
 use crate::advisor::materials::AdvisorMaterial;
 use crate::harness::knowledge::csv_list;
 use crate::harness::product_gate::extract_model_tokens;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// カードのボタン1件(design doc §3.3、2026-08-21 conversation-rhythm-implementation §要件4)。
+///
+/// タップ後に会話が行き止まりになる問題(本番実害 (c))への是正: 旧実装は
+/// `button_text`/`button_message` の単一ペア(常に「詳しく聞く」相当の1ボタン)しか持てず、
+/// 特に他社製品(partner_product)のカードから「入手方法・頼み方」へ会話を繋げられなかった。
+/// `kind` タグで LINE Messaging API の action 種別(`uri` / `message`)をそのまま表現する。
+///
+/// JSON 表現(`#[serde(tag = "kind", rename_all = "snake_case")]`):
+/// `{"kind":"uri","label":"商品ページを見る","url":"https://..."}`
+/// `{"kind":"message","label":"詳しく聞く","message":"ADC-V724について詳しく教えて"}`
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CardButton {
+    Uri { label: String, url: String },
+    Message { label: String, message: String },
+}
 
 /// design doc §3.3 の `product_cards` 1 件。
 ///
 /// `Serialize` を derive する(Task 6): フィールド名は design doc §3.3 の JSON 例
-/// (`material_key` / `title` / `description` / `image_url` / `product_page_url` /
-/// `button_text` / `button_message`)と完全一致しているため `#[serde(rename = ...)]` は不要。
+/// (`material_key` / `title` / `description` / `image_url` / `buttons`)と完全一致している
+/// ため `#[serde(rename = ...)]` は不要。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProductCard {
     pub material_key: String,
     pub title: String,
     pub description: String,
     pub image_url: Option<String>,
-    /// カードの「商品ページを見る」ボタン(URI action)の遷移先。無ければ
-    /// `line_adapter.rs::build_flex_message` がこのボタンを出さない(design doc §3.3)。
-    pub product_page_url: Option<String>,
-    pub button_text: String,
-    pub button_message: String,
+    /// このカードのボタン列(design doc §3.3、要件4)。組み立て規則は [`build_card_buttons`]
+    /// の doc comment を参照。
+    pub buttons: Vec<CardButton>,
 }
 
-/// 「この商品について聞く」ボタンの文言(固定。ユーザー指定の既定値。Issue #34
-/// カルーセル→Flex 移行に伴い旧文言から変更。現行文言はユーザー指定(2026-08-20))。
-const BUTTON_TEXT: &str = "この商品について聞く";
+/// own_product の「詳しく聞く」ボタンの文言(固定。ユーザー指定)。
+const DETAIL_BUTTON_LABEL: &str = "詳しく聞く";
+/// own_product の「導入を相談する」ボタンの文言(固定。ユーザー指定)。
+const CONSULT_BUTTON_LABEL: &str = "導入を相談する";
+/// partner_product の「選び方を聞く」ボタンの文言(固定。ユーザー指定)。
+const CHOOSING_BUTTON_LABEL: &str = "選び方を聞く";
+/// `product_page_url` がある場合に先頭へ加える URI ボタンの文言(固定)。
+const PRODUCT_PAGE_BUTTON_LABEL: &str = "商品ページを見る";
 
-/// design doc §7.2 の製品カード添付判定本体。
+/// design doc §7.2 の製品カード添付判定本体。2026-08-21 conversation-rhythm-implementation
+/// §要件3 により、候補の起点を LLM Call#2 のメタ(`meta.featured`)へ変更した。
 ///
 /// 手順:
+/// 0. `meta` が `None`、または `meta.closing != ClosingKind::Proposal` なら、この応答は
+///    「提案」で締めていない(質問で締めた、または Call#2 がメタ付きで成功しなかった)ため
+///    カードは一切出さない(空配列)。これが最優先のゲートで、以下の手順1〜5は
+///    `closing == Proposal` のときだけ評価する(本番実害 (a):「特に心配な場所は?」と
+///    質問で締めたターンに商品カードが付き会話が噛み合わない、への是正)。
 /// 1. `injected` のうち `kind` が `own_product` / `partner_product`、かつ
-///    `card_description.is_some()` の材料だけを候補にする(design doc §7.2 手順1は候補を
-///    「own_product / partner_product 材料(`card_description` を持つもの)」と定めている。
-///    `kind` 側の絞り込みが無いと `statistic` / `scenario` 材料でも `card_description` さえ
-///    あればカード化されてしまい、`kind_priority` の「own_product 以外は一律 partner 相当」
-///    という前提とも食い違う。`known_resolution_to_material` により `card_description = None`
-///    の KR 由来材料は元々ここで除外される)。
-/// 2. `final_text`(出口関門を通過した最終応答文、正規化後)に照合語が含まれるかを判定する:
+///    `card_description.is_some()`、かつ `meta.featured` に `material_key` が列挙されている
+///    材料だけを候補にする(`meta.featured` に無いものは「今回主役として提案していない」と
+///    みなし破棄する。本番実害 (b): 助言の一要素(防犯フィルム等、提案の主役でない商品)まで
+///    カード化される、への是正)。`kind` 側の絞り込みが無いと `statistic` / `scenario` 材料でも
+///    `card_description` さえあればカード化されてしまい、`kind_priority` の「own_product
+///    以外は一律 partner 相当」という前提とも食い違う。`known_resolution_to_material` により
+///    `card_description = None` の KR 由来材料は元々ここで除外される。`meta.featured` に
+///    列挙されていても `injected` に実在しない `material_key`(存在しない材料への言及)は、
+///    この filter が `injected` を起点に回る以上、自然に無視される(カードを捏造しない)。
+/// 2. `final_text`(出口関門を通過した最終応答文、正規化後)に照合語が含まれるかを判定する
+///    (`matches_final_text`。手順1の featured フィルタとは独立の第2ゲート — LLM がメタの
+///    featured に挙げても、本文中で実際に言及していなければカード化しない):
 ///    `kind == "own_product"` は**型番明示のみ**(`product_key` を
 ///    [`extract_model_tokens`] で正規化したトークンが `final_text` の型番トークン集合に
 ///    含まれる場合だけ合致。`card_match_terms` の汎用語では合致させない — 本番実害
@@ -66,13 +98,49 @@ pub fn select_cards(
     injected: &[AdvisorMaterial],
     shown_csv: &str,
     images_dir: &Path,
+    meta: Option<&DraftMeta>,
 ) -> Vec<ProductCard> {
-    let shown: std::collections::HashSet<String> = csv_list(shown_csv).into_iter().collect();
+    let Some(meta) = meta else {
+        return Vec::new();
+    };
+    if meta.closing != ClosingKind::Proposal {
+        return Vec::new();
+    }
 
-    let mut candidates: Vec<&AdvisorMaterial> = injected
+    let shown: std::collections::HashSet<String> = csv_list(shown_csv).into_iter().collect();
+    let featured: std::collections::HashSet<&str> =
+        meta.featured.iter().map(String::as_str).collect();
+
+    // featured フィルタまでを一旦区切って持つ(reviewer 一次レビュー Major 3 是正)。以前は
+    // `own_product`/`partner_product` の materials.json 側で `card_description` が
+    // 欠けているだけでも本番でカードが完全に死んでいた(draftgen.rs のコメント参照)のと
+    // 同じクラスの静かな失敗が、LLM が featured に返す material_key の側でも起こりうる
+    // (資料タグの値をそのままコピーしなかった・型番から推測した等)。このゲートを通過した
+    // 候補が0件の場合だけ warn する。以降の `matches_final_text` / `shown` フィルタは
+    // 独立した別ゲートであり、そちらの0件は「本文に言及していない」「既出」という別の
+    // 正当な理由がありうるため対象にしない。
+    let after_featured_filter: Vec<&AdvisorMaterial> = injected
         .iter()
         .filter(|m| matches!(m.kind.as_str(), "own_product" | "partner_product"))
         .filter(|m| m.card_description.is_some())
+        .filter(|m| featured.contains(m.material_key.as_str()))
+        .collect();
+
+    if !meta.featured.is_empty() && after_featured_filter.is_empty() {
+        tracing::warn!(
+            route = "advisor_cards",
+            featured_len = meta.featured.len(),
+            injected_len = injected.len(),
+            "none of the material_keys the LLM returned in featured matched any injected \
+             own_product/partner_product material; the LLM may not have copied the \
+             material_key verbatim from the material tag. Check the material tags built by \
+             build_advisor_user_message and the material_key values in \
+             server/data/homesec/materials.json"
+        );
+    }
+
+    let mut candidates: Vec<&AdvisorMaterial> = after_featured_filter
+        .into_iter()
         .filter(|m| matches_final_text(m, final_text))
         .filter(|m| !shown.contains(&m.material_key))
         .collect();
@@ -169,10 +237,57 @@ fn to_product_card(material: &AdvisorMaterial, images_dir: &Path) -> ProductCard
         title: material.title_ja.clone(),
         description,
         image_url: resolve_image_url(material, images_dir),
-        product_page_url: material.product_page_url.clone(),
-        button_text: BUTTON_TEXT.to_string(),
-        button_message: format!("{}について詳しく教えて", material.title_ja),
+        buttons: build_card_buttons(material),
     }
+}
+
+/// [`ProductCard::buttons`] の組み立て規則(design doc §3.3、要件4)。
+///
+/// - `product_page_url` があれば、先頭に [`CardButton::Uri`](「商品ページを見る」)を置く。
+/// - `kind == "own_product"` の材料は「詳しく聞く」→「導入を相談する」の順で
+///   [`CardButton::Message`] を2つ加える。
+/// - `kind == "partner_product"` の材料は「選び方を聞く」の [`CardButton::Message`] を1つだけ
+///   加える(他社製品は「詳しく聞く」の行き止まりではなく、入手方法・頼み方へ会話を繋げる誘導、
+///   本番実害 (c) の是正)。
+/// - それ以外の `kind`(このターゲットには `select_cards` の filter により到達しない)は
+///   `product_page_url` ボタン以外を追加しない。
+fn build_card_buttons(material: &AdvisorMaterial) -> Vec<CardButton> {
+    let mut buttons = Vec::with_capacity(3);
+    if let Some(url) = material.product_page_url.clone() {
+        buttons.push(CardButton::Uri {
+            label: PRODUCT_PAGE_BUTTON_LABEL.to_string(),
+            url,
+        });
+    }
+    match material.kind.as_str() {
+        "own_product" => {
+            buttons.push(CardButton::Message {
+                label: DETAIL_BUTTON_LABEL.to_string(),
+                message: format!("{}について詳しく教えて", material.title_ja),
+            });
+            buttons.push(CardButton::Message {
+                label: CONSULT_BUTTON_LABEL.to_string(),
+                message: format!("{}の導入を相談したい", material.title_ja),
+            });
+        }
+        "partner_product" => {
+            buttons.push(CardButton::Message {
+                label: CHOOSING_BUTTON_LABEL.to_string(),
+                message: format!("{}の選び方を教えて", material.title_ja),
+            });
+        }
+        other => {
+            tracing::warn!(
+                material_key = %material.material_key,
+                kind = other,
+                "select_cards produced a card candidate whose kind is neither own_product nor \
+                 partner_product; this should be unreachable because candidates are filtered \
+                 by kind upstream. Producing a card with only the product_page_url button (if \
+                 any), matching the pre-Issue-34 no-message-button-for-unknown-kind behavior"
+            );
+        }
+    }
+    buttons
 }
 
 /// design doc §7.2 手順4「画像は存在するファイルのみ URL 化」の実装。ファイル名の決定規則:
@@ -233,6 +348,17 @@ fn is_safe_filename_component(filename: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// closing = Proposal の [`DraftMeta`] を組み立てるテストヘルパー(2026-08-21
+    /// conversation-rhythm-implementation §要件3)。`featured` に渡した material_key だけが
+    /// 候補になる。
+    fn proposal_meta(featured: &[&str]) -> DraftMeta {
+        DraftMeta {
+            featured: featured.iter().map(|s| s.to_string()).collect(),
+            closing: ClosingKind::Proposal,
+            choices: Vec::new(),
+        }
+    }
 
     /// `tempfile` crate は `server/Cargo.toml` に無いため、`std::env::temp_dir()` 配下に
     /// テストごとの一意なサブディレクトリを作って手動で作成・掃除する。`Drop` で確実に
@@ -310,6 +436,7 @@ mod tests {
             &[m],
             "",
             &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
         );
         assert!(
             cards.is_empty(),
@@ -322,7 +449,13 @@ mod tests {
         // 必須テスト2: final_text に型番が明示されていれば合致する。
         let dir = TempImagesDir::new("own-product-model-token-match");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].material_key, "own_product:adc-v724");
     }
@@ -334,7 +467,13 @@ mod tests {
         let dir = TempImagesDir::new("own-product-model-token-no-terms");
         let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
         m.card_match_terms = None;
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert_eq!(cards.len(), 1);
     }
 
@@ -346,7 +485,13 @@ mod tests {
         let dir = TempImagesDir::new("own-product-no-title-ja-fallback");
         let mut m = own_product("own_product:adc-v724", "屋外カメラ", "ADC-V724");
         m.card_match_terms = None;
-        let cards = select_cards("屋外カメラをご検討ください", &[m], "", &dir.path);
+        let cards = select_cards(
+            "屋外カメラをご検討ください",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert!(
             cards.is_empty(),
             "own_product must not fall back to title_ja matching"
@@ -358,7 +503,13 @@ mod tests {
         let dir = TempImagesDir::new("own-product-no-product-key");
         let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
         m.product_key = None;
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert!(cards.is_empty());
     }
 
@@ -370,7 +521,13 @@ mod tests {
         // own_product は型番トークン以外では合致しないため、この材料は決して選ばれない。
         let dir = TempImagesDir::new("own-product-non-model-shaped-key");
         let m = own_product("own_product:mystery", "謎の製品", "PLAIN-MODEL-123");
-        let cards = select_cards("PLAIN-MODEL-123がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "PLAIN-MODEL-123がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:mystery"])),
+        );
         assert!(
             cards.is_empty(),
             "a product_key with no extractable model token must never produce a card"
@@ -381,7 +538,13 @@ mod tests {
     fn own_product_no_match_produces_no_card() {
         let dir = TempImagesDir::new("own-product-no-match");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
-        let cards = select_cards("窓の防犯フィルムが有効です", &[m], "", &dir.path);
+        let cards = select_cards(
+            "窓の防犯フィルムが有効です",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert!(cards.is_empty());
     }
 
@@ -395,7 +558,13 @@ mod tests {
             "ALSOKホームセキュリティ",
             "intrusion",
         );
-        let cards = select_cards("ALSOK駆けつけがおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ALSOK駆けつけがおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+        );
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].material_key, "partner_product:alsok");
     }
@@ -409,7 +578,13 @@ mod tests {
             "intrusion",
         );
         m.card_match_terms = None;
-        let cards = select_cards("ALSOKホームセキュリティがおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ALSOKホームセキュリティがおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+        );
         assert_eq!(cards.len(), 1);
     }
 
@@ -420,7 +595,13 @@ mod tests {
         m.card_match_terms = None;
         m.product_key = Some("ALSOK-PLAN-A".to_string());
         // final_text は title_ja を含まないが product_key を含む。
-        let cards = select_cards("ALSOK-PLAN-Aがおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ALSOK-PLAN-Aがおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+        );
         assert_eq!(cards.len(), 1);
     }
 
@@ -432,7 +613,13 @@ mod tests {
             "ALSOKホームセキュリティ",
             "intrusion",
         );
-        let cards = select_cards("窓の防犯フィルムが有効です", &[m], "", &dir.path);
+        let cards = select_cards(
+            "窓の防犯フィルムが有効です",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+        );
         assert!(cards.is_empty());
     }
 
@@ -441,7 +628,13 @@ mod tests {
         let dir = TempImagesDir::new("no-card-description");
         let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
         m.card_description = None;
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert!(cards.is_empty());
     }
 
@@ -465,7 +658,13 @@ mod tests {
             card_match_terms: Some("無締り".to_string()),
             product_page_url: None,
         };
-        let cards = select_cards("無締りにご注意ください", &[m], "", &dir.path);
+        let cards = select_cards(
+            "無締りにご注意ください",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["statistic:mujimari"])),
+        );
         assert!(
             cards.is_empty(),
             "kind=statistic must never become a card candidate even with card_description set"
@@ -488,7 +687,13 @@ mod tests {
             card_match_terms: Some("賃貸一人暮らし".to_string()),
             product_page_url: None,
         };
-        let cards = select_cards("賃貸一人暮らしの防犯対策です", &[m], "", &dir.path);
+        let cards = select_cards(
+            "賃貸一人暮らしの防犯対策です",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["scenario:rental-single"])),
+        );
         assert!(
             cards.is_empty(),
             "kind=scenario must never become a card candidate even with card_description set"
@@ -512,6 +717,10 @@ mod tests {
             &[partner, own],
             "",
             &dir.path,
+            Some(&proposal_meta(&[
+                "own_product:adc-v724",
+                "partner_product:alsok",
+            ])),
         );
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].material_key, "own_product:adc-v724");
@@ -532,7 +741,13 @@ mod tests {
             own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724"),
         ];
         let final_text = "ADC-V523 ADC-V724 A社サービス B社サービス が候補です";
-        let cards = select_cards(final_text, &materials, "", &dir.path);
+        let meta = proposal_meta(&[
+            "partner_product:a",
+            "own_product:adc-v523",
+            "partner_product:b",
+            "own_product:adc-v724",
+        ]);
+        let cards = select_cards(final_text, &materials, "", &dir.path, Some(&meta));
         assert_eq!(cards.len(), 3);
         assert_eq!(cards[0].material_key, "own_product:adc-v523");
         assert_eq!(cards[1].material_key, "own_product:adc-v724");
@@ -550,6 +765,7 @@ mod tests {
             &[m],
             "own_product:adc-v724",
             &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
         );
         assert!(cards.is_empty());
     }
@@ -561,7 +777,13 @@ mod tests {
         let dir = TempImagesDir::new("image-exists-own");
         dir.touch("adc-v724.jpg");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert_eq!(
             cards[0].image_url.as_deref(),
             Some("/static/products/adc-v724.jpg")
@@ -572,7 +794,13 @@ mod tests {
     fn image_url_is_none_when_the_file_does_not_exist_but_the_card_still_forms() {
         let dir = TempImagesDir::new("image-missing");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert_eq!(cards.len(), 1, "card must still form without an image");
         assert_eq!(cards[0].image_url, None);
     }
@@ -591,7 +819,13 @@ mod tests {
             "ADC-V724/../../etc/passwd",
         );
         let final_text = "ADC-V724がおすすめです";
-        let cards = select_cards(final_text, &[m], "", &dir.path);
+        let cards = select_cards(
+            final_text,
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:evil"])),
+        );
         assert_eq!(
             cards.len(),
             1,
@@ -612,7 +846,13 @@ mod tests {
             "ALSOKホームセキュリティ",
             "intrusion",
         );
-        let cards = select_cards("ALSOK駆けつけがおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ALSOK駆けつけがおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+        );
         assert_eq!(
             cards[0].image_url.as_deref(),
             Some("/static/products/intrusion.jpg")
@@ -625,34 +865,120 @@ mod tests {
     fn card_fields_are_built_from_the_material() {
         let dir = TempImagesDir::new("card-fields");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         let card = &cards[0];
         assert_eq!(card.title, "URTECT ADC-V724");
         assert_eq!(card.description, "屋外対応・夜間撮影");
-        assert_eq!(card.button_text, "この商品について聞く");
-        assert_eq!(card.button_message, "URTECT ADC-V724について詳しく教えて");
     }
 
-    // --- product_page_url(design doc §3.3・§5.1、Issue #34 カルーセル→Flex 移行) ---
+    // --- buttons 組み立て(design doc §3.3・要件4、必須テスト4) ---
 
     #[test]
-    fn product_page_url_is_copied_from_the_material_when_present() {
-        let dir = TempImagesDir::new("product-page-url-present");
-        let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
-        m.product_page_url = Some("https://example.com/products/adc-v724".to_string());
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+    fn own_product_card_has_two_message_buttons_in_order() {
+        let dir = TempImagesDir::new("buttons-own-product");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert_eq!(
-            cards[0].product_page_url.as_deref(),
-            Some("https://example.com/products/adc-v724")
+            cards[0].buttons,
+            vec![
+                CardButton::Message {
+                    label: "詳しく聞く".to_string(),
+                    message: "URTECT ADC-V724について詳しく教えて".to_string(),
+                },
+                CardButton::Message {
+                    label: "導入を相談する".to_string(),
+                    message: "URTECT ADC-V724の導入を相談したい".to_string(),
+                },
+            ]
         );
     }
 
     #[test]
-    fn product_page_url_is_none_when_the_material_has_none() {
-        let dir = TempImagesDir::new("product-page-url-absent");
+    fn partner_product_card_has_exactly_one_message_button() {
+        let dir = TempImagesDir::new("buttons-partner-product");
+        let m = partner_product(
+            "partner_product:alsok",
+            "ALSOKホームセキュリティ",
+            "intrusion",
+        );
+        let cards = select_cards(
+            "ALSOK駆けつけがおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+        );
+        assert_eq!(
+            cards[0].buttons,
+            vec![CardButton::Message {
+                label: "選び方を聞く".to_string(),
+                message: "ALSOKホームセキュリティの選び方を教えて".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn product_page_url_present_prepends_a_uri_button_before_the_message_buttons() {
+        let dir = TempImagesDir::new("buttons-product-page-url-present");
+        let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        m.product_page_url = Some("https://example.com/products/adc-v724".to_string());
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
+        assert_eq!(
+            cards[0].buttons,
+            vec![
+                CardButton::Uri {
+                    label: "商品ページを見る".to_string(),
+                    url: "https://example.com/products/adc-v724".to_string(),
+                },
+                CardButton::Message {
+                    label: "詳しく聞く".to_string(),
+                    message: "URTECT ADC-V724について詳しく教えて".to_string(),
+                },
+                CardButton::Message {
+                    label: "導入を相談する".to_string(),
+                    message: "URTECT ADC-V724の導入を相談したい".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn product_page_url_absent_omits_the_uri_button() {
+        let dir = TempImagesDir::new("buttons-product-page-url-absent");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
-        assert_eq!(cards[0].product_page_url, None);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
+        assert!(
+            cards[0]
+                .buttons
+                .iter()
+                .all(|b| !matches!(b, CardButton::Uri { .. })),
+            "no product_page_url means no uri button: {:?}",
+            cards[0].buttons
+        );
     }
 
     // --- 必須テスト3: カードが1件のみ合致する場合でも非空の Vec が返ること
@@ -663,12 +989,126 @@ mod tests {
     fn select_cards_returns_exactly_one_card_when_only_one_material_matches() {
         let dir = TempImagesDir::new("single-match");
         let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
-        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path);
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
         assert_eq!(
             cards.len(),
             1,
             "a single matching material must yield a non-empty Vec of exactly one card, so \
              api.rs's is_empty()-guarded Option wrap yields Some(vec![1 card]), not None"
+        );
+    }
+
+    // --- 必須テスト3: closing 別の出し分け(カード側)。2026-08-21
+    // conversation-rhythm-implementation §要件3: closing != Proposal(meta が None の場合を
+    // 含む)ならカードは一切出さない。本番実害 (a):「特に心配な場所は?」と質問で締めた
+    // ターンに商品カードが付き会話が噛み合わない、への是正。 ---
+
+    #[test]
+    fn no_cards_when_meta_is_none_even_if_the_material_would_otherwise_match() {
+        let dir = TempImagesDir::new("meta-none-no-cards");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path, None);
+        assert!(
+            cards.is_empty(),
+            "meta = None must suppress cards even when the material would otherwise match"
+        );
+    }
+
+    #[test]
+    fn no_cards_when_closing_is_question_choice() {
+        let dir = TempImagesDir::new("closing-question-choice-no-cards");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let meta = DraftMeta {
+            featured: vec!["own_product:adc-v724".to_string()],
+            closing: ClosingKind::QuestionChoice,
+            choices: vec!["侵入が心配".to_string()],
+        };
+        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path, Some(&meta));
+        assert!(
+            cards.is_empty(),
+            "closing = QuestionChoice must suppress cards even when featured lists the material"
+        );
+    }
+
+    #[test]
+    fn no_cards_when_closing_is_question_open() {
+        let dir = TempImagesDir::new("closing-question-open-no-cards");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let meta = DraftMeta {
+            featured: vec!["own_product:adc-v724".to_string()],
+            closing: ClosingKind::QuestionOpen,
+            choices: Vec::new(),
+        };
+        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path, Some(&meta));
+        assert!(
+            cards.is_empty(),
+            "closing = QuestionOpen must suppress cards even when featured lists the material"
+        );
+    }
+
+    #[test]
+    fn cards_are_shown_when_closing_is_proposal() {
+        // proposal_meta の positive path は上の各テストで既に固定済みだが、closing の
+        // 出し分けを1箇所にまとめて確認する回帰テスト。
+        let dir = TempImagesDir::new("closing-proposal-shows-cards");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:adc-v724"])),
+        );
+        assert_eq!(cards.len(), 1);
+    }
+
+    // --- 必須テスト2: featured 検証。2026-08-21 conversation-rhythm-implementation §要件2
+    // (要件3 実装箇所での検証)。 ---
+
+    #[test]
+    fn a_featured_material_key_absent_from_injected_materials_is_silently_discarded() {
+        // meta.featured が注入材料に存在しない material_key を挙げていても、injected の
+        // 中に実在する候補(このケースでは無し)しかカードにならない。捏造しない。
+        //
+        // reviewer 一次レビュー Major 3 是正: 戻り値が空になる判定ロジック自体はこのテストの
+        // 名前どおり変わっていないが、この経路は `tracing::warn!`(route="advisor_cards")を
+        // 出すようになった(運用者が「なぜカードが出なかったか」を判断できるようにするため)。
+        // 呼び出し側から見える戻り値は変わらないため、ここでは warn 出力自体はアサートしない。
+        let dir = TempImagesDir::new("featured-key-not-in-injected");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let cards = select_cards(
+            "ADC-V724がおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["own_product:does-not-exist"])),
+        );
+        assert!(
+            cards.is_empty(),
+            "a featured material_key with no matching injected material must not produce a card, \
+             and must not cause the (unrelated, non-featured) injected material to be shown either"
+        );
+    }
+
+    #[test]
+    fn an_injected_material_key_not_listed_in_featured_is_discarded_even_if_mentioned_in_text() {
+        // injected に実在し、final_text でも言及されているが、meta.featured に挙げられて
+        // いない material_key はカードにならない(このターンの主役として提案していない、
+        // 本番実害 (b) の是正)。
+        let dir = TempImagesDir::new("injected-key-not-in-featured");
+        let m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
+        let meta = proposal_meta(&["own_product:adc-v523"]); // 別の material_key だけを featured にする
+        let cards = select_cards("ADC-V724がおすすめです", &[m], "", &dir.path, Some(&meta));
+        assert!(
+            cards.is_empty(),
+            "an injected material not listed in meta.featured must be discarded even when the \
+             final text mentions it"
         );
     }
 }

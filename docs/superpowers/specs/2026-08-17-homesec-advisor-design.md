@@ -57,6 +57,17 @@
 - 担当者連絡の提案は、**明確な導入意欲**(価格・購入方法・設置依頼・機種の絞り込みへの言及)が読み取れたターンだけ、応答の末尾で 1 会話につき 1 回行う(概念的な質問や初回の一般相談への機械的な付加を禁止。押し売りしない。断られたら再提案しない)
 - 顧客が担当者連絡を望んだら、時間帯受付フロー(第 4.4 節)で希望時間帯を確定し、リードとして記録する
 
+### 2.4 会話の締めの動作(質問・カード・チップの節度)
+
+本番実害(質問で締めたターンに商品カードが付く / チップと質問の連発が尋問になる)への規則:
+
+- **1 ターンの締めは「質問」か「提案」のどちらか 1 つ**。質問で締めるのは、答えによって次の提案が変わるときだけ。そうでなければ提案 + 継続誘導の一言(質問ではない)で締める
+- **質問で締めるターンは連続 2 回まで**。3 回目は必ず「いま分かっている情報での提案」で締める。会話状態 `question_streak`(case 属性、int)で管理し、値をプロンプトへ注入する(clarify の聞き返し予算とは別)
+- **締めが質問のターンにはカードを出さない**(付けてよいのはその質問への回答チップだけ)。**締めが提案のターンにチップを出さない**(付けてよいのは提案した商品のカードだけ)
+- **チップは「選択式の質問」だけに付ける**(自由に話してほしい質問には付けない)。最大 4 件・各 20 字以内。チップは回答のショートカットであり、自由入力を妨げる位置づけにしない
+- **カードは「このターンの主役として提案した商品」だけ**。複数の対策を並べた助言の中で触れただけの商品はカード化せず、必要なら「〜を詳しく」の絞り込みチップ(選択式質問の一種)で顧客に選ばせ、選ばれた次のターンでカードを出す
+- **カードのボタンは商品種別で変える**: own_product は「詳しく聞く」(message)+「**導入を相談する**」(message、発話「(商品名)の導入を相談したい」→ 理解の `lead_interest` 経由でリードフローへ接続)。partner_product は「**選び方を聞く**」(message、発話「(商品名)の選び方を教えて」)。ボタン起点の質問への応答は「あなたの状況での適合 → 要点 2〜3 → 次の一歩(他社: 入手方法・頼み方 / 自社: 担当者相談への誘い)」で締め、行き止まりにしない
+
 ## 3. 構成
 
 ### 3.1 バイナリと service
@@ -89,15 +100,17 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
       "title": "URTECT ADC-V724",
       "description": "屋外対応・夜間撮影。スマホから映像確認",
       "image_url": "https://<advisor host>/static/products/adc-v724.jpg",
-      "product_page_url": "https://<商品ページ URL。材料の product_page_url>",
-      "button_text": "この商品について聞く",
-      "button_message": "ADC-V724について詳しく教えて"
+      "buttons": [
+        {"kind": "uri", "label": "商品ページを見る", "url": "https://<商品ページ URL。材料の product_page_url>"},
+        {"kind": "message", "label": "詳しく聞く", "message": "URTECT ADC-V724について詳しく教えて"},
+        {"kind": "message", "label": "導入を相談する", "message": "URTECT ADC-V724の導入を相談したい"}
+      ]
     }
   ]
 }
 ```
 
-- `line_adapter` は `product_cards` が非空のとき、テキスト応答の後に **Flex Message** を 1 通送る(カルーセルテンプレートは廃止)。1 件なら単一バブル、2 件以上なら Flex カルーセル(バブル横並び)。バブル構成: hero 画像(`image_url` があるとき)→ 商品名 → 説明 → ボタン 2 つ: **「商品ページを見る」**(URI action、`product_page_url` があるときだけ)と **「この商品について聞く」**(message action、タップで `button_message` がユーザー発話として送信)。アダプタは server が返した構造化データを Flex JSON へ写像するだけで、独自判断を持たない
+- `line_adapter` は `product_cards` が非空のとき、テキスト応答の後に **Flex Message** を 1 通送る(カルーセルテンプレートは廃止)。1 件なら単一バブル、2 件以上なら Flex カルーセル(バブル横並び)。バブル構成: hero 画像(`image_url` があるとき)→ 商品名 → 説明 → ボタン(すべて message action、server が返す `buttons` 配列を写像): **own_product** = 「詳しく聞く」+「**導入を相談する**」(発話「(商品名)の導入を相談したい」)、**partner_product** = 「**選び方を聞く**」(発話「(商品名)の選び方を教えて」)。`product_page_url` がある商品は「商品ページを見る」(URI action)も先頭に付く。アダプタは server が返した構造化データを Flex JSON へ写像するだけで、独自判断を持たない
 - カードは最大 3 件・**1 件でも表示する**(商品を提案したターンの標準 UI。第 7.2 節)。own_product / partner_product 材料から組み立てる。`image_url` / `product_page_url` は任意で、無い場合はその要素を省いたバブルになる。他社製品の実写画像は権利上使わず、使うのは同梱の自社製品画像と自前の汎用カテゴリ画像のみ
 
 レスポンスにはもう 1 つ任意フィールド `quick_replies` を加算する(CS 側は常に省略。省略時のアダプタ挙動は従来どおり):
@@ -111,8 +124,8 @@ advisor は MCP endpoint・OAuth 認可サーバ(AS)・署名鍵を持たない�
 }
 ```
 
-- `line_adapter` は `quick_replies` が非空のとき、送信する最後のメッセージに LINE の quick reply items(message action のみ)として付与する。上限 6 件(LINE 仕様の 13 件より狭く運用)。label は 20 字以内に切り詰め
-- 生成は**コードの決定論のみ**: `clarify` ターンは尋ねた条件キーの語彙選択肢(顧客向けラベル)、`time_pref` ターンは営業時間内の固定スロット(「平日 10-12 時」「13-15 時」「16-18 時」)。`answer` 等その他のターンでは付けない
+- `line_adapter` は `quick_replies` が非空のとき、送信する最後のメッセージに LINE の quick reply items(message action のみ)として付与する。上限 **4 件**。label は 20 字以内に切り詰め
+- 生成: `clarify` ターンは条件キーの語彙選択肢(決定論)、`time_pref` ターンは営業時間内の固定スロット(決定論)。`answer` ターンは、締めの質問が**選択式**のときだけ LLM Call #2 の構造化メタ(第 6 節手順 8)の候補をコードで検証して付ける(自由記述の質問・提案で締めたターンには付けない — 第 2.4 節)
 
 `reply_kind` の値は advisor 固有に次の 8 値とする。管理画面のバッジ表示に追加する:
 
@@ -185,7 +198,7 @@ LLM Call #1 が失敗(タイムアウト・パース不能)した場合は 1 回
 3. 時間帯が確定したら `lead_requested = true` と `preferred_contact_time` を case へ書き戻し、`lead` 定型(「◯◯に担当者からご連絡しますね」+ 継続誘導)を返す
 4. 担当者はリードを管理画面のスレッド詳細(case メタ)で確認する。デモでは通知連携(メール・Slack 等)は行わない
 
-case 属性の加算: `lead_offered`(bool)、`lead_requested`(bool)、`shown_product_cards`(string、カード表示済み material_key の CSV)。`preferred_contact_time` は既存属性を流用する。
+case 属性の加算: `lead_offered`(bool)、`lead_requested`(bool)、`shown_product_cards`(string、カード表示済み material_key の CSV)、`question_streak`(int、質問で締めたターンの連続数 — 第 2.4 節)。`preferred_contact_time` は既存属性を流用する。
 
 ## 5. schema とデータ計画
 
@@ -233,7 +246,7 @@ ingest CLI: `server/src/bin/ingest_homesec.rs`。schema `homesec` の作成(`adv
    - **own_product**: `understanding.product_intent == true`(第 4.1 節)、または累積条件に `concern` があるターンは、検索順位に関わらず別枠注入(`category` が `concern` の値に合致するものを優先し、合致が無ければ全 7 件。material_key の重複は除去)
    - **category 合致材料**: 累積条件の `concern` と同じ `category` を持つ材料を、検索結果と別枠で kind ごとに注入する — `statistic` 最大 2・`partner_product` 最大 2・`scenario` 最大 1(material_key で重複除去。検索ヒットと保証注入を合わせた総数は最大 12 件)
 7. コード判定: `clarify` か `answer` かを確定(第 4.3 節)
-8. LLM Call #2: 下書き生成。プロンプトに材料全文・累積条件・会話履歴・ペルソナ規則・接地 2 層規則・URTECT 優遇規則・リード提案規則(第 4.4 節)・安全下限・Markdown 禁止・継続会話の挨拶抑制を注入
+8. LLM Call #2: 下書き生成。プロンプトに材料全文・累積条件・会話履歴・ペルソナ規則・接地 2 層規則・URTECT 優遇規則・リード提案規則(第 4.4 節)・安全下限・Markdown 禁止・継続会話の挨拶抑制・`question_streak`(第 2.4 節)を注入。**応答本文に加えて構造化メタを出力させる**(本文の後に区切り行 + JSON: `featured`(このターンの主役として提案した商品の material_key 配列)、`closing`(`question_choice` / `question_open` / `proposal` の 3 値)、`choices`(closing が question_choice のときの回答チップ候補、最大 4))。コードはメタを分離してパースし、**失敗時はメタ無し(カード・チップ無し)として応答本文だけで続行**(fail-soft)。`featured` は「注入材料に存在し、かつ応答本文で言及されているもの」だけをコードが採用する(幻覚ガード)
 9. 出口関門(第 7 節)。違反時は `fallback` 定型へ差し替え(warn)
 10. 製品カードの添付判定(第 7.2 節、決定論)
 11. 条件・`clarify_turns`・リード関連属性を `support_case` へ書き戻し、`ConversationTurn` を永続化(5 秒上限・応答優先)して返却
@@ -259,12 +272,12 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 
 ### 7.2 製品カードの添付判定(決定論)
 
-カードは「**このターンで提案した商品**」の提示 UI であり、言及の装飾ではない(本番で、提案していない製品までカード化される実害が出たための規則)。
+カードは「**このターンの主役として提案した商品**」の提示 UI であり、言及の装飾ではない(本番で、提案していない製品や助言の一要素までカード化される実害が出たための規則)。カード候補の起点は LLM Call #2 の構造化メタ `featured`(第 6 節手順 8)とし、以下の決定論検証を通ったものだけをカード化する。**締めが質問のターン(`closing != proposal`)にはカードを出さない**(第 2.4 節)。
 
-1. 今回のターンで注入した own_product / partner_product 材料(`card_description` を持つもの)について、出口関門を通過した最終応答文(正規化後)との合致を判定する:
-   - **own_product**: 応答文にその**型番**(`product_key`。既存の型番検出・正規化と同じ規約)が明示されている場合のみ合致。`card_match_terms` の汎用語(「防犯カメラ」等)では合致させない
-   - **partner_product**: `card_match_terms`(省略時は `title_ja`)の文字列照合(カテゴリ語がそのまま製品の同一性であるため現行どおり)
-2. 合致した材料のうち、case の `shown_product_cards`(material_key 単位)に未記録のものをカード化する。**1 件でも返す**(提案した商品は常にカードで見せる)。3 件を超えるときは own_product を優先し、残りは検索ヒット順
+1. メタ `featured` の各 material_key を検証する(すべて満たすものだけ採用):
+   - 今回のターンで注入した own_product / partner_product 材料(`card_description` を持つもの)に存在する
+   - 出口関門を通過した最終応答文(正規化後)で言及されている — **own_product** は型番(`product_key`。既存の型番検出・正規化規約)の明示、**partner_product** は `card_match_terms`(省略時 `title_ja`)の文字列照合
+2. 検証を通った材料のうち、case の `shown_product_cards`(material_key 単位)に未記録のものをカード化する。1 件でも返す。3 件を超えるときは own_product を優先し、残りは検索ヒット順
 3. 送出したら `shown_product_cards` へ追記する(同じカードを同一会話で繰り返し出さない)
 4. カードの `image_url` は advisor 自ホストの `/static/products/` の同梱画像(自社製品・汎用カテゴリ)のみ。今回注入していない材料のカードは組み立てない
 

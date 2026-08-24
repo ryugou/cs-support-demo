@@ -456,24 +456,47 @@ pub fn decide_time_pref_extraction_failed(
     }
 }
 
-/// support_case の advisor 固有属性 3 つ(design doc §4.4 手順4)。
+/// support_case の advisor 固有属性(design doc §4.4 手順4、`question_streak` は
+/// 2026-08-21 conversation-rhythm-implementation §要件2 で加算)。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AdvisorCaseAttrs {
     pub lead_offered: bool,
     pub lead_requested: bool,
     pub shown_product_cards: String,
+    /// Call#2 のメタ `closing` が質問系(`QuestionChoice` / `QuestionOpen`)で連続した回数。
+    /// [`next_question_streak`] が更新する。
+    pub question_streak: i32,
 }
 
+/// `question_streak` の上限(2次 codex レビュー Warning C 是正)。永続ストア(support_case
+/// 属性)の値は入力境界として扱う: プロンプト分岐([`build_advisor_system_prompt`] の
+/// `question_streak >= 2` 判定)は「2以上か」しか見ないため、これより大きい値に意味は無い。
+/// 上限を設けるのは、破損・改竄された属性値がそのままプロンプトへ埋め込まれて
+/// (`format!("...{question_streak}回連続しています...")`)非現実的な桁の数値が顧客向け
+/// 応答文の生成に使われる事態を避けるため。
+const MAX_QUESTION_STREAK: i32 = 99;
+
 /// support_case の属性 map から [`AdvisorCaseAttrs`] を復元する純関数。欠落・空文字は既定値
-/// (false / false / 空文字列)に倒す(`harness::conv_state_from_attrs` と同じ書き方)。
+/// (false / false / 空文字列 / 0)に倒す(`harness::conv_state_from_attrs` と同じ書き方)。
+///
+/// 2次 codex レビュー Warning C 是正: `question_streak` は永続ストアの値であり入力境界として
+/// 扱う。パース失敗は 0 に倒す(既存どおり)が、パースに成功しても負値や `i32::MAX` のような
+/// 異常値をそのまま受け入れると、後段の `next_question_streak` の `current + 1` が
+/// (debug build では)オーバーフロー panic、(release build では)ラップアラウンドしうる。
+/// `clamp(0, MAX_QUESTION_STREAK)` で読み込み時点から正常範囲に丸める。
 pub fn parse_advisor_case_attrs(
     attrs: &std::collections::HashMap<String, String>,
 ) -> AdvisorCaseAttrs {
     let get = |key: &str| attrs.get(key).map(String::as_str).unwrap_or("");
+    let question_streak = get("question_streak")
+        .parse::<i32>()
+        .unwrap_or(0)
+        .clamp(0, MAX_QUESTION_STREAK);
     AdvisorCaseAttrs {
         lead_offered: get("lead_offered") == "true",
         lead_requested: get("lead_requested") == "true",
         shown_product_cards: get("shown_product_cards").to_string(),
+        question_streak,
     }
 }
 
@@ -490,7 +513,45 @@ pub fn advisor_attr_updates(attrs: &AdvisorCaseAttrs) -> Vec<(String, String)> {
             "shown_product_cards".to_string(),
             attrs.shown_product_cards.clone(),
         ),
+        (
+            "question_streak".to_string(),
+            attrs.question_streak.to_string(),
+        ),
     ]
+}
+
+/// 2026-08-21 conversation-rhythm-implementation §要件2: `question_streak` の遷移。
+///
+/// `meta_closing` は「今回のターンが実際に `DraftMode::Answer` の Call#2 がメタ付きで成功した
+/// ターンだったか」を呼び出し側([`crate::advisor::api`])が判定した結果を渡す契約。
+/// handoff/safety/out_of_domain/time_pref/lead/clarify/fallback(出口関門違反や Call#2 失敗で
+/// 応答が定型文に差し替わったターンを含む)は呼び出し側が `None` を渡し、この関数は現在値を
+/// そのまま返す(据え置き)。`Some(Proposal)` は 0 にリセット、`Some(QuestionChoice)` /
+/// `Some(QuestionOpen)` は +1 する。
+///
+/// 2次 codex レビュー Warning C 是正: 加算は `saturating_add(1)` を使い、結果をさらに
+/// [`MAX_QUESTION_STREAK`] で clamp する。`current` は [`parse_advisor_case_attrs`] で
+/// 読み込み時に既に同じ上限へ丸め済みだが、この関数単体が呼ばれるテスト・将来の呼び出し元でも
+/// 同じ不変条件(0 以上・上限以下)を保つよう、この関数自身でも防御する(読み込み側だけに
+/// 依存しない多層防御)。
+///
+/// 3次 codex レビュー Suggestion F3 是正: `None`(据え置き)分岐も `current` をそのまま
+/// 返さず `clamp(0, MAX_QUESTION_STREAK)` を通す。現在の唯一の呼び出し元
+/// ([`parse_advisor_case_attrs`] 経由)は既に丸め済みの値しか渡さないため実害は無いが、
+/// 将来この関数が読み込み境界を経由せず直接呼ばれた場合に異常値がそのまま素通りする経路を
+/// 残さないため、この関数単体で `0..=MAX_QUESTION_STREAK` の不変条件を常に保証する。
+pub fn next_question_streak(
+    current: i32,
+    meta_closing: Option<crate::advisor::draftgen::ClosingKind>,
+) -> i32 {
+    use crate::advisor::draftgen::ClosingKind;
+    match meta_closing {
+        None => current.clamp(0, MAX_QUESTION_STREAK),
+        Some(ClosingKind::Proposal) => 0,
+        Some(ClosingKind::QuestionChoice) | Some(ClosingKind::QuestionOpen) => {
+            current.saturating_add(1).clamp(0, MAX_QUESTION_STREAK)
+        }
+    }
 }
 
 /// 累積条件(design doc §4.2)を support_case の属性として保持するときのキー名対応表。
@@ -1775,7 +1836,52 @@ mod tests {
                 lead_offered: true,
                 lead_requested: true,
                 shown_product_cards: "own_product:adc-v724,partner_product:foo".to_string(),
+                question_streak: 0,
             }
+        );
+    }
+
+    #[test]
+    fn parse_advisor_case_attrs_reads_question_streak_when_present() {
+        let attrs: std::collections::HashMap<String, String> =
+            [("question_streak".to_string(), "3".to_string())]
+                .into_iter()
+                .collect();
+
+        assert_eq!(parse_advisor_case_attrs(&attrs).question_streak, 3);
+    }
+
+    #[test]
+    fn parse_advisor_case_attrs_defaults_question_streak_to_zero_when_absent() {
+        let attrs = std::collections::HashMap::new();
+
+        assert_eq!(parse_advisor_case_attrs(&attrs).question_streak, 0);
+    }
+
+    // --- 2次 codex レビュー Warning C: question_streak は永続ストアの入力境界として扱う ---
+
+    #[test]
+    fn parse_advisor_case_attrs_clamps_a_negative_question_streak_to_zero() {
+        // 永続属性が(改竄・不具合等で)負値を持っていても、下限 0 に丸めることを固定する。
+        let attrs: std::collections::HashMap<String, String> =
+            [("question_streak".to_string(), "-5".to_string())]
+                .into_iter()
+                .collect();
+
+        assert_eq!(parse_advisor_case_attrs(&attrs).question_streak, 0);
+    }
+
+    #[test]
+    fn parse_advisor_case_attrs_clamps_i32_max_question_streak_without_panicking() {
+        // i32::MAX を読んでも(後段の +1 でオーバーフローする前に)上限へ丸めることを固定する。
+        let attrs: std::collections::HashMap<String, String> =
+            [("question_streak".to_string(), i32::MAX.to_string())]
+                .into_iter()
+                .collect();
+
+        assert_eq!(
+            parse_advisor_case_attrs(&attrs).question_streak,
+            MAX_QUESTION_STREAK
         );
     }
 
@@ -1785,17 +1891,93 @@ mod tests {
             lead_offered: true,
             lead_requested: false,
             shown_product_cards: "statistic:foo".to_string(),
+            question_streak: 2,
         };
 
         let updates = advisor_attr_updates(&attrs);
 
-        assert_eq!(updates.len(), 3);
+        assert_eq!(updates.len(), 4);
         let map: std::collections::HashMap<_, _> = updates.into_iter().collect();
         assert_eq!(map.get("lead_offered").map(String::as_str), Some("true"));
         assert_eq!(map.get("lead_requested").map(String::as_str), Some("false"));
         assert_eq!(
             map.get("shown_product_cards").map(String::as_str),
             Some("statistic:foo")
+        );
+        assert_eq!(map.get("question_streak").map(String::as_str), Some("2"));
+    }
+
+    // --- next_question_streak(必須テスト5: question_streak の遷移) ---
+
+    #[test]
+    fn next_question_streak_increments_on_question_choice() {
+        use crate::advisor::draftgen::ClosingKind;
+        assert_eq!(
+            next_question_streak(0, Some(ClosingKind::QuestionChoice)),
+            1
+        );
+        assert_eq!(
+            next_question_streak(1, Some(ClosingKind::QuestionChoice)),
+            2
+        );
+    }
+
+    #[test]
+    fn next_question_streak_increments_on_question_open() {
+        use crate::advisor::draftgen::ClosingKind;
+        assert_eq!(next_question_streak(0, Some(ClosingKind::QuestionOpen)), 1);
+        assert_eq!(next_question_streak(2, Some(ClosingKind::QuestionOpen)), 3);
+    }
+
+    #[test]
+    fn next_question_streak_resets_to_zero_on_proposal() {
+        use crate::advisor::draftgen::ClosingKind;
+        assert_eq!(next_question_streak(3, Some(ClosingKind::Proposal)), 0);
+        assert_eq!(next_question_streak(0, Some(ClosingKind::Proposal)), 0);
+    }
+
+    #[test]
+    fn next_question_streak_unchanged_when_meta_closing_is_none() {
+        // fallback/clarify/handoff/safety/out_of_domain/time_pref/lead の各ターンは呼び出し側
+        // (advisor::api)が None を渡す契約。現在値をそのまま据え置く。
+        assert_eq!(next_question_streak(0, None), 0);
+        assert_eq!(next_question_streak(2, None), 2);
+    }
+
+    #[test]
+    fn next_question_streak_clamps_out_of_range_current_when_meta_closing_is_none() {
+        // 3次 codex レビュー Suggestion F3: 現在の唯一の呼び出し元
+        // (parse_advisor_case_attrs 経由)は範囲内の値しか渡さないが、この関数単体は
+        // 据え置き分岐でも 0..=MAX_QUESTION_STREAK の不変条件を保証すること。
+        assert_eq!(next_question_streak(-5, None), 0);
+        assert_eq!(next_question_streak(i32::MAX, None), MAX_QUESTION_STREAK);
+    }
+
+    // --- 2次 codex レビュー Warning C: 加算の上限・オーバーフロー安全性 ---
+
+    #[test]
+    fn next_question_streak_does_not_panic_on_i32_max_and_clamps_to_the_limit() {
+        use crate::advisor::draftgen::ClosingKind;
+        // 通常は parse_advisor_case_attrs が読み込み時点で MAX_QUESTION_STREAK 以下に丸める
+        // ため i32::MAX が current に渡ることは無いはずだが、この関数自身も
+        // saturating_add + clamp で二重に守っていることを固定する(素の `current + 1` なら
+        // debug build で overflow panic する入力)。
+        assert_eq!(
+            next_question_streak(i32::MAX, Some(ClosingKind::QuestionChoice)),
+            MAX_QUESTION_STREAK
+        );
+    }
+
+    #[test]
+    fn next_question_streak_stays_at_the_limit_once_reached() {
+        use crate::advisor::draftgen::ClosingKind;
+        assert_eq!(
+            next_question_streak(MAX_QUESTION_STREAK, Some(ClosingKind::QuestionChoice)),
+            MAX_QUESTION_STREAK
+        );
+        assert_eq!(
+            next_question_streak(MAX_QUESTION_STREAK, Some(ClosingKind::QuestionOpen)),
+            MAX_QUESTION_STREAK
         );
     }
 }

@@ -83,7 +83,9 @@ pub struct AdvisorReplyResponse {
     pub case_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product_cards: Option<Vec<ProductCard>>,
-    /// `clarify` / `time_pref` ターンの選択肢(design doc §3.3 加算フィールド、Issue #34)。
+    /// `clarify` / `time_pref` ターン、および `answer` ターンで `closing == question_choice`
+    /// のときの選択肢(design doc §3.3 加算フィールド、Issue #34。2026-08-21
+    /// conversation-rhythm-implementation §要件3 により `answer` ターンにも拡張)。
     /// CS 側は常に省略する(同上の理由)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quick_replies: Option<Vec<QuickReplyItem>>,
@@ -215,6 +217,22 @@ fn should_burn_lead_offered(already_offered: bool, drafted_text: &str) -> bool {
         && drafted_text.contains(draftgen::LEAD_OFFER_MARKER)
 }
 
+/// 2次 codex レビュー Warning B 是正: `AdvisorAction::Clarify` 経路で Call#2 から返ってきた
+/// `meta` を上位(`select_cards` / `question_streak` 更新)へ渡してよいかを決める純関数。
+///
+/// `DraftMode::Clarify` は design doc §4.3 手順6「1問だけ聞き返す」契約のターンであり、
+/// メタ出力を一切指示しない。通常は `meta == None` のはずだが、LLM の逸脱やプロンプト
+/// インジェクションが有効な `proposal` メタ(featured 付き)を返した場合、それをそのまま
+/// 上位へ渡すと「締めが質問のターンに商品カードが付く」という design doc §2.4 違反
+/// (Issue #34 実害 (a) の再発経路)になる。「通常は None のはず」というコメントは安全境界に
+/// ならないため、ここでモード境界を LLM 出力に依存しない決定論的なゲートにする: Clarify
+/// 経路で取れたメタは常に破棄する。
+fn clarify_meta_for_upstream(
+    _llm_meta: Option<draftgen::DraftMeta>,
+) -> Option<draftgen::DraftMeta> {
+    None
+}
+
 /// design doc §8「vegapunk 検索失敗 → 製品カードは添付しない」の一般化。`reply_kind ==
 /// "fallback"` のターンは答えを返せていない(材料検索自体は成功していても、下書きは顧客に
 /// 一切見えていない)ため、`cards::select_cards` を呼ばず製品カードを添付しない(reviewer 指摘
@@ -330,8 +348,9 @@ async fn draft_with_materials(
     history_digest: &str,
     is_continuation: bool,
     lead_offered: bool,
+    question_streak: i32,
     product_intent: bool,
-) -> (String, Vec<AdvisorMaterial>) {
+) -> (String, Option<draftgen::DraftMeta>, Vec<AdvisorMaterial>) {
     let resolutions = match state.harness.store() {
         Ok(store) => match store.load_known_resolutions(schema).await {
             Ok(list) => list,
@@ -371,7 +390,7 @@ async fn draft_with_materials(
     let category_candidates =
         materials::select_category_materials(&category_pool, concern_category);
     composed = materials::inject_category_materials(composed, category_candidates);
-    let text = draftgen::draft_advisor_reply(
+    let (text, meta) = draftgen::draft_advisor_reply(
         &state.llm,
         mode,
         &composed,
@@ -380,10 +399,11 @@ async fn draft_with_materials(
         history_digest,
         is_continuation,
         lead_offered,
+        question_streak,
         &state.ng,
     )
     .await;
-    (text, composed)
+    (text, meta, composed)
 }
 
 /// `POST /{project_id}/api/reply`（design doc §6 の 11 手順そのもの）。
@@ -481,12 +501,13 @@ async fn advisor_reply_handler(
     )
     .await;
 
-    let (reply_text, reply_kind, final_conditions, materials_used, quick_reply_items): (
+    let (reply_text, reply_kind, final_conditions, materials_used, quick_reply_items, draft_meta): (
         String,
         &'static str,
         Vec<(ConditionKey, String)>,
         Vec<AdvisorMaterial>,
         Option<Vec<QuickReplyItem>>,
+        Option<draftgen::DraftMeta>,
     ) = match understanding_result {
         Err(err) => {
             // design doc §4.3 末尾・§8: 理解 LLM が(内部で1回再試行しても)失敗したら
@@ -504,6 +525,7 @@ async fn advisor_reply_handler(
                 "fallback",
                 accumulated_conditions.clone(),
                 Vec::new(),
+                None,
                 None,
             )
         }
@@ -555,25 +577,32 @@ async fn advisor_reply_handler(
             // doc comment 参照)は match の前に一括で適用する(`apply_action_contract`)。
             // match 自体は応答文・reply_kind・materials の組み立てだけを担う。
             apply_action_contract(&action, &mut conv, &mut advisor_attrs);
-            let (text, kind, materials_list, quick_replies): (
+            let (text, kind, materials_list, quick_replies, meta): (
                 String,
                 &'static str,
                 Vec<AdvisorMaterial>,
                 Option<Vec<QuickReplyItem>>,
+                Option<draftgen::DraftMeta>,
             ) = match action {
-                AdvisorAction::Safety => {
-                    (canned::SAFETY_TEXT.to_string(), "safety", Vec::new(), None)
-                }
+                AdvisorAction::Safety => (
+                    canned::SAFETY_TEXT.to_string(),
+                    "safety",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
                 AdvisorAction::TimePrefContinue => (
                     canned::lead_time_pref_reask(&state.config.api.business_hours),
                     "time_pref",
                     Vec::new(),
                     quick_replies::for_time_pref(),
+                    None,
                 ),
                 AdvisorAction::OutOfDomain => (
                     canned::OUT_OF_DOMAIN_TEXT.to_string(),
                     "out_of_domain",
                     Vec::new(),
+                    None,
                     None,
                 ),
                 AdvisorAction::Handoff => (
@@ -581,20 +610,28 @@ async fn advisor_reply_handler(
                     "handoff",
                     Vec::new(),
                     None,
+                    None,
                 ),
                 AdvisorAction::LeadSolicit => (
                     canned::lead_solicit(&state.config.api.business_hours),
                     "time_pref",
                     Vec::new(),
                     quick_replies::for_time_pref(),
+                    None,
                 ),
-                AdvisorAction::LeadConfirmed { slot } => {
-                    (canned::lead_confirmed(&slot), "lead", Vec::new(), None)
-                }
+                AdvisorAction::LeadConfirmed { slot } => (
+                    canned::lead_confirmed(&slot),
+                    "lead",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
                 AdvisorAction::Clarify { missing } => {
                     // design doc §6 手順6: 検索クエリは「累積条件 + 相談要旨」。
                     // understanding.summary_ja が §4.1 の「相談要旨」そのもの。
-                    let (text, materials_list) = draft_with_materials(
+                    // question_streak はここでは更新しない(要件2: 更新対象は
+                    // `DraftMode::Answer` がメタ付きで成功したターンのみ)。
+                    let (text, meta, materials_list) = draft_with_materials(
                         &state,
                         &project.schema,
                         DraftMode::Clarify { missing: &missing },
@@ -604,9 +641,14 @@ async fn advisor_reply_handler(
                         &history_digest,
                         is_continuation,
                         advisor_attrs.lead_offered,
+                        advisor_attrs.question_streak,
                         understanding.product_intent,
                     )
                     .await;
+                    // 2次 codex レビュー Warning B 是正: Clarify 経路のメタは常に破棄する
+                    // (clarify_meta_for_upstream 参照。quick_replies 生成は従来どおり
+                    // `for_clarify` の固定語彙のみを使い、この meta には依存しない)。
+                    let meta = clarify_meta_for_upstream(meta);
                     if should_burn_lead_offered(advisor_attrs.lead_offered, &text) {
                         advisor_attrs.lead_offered = true;
                     }
@@ -621,10 +663,10 @@ async fn advisor_reply_handler(
                     } else {
                         quick_replies::for_clarify(&missing)
                     };
-                    (text, kind, materials_list, quick_replies)
+                    (text, kind, materials_list, quick_replies, meta)
                 }
                 AdvisorAction::Answer => {
-                    let (text, materials_list) = draft_with_materials(
+                    let (text, meta, materials_list) = draft_with_materials(
                         &state,
                         &project.schema,
                         DraftMode::Answer,
@@ -634,18 +676,35 @@ async fn advisor_reply_handler(
                         &history_digest,
                         is_continuation,
                         advisor_attrs.lead_offered,
+                        advisor_attrs.question_streak,
                         understanding.product_intent,
                     )
                     .await;
                     if should_burn_lead_offered(advisor_attrs.lead_offered, &text) {
                         advisor_attrs.lead_offered = true;
                     }
+                    // 要件2: question_streak の更新は Answer モードの Call#2 がメタ付きで
+                    // 成功したターンのみ(fallback へ差し替わったターンは draftgen 側で既に
+                    // meta = None になっている。draftgen::draft_advisor_reply の doc comment
+                    // 参照)。
+                    advisor_attrs.question_streak = decide::next_question_streak(
+                        advisor_attrs.question_streak,
+                        meta.as_ref().map(|m| m.closing),
+                    );
                     let kind = if text == canned::FALLBACK_TEXT {
                         "fallback"
                     } else {
                         "answer"
                     };
-                    (text, kind, materials_list, None)
+                    // 要件5: quick_replies は reply_kind == "answer" のときだけ、Call#2 の
+                    // メタ(closing == QuestionChoice かつ choices 非空)から生成する。fallback
+                    // へ差し替わったターンは出さない(仕様: fallback は quick_replies なし)。
+                    let quick_replies = if kind == "answer" {
+                        quick_replies::for_answer(meta.as_ref())
+                    } else {
+                        None
+                    };
+                    (text, kind, materials_list, quick_replies, meta)
                 }
             };
             (
@@ -654,6 +713,7 @@ async fn advisor_reply_handler(
                 understanding.conditions,
                 materials_list,
                 quick_replies,
+                meta,
             )
         }
     };
@@ -662,17 +722,21 @@ async fn advisor_reply_handler(
     // 冪等に通る(`crate::api::ok_reply_response` と同じ「一律で通す」方針)。
     let final_text = crate::harness::prompt_input::to_plain_text(&reply_text);
 
-    // 手順9: 製品カードの添付判定(design doc §7.2)。canned 応答(Safety/OutOfDomain/...)は
+    // 手順9: 製品カードの添付判定(design doc §7.2、2026-08-21
+    // conversation-rhythm-implementation §要件3)。canned 応答(Safety/OutOfDomain/...)は
     // materials_used が常に空なので select_cards は自然に空 Vec を返す(=呼ばなかったのと
     // 同じ結果になる)。fallback ターン(`reply_kind == "fallback"`)だけは select_cards 自体を
     // 呼ばない(`should_select_cards` 参照。reviewer 指摘 Warning 1: 答えを返せていないターンに
-    // カードを出さない、かつ shown_product_cards への誤った追記を防ぐ)。
+    // カードを出さない、かつ shown_product_cards への誤った追記を防ぐ)。`draft_meta` は
+    // `DraftMode::Answer` がメタ付きで成功したターンだけ `Some` になり、`closing != Proposal`
+    // (`draft_meta` が `None` の場合を含む)なら `select_cards` 自身が空を返す。
     let mut selected_cards = if should_select_cards(reply_kind) {
         cards::select_cards(
             &final_text,
             &materials_used,
             &advisor_attrs.shown_product_cards,
             &state.images_dir,
+            draft_meta.as_ref(),
         )
     } else {
         Vec::new()
@@ -703,6 +767,8 @@ async fn advisor_reply_handler(
         reply_kind,
         &materials_used,
         product_cards.as_deref(),
+        draft_meta.as_ref(),
+        advisor_attrs.question_streak,
     );
 
     // 手順10: support_case への書き込み(1 回だけ)。
@@ -781,14 +847,22 @@ async fn advisor_reply_handler(
 ///
 /// ログに載せるのは request_id / case_id / action_kind(応答種別)/ material_keys(注入した
 /// 材料の material_key。`{kind}:{slug}` 形式で kind を含む)/ card_keys(選定したカードの
-/// material_key)の5つのみ。
+/// material_key)/ closing(Call#2 のメタの締め方。メタが無いターンは `"none"`)/
+/// featured_len(メタの featured 件数。メタが無ければ0)/ question_streak(このターン終了後に
+/// 書き戻す最終値)の8つのみ。
 /// `materials_used` の `body_ja` / `title_ja`、`message` / 応答本文は一切渡さない・出さない。
+/// reviewer 一次レビュー Major 4 是正: カード・チップが出るかどうかを決める入力
+/// (`closing` / `featured` / `question_streak`)が従来出ておらず、本番で「なぜこのターンに
+/// カードが出なかったか」を運用者が特定できなかった。`choices` の中身(顧客向け文言)と
+/// `featured` の値そのもの(材料の中身が推測できる)は出さず、件数だけに留める。
 fn log_turn_decision(
     request_id: &str,
     case_id: &str,
     reply_kind: &str,
     materials_used: &[AdvisorMaterial],
     product_cards: Option<&[ProductCard]>,
+    draft_meta: Option<&draftgen::DraftMeta>,
+    question_streak: i32,
 ) {
     tracing::info!(
         request_id = %request_id,
@@ -801,6 +875,9 @@ fn log_turn_decision(
         card_keys = ?product_cards
             .map(|cards| cards.iter().map(|c| c.material_key.clone()).collect::<Vec<String>>())
             .unwrap_or_default(),
+        closing = draft_meta.map(|m| m.closing.as_str()).unwrap_or("none"),
+        featured_len = draft_meta.map(|m| m.featured.len()).unwrap_or(0),
+        question_streak,
         "homesec advisor turn decision"
     );
 }
@@ -1070,6 +1147,29 @@ mod tests {
         ));
     }
 
+    // --- clarify_meta_for_upstream(2次 codex レビュー Warning B) ---
+
+    #[test]
+    fn clarify_meta_for_upstream_discards_a_leaked_llm_meta() {
+        // LLM の逸脱・プロンプトインジェクションで DraftMode::Clarify のターンでも有効な
+        // proposal メタ(featured 付き)が返ってきたケース。Clarify は「締めが質問」の契約
+        // ターンなので、これをそのまま上位へ渡すと商品カードが付いてしまう
+        // (design doc §2.4 違反、Issue #34 実害 (a) の再発経路)。常に破棄することを固定する。
+        let leaked = draftgen::DraftMeta {
+            featured: vec!["own_product:adc-v724".to_string()],
+            closing: draftgen::ClosingKind::Proposal,
+            choices: Vec::new(),
+        };
+        assert_eq!(clarify_meta_for_upstream(Some(leaked)), None);
+    }
+
+    #[test]
+    fn clarify_meta_for_upstream_is_a_noop_when_there_is_no_meta() {
+        // 通常経路(DraftMode::Clarify はメタ出力を指示しないので meta == None)でも
+        // そのまま None を返すことを固定する。
+        assert_eq!(clarify_meta_for_upstream(None), None);
+    }
+
     #[test]
     fn fallback_text_never_contains_the_lead_offer_marker() {
         assert!(!canned::FALLBACK_TEXT.contains(draftgen::LEAD_OFFER_MARKER));
@@ -1130,6 +1230,7 @@ mod tests {
             lead_offered: false,
             lead_requested: false,
             shown_product_cards: String::new(),
+            question_streak: 0,
         }
     }
 
@@ -1279,6 +1380,7 @@ mod tests {
             lead_offered: true,
             lead_requested: true,
             shown_product_cards: "own_product:adc-v724".to_string(),
+            question_streak: 3,
         };
         let conditions = vec![
             (ConditionKey::Concern, "intrusion".to_string()),
@@ -1321,6 +1423,7 @@ mod tests {
             map.get("shown_product_cards").map(String::as_str),
             Some("own_product:adc-v724")
         );
+        assert_eq!(map.get("question_streak").map(String::as_str), Some("3"));
         assert_eq!(
             map.get("advisor_cond_concern").map(String::as_str),
             Some("intrusion")
@@ -1363,9 +1466,22 @@ mod tests {
         // material_key は `{kind}:{slug}` 形式で kind を既に含むため、そのまま出る
         // (kind を重ねて `own_product:own_product:...` にならない)ことを固定する。
         let expected_material_key = materials[0].material_key.clone();
+        let meta = draftgen::DraftMeta {
+            featured: vec!["own_product:adc-v724".to_string()],
+            closing: draftgen::ClosingKind::Proposal,
+            choices: Vec::new(),
+        };
 
         let (_, logs) = crate::test_support::capture_logs(|| {
-            log_turn_decision("req-1", "case-1", "answer", &materials, Some(&cards));
+            log_turn_decision(
+                "req-1",
+                "case-1",
+                "answer",
+                &materials,
+                Some(&cards),
+                Some(&meta),
+                2,
+            );
         });
 
         assert!(logs.contains("INFO"), "logs: {logs}");
@@ -1392,6 +1508,20 @@ mod tests {
             logs.contains(&sample_card().material_key),
             "card_keys must include the selected card's material_key: {logs}"
         );
+        // reviewer 一次レビュー Major 4 是正: closing / featured_len / question_streak が
+        // 出ることを固定する(カード・チップが出るかどうかを決める入力の可観測性)。
+        assert!(
+            logs.contains("closing=proposal") || logs.contains("closing=\"proposal\""),
+            "closing must reflect the draft meta's ClosingKind::as_str(): {logs}"
+        );
+        assert!(
+            logs.contains("featured_len=1"),
+            "featured_len must be the draft meta's featured count: {logs}"
+        );
+        assert!(
+            logs.contains("question_streak=2"),
+            "question_streak must be the final value passed in: {logs}"
+        );
     }
 
     #[test]
@@ -1404,7 +1534,7 @@ mod tests {
         material.body_ja = "ログに出てはいけない材料本文マーカー".to_string();
 
         let (_, logs) = crate::test_support::capture_logs(|| {
-            log_turn_decision("req-1", "case-1", "answer", &[material], None);
+            log_turn_decision("req-1", "case-1", "answer", &[material], None, None, 0);
         });
 
         assert!(
@@ -1423,7 +1553,7 @@ mod tests {
         // (panic せず出力されること)」。fallback ターン等(手順9で select_cards 自体を
         // 呼ばない経路)が該当する。
         let (_, logs) = crate::test_support::capture_logs(|| {
-            log_turn_decision("req-1", "case-1", "fallback", &[], None);
+            log_turn_decision("req-1", "case-1", "fallback", &[], None, None, 0);
         });
 
         assert!(logs.contains("INFO"), "logs: {logs}");
@@ -1435,6 +1565,16 @@ mod tests {
             logs.contains("material_keys=[]"),
             "material_keys must render as an empty list when materials_used is empty: {logs}"
         );
+        // reviewer 一次レビュー Major 4 是正: メタが無いターン(fallback 等)は closing が
+        // "none" になる境界を固定する。
+        assert!(
+            logs.contains("closing=none") || logs.contains("closing=\"none\""),
+            "closing must be \"none\" when draft_meta is None: {logs}"
+        );
+        assert!(
+            logs.contains("featured_len=0"),
+            "featured_len must be 0 when draft_meta is None: {logs}"
+        );
     }
 
     // ---- AdvisorReplyResponse serialization (design doc §3.3) ----
@@ -1445,9 +1585,16 @@ mod tests {
             title: "URTECT ADC-V724".to_string(),
             description: "屋外対応・夜間撮影".to_string(),
             image_url: Some("https://advisor.example.com/static/products/adc-v724.jpg".to_string()),
-            product_page_url: Some("https://example.com/products/adc-v724".to_string()),
-            button_text: "この商品について聞く".to_string(),
-            button_message: "ADC-V724について詳しく教えて".to_string(),
+            buttons: vec![
+                cards::CardButton::Uri {
+                    label: "商品ページを見る".to_string(),
+                    url: "https://example.com/products/adc-v724".to_string(),
+                },
+                cards::CardButton::Message {
+                    label: "詳しく聞く".to_string(),
+                    message: "ADC-V724について詳しく教えて".to_string(),
+                },
+            ],
         }
     }
 
@@ -1468,7 +1615,16 @@ mod tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0]["material_key"], "own_product:adc-v724");
         assert_eq!(cards[0]["title"], "URTECT ADC-V724");
-        assert_eq!(cards[0]["button_text"], "この商品について聞く");
+        let buttons = cards[0]["buttons"]
+            .as_array()
+            .expect("buttons must serialize as a JSON array");
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0]["kind"], "uri");
+        assert_eq!(buttons[0]["label"], "商品ページを見る");
+        assert_eq!(buttons[0]["url"], "https://example.com/products/adc-v724");
+        assert_eq!(buttons[1]["kind"], "message");
+        assert_eq!(buttons[1]["label"], "詳しく聞く");
+        assert_eq!(buttons[1]["message"], "ADC-V724について詳しく教えて");
     }
 
     #[test]
