@@ -117,6 +117,13 @@ pub fn select_cards(
     let shown: std::collections::HashSet<String> = csv_list(shown_csv).into_iter().collect();
     let featured: std::collections::HashSet<&str> =
         meta.featured.iter().map(String::as_str).collect();
+    // reviewer 是正(Suggestion): 呼び出し元(api.rs)は既に final_text を to_plain_text 済みで
+    // 渡してくるが、以前の matches_final_text はカード候補ごとに to_plain_text(final_text) を
+    // 再計算していた(応答本文全体の正規化を候補件数分繰り返す無駄な計算)。ここで1回だけ
+    // 正規化し、matches_final_text には正規化済みの文字列を渡す。own_product 分岐
+    // (matches_own_product_by_model_token)は extract_model_tokens が独自の正規化経路を持つため、
+    // 従来どおり生の final_text を使う(挙動を変えない)。
+    let normalized_final_text = to_plain_text(final_text);
 
     // featured フィルタまでを一旦区切って持つ(reviewer 一次レビュー Major 3 是正)。以前は
     // `own_product`/`partner_product` の materials.json 側で `card_description` が
@@ -148,7 +155,7 @@ pub fn select_cards(
 
     let mut candidates: Vec<&AdvisorMaterial> = after_featured_filter
         .into_iter()
-        .filter(|m| matches_final_text(m, final_text))
+        .filter(|m| matches_final_text(m, final_text, &normalized_final_text))
         .filter(|m| !shown.contains(&m.material_key))
         .filter(|m| card_text_passes_ng_gate(m, ng))
         .collect();
@@ -228,18 +235,56 @@ fn kind_priority(kind: &str) -> u8 {
 
 /// design doc §7.2 手順1 の照合判定。`own_product` とそれ以外で判定方法を分ける
 /// (本番実害是正: own_product は汎用語で合致させない)。
-fn matches_final_text(material: &AdvisorMaterial, final_text: &str) -> bool {
+///
+/// 4次 codex レビュー 指摘4 是正: `card_match_terms` / `title_ja` は材料データ側の生の値であり
+/// Markdown 風の装飾(例: `**ALSOK**`)が入っていることがある一方、`final_text`(応答本文)は
+/// 既に Markdown 除去済みの plain text である。両辺を [`to_plain_text`] で正規化してから比較
+/// することで、材料データ側の装飾の有無に照合結果が左右されないようにする(`own_product`
+/// 分岐は対象外 — 型番トークン抽出は既に別の正規化経路を持つため)。
+///
+/// reviewer 一次レビュー Warning 1 是正: 正規化後に空文字列になる照合語(例 `"**"` は対の
+/// Markdown 強調記号として除去され空になる)は候補から除く。`String::contains("")` は本文の
+/// 内容に関わらず常に `true` を返すため、ガードが無いとその材料は無条件にカード化されて
+/// しまう。
+///
+/// Issue #47 フォローアップ(reviewer/codex レビュー Warning 是正): 正規化後に「空文字列」
+/// ではなく「空白のみ」になる照合語(例 `"**  **"` は対の Markdown 強調記号だけが除去され、
+/// 中身の半角スペース2個が残った `"  "` になる)も同じ欠陥を持つ — `is_empty()` は false を
+/// 返すため、応答本文にたまたま連続する空白が含まれるだけで、その材料が製品に一切言及して
+/// いなくてもカード候補になっていた。正規化後の語を `trim()` してから空判定・`contains` を
+/// 行うことでこれを塞ぐ。`trim()` は Unicode 空白(全角スペース・改行含む)を対象にするため、
+/// 全角スペースのみに正規化される語も同時に塞がる。
+///
+/// `final_text` は `matches_own_product_by_model_token` 用の生の値(呼び出し元
+/// [`select_cards`] が受け取った引数そのまま)、`normalized_final_text` はそれを
+/// [`to_plain_text`] で正規化済みの値(reviewer 是正・Suggestion: 以前はここで候補ごとに
+/// `to_plain_text(final_text)` を再計算していたが、`select_cards` は既に呼び出し元
+/// (`api.rs`)から正規化済みの `final_text` を渡されている上、この関数自体も候補1件ごとに
+/// 呼ばれるため、応答本文全体の正規化を候補件数分だけ繰り返す無駄な計算になっていた。
+/// `select_cards` で1回だけ正規化し、その結果をここへ渡す)。
+fn matches_final_text(
+    material: &AdvisorMaterial,
+    final_text: &str,
+    normalized_final_text: &str,
+) -> bool {
     if material.kind == "own_product" {
         return matches_own_product_by_model_token(material, final_text);
     }
+    let matches_normalized_term = |term: &str| -> bool {
+        let normalized_term = to_plain_text(term);
+        let normalized_term = normalized_term.trim();
+        !normalized_term.is_empty() && normalized_final_text.contains(normalized_term)
+    };
     match &material.card_match_terms {
-        Some(terms) => csv_list(terms).iter().any(|term| final_text.contains(term)),
+        Some(terms) => csv_list(terms)
+            .iter()
+            .any(|term| matches_normalized_term(term)),
         None => {
-            final_text.contains(&material.title_ja)
+            matches_normalized_term(&material.title_ja)
                 || material
                     .product_key
                     .as_deref()
-                    .is_some_and(|pk| final_text.contains(pk))
+                    .is_some_and(matches_normalized_term)
         }
     }
 }
@@ -714,6 +759,151 @@ mod tests {
             &permissive_ng(),
         );
         assert_eq!(cards.len(), 1);
+    }
+
+    #[test]
+    fn partner_product_matches_via_card_match_terms_despite_markdown_decoration_in_material_data() {
+        // 4次 codex レビュー 指摘4 是正: card_match_terms は材料データ側の生の値であり、
+        // Markdown 風の装飾(例: "**ALSOK**")が入っていることがある。final_text は既に
+        // Markdown 除去済みの plain text なので、正規化せずに contains 比較すると本来一致
+        // すべきカードが出なくなる。
+        //
+        // card_match_terms は装飾された語1件だけにする(装飾なしの語を混ぜない)。混ぜると
+        // 装飾なし側の語だけで一致してしまい、正規化そのものの効果を検証できなくなる
+        // (Fable のコーディネーターレビュー指摘: 旧テストデータは実装変更前でも green だった)。
+        let dir = TempImagesDir::new("partner-match-terms-markdown");
+        let mut m = partner_product(
+            "partner_product:alsok",
+            "ALSOKホームセキュリティ",
+            "intrusion",
+        );
+        m.card_match_terms = Some("**ALSOK**".to_string());
+        let cards = select_cards(
+            "ALSOKがおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+            &permissive_ng(),
+        );
+        assert_eq!(cards.len(), 1);
+    }
+
+    #[test]
+    fn partner_product_matches_via_title_ja_fallback_despite_markdown_decoration_in_material_data()
+    {
+        // 同上、title_ja フォールバック経路(card_match_terms が無い場合)でも同じ正規化が
+        // 必要なことを固定する。
+        let dir = TempImagesDir::new("partner-title-fallback-markdown");
+        let mut m = partner_product(
+            "partner_product:alsok",
+            "**ALSOKホームセキュリティ**",
+            "intrusion",
+        );
+        m.card_match_terms = None;
+        let cards = select_cards(
+            "ALSOKホームセキュリティがおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+            &permissive_ng(),
+        );
+        assert_eq!(cards.len(), 1);
+    }
+
+    #[test]
+    fn partner_product_with_a_match_term_that_normalizes_to_an_empty_string_never_matches() {
+        // reviewer 一次レビュー Warning 1 是正: card_match_terms の語が to_plain_text 正規化後に
+        // 空文字列になる場合(例 "**" は対の Markdown 強調記号として除去され空になる)、
+        // `String::contains("")` は常に true を返すため、ガードが無いと final_text の内容に
+        // 関わらず無条件に一致してしまう(design doc §7.2 が是正した本番実害 (b) の再発)。
+        // final_text はこの材料と一切関係の無い語だけを含むものとし、それでもカード化されない
+        // ことを固定する。
+        let dir = TempImagesDir::new("partner-empty-normalized-term-no-match");
+        let mut m = partner_product(
+            "partner_product:alsok",
+            "ALSOKホームセキュリティ",
+            "intrusion",
+        );
+        m.card_match_terms = Some("**".to_string());
+        let cards = select_cards(
+            "窓の防犯フィルムが有効です",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+            &permissive_ng(),
+        );
+        assert!(
+            cards.is_empty(),
+            "a card_match_terms value that normalizes to an empty string must never match any \
+             final_text: {cards:?}"
+        );
+    }
+
+    #[test]
+    fn partner_product_with_a_match_term_that_normalizes_to_whitespace_only_never_matches() {
+        // Issue #47 フォローアップ(reviewer/codex レビュー Warning 是正)。上の
+        // `partner_product_with_a_match_term_that_normalizes_to_an_empty_string_never_matches`
+        // と対になるテスト: 正規化後に「空文字列」ではなく「空白のみ」になる照合語
+        // (例 "**  **" は対の Markdown 強調記号だけが除去され、中身の半角スペース2個が
+        // 残った "  " になる)は、`is_empty()` チェックを素通りしてしまう。final_text 側に
+        // (この材料と無関係な文脈で)たまたま連続する半角スペースが含まれていると、
+        // ガードが無ければ無条件に一致してしまう(空文字列ケースと同じクラスの欠陥)。
+        // `trim()` してから空判定することで、空白のみに正規化される語も同様に塞がれることを
+        // 固定する。
+        let dir = TempImagesDir::new("partner-whitespace-normalized-term-no-match");
+        let mut m = partner_product(
+            "partner_product:alsok",
+            "ALSOKホームセキュリティ",
+            "intrusion",
+        );
+        m.card_match_terms = Some("**  **".to_string());
+        let cards = select_cards(
+            "窓には  防犯フィルムが有効です",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+            &permissive_ng(),
+        );
+        assert!(
+            cards.is_empty(),
+            "a card_match_terms value that normalizes to whitespace-only must never match a \
+             final_text that merely happens to contain consecutive spaces: {cards:?}"
+        );
+    }
+
+    #[test]
+    fn partner_product_matches_via_card_match_terms_with_a_csv_mix_of_empty_and_normalized_empty_and_decorated_elements(
+    ) {
+        // 修正5(reviewer 是正・軽微指摘): card_match_terms の CSV に「生の空要素(カンマの
+        // 連続や前後の空白)」「正規化後に空文字列になる語(Markdown 記号のみ)」「装飾された
+        // 有効語」が混在するケースを固定する。`csv_list` が生の空要素を除去し、
+        // `matches_normalized_term` が正規化後に空になる語を無視するので、残った
+        // "**ALSOK**" だけが正規化後 "ALSOK" として final_text と照合できることを確認する。
+        let dir = TempImagesDir::new("partner-csv-mixed-empty-and-decorated");
+        let mut m = partner_product(
+            "partner_product:alsok",
+            "ALSOKホームセキュリティ",
+            "intrusion",
+        );
+        m.card_match_terms = Some(" , **, **ALSOK**, ".to_string());
+        let cards = select_cards(
+            "ALSOKがおすすめです",
+            &[m],
+            "",
+            &dir.path,
+            Some(&proposal_meta(&["partner_product:alsok"])),
+            &permissive_ng(),
+        );
+        assert_eq!(
+            cards.len(),
+            1,
+            "empty and normalized-empty CSV elements must be ignored, and the decorated \
+             valid element must still match: {cards:?}"
+        );
     }
 
     #[test]
@@ -1428,10 +1618,12 @@ mod tests {
 
     #[test]
     fn product_page_url_button_is_omitted_when_the_material_carries_a_not_well_formed_url() {
-        // AdvisorMaterial::from_attributes は不正な product_page_url を持つ材料自体を除外する
-        // (Issue #47 修正(a))が、この材料は from_attributes を経由せず直接構造体リテラルで
-        // 組み立てているため、その入口検証を素通りしている。cards.rs 自身の多層防御
-        // (build_card_buttons の再検証)を単体で確認する
+        // AdvisorMaterial::from_attributes は不正な product_page_url を検出すると、材料自体を
+        // 除外するのではなく product_page_url フィールドだけを None に落とし、材料本体
+        // (本文・title_ja・card_description 等)は残す(4次 codex レビュー 指摘3 是正、
+        // server/src/advisor/materials.rs の該当コメント参照)。この材料は from_attributes を
+        // 経由せず直接構造体リテラルで組み立てているため、その入口検証を素通りしている。
+        // cards.rs 自身の多層防御(build_card_buttons の再検証)を単体で確認する
         // (image_url_is_none_when_product_key_attempts_path_traversal と同じ「多層防御を直接
         // 構造体リテラルで検証する」パターン)。
         let dir = TempImagesDir::new("product-page-url-not-well-formed");
