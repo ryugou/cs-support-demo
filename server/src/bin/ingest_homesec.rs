@@ -11,6 +11,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use cs_support_mcp::{
+    advisor::materials::is_well_formed_https_url,
     config::AppConfig,
     harness::knowledge::harness_node_id,
     manual::schema_ids::with_schema_name,
@@ -168,6 +169,19 @@ fn validate_entry(entry: &MaterialEntry) -> Result<()> {
             "material {:?}: card_description present but title_ja is empty",
             entry.material_key
         );
+    }
+    // ルール6: product_page_url を持つ場合は well-formed な https URL であること
+    // （Issue #47 Critical指摘2: AdvisorMaterial::from_attributes 側の検証と揃える。ingest
+    // 時点で弾くことで、不正な値が vegapunk へ投入されて初めて検索側の warn ログで気づく、
+    // という発見の遅延を防ぐ）
+    if let Some(url) = entry.product_page_url.as_deref() {
+        if !is_blank(url) && !is_well_formed_https_url(url) {
+            bail!(
+                "material {:?}: product_page_url {:?} is not a well-formed absolute https:// URL",
+                entry.material_key,
+                url
+            );
+        }
     }
     Ok(())
 }
@@ -581,6 +595,55 @@ mod tests {
         let mut entry = valid_entry("own_product", "adc-v724");
         entry.product_key = Some("ADC-V724".to_string());
         entry.card_description = Some("屋外対応".to_string());
+        assert!(validate_entry(&entry).is_ok());
+    }
+
+    // --- ルール6: product_page_url は well-formed な https URL であること（Issue #47） ---
+
+    #[test]
+    fn product_page_url_that_is_well_formed_https_passes() {
+        let mut entry = valid_entry("own_product", "adc-v724");
+        entry.product_page_url = Some("https://example.com/products/adc-v724".to_string());
+        assert!(validate_entry(&entry).is_ok());
+    }
+
+    #[test]
+    fn plain_http_product_page_url_is_rejected() {
+        let mut entry = valid_entry("own_product", "adc-v724");
+        entry.product_page_url = Some("http://example.com/products/adc-v724".to_string());
+        let err = validate_entry(&entry).unwrap_err();
+        assert!(
+            err.to_string().contains("product_page_url"),
+            "expected product_page_url error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn hostless_https_product_page_url_is_rejected() {
+        let mut entry = valid_entry("own_product", "adc-v724");
+        entry.product_page_url = Some("https://".to_string());
+        let err = validate_entry(&entry).unwrap_err();
+        assert!(
+            err.to_string().contains("product_page_url"),
+            "expected product_page_url error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn product_page_url_with_userinfo_impersonating_a_host_is_rejected() {
+        let mut entry = valid_entry("own_product", "adc-v724");
+        entry.product_page_url = Some("https://example.com@evil.example/path".to_string());
+        let err = validate_entry(&entry).unwrap_err();
+        assert!(
+            err.to_string().contains("product_page_url"),
+            "expected product_page_url error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn blank_product_page_url_is_treated_as_absent_and_passes() {
+        let mut entry = valid_entry("own_product", "adc-v724");
+        entry.product_page_url = Some("   ".to_string());
         assert!(validate_entry(&entry).is_ok());
     }
 

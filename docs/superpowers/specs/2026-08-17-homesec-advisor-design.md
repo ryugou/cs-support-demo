@@ -217,7 +217,7 @@ case 属性の加算: `lead_offered`(bool)、`lead_requested`(bool)、`shown_pro
   - `price_band` string optional(`own_product` / `partner_product`)
   - `card_description` string optional(`own_product` / `partner_product`。製品カードの 1 行説明。これを持つ材料だけがカード化対象)
   - `card_match_terms` string optional(`partner_product` のカード合致判定に使う語の CSV。省略時は `title_ja` で照合する。own_product の合致は常に `product_key` の型番明示のみ)
-  - `product_page_url` string optional(`own_product` / `partner_product`。カードの「商品ページを見る」ボタンの遷移先。無い場合はボタンを出さない)
+  - `product_page_url` string optional(`own_product` / `partner_product`。カードの「商品ページを見る」ボタンの遷移先。無い場合はボタンを出さない)。値を持つ場合は well-formed な絶対 https URL(userinfo 不可・host 必須)であることが必須(Issue #47)。違反すると `ingest_homesec` はバリデーションで bail し(投入自体が止まる)、既に投入済みの不正値がある場合は `AdvisorMaterial::from_attributes` がその材料ごと読み捨てる(ボタンだけでなくカード自体が出なくなる)
 - `support_case`、`ConversationTurn`、known_resolution 系ノード: 現行 CS と同一定義(正本: `2026-08-16-admin-dashboard-design.md` と `specs/production-cs-mcp.md`)に、第 4.4 節の case 属性 3 つを加算。検索非汚染の閉じ込めテスト(ターン・case が材料検索に現れない)を homesec にも適用する
 
 エッジは初期投入では張らない。シナリオと材料の関連は `category` 属性の一致で代替し、構造 traversal は PDCA 後の課題とする。

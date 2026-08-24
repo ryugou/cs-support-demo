@@ -737,6 +737,7 @@ async fn advisor_reply_handler(
             &advisor_attrs.shown_product_cards,
             &state.images_dir,
             draft_meta.as_ref(),
+            &state.ng,
         )
     } else {
         Vec::new()
