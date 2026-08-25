@@ -301,6 +301,73 @@ pub async fn run_support_turn(
     .await)
 }
 
+/// design doc §13.2 rule 2(a)の実装: 「CS 側(urtect schema)が継続状態(聞き返し中・時間帯受付中)に
+/// あるか」を返す。呼び出し元(`crate::advisor::api::advisor_reply_handler`)がこの結果を
+/// `decide::decide` 系関数の `cs_continuing` 引数へそのまま渡す(`decide.rs` の doc comment が
+/// 定める契約)。
+///
+/// `run_support_turn` の冒頭(`harness.begin` → `harness.load_conv_state`)と同じパターンで
+/// 読むだけの操作(書き込みは一切しない)。`harness.begin` / `load_conv_state` が失敗した場合は
+/// fail-soft で `false` を返す: モード遷移の判定は「継続とみなさない」側に倒れても
+/// `decide_in_domain_flow` の他の分岐(`support_mode` 単独、または `u.urtect_support`)で
+/// 拾われる可能性が残るため、ここで `Err` を伝播してターン全体を失敗させるほどの重大度ではない
+/// (CLAUDE.md: エラーをログも吐かずに握りつぶすことを禁止。warn は必ず出す)。
+pub async fn peek_conv_state(
+    harness: &Harness,
+    identity: &VerifiedIdentity,
+    schema: &str,
+    manual_schema: ManualSchemaKind,
+    case_id: &str,
+) -> bool {
+    let ctx = match harness.begin(identity, schema, manual_schema) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                schema = schema,
+                case_id = case_id,
+                "cs_support: peek_conv_state failed to begin a request context against the CS \
+                 schema; treating the CS side as not-continuing for this turn"
+            );
+            return false;
+        }
+    };
+    match harness.load_conv_state(&ctx, case_id).await {
+        Ok(conv) => cs_continuing_from_conv_state(&conv),
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                schema = schema,
+                case_id = case_id,
+                "cs_support: peek_conv_state failed to load the CS conv state; treating the CS \
+                 side as not-continuing for this turn"
+            );
+            false
+        }
+    }
+}
+
+/// [`peek_conv_state`] の判定ロジック本体(design doc §13.2 rule 2(a): 「時間帯受付中」)。
+/// 純関数として切り出しているのは、`load_conv_state` が実 vegapunk を要求するため、判定条件
+/// そのもの(true/false の境界)を実バックエンド無しで固定するため(`is_continuation` 等、
+/// このモジュールの他の小さな純関数と同じ設計)。
+///
+/// **`conv.clarify_turns > 0` は使わない(Issue #50 バッチ2 レビュー修正 Critical 1)。**
+/// `clarify_turns` はその CS case で累積した聞き返し回数のカウンタであり、「今まさに聞き返し
+/// 中」を表す transient なフラグではない: `Clarify` 分岐が `+= 1` する(本ファイル439行目)一方、
+/// 0 に戻すのは `arm_time_pref_solicitation`(= `EscalationReply` 経路、583行目)だけで、
+/// `Answer` は conv 状態を一切変更しない(`save_conv_state` すら呼ばない。279〜289行目の
+/// コメント参照)。そのため `clarify_turns > 0` を継続条件に使うと、**CS が一度でも聞き返しを
+/// した case は、その後 CS が正常に `Answer` を返しても `clarify_turns` が 1 以上のまま残り、
+/// 客が話題を変えても永久にサポートモードから出られなくなる**(design doc §13.2 rule 3 の
+/// 退場条件、§13.4 の E2E 受け入れ条件「続けて『ところで空き巣対策は?』→ 通常モードへ復帰」
+/// への違反)。「聞き返し中かどうか」は CS 側 conv state からは導出できないため、advisor 側の
+/// case 属性(`decide::AdvisorCaseAttrs::support_last_reply_kind`)で別途保持する
+/// (`crate::advisor::api::advisor_reply_handler` の `cs_continuing` 計算箇所を参照)。
+fn cs_continuing_from_conv_state(conv: &CaseConvState) -> bool {
+    conv.awaiting_time_pref
+}
+
 /// フロー表 #8〜#10: `evaluate()` 後の応答種別決定と応答文組み立て。
 ///
 /// `run_support_turn` から論理的に切り出しているのは、`evaluate()`(実 vegapunk が必要)を
@@ -1175,6 +1242,89 @@ mod tests {
         assert_eq!(
             text,
             "マニュアルとの一致度が必要水準に届いていません（必要: 0.80 以上、現在: 0.50）"
+        );
+    }
+
+    // ---- cs_continuing_from_conv_state(peek_conv_state の判定ロジック本体) ----
+
+    #[test]
+    fn cs_continuing_from_conv_state_true_when_awaiting_time_pref() {
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true;
+        assert!(cs_continuing_from_conv_state(&conv));
+    }
+
+    #[test]
+    fn cs_continuing_from_conv_state_false_when_only_clarify_turns_is_positive() {
+        // Issue #50 バッチ2 レビュー修正 Critical 1: `clarify_turns` はその case で累積した
+        // 聞き返し回数のカウンタであり、`Answer` 応答後も 0 に戻らない(`Clarify` 分岐が
+        // += 1 する一方、0 に戻すのは `arm_time_pref_solicitation` = EscalationReply 経路
+        // だけ)。これを継続扱いにすると、CS が一度でも聞き返した case は、その後正常に
+        // 回答しても客の話題転換を検出できず、永久にサポートモードから出られなくなる
+        // (design doc §13.2 rule 3 の退場条件に違反する)。
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 1;
+        assert!(!cs_continuing_from_conv_state(&conv));
+    }
+
+    #[test]
+    fn cs_continuing_from_conv_state_false_when_neither_condition_holds() {
+        assert!(!cs_continuing_from_conv_state(&default_conv_state()));
+    }
+
+    // ---- peek_conv_state(fail-soft 経路。実 vegapunk 接続は不要) ----
+
+    #[tokio::test]
+    async fn peek_conv_state_returns_false_and_warns_when_load_conv_state_fails() {
+        // `knowledge: None` の harness では `load_conv_state` が必ず `Err` になる
+        // (`Harness::knowledge()` が `self.knowledge.as_ref().ok_or_else(...)`)。
+        let harness = test_harness(vec!["ADC-V724"]);
+        let identity = test_identity();
+
+        let (continuing, logs) = crate::test_support::capture_logs_async(peek_conv_state(
+            &harness,
+            &identity,
+            TEST_SCHEMA,
+            ManualSchemaKind::default(),
+            "case-1",
+        ))
+        .await;
+
+        assert!(
+            !continuing,
+            "load_conv_state failure must fail-soft to not-continuing"
+        );
+        assert!(logs.contains("WARN"), "logs: {logs}");
+        assert!(
+            logs.contains("peek_conv_state failed to load the CS conv state"),
+            "logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peek_conv_state_returns_false_and_warns_when_begin_fails() {
+        // `harness.begin` は authenticator の allowed_schemas に無い schema を渡すと失敗する
+        // (`Authenticator::new(vec![TEST_SCHEMA])` は TEST_SCHEMA 以外を許可しない)。
+        let harness = test_harness(vec!["ADC-V724"]);
+        let identity = test_identity();
+
+        let (continuing, logs) = crate::test_support::capture_logs_async(peek_conv_state(
+            &harness,
+            &identity,
+            "no-such-schema",
+            ManualSchemaKind::default(),
+            "case-1",
+        ))
+        .await;
+
+        assert!(
+            !continuing,
+            "harness.begin failure must fail-soft to not-continuing"
+        );
+        assert!(logs.contains("WARN"), "logs: {logs}");
+        assert!(
+            logs.contains("peek_conv_state failed to begin a request context"),
+            "logs: {logs}"
         );
     }
 }

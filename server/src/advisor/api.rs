@@ -13,6 +13,7 @@
 
 use crate::advisor::canned;
 use crate::advisor::cards::{self, ProductCard};
+use crate::advisor::cs_support;
 use crate::advisor::decide::{self, AdvisorAction, AdvisorCaseAttrs};
 use crate::advisor::draftgen::{self, DraftMode};
 use crate::advisor::materials::{self, AdvisorMaterial};
@@ -21,6 +22,7 @@ use crate::advisor::understand::{self, ConditionKey};
 use crate::api::{authorize, validate, HistoryEntry, HistoryRole, ReplyRequest};
 use crate::config::AppConfig;
 use crate::harness::egress::NgDictionary;
+use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
 use crate::harness::time_pref;
 use crate::harness::{CaseConvState, Harness};
 use crate::llm::AnthropicClient;
@@ -73,8 +75,6 @@ pub struct AdvisorApiState {
     /// env `CS_SUPPORT_ANSWER_API_KEY` の値。ログ・Debug 出力に含めないため、この構造体は
     /// `Debug` を derive しない。
     pub api_key: String,
-    /// design doc §4.3 手順4 の handoff 案内文（`AdvisorConfig.handoff_contact_text`）。
-    pub handoff_contact_text: String,
     /// 製品カード画像の同梱ディレクトリ（解決済み絶対パス。`cards::select_cards` と
     /// `ServeDir` の両方が同じパスを参照する）。
     pub images_dir: PathBuf,
@@ -178,6 +178,21 @@ fn append_shown_product_cards(existing_csv: &str, new_keys: &[&str]) -> String {
 /// **前に** この関数を必ず 1 回呼ぶ(reviewer 指摘 Critical 2: 以前はこの 4 つの副作用が
 /// `match` の各アーム内にインラインで書かれており、どれか 1 行消してもテストが 1 件も
 /// 落ちなかった)。`match` 自体は応答文・`reply_kind`・materials の決定だけを担う。
+///
+/// **Issue #50 バッチ2(design doc §13.2)**: `support_mode` の書き戻しもここに集約する。
+/// `AdvisorAction::SupportMode` は `support_mode = true`(入場・継続)。`Safety` /
+/// `TimePrefContinue` は触れない(emergency 応答・advisor 自身のリード時間帯受付は CS
+/// 継続性を壊さない設計)。それ以外の全アクション(`OutOfDomain` / `LeadSolicit` / `Clarify` /
+/// `LeadConfirmed` / `Answer`)は退場とみなし `support_mode = false` に落とす
+/// (`support_case_id` はどのアクションでもクリアしない。design doc §13.2: 退場後に再入場した
+/// とき、同じ CS case を再利用して会話を継続できるようにするため)。
+///
+/// **Issue #50 バッチ2 レビュー修正 Critical 1**: `support_mode` を false に落とす同じ
+/// アクションで `support_last_reply_kind` も空文字列にクリアする。退場時に stale な値
+/// (例: 前回入場時の `"support_clarify"`)が残ったままだと、次にこの case が再入場したとき
+/// `advisor_reply_handler` の `cs_continuing` 計算が `peek_conv_state` を呼ばずに誤って
+/// 継続扱いにしてしまう(`decide::AdvisorCaseAttrs::support_last_reply_kind` の doc comment
+/// 参照)。
 fn apply_action_contract(
     action: &AdvisorAction,
     conv: &mut CaseConvState,
@@ -188,21 +203,31 @@ fn apply_action_contract(
             conv.awaiting_time_pref = false;
             conv.time_pref_false_count = 0;
         }
+        AdvisorAction::TimePrefContinue => {}
+        AdvisorAction::SupportMode => {
+            advisor_attrs.support_mode = true;
+        }
         AdvisorAction::LeadSolicit => {
             conv.awaiting_time_pref = true;
             conv.time_pref_false_count = 0;
             conv.clarify_turns = 0;
+            advisor_attrs.support_mode = false;
+            advisor_attrs.support_last_reply_kind = String::new();
         }
         AdvisorAction::Clarify { .. } => {
             conv.clarify_turns += 1;
+            advisor_attrs.support_mode = false;
+            advisor_attrs.support_last_reply_kind = String::new();
         }
         AdvisorAction::LeadConfirmed { .. } => {
             advisor_attrs.lead_requested = true;
+            advisor_attrs.support_mode = false;
+            advisor_attrs.support_last_reply_kind = String::new();
         }
-        AdvisorAction::TimePrefContinue
-        | AdvisorAction::OutOfDomain
-        | AdvisorAction::Handoff
-        | AdvisorAction::Answer => {}
+        AdvisorAction::OutOfDomain | AdvisorAction::Answer => {
+            advisor_attrs.support_mode = false;
+            advisor_attrs.support_last_reply_kind = String::new();
+        }
     }
 }
 
@@ -348,6 +373,106 @@ fn internal_error_response(err: &anyhow::Error, request_id: &str, step: &str) ->
         "internal",
         format!("internal error processing the request; request_id={request_id}"),
     )
+}
+
+/// design doc §13.3: CS 応答種別(`cs_support::SupportReplyKind`)を advisor 自身の
+/// `ConversationTurn.reply_kind` へ写像する。catch-all を書かない(将来 variant が増えたときに
+/// コンパイルエラーで気づけるようにするため。このファイルの他の網羅的 match と同じ流儀)。
+fn support_reply_kind_to_advisor(kind: cs_support::SupportReplyKind) -> &'static str {
+    use cs_support::SupportReplyKind;
+    match kind {
+        SupportReplyKind::Answer => "support_answer",
+        SupportReplyKind::Clarify => "support_clarify",
+        SupportReplyKind::Escalation => "support_escalation",
+        SupportReplyKind::TimePref => "support_time_pref",
+        SupportReplyKind::OutOfScope => "support_out_of_scope",
+    }
+}
+
+/// design doc §13.2 手順4: SupportMode のターンは CS の応答をそのまま返し、製品カード・チップ・
+/// リード提案を一切出さない。`materials`(空 Vec)・`quick_replies`(None)・`meta`(None)を固定で
+/// 返すことで、後続の `select_cards` / `quick_replies::for_answer` 組み立てが自然に「何も
+/// 出さない」へ倒れることを保証する(reviewer 指摘 Critical 2 と同じ流儀: この抑止をハンドラ
+/// 本体にインラインで書くと、将来 materials/meta を渡すよう書き換えられてもテストで検出
+/// できない。ここへ切り出すことで単体テストで固定できる)。
+fn support_mode_reply_parts(
+    outcome: cs_support::SupportReplyOutcome,
+) -> (
+    String,
+    &'static str,
+    Vec<AdvisorMaterial>,
+    Option<Vec<QuickReplyItem>>,
+    Option<draftgen::DraftMeta>,
+) {
+    (
+        outcome.reply_text,
+        support_reply_kind_to_advisor(outcome.reply_kind),
+        Vec::new(),
+        None,
+        None,
+    )
+}
+
+/// `crate::api::HistoryEntry`(advisor の answer-api 契約が受け取る形)を
+/// `crate::harness::reply::ReplyHistoryTurn`(`cs_support::run_support_turn` が要求する形)へ
+/// 変換する。ロールの対応関係以外に意味を持たない純関数。
+fn convert_history_for_support(history: &[HistoryEntry]) -> Vec<ReplyHistoryTurn> {
+    history
+        .iter()
+        .map(|entry| ReplyHistoryTurn {
+            role: match entry.role {
+                HistoryRole::Customer => ReplyHistoryRole::Customer,
+                HistoryRole::Assistant => ReplyHistoryRole::Assistant,
+            },
+            text: entry.text.clone(),
+        })
+        .collect()
+}
+
+/// design doc §13.2(SupportMode)の呼び出し構築: `cs_support::run_support_turn` を urtect
+/// schema(`state.support_schema`)で呼ぶための薄い glue。ハンドラ本体から切り出しているのは
+/// テスト容易性のため(reviewer 指摘 Critical 2 と同じ流儀: インラインで書くと、schema の
+/// 取り違え・`case_id` の `Some`/`None` 変換ミスをテストで検出できない)。
+///
+/// **契約**: `advisor_attrs.support_case_id` が空文字列なら新規 CS case として `None` を渡し、
+/// 非空ならその case を継続する `Some(&str)` を渡す。呼び出しが成功したら、返ってきた
+/// `outcome.case_id` を `advisor_attrs.support_case_id` へ**常に**書き戻す(同じ値でも冪等)。
+/// 失敗時は `advisor_attrs` を一切変更せず、そのまま `Err` を呼び出し元へ伝播する
+/// (呼び出し元 `advisor_reply_handler` が `internal_error_response` へ変換する)。
+async fn run_cs_support_mode_turn(
+    state: &AdvisorApiState,
+    identity: &VerifiedIdentity,
+    message: &str,
+    history: &[HistoryEntry],
+    end_user_id: Option<&str>,
+    advisor_attrs: &mut AdvisorCaseAttrs,
+) -> anyhow::Result<cs_support::SupportReplyOutcome> {
+    let support_history = convert_history_for_support(history);
+    let case_id = if advisor_attrs.support_case_id.is_empty() {
+        None
+    } else {
+        Some(advisor_attrs.support_case_id.as_str())
+    };
+    let outcome = cs_support::run_support_turn(
+        &state.support_harness,
+        &state.support_tools,
+        &state.config.api,
+        identity,
+        &state.support_schema,
+        state.support_manual_schema,
+        message,
+        &support_history,
+        case_id,
+        end_user_id,
+    )
+    .await?;
+    advisor_attrs.support_case_id = outcome.case_id.clone();
+    // Issue #50 バッチ2 レビュー修正 Critical 1: 「直前の CS 応答が聞き返しだったか」を advisor
+    // 側の case 属性へ書き戻す(CS 側の `clarify_turns` は累積カウンタで継続状態を表せないため。
+    // `decide::AdvisorCaseAttrs::support_last_reply_kind` の doc comment 参照)。
+    advisor_attrs.support_last_reply_kind =
+        support_reply_kind_to_advisor(outcome.reply_kind).to_string();
+    Ok(outcome)
 }
 
 /// design doc §6 手順6・8 の「材料検索・KR 照合・下書き生成」をまとめた薄いラッパー。
@@ -558,6 +683,39 @@ async fn advisor_reply_handler(
                 decide::merge_conditions(&accumulated_conditions, &understanding.conditions);
             let is_continuation = !history.is_empty() || req.case_id.is_some();
 
+            // Issue #50 バッチ2(design doc §13.2 rule 2(a)): CS 側(urtect schema)が継続状態
+            // (聞き返し中・時間帯受付中)にあるかを、decide 系関数を呼ぶ前に確定させる
+            // (`decide::decide` は非同期にできないため、time_pref 抽出と同じ理由で呼び出し元に
+            // 前倒しさせる設計。decide.rs の `cs_continuing` 引数 doc comment 参照)。
+            // - emergency ターンは確認しない(常に false でよい。110番案内の遅延を避けるため
+            //   time_pref 抽出 LLM 呼び出しを emergency 時にスキップしているのと同じ理由)。
+            // - support_mode == false、または CS case がまだ無い(support_case_id が空)ときは
+            //   vegapunk 往復が無駄なので false を即値で返す。
+            //
+            // レビュー修正 Critical 1: 「聞き返し中」は CS 側 conv state(`clarify_turns`)からは
+            // 判定できない(累積カウンタのため。`cs_support::cs_continuing_from_conv_state` の
+            // doc comment 参照)。advisor 側で保持する `support_last_reply_kind` が
+            // `"support_clarify"` ならその時点で継続確定なので、`peek_conv_state` の vegapunk
+            // 往復は行わない(短絡評価: ローカル判定を先に評価する)。それ以外は従来どおり
+            // `peek_conv_state`(いまは `awaiting_time_pref` のみを見る)で時間帯受付中かどうかを
+            // 確認する。
+            let cs_continuing = if understanding.emergency {
+                false
+            } else if !advisor_attrs.support_mode || advisor_attrs.support_case_id.is_empty() {
+                false
+            } else if advisor_attrs.support_last_reply_kind == "support_clarify" {
+                true
+            } else {
+                cs_support::peek_conv_state(
+                    &state.support_harness,
+                    &identity,
+                    &state.support_schema,
+                    state.support_manual_schema,
+                    &advisor_attrs.support_case_id,
+                )
+                .await
+            };
+
             // 手順6: 応答種別を決める。emergency は decide::decide /
             // decide::decide_time_pref / decide::decide_time_pref_extraction_failed の
             // いずれもが最優先で Safety を返す契約だが(decide.rs の各関数冒頭)、時間帯受付
@@ -578,12 +736,16 @@ async fn advisor_reply_handler(
                         &state.config.api.business_hours,
                         advisor_attrs.lead_requested,
                         state.config.api.clarify_max_turns,
+                        advisor_attrs.support_mode,
+                        cs_continuing,
                     ),
                     Err(_) => decide::decide_time_pref_extraction_failed(
                         &understanding,
                         &mut conv,
                         advisor_attrs.lead_requested,
                         state.config.api.clarify_max_turns,
+                        advisor_attrs.support_mode,
+                        cs_continuing,
                     ),
                 }
             } else {
@@ -593,6 +755,8 @@ async fn advisor_reply_handler(
                     advisor_attrs.lead_offered,
                     advisor_attrs.lead_requested,
                     state.config.api.clarify_max_turns,
+                    advisor_attrs.support_mode,
+                    cs_continuing,
                 )
             };
 
@@ -628,13 +792,25 @@ async fn advisor_reply_handler(
                     None,
                     None,
                 ),
-                AdvisorAction::Handoff => (
-                    canned::handoff(&state.handoff_contact_text),
-                    "handoff",
-                    Vec::new(),
-                    None,
-                    None,
-                ),
+                AdvisorAction::SupportMode => match run_cs_support_mode_turn(
+                    &state,
+                    &identity,
+                    &req.message,
+                    history,
+                    req.end_user_id.as_deref(),
+                    &mut advisor_attrs,
+                )
+                .await
+                {
+                    Ok(outcome) => support_mode_reply_parts(outcome),
+                    Err(err) => {
+                        return internal_error_response(
+                            &err,
+                            &ctx.request_id,
+                            "cs_support_run_support_turn",
+                        );
+                    }
+                },
                 AdvisorAction::LeadSolicit => (
                     canned::lead_solicit(&state.config.api.business_hours),
                     "time_pref",
@@ -1087,29 +1263,111 @@ mod tests {
     }
 
     #[test]
-    fn apply_action_contract_answer_handoff_out_of_domain_and_time_pref_continue_touch_nothing() {
-        for action in [
-            AdvisorAction::Answer,
-            AdvisorAction::Handoff,
-            AdvisorAction::OutOfDomain,
-            AdvisorAction::TimePrefContinue,
-        ] {
-            let mut conv = base_conv();
-            conv.clarify_turns = 1;
-            conv.awaiting_time_pref = true;
-            conv.time_pref_false_count = 1;
-            let mut attrs = base_advisor_attrs();
-            attrs.lead_offered = true;
+    fn apply_action_contract_time_pref_continue_touches_nothing() {
+        let mut conv = base_conv();
+        conv.clarify_turns = 1;
+        conv.awaiting_time_pref = true;
+        conv.time_pref_false_count = 1;
+        let mut attrs = base_advisor_attrs();
+        attrs.lead_offered = true;
 
-            let conv_before = conv.clone();
-            let attrs_before = attrs.clone();
+        let conv_before = conv.clone();
+        let attrs_before = attrs.clone();
+
+        apply_action_contract(&AdvisorAction::TimePrefContinue, &mut conv, &mut attrs);
+
+        assert_eq!(
+            conv, conv_before,
+            "TimePrefContinue must not touch conv state"
+        );
+        assert_eq!(
+            attrs, attrs_before,
+            "TimePrefContinue must not touch advisor attrs"
+        );
+    }
+
+    // ---- apply_action_contract: Issue #50 バッチ2(design doc §13.2)の support_mode 契約 ----
+
+    #[test]
+    fn apply_action_contract_safety_does_not_touch_support_mode_when_already_true() {
+        // decide::AdvisorAction::Safety の doc comment: emergency 応答は CS 継続性を壊さない
+        // 設計(support_mode に一切触れない)。false からの不変は既存の
+        // apply_action_contract_safety_disarms_time_pref_and_resets_false_count が固定済みなので、
+        // ここでは true からの不変を固定する。
+        let mut conv = base_conv();
+        let mut attrs = base_advisor_attrs();
+        attrs.support_mode = true;
+        let attrs_before = attrs.clone();
+
+        apply_action_contract(&AdvisorAction::Safety, &mut conv, &mut attrs);
+
+        assert_eq!(
+            attrs, attrs_before,
+            "Safety must not touch support_mode either way"
+        );
+    }
+
+    #[test]
+    fn apply_action_contract_time_pref_continue_does_not_touch_support_mode_when_already_true() {
+        // decide::AdvisorAction::TimePrefContinue も Safety と同じ設計(advisor 自身のリード
+        // 時間帯受付は CS 継続性を壊さない)。
+        let mut conv = base_conv();
+        let mut attrs = base_advisor_attrs();
+        attrs.support_mode = true;
+
+        apply_action_contract(&AdvisorAction::TimePrefContinue, &mut conv, &mut attrs);
+
+        assert!(attrs.support_mode);
+    }
+
+    #[test]
+    fn apply_action_contract_support_mode_sets_support_mode_true_and_does_not_touch_conv() {
+        // design doc §13.2 rule 1・2(入場・継続): SupportMode を返したら support_mode = true。
+        let mut conv = base_conv();
+        let conv_before = conv.clone();
+        let mut attrs = base_advisor_attrs();
+
+        apply_action_contract(&AdvisorAction::SupportMode, &mut conv, &mut attrs);
+
+        assert!(attrs.support_mode);
+        assert_eq!(conv, conv_before, "SupportMode must not touch conv state");
+    }
+
+    #[test]
+    fn apply_action_contract_clears_support_mode_for_out_of_domain_lead_solicit_clarify_lead_confirmed_and_answer(
+    ) {
+        // design doc §13.2 rule 3(退場): SupportMode 以外の全アクションは support_mode を
+        // false へ落とす。既存の各 variant 固有の副作用(clarify_turns 加算・lead_requested
+        // セット等)は上の個別テストで既に固定済みなので、ここでは support_mode のクリアだけを
+        // 横断的に検証する。
+        //
+        // Issue #50 バッチ2 レビュー修正 Critical 1: 同じアクションで `support_last_reply_kind`
+        // も空文字列にクリアされることを固定する。退場時に stale な値(前回入場時の
+        // "support_clarify")が残ると、次に再入場したときの `cs_continuing` 計算
+        // (`advisor_reply_handler`)が `peek_conv_state` を呼ばずに誤って継続扱いにしてしまう。
+        let actions = [
+            AdvisorAction::OutOfDomain,
+            AdvisorAction::LeadSolicit,
+            AdvisorAction::Clarify {
+                missing: vec![ConditionKey::Concern],
+            },
+            AdvisorAction::LeadConfirmed {
+                slot: "平日13:00〜15:00".to_string(),
+            },
+            AdvisorAction::Answer,
+        ];
+        for action in actions {
+            let mut conv = base_conv();
+            let mut attrs = base_advisor_attrs();
+            attrs.support_mode = true;
+            attrs.support_last_reply_kind = "support_clarify".to_string();
 
             apply_action_contract(&action, &mut conv, &mut attrs);
 
-            assert_eq!(conv, conv_before, "{action:?} must not touch conv state");
+            assert!(!attrs.support_mode, "{action:?} must clear support_mode");
             assert_eq!(
-                attrs, attrs_before,
-                "{action:?} must not touch advisor attrs"
+                attrs.support_last_reply_kind, "",
+                "{action:?} must clear support_last_reply_kind"
             );
         }
     }
@@ -1215,9 +1473,13 @@ mod tests {
             "clarify",
             "safety",
             "out_of_domain",
-            "handoff",
             "time_pref",
             "lead",
+            "support_answer",
+            "support_clarify",
+            "support_escalation",
+            "support_time_pref",
+            "support_out_of_scope",
         ] {
             assert!(should_select_cards(kind), "{kind}");
         }
@@ -1255,6 +1517,9 @@ mod tests {
             lead_requested: false,
             shown_product_cards: String::new(),
             question_streak: 0,
+            support_mode: false,
+            support_case_id: String::new(),
+            support_last_reply_kind: String::new(),
         }
     }
 
@@ -1405,6 +1670,9 @@ mod tests {
             lead_requested: true,
             shown_product_cards: "own_product:adc-v724".to_string(),
             question_streak: 3,
+            support_mode: true,
+            support_case_id: "case-urtect-abc".to_string(),
+            support_last_reply_kind: "support_clarify".to_string(),
         };
         let conditions = vec![
             (ConditionKey::Concern, "intrusion".to_string()),
@@ -1448,6 +1716,15 @@ mod tests {
             Some("own_product:adc-v724")
         );
         assert_eq!(map.get("question_streak").map(String::as_str), Some("3"));
+        assert_eq!(map.get("support_mode").map(String::as_str), Some("true"));
+        assert_eq!(
+            map.get("support_case_id").map(String::as_str),
+            Some("case-urtect-abc")
+        );
+        assert_eq!(
+            map.get("support_last_reply_kind").map(String::as_str),
+            Some("support_clarify")
+        );
         assert_eq!(
             map.get("advisor_cond_concern").map(String::as_str),
             Some("intrusion")
@@ -1809,7 +2086,6 @@ clarify_max_turns = 3
             ),
             vegapunk,
             api_key: api_key.to_string(),
-            handoff_contact_text: "テスト用の案内文です。".to_string(),
             images_dir,
             public_host: "advisor.example.com".to_string(),
             support_harness: Arc::new(advisor_test_harness(None)),
@@ -1975,5 +2251,281 @@ clarify_max_turns = 3
             state.config.projects[0].manual_schema,
             ManualSchemaKind::ManualV1
         ));
+    }
+
+    // ---- Issue #50 バッチ2(design doc §13.2〜13.4、CS サポートモード) ----
+
+    // ---- support_reply_kind_to_advisor ----
+
+    #[test]
+    fn support_reply_kind_to_advisor_covers_all_five_variants() {
+        use cs_support::SupportReplyKind;
+        assert_eq!(
+            support_reply_kind_to_advisor(SupportReplyKind::Answer),
+            "support_answer"
+        );
+        assert_eq!(
+            support_reply_kind_to_advisor(SupportReplyKind::Clarify),
+            "support_clarify"
+        );
+        assert_eq!(
+            support_reply_kind_to_advisor(SupportReplyKind::Escalation),
+            "support_escalation"
+        );
+        assert_eq!(
+            support_reply_kind_to_advisor(SupportReplyKind::TimePref),
+            "support_time_pref"
+        );
+        assert_eq!(
+            support_reply_kind_to_advisor(SupportReplyKind::OutOfScope),
+            "support_out_of_scope"
+        );
+    }
+
+    // ---- support_mode_reply_parts ----
+
+    #[test]
+    fn support_mode_reply_parts_suppresses_materials_quick_replies_and_meta() {
+        // design doc §13.2 手順4: サポートモードのターンは製品カード・チップ・リード提案を
+        // 一切出さない。
+        let outcome = cs_support::SupportReplyOutcome {
+            reply_text: "回答本文です。".to_string(),
+            case_id: "case-urtect-1".to_string(),
+            reply_kind: cs_support::SupportReplyKind::Answer,
+            audit_event_id: "audit-1".to_string(),
+        };
+
+        let (text, kind, materials, quick_replies, meta) = support_mode_reply_parts(outcome);
+
+        assert_eq!(text, "回答本文です。");
+        assert_eq!(kind, "support_answer");
+        assert!(
+            materials.is_empty(),
+            "SupportMode must not attach materials"
+        );
+        assert!(
+            quick_replies.is_none(),
+            "SupportMode must not attach quick_replies (no chips/lead proposal)"
+        );
+        assert!(
+            meta.is_none(),
+            "SupportMode must not leak a DraftMeta (a Some(meta) would let select_cards attach \
+             product cards)"
+        );
+    }
+
+    // ---- convert_history_for_support ----
+
+    #[test]
+    fn convert_history_for_support_maps_roles_and_preserves_order() {
+        let history = vec![
+            HistoryEntry {
+                role: HistoryRole::Customer,
+                text: "録画が見られません".to_string(),
+            },
+            HistoryEntry {
+                role: HistoryRole::Assistant,
+                text: "型番を教えてください".to_string(),
+            },
+        ];
+
+        let converted = convert_history_for_support(&history);
+
+        assert_eq!(
+            converted,
+            vec![
+                ReplyHistoryTurn {
+                    role: ReplyHistoryRole::Customer,
+                    text: "録画が見られません".to_string(),
+                },
+                ReplyHistoryTurn {
+                    role: ReplyHistoryRole::Assistant,
+                    text: "型番を教えてください".to_string(),
+                },
+            ]
+        );
+    }
+
+    // ---- run_cs_support_mode_turn(呼び出し構築: schema 配線・case_id の Option 変換・
+    // outcome.case_id の書き戻し) ----
+    //
+    // 実 vegapunk 接続は使わない。`knowledge: None` の support_harness に対して質問側ゲート
+    // (`ProductAllowlist::first_out_of_scope_token`、evaluate() より前の LLM 不使用ゲート)を
+    // 発火させる型番言及の発話を送ると、`cs_support::run_support_turn` は evaluate() を呼ばず
+    // `Ok` を返す(`cs_support.rs` 自身の
+    // `run_support_turn_returns_a_canned_reply_for_an_out_of_scope_model_without_calling_evaluate`
+    // と同じ手法)。`record_out_of_scope_case` は knowledge 不在時、渡された `case_id` を
+    // (`Some` ならそのまま、`None` なら新規 UUID で)フォールバック採用して `Ok` を返すため、
+    // 戻ってきた `case_id` を見れば呼び出し側が `Some`/`None` のどちらを渡したかを判別できる。
+
+    /// `support_schema` を差し替えた `Harness` を持つ `AdvisorApiState` を組み立てる。
+    /// `advisor_test_harness` / `test_harness`(`cs_support.rs`)と同じ最小構成だが、
+    /// authenticator と product_gate を呼び出し元が指定する schema 専用にする(schema の
+    /// 取り違えがあれば `harness.begin` が resolve_scope で弾いて `Err` になるようにするため)。
+    fn support_mode_test_state(
+        support_schema: &str,
+        allowlist_models: Vec<&str>,
+    ) -> AdvisorApiState {
+        let mut state = advisor_test_state("correct-key", None);
+        let dir = std::env::temp_dir().join(format!(
+            "advisor-api-support-harness-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let lexicon = Arc::new(
+            crate::harness::signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap(),
+        );
+        let support_harness = Harness {
+            authenticator: crate::harness::authn::Authenticator::new(vec![
+                support_schema.to_string()
+            ]),
+            normalizer: lexicon.clone(),
+            extractor: Arc::new(crate::harness::extraction::HybridExtractor::new(
+                lexicon.clone(),
+                None,
+            )),
+            lexicon,
+            ng: NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).unwrap(),
+            worm: Arc::new(
+                crate::harness::audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap(),
+            ),
+            knowledge: None,
+            thresholds: crate::harness::decision::Thresholds {
+                low: 0.6,
+                mid: 0.8,
+                high: 0.95,
+            },
+            grading: crate::harness::grading::GradingThresholds {
+                promote_approvals: 3,
+                promote_approvers: 2,
+                promote_max_rejection_rate: 0.2,
+                demote_rejections: 2,
+            },
+            queue_path: dir.join("queue.jsonl"),
+            grade_lock: tokio::sync::Mutex::new(()),
+            manual: None,
+            corpus: None,
+            default_route: "triage".to_string(),
+            vector_route_enabled: false,
+            reply_drafter: None,
+            reply_draft_max_tokens: 700,
+            product_gate: Some(crate::harness::product_gate::ProductGate::seeded_for_test(
+                support_schema,
+                crate::harness::product_gate::ProductAllowlist::from_models(
+                    allowlist_models.into_iter().map(str::to_string).collect(),
+                ),
+            )),
+        };
+        state.support_harness = Arc::new(support_harness);
+        state.support_schema = support_schema.to_string();
+        state
+    }
+
+    #[tokio::test]
+    async fn run_cs_support_mode_turn_routes_to_the_configured_support_schema() {
+        // support_harness の authenticator/product_gate は "urtect" にしか登録していないので、
+        // run_support_turn が正しく state.support_schema("urtect")を渡していなければ
+        // harness.begin の resolve_scope で Err になる。
+        let state = support_mode_test_state("urtect", vec!["ADC-V724"]);
+        let identity = advisor_service_principal();
+        let mut attrs = base_advisor_attrs();
+
+        let outcome = run_cs_support_mode_turn(
+            &state,
+            &identity,
+            "ADC-V999は使えますか",
+            &[],
+            None,
+            &mut attrs,
+        )
+        .await
+        .expect("the question-side gate must short-circuit before evaluate() is called");
+
+        assert_eq!(outcome.reply_kind, cs_support::SupportReplyKind::OutOfScope);
+    }
+
+    #[tokio::test]
+    async fn run_cs_support_mode_turn_passes_none_when_support_case_id_is_empty() {
+        let state = support_mode_test_state("urtect", vec!["ADC-V724"]);
+        let identity = advisor_service_principal();
+        let mut attrs = base_advisor_attrs();
+        assert_eq!(attrs.support_case_id, "", "precondition: no CS case yet");
+
+        let outcome = run_cs_support_mode_turn(
+            &state,
+            &identity,
+            "ADC-V999は使えますか",
+            &[],
+            None,
+            &mut attrs,
+        )
+        .await
+        .expect("question-side gate short-circuit");
+
+        assert!(
+            outcome.case_id.starts_with("case-"),
+            "an empty support_case_id must be passed through as None, which \
+             record_out_of_scope_case falls back to a freshly generated \"case-<uuid>\" id \
+             (a wrongly-passed Some(\"\") would instead yield an empty case_id): {}",
+            outcome.case_id
+        );
+        assert_eq!(
+            attrs.support_case_id, outcome.case_id,
+            "the outcome's case_id must be written back to advisor_attrs.support_case_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cs_support_mode_turn_passes_some_when_support_case_id_is_present() {
+        let state = support_mode_test_state("urtect", vec!["ADC-V724"]);
+        let identity = advisor_service_principal();
+        let mut attrs = base_advisor_attrs();
+        attrs.support_case_id = "case-existing-abc".to_string();
+
+        let outcome = run_cs_support_mode_turn(
+            &state,
+            &identity,
+            "ADC-V999は使えますか",
+            &[],
+            None,
+            &mut attrs,
+        )
+        .await
+        .expect("question-side gate short-circuit");
+
+        assert_eq!(
+            outcome.case_id, "case-existing-abc",
+            "a non-empty support_case_id must be passed through verbatim as Some(&str); \
+             record_out_of_scope_case echoes it back unchanged when knowledge is unavailable"
+        );
+        assert_eq!(
+            attrs.support_case_id, "case-existing-abc",
+            "the outcome's case_id must be written back to advisor_attrs.support_case_id \
+             (idempotent: same value)"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cs_support_mode_turn_writes_back_support_last_reply_kind_on_success() {
+        // Issue #50 バッチ2 レビュー修正 Critical 1: 成功時に
+        // `support_reply_kind_to_advisor(outcome.reply_kind)` を `support_last_reply_kind` へ
+        // 書き戻すこと。この harness は質問側ゲートで OutOfScope 短絡するので、期待値は
+        // "support_out_of_scope"。
+        let state = support_mode_test_state("urtect", vec!["ADC-V724"]);
+        let identity = advisor_service_principal();
+        let mut attrs = base_advisor_attrs();
+
+        let outcome = run_cs_support_mode_turn(
+            &state,
+            &identity,
+            "ADC-V999は使えますか",
+            &[],
+            None,
+            &mut attrs,
+        )
+        .await
+        .expect("question-side gate short-circuit");
+
+        assert_eq!(outcome.reply_kind, cs_support::SupportReplyKind::OutOfScope);
+        assert_eq!(attrs.support_last_reply_kind, "support_out_of_scope");
     }
 }

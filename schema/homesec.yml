@@ -94,6 +94,19 @@ nodes:
       # Call#2 のメタ closing が質問系で連続した回数。decide.rs::next_question_streak が
       # 更新する。他 2 schema ファイルへの複製は上と同じ理由（加算のみ）。
       question_streak: { type: int }
+      # CS サポートモード（composition、Issue #50、design doc §13.2）。bool 相当だが
+      # 既存 awaiting_time_pref と同じく実体は "true"/"false" 文字列として書き込まれるため
+      # type は string にする。support_case_id は urtect 側 CS case への参照（空文字列 =
+      # 未着手）。decide.rs::AdvisorCaseAttrs / advisor_attr_updates が読み書きする。
+      support_mode: { type: string }
+      support_case_id: { type: string }
+      # Issue #50 バッチ2 レビュー修正: 「直前の CS 応答が聞き返しだったか」を advisor 側で
+      # 保持する（CS 側の clarify_turns は累積カウンタで Answer 後も 0 に戻らないため継続状態を
+      # 表せない。cs_support.rs::cs_continuing_from_conv_state の doc comment 参照）。値は
+      # `crate::advisor::api::support_reply_kind_to_advisor` の戻り値（例: "support_clarify"）
+      # または空文字列（未使用/退場によりクリア済み）。decide.rs::AdvisorCaseAttrs /
+      # advisor_attr_updates が読み書きする。
+      support_last_reply_kind: { type: string }
   ConversationTurn:
     attributes:
       turn_id: { type: string, required: true }

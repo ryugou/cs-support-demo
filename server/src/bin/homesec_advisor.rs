@@ -299,7 +299,6 @@ async fn main() -> Result<()> {
         ng,
         vegapunk,
         api_key,
-        handoff_contact_text: advisor_cfg.handoff_contact_text,
         images_dir,
         public_host,
         support_harness,

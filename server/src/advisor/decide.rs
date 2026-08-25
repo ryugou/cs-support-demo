@@ -18,7 +18,15 @@ pub enum AdvisorAction {
     Safety,
     TimePrefContinue,
     OutOfDomain,
-    Handoff,
+    /// design doc §13.2 のモード遷移(入場・継続)。**呼び出し側の契約**: この action を
+    /// 返したら `AdvisorCaseAttrs.support_mode = true` をセットして support_case へ書き戻す
+    /// こと(`crate::advisor::api::apply_action_contract` が担う)。実際の応答は
+    /// `crate::advisor::cs_support::run_support_turn`(既存 CS パイプラインを urtect schema で
+    /// そのまま実行するオーケストレーション)が生成する。ペイロードを持たない unit variant
+    /// のままなのは、CS 側から返る `case_id` / `reply_text` / `reply_kind` を呼び出し側
+    /// (`crate::advisor::api::advisor_reply_handler`)が別途 `AdvisorCaseAttrs.support_case_id`
+    /// へ書き込むため(この enum 自体に持たせる必要が無い)。
+    SupportMode,
     /// design doc §4.3 手順5。**呼び出し側の契約**: この action を返したら、返信を組み立てる前に
     /// 次の 3 つをセットすること(`api.rs` の `arm_time_pref_solicitation` と同じ 3 操作):
     /// - `conv.awaiting_time_pref = true`
@@ -67,12 +75,21 @@ pub enum AdvisorAction {
 /// 再現手順: 1 ターン目 concern=intrusion → Clarify{Housing}、2 ターン目
 /// housing=apartment_rented のみを渡すと、concern が消えたように見えて再度
 /// Clarify{Concern} になってしまう)。
+///
+/// `support_mode` / `cs_continuing` は design doc §13.2 のモード遷移に使う(Issue #50
+/// バッチ2)。`support_mode` は `AdvisorCaseAttrs.support_mode`(呼び出し側が読んだ現在値)を
+/// そのまま渡す。`cs_continuing` は「CS 側が継続状態(聞き返し中・時間帯受付中)にあるか」を
+/// 呼び出し側が非同期で確認した結果(`crate::advisor::cs_support::peek_conv_state` 経由)を渡す
+/// (`decide` 自身は非同期にできないため、`decide_time_pref` と同じ理由で呼び出し元に判定を
+/// 前倒しさせる設計)。
 pub fn decide(
     u: &crate::advisor::understand::Understanding,
     conv: &crate::harness::CaseConvState,
     _lead_offered: bool,
     lead_requested: bool,
     clarify_max: u32,
+    support_mode: bool,
+    cs_continuing: bool,
 ) -> AdvisorAction {
     // 手順1: emergency は他の何より優先する。
     if u.emergency {
@@ -82,7 +99,15 @@ pub fn decide(
     if conv.awaiting_time_pref {
         return AdvisorAction::TimePrefContinue;
     }
-    decide_in_domain_flow(u, conv, lead_requested, clarify_max, false)
+    decide_in_domain_flow(
+        u,
+        conv,
+        lead_requested,
+        clarify_max,
+        false,
+        support_mode,
+        cs_continuing,
+    )
 }
 
 /// 提案に必要な条件のうち未取得のものを返す(design doc §4.3 手順6)。
@@ -118,11 +143,29 @@ fn missing_conditions(
     }
 }
 
-/// 手順3〜7(emergency・時間帯受付モードの判定を終えたあとの通常フロー)。[`decide`] 本体と
+/// design doc §13.2 のモード遷移(入場・継続・退場)と、旧手順3〜7(emergency・時間帯受付
+/// モードの判定を終えたあとの通常フロー)を合わせたもの。[`decide`] 本体と
 /// [`decide_time_pref`] の「時間帯の話ではなかった」経路の両方から呼ばれる共有ロジック
 /// (design doc §3.2「解釈・状態機械は既存実装のまま」= CS と同様、時間帯の話でなければ
 /// 通常の判定へ続行する。reviewer 指摘: 従来は無条件で `TimePrefContinue` を返しており、
 /// 顧客の実際の質問が無視されていた)。
+///
+/// **優先順(Issue #50 バッチ2、design doc §13.2 を確定させたもの。呼び出し元の `decide` /
+/// `decide_time_pref` / `decide_time_pref_extraction_failed` が処理する emergency・
+/// 時間帯受付モード判定の**後**に評価される)**:
+/// 1. `!u.in_domain && (support_mode || u.urtect_support)` → [`AdvisorAction::SupportMode`]
+///    (継続)。in_domain でない発話でも、既に support_mode 中、またはこのターン自体が
+///    urtect_support なら CS 文脈が続いていると見なす(design doc §13.2 rule 2(b)「直前
+///    サポート質問への応答」の実装上の代替: CS への短い技術的返答は advisor 自身の
+///    `in_domain` 判定では真の防犯相談トピックと判定されないことが多いため、この分岐で拾う)。
+/// 2. `!u.in_domain`(上記に該当しない)→ [`AdvisorAction::OutOfDomain`]。
+/// 3. `u.urtect_support` → [`AdvisorAction::SupportMode`](入場、または urtect_support が
+///    明示的なターンでの継続)。design doc §13.2 rule 1「入場: urtect_support == true の
+///    ターンで ON」は in_domain の値を問わない(上記 1 で !in_domain の場合は既に拾っている)。
+/// 4. `support_mode && cs_continuing`(CS 側が聞き返し中・時間帯受付中)→
+///    [`AdvisorAction::SupportMode`](継続)。
+/// 5〜7. 上記のいずれにも該当しない場合、旧手順5〜7(LeadSolicit → Clarify → Answer)へ
+///    フォールスルーする(下記の実装参照)。
 ///
 /// `suppress_lead_solicit`: true のときは手順5([`AdvisorAction::LeadSolicit`])を評価せず、
 /// 手順6・手順7へそのまま進む。**時間帯受付フローの内側**([`decide_time_pref`] の
@@ -148,20 +191,31 @@ fn missing_conditions(
 /// 残る。これを完全に断つには「1 会話での受付試行回数」を support_case 属性として永続化し、
 /// この関数の手順5 判定に組み込む必要があるが、それは呼び出し側(Task 6)の配線と design doc
 /// §4.2/§4.4 の spec 更新を伴うため今回のスコープ外。Task 6 の実装者はこの制約を踏まえること。
+#[allow(clippy::too_many_arguments)]
 fn decide_in_domain_flow(
     u: &crate::advisor::understand::Understanding,
     conv: &crate::harness::CaseConvState,
     lead_requested: bool,
     clarify_max: u32,
     suppress_lead_solicit: bool,
+    support_mode: bool,
+    cs_continuing: bool,
 ) -> AdvisorAction {
-    // 手順3
+    // 優先順1・2: in_domain でない発話。support_mode 中、または urtect_support 自体が
+    // 立っているターンは CS サポート文脈の継続とみなし、退場させない。
     if !u.in_domain {
+        if support_mode || u.urtect_support {
+            return AdvisorAction::SupportMode;
+        }
         return AdvisorAction::OutOfDomain;
     }
-    // 手順4
+    // 優先順3: urtect_support は常に CS サポートモードへ(入場、または明示的な継続)。
     if u.urtect_support {
-        return AdvisorAction::Handoff;
+        return AdvisorAction::SupportMode;
+    }
+    // 優先順4: support_mode 中に CS 側が継続状態(聞き返し中・時間帯受付中)にあれば継続する。
+    if support_mode && cs_continuing {
+        return AdvisorAction::SupportMode;
     }
     // 手順5(抑止時はスキップ。上記 doc comment 参照)
     if !suppress_lead_solicit && u.lead_interest && !lead_requested {
@@ -233,6 +287,7 @@ fn decide_in_domain_flow(
 /// 再開する。特に再アーム分岐(下記)は保存漏れがあると `time_pref_false_count` が毎ターン
 /// 0 起点になり、2 回連続打ち切り条件へ永久に到達しない(前ラウンドで潰した livelock が
 /// 別経路で復活する)。
+#[allow(clippy::too_many_arguments)]
 pub fn decide_time_pref(
     u: &crate::advisor::understand::Understanding,
     extraction: &crate::harness::time_pref::TimePrefExtraction,
@@ -240,6 +295,8 @@ pub fn decide_time_pref(
     cfg: &crate::config::BusinessHoursConfig,
     lead_requested: bool,
     clarify_max: u32,
+    support_mode: bool,
+    cs_continuing: bool,
 ) -> AdvisorAction {
     // emergency は時間帯受付モード中でも最優先(design doc §9 不変条件5)。呼び出し側が
     // 事前にチェックしている想定でも、ここでも防御的に確認する(このモード中は
@@ -266,7 +323,15 @@ pub fn decide_time_pref(
             // 自動解除するかどうかを判断済み)。suppress_lead_solicit = true: ここは時間帯受付
             // フローの内側であり、手順5(LeadSolicit)を成立させると呼び出し側の契約により
             // 受付モードが再開始してしまう(decide_in_domain_flow の doc comment 参照)。
-            decide_in_domain_flow(u, conv, lead_requested, clarify_max, true)
+            decide_in_domain_flow(
+                u,
+                conv,
+                lead_requested,
+                clarify_max,
+                true,
+                support_mode,
+                cs_continuing,
+            )
         }
         crate::harness::time_pref::TimePrefAction::Reply(_) => {
             let fitting_window = extraction
@@ -303,7 +368,15 @@ pub fn decide_time_pref(
                         // (LeadSolicit)を成立させると、呼び出し側の契約により受付モードが
                         // 即座に再開始し、この打ち切りそのものが無意味になる
                         // (decide_in_domain_flow の doc comment 参照)。
-                        decide_in_domain_flow(u, conv, lead_requested, clarify_max, true)
+                        decide_in_domain_flow(
+                            u,
+                            conv,
+                            lead_requested,
+                            clarify_max,
+                            true,
+                            support_mode,
+                            cs_continuing,
+                        )
                     } else {
                         conv.awaiting_time_pref = true;
                         AdvisorAction::TimePrefContinue
@@ -423,6 +496,8 @@ pub fn decide_time_pref_extraction_failed(
     conv: &mut crate::harness::CaseConvState,
     lead_requested: bool,
     clarify_max: u32,
+    support_mode: bool,
+    cs_continuing: bool,
 ) -> AdvisorAction {
     // ここで conv を変更しないのは意図的(抽出インフラ失敗カウンタを積む前に早期returnする
     // ため)だが、awaiting_time_pref の解除自体は呼び出し側の責務(AdvisorAction::Safety の
@@ -450,14 +525,23 @@ pub fn decide_time_pref_extraction_failed(
         // suppress_lead_solicit = true: 抽出インフラ 3 回連続失敗による打ち切りも、時間帯受付
         // フローの内側からの委譲である以上、同一ターンでの受付モード再開始を防ぐ必要がある
         // (decide_in_domain_flow の doc comment 参照)。
-        decide_in_domain_flow(u, conv, lead_requested, clarify_max, true)
+        decide_in_domain_flow(
+            u,
+            conv,
+            lead_requested,
+            clarify_max,
+            true,
+            support_mode,
+            cs_continuing,
+        )
     } else {
         AdvisorAction::TimePrefContinue
     }
 }
 
 /// support_case の advisor 固有属性(design doc §4.4 手順4、`question_streak` は
-/// 2026-08-21 conversation-rhythm-implementation §要件2 で加算)。
+/// 2026-08-21 conversation-rhythm-implementation §要件2 で加算、`support_mode` /
+/// `support_case_id` は Issue #50 design doc §13.2 で加算)。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AdvisorCaseAttrs {
     pub lead_offered: bool,
@@ -466,6 +550,29 @@ pub struct AdvisorCaseAttrs {
     /// Call#2 のメタ `closing` が質問系(`QuestionChoice` / `QuestionOpen`)で連続した回数。
     /// [`next_question_streak`] が更新する。
     pub question_streak: i32,
+    /// design doc §13.2: CS サポートモード(composition)が ON かどうか。既定 false。
+    /// `crate::advisor::api::apply_action_contract` が `AdvisorAction::SupportMode` で
+    /// true に、それ以外の大半のアクション(`Safety` / `TimePrefContinue` を除く)で
+    /// false に書き戻す。
+    pub support_mode: bool,
+    /// urtect 側 CS case(`crate::advisor::cs_support::run_support_turn` が返す `case_id`)
+    /// への参照。既定は空文字列(= まだ CS case が無い)。`support_mode` が false に戻っても
+    /// この値は保持する(design doc §13.2: 退場後に再入場したとき、同じ CS case を
+    /// 再利用して会話を継続できるようにするため)。
+    pub support_case_id: String,
+    /// Issue #50 バッチ2 レビュー修正(Critical 1): 「直前の CS 応答が聞き返しだったか」を
+    /// advisor 側の case 属性として保持する。CS 側の `CaseConvState.clarify_turns` は
+    /// その case で累積した聞き返し回数のカウンタであり、`Answer` を返しても 0 に戻らないため
+    /// (`cs_support.rs` の `Clarify` 分岐と `Answer` 分岐の doc comment 参照)、これを
+    /// 「継続状態」の判定に使うと CS が一度でも聞き返した case は永久にサポートモードから
+    /// 出られなくなる。既定は空文字列(= まだ CS 応答が無い、または退場済み)。
+    /// `"support_clarify"`(`crate::advisor::api::support_reply_kind_to_advisor` の戻り値)の
+    /// ときだけ「直前が聞き返しだった」ことを表す。
+    /// `crate::advisor::api::run_cs_support_mode_turn` が CS 応答成功時に書き戻し、
+    /// `crate::advisor::api::apply_action_contract` が `support_mode` を false に落とす
+    /// アクション(`OutOfDomain` / `LeadSolicit` / `Clarify` / `LeadConfirmed` / `Answer`)で
+    /// 空文字列にクリアする(`support_mode` と同じ退場タイミング)。
+    pub support_last_reply_kind: String,
 }
 
 /// `question_streak` の上限(2次 codex レビュー Warning C 是正)。永続ストア(support_case
@@ -497,6 +604,9 @@ pub fn parse_advisor_case_attrs(
         lead_requested: get("lead_requested") == "true",
         shown_product_cards: get("shown_product_cards").to_string(),
         question_streak,
+        support_mode: get("support_mode") == "true",
+        support_case_id: get("support_case_id").to_string(),
+        support_last_reply_kind: get("support_last_reply_kind").to_string(),
     }
 }
 
@@ -516,6 +626,12 @@ pub fn advisor_attr_updates(attrs: &AdvisorCaseAttrs) -> Vec<(String, String)> {
         (
             "question_streak".to_string(),
             attrs.question_streak.to_string(),
+        ),
+        ("support_mode".to_string(), attrs.support_mode.to_string()),
+        ("support_case_id".to_string(), attrs.support_case_id.clone()),
+        (
+            "support_last_reply_kind".to_string(),
+            attrs.support_last_reply_kind.clone(),
         ),
     ]
 }
@@ -699,7 +815,10 @@ mod tests {
         u.lead_interest = true;
         let conv = base_conv();
 
-        assert_eq!(decide(&u, &conv, false, false, 3), AdvisorAction::Safety);
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::Safety
+        );
     }
 
     #[test]
@@ -709,7 +828,7 @@ mod tests {
         conv.awaiting_time_pref = true;
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3),
+            decide(&u, &conv, false, false, 3, false, false),
             AdvisorAction::TimePrefContinue
         );
     }
@@ -721,18 +840,22 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3),
+            decide(&u, &conv, false, false, 3, false, false),
             AdvisorAction::OutOfDomain
         );
     }
 
     #[test]
-    fn handoff_when_urtect_support() {
+    fn support_mode_entry_when_urtect_support() {
+        // design doc §13.2 rule 1: 入場は urtect_support == true のターンで ON。
         let mut u = base_understanding();
         u.urtect_support = true;
         let conv = base_conv();
 
-        assert_eq!(decide(&u, &conv, false, false, 3), AdvisorAction::Handoff);
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::SupportMode
+        );
     }
 
     #[test]
@@ -742,7 +865,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3),
+            decide(&u, &conv, false, false, 3, false, false),
             AdvisorAction::LeadSolicit
         );
     }
@@ -753,7 +876,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3),
+            decide(&u, &conv, false, false, 3, false, false),
             AdvisorAction::Clarify {
                 missing: vec![ConditionKey::Concern]
             }
@@ -768,7 +891,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3),
+            decide(&u, &conv, false, false, 3, false, false),
             AdvisorAction::Clarify {
                 missing: vec![ConditionKey::Housing]
             }
@@ -782,7 +905,10 @@ mod tests {
             .push((ConditionKey::Concern, "monitoring".to_string()));
         let conv = base_conv();
 
-        assert_eq!(decide(&u, &conv, false, false, 3), AdvisorAction::Answer);
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::Answer
+        );
     }
 
     #[test]
@@ -791,7 +917,10 @@ mod tests {
         let mut conv = base_conv();
         conv.clarify_turns = 3;
 
-        assert_eq!(decide(&u, &conv, false, false, 3), AdvisorAction::Answer);
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::Answer
+        );
     }
 
     #[test]
@@ -803,7 +932,10 @@ mod tests {
             .push((ConditionKey::Housing, "detached_owned".to_string()));
         let conv = base_conv();
 
-        assert_eq!(decide(&u, &conv, false, false, 3), AdvisorAction::Answer);
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::Answer
+        );
     }
 
     // --- decide: 優先順の交差ケース ---
@@ -815,7 +947,10 @@ mod tests {
         u.lead_interest = true;
         let conv = base_conv();
 
-        assert_eq!(decide(&u, &conv, false, false, 3), AdvisorAction::Safety);
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::Safety
+        );
     }
 
     #[test]
@@ -826,7 +961,10 @@ mod tests {
         let mut conv = base_conv();
         conv.awaiting_time_pref = true;
 
-        assert_eq!(decide(&u, &conv, false, false, 3), AdvisorAction::Safety);
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::Safety
+        );
     }
 
     #[test]
@@ -837,32 +975,42 @@ mod tests {
         conv.awaiting_time_pref = true;
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3),
+            decide(&u, &conv, false, false, 3, false, false),
             AdvisorAction::TimePrefContinue
         );
     }
 
     #[test]
-    fn out_of_domain_wins_over_handoff() {
+    fn urtect_support_wins_over_out_of_domain_when_entering() {
+        // design doc §13.2 rule 1(入場)は in_domain の値を問わない。優先順1
+        // (decide_in_domain_flow の doc comment 参照): CS への短い技術的返答は advisor 自身の
+        // in_domain 判定では真の防犯相談トピックと判定されないことが多いため、
+        // urtect_support == true をここで拾い上げて OutOfDomain より先に SupportMode へ倒す
+        // (このテストは以前 `out_of_domain_wins_over_handoff` という名前で、旧来の
+        // Handoff 定型が廃止される前は OutOfDomain を期待していた。Issue #50 バッチ2で
+        // 期待値そのものが設計変更された)。
         let mut u = base_understanding();
         u.in_domain = false;
         u.urtect_support = true;
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3),
-            AdvisorAction::OutOfDomain
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::SupportMode
         );
     }
 
     #[test]
-    fn handoff_wins_over_lead_solicit() {
+    fn support_mode_wins_over_lead_solicit() {
         let mut u = base_understanding();
         u.urtect_support = true;
         u.lead_interest = true;
         let conv = base_conv();
 
-        assert_eq!(decide(&u, &conv, false, false, 3), AdvisorAction::Handoff);
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false),
+            AdvisorAction::SupportMode
+        );
     }
 
     #[test]
@@ -873,10 +1021,98 @@ mod tests {
 
         // lead_requested = true なので手順5は不成立、後続(手順6: concern 未取得)へ進む。
         assert_eq!(
-            decide(&u, &conv, false, true, 3),
+            decide(&u, &conv, false, true, 3, false, false),
             AdvisorAction::Clarify {
                 missing: vec![ConditionKey::Concern]
             }
+        );
+    }
+
+    // --- decide: サポートモードの遷移(入場・継続・退場)。Issue #50 バッチ2 レビュー修正
+    // Critical 2: 修正前はこれらの分岐(優先順1・優先順4)を担うテストが1件も無く、
+    // `support_mode ||` の項と `support_mode && cs_continuing` の分岐を丸ごと削除しても
+    // テストが1件も落ちなかった。design doc §13.4 が要求する「入場・継続・退場・emergency
+    // 優先」を固定する。---
+
+    #[test]
+    fn support_mode_continues_via_priority_1_when_out_of_domain_and_support_mode_is_on() {
+        // design doc §13.2 rule 2: 優先順1(decide_in_domain_flow の doc comment)。
+        // in_domain でない発話でも、既に support_mode 中なら CS 文脈の継続とみなす。
+        let mut u = base_understanding();
+        u.in_domain = false;
+        let conv = base_conv();
+
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, true, false),
+            AdvisorAction::SupportMode,
+            "優先順1: support_mode=true なら in_domain でなくても SupportMode を継続する"
+        );
+    }
+
+    #[test]
+    fn support_mode_continues_via_priority_4_when_in_domain_and_cs_side_is_continuing() {
+        // design doc §13.2 rule 2(a) / 優先順4: in_domain な発話でも、support_mode 中に
+        // CS 側が継続状態(聞き返し中・時間帯受付中)にあれば SupportMode を継続する。
+        let u = base_understanding(); // in_domain = true, urtect_support = false
+        let conv = base_conv();
+
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, true, true),
+            AdvisorAction::SupportMode,
+            "優先順4: support_mode=true かつ cs_continuing=true なら SupportMode を継続する"
+        );
+    }
+
+    #[test]
+    fn support_mode_exits_when_in_domain_topic_and_cs_side_is_not_continuing() {
+        // design doc §13.2 rule 3(退場)。Critical 1 の回帰テスト: cs_continuing=false
+        // (CS 側が聞き返し中でも時間帯受付中でもない)なら、support_mode=true が残っていても
+        // 通常フローへフォールスルーし SupportMode 以外を返す。conditions を揃えて Answer を
+        // 期待する形にする(手順5〜7が正常に評価されることの確認も兼ねる)。
+        let mut u = base_understanding();
+        u.conditions
+            .push((ConditionKey::Concern, "monitoring".to_string()));
+        let conv = base_conv();
+
+        let action = decide(&u, &conv, false, false, 3, true, false);
+
+        assert_ne!(
+            action,
+            AdvisorAction::SupportMode,
+            "cs_continuing=false なら support_mode=true が残っていても退場すること(=CS が \
+             聞き返した後に回答し、客が話題を変えたターンで永久にサポートモードから \
+             出られなくなっていた Critical 1 の再発防止)"
+        );
+        assert_eq!(action, AdvisorAction::Answer);
+    }
+
+    #[test]
+    fn cs_continuing_alone_does_not_enter_support_mode() {
+        // 優先順4の `support_mode &&` の項が万一落ちても検出できるようにする回帰テスト:
+        // support_mode=false のときは cs_continuing=true だけでは SupportMode に入らない。
+        let u = base_understanding(); // in_domain = true, urtect_support = false
+        let conv = base_conv();
+
+        let action = decide(&u, &conv, false, false, 3, false, true);
+
+        assert_ne!(
+            action,
+            AdvisorAction::SupportMode,
+            "support_mode=false なら cs_continuing=true だけでは SupportMode に入らないこと"
+        );
+    }
+
+    #[test]
+    fn emergency_wins_over_support_mode_and_cs_continuing() {
+        // emergency は他の何より優先する(手順1)。support_mode / cs_continuing が両方 true でも
+        // Safety が最優先されること。
+        let mut u = base_understanding();
+        u.emergency = true;
+        let conv = base_conv();
+
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, true, true),
+            AdvisorAction::Safety
         );
     }
 
@@ -958,7 +1194,7 @@ mod tests {
             .conditions
             .push((ConditionKey::Concern, "intrusion".to_string()));
 
-        let action1 = decide(&turn1, &conv, false, false, 3);
+        let action1 = decide(&turn1, &conv, false, false, 3, false, false);
         assert_eq!(
             action1,
             AdvisorAction::Clarify {
@@ -982,7 +1218,7 @@ mod tests {
         let mut turn2 = base_understanding();
         turn2.conditions = merged;
 
-        let action2 = decide(&turn2, &conv, false, false, 3);
+        let action2 = decide(&turn2, &conv, false, false, 3, false, false);
 
         assert_eq!(
             action2,
@@ -1327,7 +1563,7 @@ mod tests {
         let extraction = extraction_false("別の話です");
 
         assert_eq!(
-            decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3),
+            decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false),
             AdvisorAction::Safety
         );
         assert!(
@@ -1345,7 +1581,7 @@ mod tests {
         conv.awaiting_time_pref = true;
         let extraction = extraction_false("別の話です");
 
-        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
         assert_eq!(
             action1,
             AdvisorAction::Clarify {
@@ -1355,7 +1591,7 @@ mod tests {
         );
         assert!(conv.awaiting_time_pref, "1回目では自動解除しない");
 
-        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
         assert_eq!(
             action2,
             AdvisorAction::Clarify {
@@ -1381,7 +1617,7 @@ mod tests {
         };
         let extraction = extraction_true(vec![w.clone()], "金曜の17時ごろ");
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
 
         match &action {
             AdvisorAction::LeadConfirmed { slot } => {
@@ -1458,7 +1694,7 @@ mod tests {
             conv.awaiting_time_pref = true;
             let extraction = extraction_true(vec![w], "テスト発話");
 
-            let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+            let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
             let AdvisorAction::LeadConfirmed { slot } = action else {
                 panic!("expected LeadConfirmed, got {action:?}");
             };
@@ -1481,7 +1717,7 @@ mod tests {
             "土曜の午前中",
         );
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
 
         assert_eq!(action, AdvisorAction::TimePrefContinue);
         assert!(
@@ -1510,7 +1746,7 @@ mod tests {
             "16時から20時なら",
         );
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
 
         assert_eq!(
             action,
@@ -1536,7 +1772,7 @@ mod tests {
             raw: "よくわからない時間帯の話".to_string(),
         };
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
 
         assert_eq!(action, AdvisorAction::TimePrefContinue);
         assert!(conv.awaiting_time_pref);
@@ -1560,7 +1796,7 @@ mod tests {
             "土曜の午前中",
         );
 
-        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
         assert_eq!(
             action1,
             AdvisorAction::TimePrefContinue,
@@ -1569,7 +1805,7 @@ mod tests {
         assert!(conv.awaiting_time_pref);
         assert_eq!(conv.time_pref_false_count, 1);
 
-        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
         assert_eq!(
             action2,
             AdvisorAction::Answer,
@@ -1600,10 +1836,11 @@ mod tests {
             }],
             "土曜の午前中",
         );
-        decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
 
-        let (action2, logs) =
-            capture_logs(|| decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3));
+        let (action2, logs) = capture_logs(|| {
+            decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false)
+        });
 
         assert_eq!(action2, AdvisorAction::Answer);
         assert!(
@@ -1624,7 +1861,7 @@ mod tests {
         let mut conv = base_conv();
         conv.awaiting_time_pref = true;
 
-        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3);
+        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false);
 
         assert_eq!(action, AdvisorAction::TimePrefContinue);
         assert!(conv.awaiting_time_pref);
@@ -1638,7 +1875,7 @@ mod tests {
         conv.awaiting_time_pref = true;
         conv.time_pref_extraction_error_count = 1;
 
-        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3);
+        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false);
 
         assert_eq!(action, AdvisorAction::TimePrefContinue);
         assert!(conv.awaiting_time_pref);
@@ -1654,7 +1891,7 @@ mod tests {
         conv.awaiting_time_pref = true;
         conv.time_pref_extraction_error_count = 2;
 
-        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3);
+        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false);
 
         assert_eq!(action, AdvisorAction::Answer);
         assert!(!conv.awaiting_time_pref);
@@ -1672,8 +1909,9 @@ mod tests {
         conv.awaiting_time_pref = true;
         conv.time_pref_extraction_error_count = 2;
 
-        let (action, logs) =
-            capture_logs(|| decide_time_pref_extraction_failed(&u, &mut conv, false, 3));
+        let (action, logs) = capture_logs(|| {
+            decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false)
+        });
 
         assert_eq!(action, AdvisorAction::Answer);
         assert!(
@@ -1705,14 +1943,14 @@ mod tests {
             "土曜の午前中でお願いします",
         );
 
-        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
         assert_eq!(
             action1,
             AdvisorAction::TimePrefContinue,
             "1回目は再アームする"
         );
 
-        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
 
         assert_ne!(
             action2,
@@ -1744,7 +1982,7 @@ mod tests {
         conv.awaiting_time_pref = true;
         let extraction = extraction_false("全然関係ない質問です");
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
 
         assert_ne!(action, AdvisorAction::LeadSolicit);
         assert_eq!(action, AdvisorAction::Answer);
@@ -1762,7 +2000,7 @@ mod tests {
         conv.awaiting_time_pref = true;
         conv.time_pref_extraction_error_count = 2;
 
-        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3);
+        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false);
 
         assert_ne!(action, AdvisorAction::LeadSolicit);
         assert_eq!(action, AdvisorAction::Answer);
@@ -1782,7 +2020,7 @@ mod tests {
         conv.time_pref_extraction_error_count = 2;
         let extraction = extraction_false("別の話です");
 
-        decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3);
+        decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
 
         assert_eq!(conv.time_pref_extraction_error_count, 0);
     }
@@ -1796,7 +2034,7 @@ mod tests {
         conv.time_pref_extraction_error_count = 2;
 
         assert_eq!(
-            decide_time_pref_extraction_failed(&u, &mut conv, false, 3),
+            decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false),
             AdvisorAction::Safety
         );
         assert_eq!(
@@ -1837,8 +2075,35 @@ mod tests {
                 lead_requested: true,
                 shown_product_cards: "own_product:adc-v724,partner_product:foo".to_string(),
                 question_streak: 0,
+                support_mode: false,
+                support_case_id: String::new(),
+                support_last_reply_kind: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn parse_advisor_case_attrs_reads_support_mode_and_support_case_id_when_present() {
+        let attrs: std::collections::HashMap<String, String> = [
+            ("support_mode".to_string(), "true".to_string()),
+            ("support_case_id".to_string(), "case-urtect-abc".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let parsed = parse_advisor_case_attrs(&attrs);
+        assert!(parsed.support_mode);
+        assert_eq!(parsed.support_case_id, "case-urtect-abc");
+    }
+
+    #[test]
+    fn parse_advisor_case_attrs_defaults_support_mode_false_and_support_case_id_empty_when_absent()
+    {
+        let attrs = std::collections::HashMap::new();
+
+        let parsed = parse_advisor_case_attrs(&attrs);
+        assert!(!parsed.support_mode);
+        assert_eq!(parsed.support_case_id, "");
     }
 
     #[test]
@@ -1892,11 +2157,14 @@ mod tests {
             lead_requested: false,
             shown_product_cards: "statistic:foo".to_string(),
             question_streak: 2,
+            support_mode: true,
+            support_case_id: "case-urtect-abc".to_string(),
+            support_last_reply_kind: "support_clarify".to_string(),
         };
 
         let updates = advisor_attr_updates(&attrs);
 
-        assert_eq!(updates.len(), 4);
+        assert_eq!(updates.len(), 7);
         let map: std::collections::HashMap<_, _> = updates.into_iter().collect();
         assert_eq!(map.get("lead_offered").map(String::as_str), Some("true"));
         assert_eq!(map.get("lead_requested").map(String::as_str), Some("false"));
@@ -1905,6 +2173,37 @@ mod tests {
             Some("statistic:foo")
         );
         assert_eq!(map.get("question_streak").map(String::as_str), Some("2"));
+        assert_eq!(map.get("support_mode").map(String::as_str), Some("true"));
+        assert_eq!(
+            map.get("support_case_id").map(String::as_str),
+            Some("case-urtect-abc")
+        );
+        assert_eq!(
+            map.get("support_last_reply_kind").map(String::as_str),
+            Some("support_clarify")
+        );
+    }
+
+    #[test]
+    fn parse_advisor_case_attrs_reads_support_last_reply_kind_when_present() {
+        let attrs: std::collections::HashMap<String, String> = [(
+            "support_last_reply_kind".to_string(),
+            "support_clarify".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            parse_advisor_case_attrs(&attrs).support_last_reply_kind,
+            "support_clarify"
+        );
+    }
+
+    #[test]
+    fn parse_advisor_case_attrs_defaults_support_last_reply_kind_to_empty_when_absent() {
+        let attrs = std::collections::HashMap::new();
+
+        assert_eq!(parse_advisor_case_attrs(&attrs).support_last_reply_kind, "");
     }
 
     // --- next_question_streak(必須テスト5: question_streak の遷移) ---
@@ -1978,6 +2277,72 @@ mod tests {
         assert_eq!(
             next_question_streak(MAX_QUESTION_STREAK, Some(ClosingKind::QuestionOpen)),
             MAX_QUESTION_STREAK
+        );
+    }
+
+    // --- schema/*.yml の support_case.attributes 宣言(Issue #50 バッチ2 必須テスト5) ---
+    //
+    // `harness::knowledge::written_support_case_attribute_keys` は `server/src/harness/`
+    // 配下にあり、今回のバッチでは 1 行も変更できない(spec の絶対条件)。あのテストは
+    // 「written ⊆ declared」の片方向しか検証しないため、schema ファイル側だけに
+    // support_mode / support_case_id を追記しても既存 3 テストは無変更で PASS する。
+    // その代わりとして、ここで advisor 側に独立して「宣言されていること」を固定する
+    // (harness::knowledge::declared_support_case_attribute_keys と同じ考え方の複製。
+    // `cs_support.rs` の doc comment が既に明記する「api.rs の private 関数を同じ契約で
+    // advisor 側に再実装する」という前例に倣う)。
+
+    /// `harness::knowledge::declared_support_case_attribute_keys` と同じ考え方:
+    /// `schema_relative_path`(`CARGO_MANIFEST_DIR` 起点、cwd 非依存)の
+    /// `nodes.support_case.attributes` が `support_mode` / `support_case_id` /
+    /// `support_last_reply_kind`(Issue #50 バッチ2 レビュー修正で追加)を宣言しているかを
+    /// 検証し、宣言されていないキー名を返す(空なら全て宣言済み)。
+    fn missing_support_mode_attrs_in_schema(schema_relative_path: &str) -> Vec<&'static str> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(schema_relative_path);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read schema file {path:?}: {e}"));
+        let value: serde_yaml::Value = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("parse schema file {path:?} as YAML: {e}"));
+        let attributes = value["nodes"]["support_case"]["attributes"]
+            .as_mapping()
+            .unwrap_or_else(|| panic!("{path:?}: nodes.support_case.attributes is not a mapping"));
+        let declared: std::collections::HashSet<String> = attributes
+            .keys()
+            .map(|k| {
+                k.as_str()
+                    .unwrap_or_else(|| panic!("{path:?}: non-string attribute key"))
+                    .to_string()
+            })
+            .collect();
+        ["support_mode", "support_case_id", "support_last_reply_kind"]
+            .into_iter()
+            .filter(|key| !declared.contains(*key))
+            .collect()
+    }
+
+    #[test]
+    fn homesec_yml_declares_support_mode_and_support_case_id() {
+        let missing = missing_support_mode_attrs_in_schema("../schema/homesec.yml");
+        assert!(
+            missing.is_empty(),
+            "schema/homesec.yml nodes.support_case.attributes is missing: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn cs_schema_yml_declares_support_mode_and_support_case_id() {
+        let missing = missing_support_mode_attrs_in_schema("../schema/cs-schema.yml");
+        assert!(
+            missing.is_empty(),
+            "schema/cs-schema.yml nodes.support_case.attributes is missing: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn cs_support_yml_declares_support_mode_and_support_case_id() {
+        let missing = missing_support_mode_attrs_in_schema("../schema/cs-support.yml");
+        assert!(
+            missing.is_empty(),
+            "schema/cs-support.yml nodes.support_case.attributes is missing: {missing:?}"
         );
     }
 }

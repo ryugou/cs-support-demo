@@ -103,6 +103,15 @@ nodes:
       # ではない（値は advisor/decide.rs::next_question_streak が質問系 closing で加算、
       # proposal closing で 0 にリセットする）。
       question_streak: { type: int }
+      # CS サポートモード（composition、Issue #50、design doc §13.2）。urtect（このスキーマ）
+      # 自体では書き込まれないが、上と同じ理由（3 schema ファイル全部の一致テスト対象）で
+      # 加算のみ行う。
+      support_mode: { type: string }
+      support_case_id: { type: string }
+      # Issue #50 バッチ2 レビュー修正: advisor 側が「直前の CS 応答が聞き返しだったか」を
+      # 保持するための属性。urtect（このスキーマ）自体では書き込まれないが、上と同じ理由
+      # （3 schema ファイル全部の一致テスト対象）で加算のみ行う。
+      support_last_reply_kind: { type: string }
   answer_attempt:
     attributes:
       attempt_id: { type: string, required: true }
