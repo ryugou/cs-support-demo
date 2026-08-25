@@ -65,9 +65,11 @@ fn kind_requires_source_url(kind: &str) -> bool {
     matches!(kind, "statistic" | "partner_product")
 }
 
-/// レビュー3巡目 Warning 是正: `source_url` が `url::Url` としてパース可能な絶対 https URL
-/// かを検証する。parse 成功・scheme が https・userinfo 不在・host 存在を**すべて**満たす
-/// 場合のみ true。
+/// レビュー3巡目 Warning 是正: 任意の値が `url::Url` としてパース可能な絶対 https URL かを
+/// 検証する。parse 成功・scheme が https・userinfo 不在・host 存在を**すべて**満たす場合のみ
+/// true。`source_url`(§5.1「公式サイト」)と `product_page_url`(§5.1 カードの「商品ページを
+/// 見る」ボタン遷移先)の両方に使う汎用検証(Issue #47 Critical指摘2: 両フィールドとも
+/// カード/応答本文を通じて顧客のブラウザへ渡る遷移先である以上、同じ強度の整形検証を課す)。
 ///
 /// userinfo チェックは `username()`/`password()` だけでは不十分: `https://@host` のように
 /// `@` はあるが中身が空の userinfo は、url crate が正規化時に userinfo を完全に消し去って
@@ -76,7 +78,7 @@ fn kind_requires_source_url(kind: &str) -> bool {
 /// authority 部分(スキーム "://" の直後から最初の `/`・`?`・`#` まで)に生の `@` が
 /// 含まれるかを別途見ることで、意味上は無害でも「userinfo らしき記法」自体を一律拒否する
 /// (拒否範囲を広げるだけなので、正規の https URL を誤って弾くことはない)。
-fn is_well_formed_https_source_url(raw: &str) -> bool {
+pub fn is_well_formed_https_url(raw: &str) -> bool {
     if authority_contains_raw_userinfo_marker(raw) {
         return false;
     }
@@ -92,7 +94,7 @@ fn is_well_formed_https_source_url(raw: &str) -> bool {
 }
 
 /// scheme "://" の直後から authority の終端(最初の `/`・`?`・`#`、無ければ文字列末尾)までに
-/// 生の `@` が含まれるかを見る。[`is_well_formed_https_source_url`] のコメント参照。
+/// 生の `@` が含まれるかを見る。[`is_well_formed_https_url`] のコメント参照。
 fn authority_contains_raw_userinfo_marker(raw: &str) -> bool {
     let Some((_, after_scheme)) = raw.split_once("://") else {
         return false;
@@ -183,10 +185,9 @@ impl AdvisorMaterial {
         // (userinfo による接続先偽装)のような値も通過していた。これがそのまま
         // `draftgen.rs` の URL allowlist gate の許可集合(`allowed_urls`)に入ると、
         // allowlist 自体に偽装ホストを許可する値が混入することになる。`url::Url` でパースし、
-        // scheme・userinfo 不在・host 存在を検証する
-        // ([`is_well_formed_https_source_url`] 参照)。
+        // scheme・userinfo 不在・host 存在を検証する([`is_well_formed_https_url`] 参照)。
         if let Some(url) = &source_url {
-            if !is_well_formed_https_source_url(url) {
+            if !is_well_formed_https_url(url) {
                 tracing::warn!(
                     material_key = %material_key,
                     kind = %kind,
@@ -201,6 +202,37 @@ impl AdvisorMaterial {
             }
         }
 
+        // Issue #47 Critical指摘2: `product_page_url` はカードの「商品ページを見る」ボタンの
+        // 遷移先(`cards.rs::build_card_buttons`)としてそのまま顧客のブラウザへ渡る。
+        // `source_url` と同じ入口を通らないため出口関門(URL allowlist gate)の対象外であり、
+        // ここで同等の整形検証を課さないと未検証の値がボタンの URL にまで届く。
+        //
+        // 4次 codex レビュー 指摘3 是正: `source_url` の検証失敗は材料全体(本文・タイトル等)を
+        // 落とす必要がある(design doc 上 `source_url` は根拠の出典として required なフィールド
+        // であり、欠陥のある材料を接地材料として使わせないため)。一方 `product_page_url` は
+        // カードの URI ボタンという1フィールドの装飾に過ぎない optional 属性であり、他の
+        // フィールドに欠陥は無い。検証失敗時に材料全体を `None` で握りつぶすと、本文・
+        // card_description まで失われ、実害に対して被害が不釣り合いに大きい。ここでは
+        // `product_page_url` だけを `None` に落とし(ボタンが省略されるだけ)、材料自体は
+        // 残す非対称な扱いにする。
+        let product_page_url = trimmed_non_empty(attrs, "product_page_url").and_then(|url| {
+            if is_well_formed_https_url(&url) {
+                Some(url)
+            } else {
+                tracing::warn!(
+                    material_key = %material_key,
+                    kind = %kind,
+                    product_page_url = %url,
+                    "advisor_material node has a product_page_url that is not a well-formed absolute \
+                     https:// URL (parse failure, non-https scheme, embedded/empty userinfo, or \
+                     missing host); dropping only the product_page_url (the card's URI button will be \
+                     omitted) rather than discarding the whole material. Fix \
+                     server/data/homesec/materials.json"
+                );
+                None
+            }
+        });
+
         Some(Self {
             material_key,
             kind,
@@ -212,7 +244,7 @@ impl AdvisorMaterial {
             price_band: trimmed_non_empty(attrs, "price_band"),
             card_description: trimmed_non_empty(attrs, "card_description"),
             card_match_terms: trimmed_non_empty(attrs, "card_match_terms"),
-            product_page_url: trimmed_non_empty(attrs, "product_page_url"),
+            product_page_url,
         })
     }
 }
@@ -689,6 +721,67 @@ mod tests {
         a.insert("product_page_url".to_string(), "   ".to_string());
         let material = AdvisorMaterial::from_attributes(&a).expect("must parse");
         assert_eq!(material.product_page_url, None);
+    }
+
+    // --- Issue #47 Critical指摘2: product_page_url に source_url と同等の https 整形検証 ---
+
+    #[test]
+    fn from_attributes_drops_a_plain_http_product_page_url_but_keeps_the_material_and_warns() {
+        // 4次 codex レビュー 指摘3 是正: product_page_url はカードの URI ボタン用の1フィールド
+        // に過ぎず、検証失敗を理由に材料全体(本文・タイトル等)まで捨てるのは過剰。ここでは
+        // product_page_url だけが None になり、他フィールドは full_attrs() 由来のまま残ること
+        // を固定する。
+        let mut a = full_attrs();
+        a.insert(
+            "product_page_url".to_string(),
+            "http://example.com/products/adc-v724".to_string(),
+        );
+        let (result, logs) = capture_logs(|| AdvisorMaterial::from_attributes(&a));
+        let material = result.expect(
+            "product_page_url must be https, but an invalid product_page_url alone must not \
+             discard the whole material",
+        );
+        assert_eq!(material.product_page_url, None);
+        assert_eq!(material.material_key, "own_product:adc-v724");
+        assert_eq!(material.title_ja, "URTECT ADC-V724");
+        assert_eq!(material.body_ja, "屋外対応の防犯カメラです。");
+        assert!(logs.contains("WARN"), "logs: {logs}");
+    }
+
+    #[test]
+    fn from_attributes_drops_a_hostless_https_product_page_url_but_keeps_the_material_and_warns() {
+        let mut a = full_attrs();
+        a.insert("product_page_url".to_string(), "https://".to_string());
+        let (result, logs) = capture_logs(|| AdvisorMaterial::from_attributes(&a));
+        let material = result.expect(
+            "a bare https:// with no host must be dropped from product_page_url before it \
+             reaches the card's URI button, but must not discard the whole material",
+        );
+        assert_eq!(material.product_page_url, None);
+        assert_eq!(material.material_key, "own_product:adc-v724");
+        assert_eq!(material.title_ja, "URTECT ADC-V724");
+        assert_eq!(material.body_ja, "屋外対応の防犯カメラです。");
+        assert!(logs.contains("WARN"), "logs: {logs}");
+    }
+
+    #[test]
+    fn from_attributes_drops_a_product_page_url_with_userinfo_impersonating_a_host_but_keeps_the_material_and_warns(
+    ) {
+        let mut a = full_attrs();
+        a.insert(
+            "product_page_url".to_string(),
+            "https://example.com@evil.example/path".to_string(),
+        );
+        let (result, logs) = capture_logs(|| AdvisorMaterial::from_attributes(&a));
+        let material = result.expect(
+            "a product_page_url embedding a real-looking host as userinfo must be dropped, but \
+             must not discard the whole material",
+        );
+        assert_eq!(material.product_page_url, None);
+        assert_eq!(material.material_key, "own_product:adc-v724");
+        assert_eq!(material.title_ja, "URTECT ADC-V724");
+        assert_eq!(material.body_ja, "屋外対応の防犯カメラです。");
+        assert!(logs.contains("WARN"), "logs: {logs}");
     }
 
     #[test]

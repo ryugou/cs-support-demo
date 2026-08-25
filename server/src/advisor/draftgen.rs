@@ -456,6 +456,16 @@ enum MetaSeparationOutcome {
     /// 付けた場合の多層防御)。呼び出し元は常に warn する(LLM がメタ出力の指示に従って
     /// いないことを示す信号のため)。
     RecoveredWithoutMarker,
+    /// マーカーが見つからず、[`recover_meta_from_body_json`] による [`DraftMeta`] としての
+    /// 復旧にも失敗したが、本文の末尾側に [`DraftMeta`] の署名キー(`"featured"` / `"closing"` /
+    /// `"choices"`)を字句的に含む `{` 候補を [`strip_body_from_meta_signature_region`]
+    /// が検出できたため、その位置から本文を切り捨てた(Issue #47 Critical指摘1 是正、4次
+    /// codex レビュー 指摘1・2 是正で判定基準を「構文的にパース可能か」から「署名キーを
+    /// 含むか」へ変更。判定は JSON 構造を見ない字句走査であり、キーの位置にあることまでは
+    /// 検証していない)。典型は `closing` が3値語彙外・JSON 自体が構文エラーを含む場合。
+    /// メタは採用しない(`None` のまま fail-soft 継続)。呼び出し元は常に warn する(LLM が
+    /// メタ出力の指示に従っていない、または `closing` の語彙を外している信号のため)。
+    TailJsonStrippedInvalidMeta,
 }
 
 /// 2026-08-21 conversation-rhythm-implementation §要件1: LLM の生テキストを、
@@ -491,13 +501,26 @@ fn separate_draft_meta(raw: &str) -> (String, Option<DraftMeta>, MetaSeparationO
             let trimmed = raw.trim().to_string();
             match recover_meta_from_body_json(&trimmed) {
                 Some((body, meta)) => (
-                    body,
+                    strip_additional_trailing_json_after_recovery(body),
                     Some(meta),
                     MetaSeparationOutcome::RecoveredWithoutMarker,
                 ),
-                None => (trimmed, None, MetaSeparationOutcome::NoMarker),
+                None => match strip_body_from_meta_signature_region(&trimmed) {
+                    Some(stripped_body) => (
+                        stripped_body,
+                        None,
+                        MetaSeparationOutcome::TailJsonStrippedInvalidMeta,
+                    ),
+                    None => (trimmed, None, MetaSeparationOutcome::NoMarker),
+                },
             }
         }
+        // マーカーが見つかった経路には strip_additional_trailing_json_after_recovery を
+        // 適用しない(Issue #47 レビュー指摘F1、意図的なスコープ限定)。この経路は本文が
+        // マーカー位置で確定済みの通常系 hot path であり、マーカー前の本文中に偶然「本文末尾を
+        // ちょうど占める JSON 値」に見える文字列があっても削ってはならない。マーカー無し経路
+        // だけが「本文の一部が実はメタ JSON の残骸である」という曖昧さを持つため、削除対象を
+        // その経路に限定する。
         Some((body, rest)) => {
             let body = body.trim().to_string();
             match parse_draft_meta(rest) {
@@ -656,6 +679,216 @@ fn strip_first_recoverable_meta_json_object(body: &str) -> Option<(String, Draft
         return Some((rest.trim().to_string(), meta));
     }
     None
+}
+
+/// Issue #47 レビュー指摘F1 是正: [`recover_meta_from_body_json`] が復旧に成功した後の本文に
+/// 対する、もう1段のフォールバック除去。
+///
+/// **これが無いと起きていた不具合**: [`recover_meta_from_body_json`] は [`DraftMeta`] として
+/// 「妥当な」JSON しか取り除かない([`strip_first_recoverable_meta_json_object`] が使う
+/// [`parse_draft_meta_prefix`] は `closing` の3値検証まで要求する厳密パーサのため)。したがって
+/// 「妥当なメタ JSON が1つ以上あり、かつその直後に `DraftMeta` としては不正な JSON(`closing`
+/// が語彙外など)がもう1つ続く」入力では、復旧自体は成功する(`meta` は `Some`)のに、その
+/// 不正 JSON だけが取り除かれずに本文へ残っていた。この経路にはマーカーも
+/// [`ADVISOR_META_SENTINEL`] も含まれないため、後段の [`sanitize_body_of_meta_fragments`]
+/// も素通りし、JSON テキストがそのまま顧客向け本文に残る([`strip_body_from_meta_signature_region`]
+/// の doc comment が記述する不具合と同じクラスで、発生条件だけが「復旧が失敗した場合」から
+/// 「復旧は成功したが取り切れなかった残骸がある場合」に変わる)。
+///
+/// [`strip_body_from_meta_signature_region`] をここでも適用し、[`DraftMeta`] の署名キー
+/// (`"featured"` / `"closing"` / `"choices"`)を字句的に含む末尾領域が残っていれば、パース可否を
+/// 問わず取り除く。メタは既に取れているため採用はそのまま(`Some` を維持する) — 呼び出し元は
+/// 追加の除去が起きたことだけを warn で知る。
+fn strip_additional_trailing_json_after_recovery(body: String) -> String {
+    match strip_body_from_meta_signature_region(&body) {
+        Some(stripped) => {
+            tracing::warn!(
+                route = ADVISOR_DRAFT_ROUTE,
+                "advisor draft recovered a valid DraftMeta without the marker, but the \
+                 recovered body's tail still contained a region with a DraftMeta signature key \
+                 (\"featured\", \"closing\", or \"choices\") detected by a lexical substring \
+                 scan (not verified to be at an actual JSON key position) that was not consumed \
+                 as part of that valid DraftMeta (e.g. a second JSON object with a closing value \
+                 outside the 3-value vocabulary); stripped that trailing region from the \
+                 customer-facing body too so it does not leak to the customer. This indicates \
+                 the LLM emitted more than one trailing JSON object and should be investigated"
+            );
+            stripped
+        }
+        None => body,
+    }
+}
+
+/// Issue #47 Critical指摘1 是正: [`recover_meta_from_body_json`] が失敗した場合(マーカー無しで、
+/// 本文末尾の JSON 値が構文的には妥当だが [`DraftMeta`] としては不正 — `closing` が3値語彙外
+/// など)のもう1段のフォールバック。[`DraftMeta`] として妥当かどうかを問わず、[`DraftMeta`] の
+/// 署名キーを字句的に含む領域を検出できたら、その位置(先行する `{`)から本文末尾までを丸ごと
+/// 除去する(メタは採用しない。`None` のまま fail-soft 継続する)。
+///
+/// **これが無いと起きていた不具合**: 本文末尾の JSON が構文的には妥当だが `closing` が語彙外
+/// などの理由で `DraftMeta` として不正な場合、[`recover_meta_from_body_json`] は何も取り除けず
+/// `None` を返す。この経路にはマーカーも [`ADVISOR_META_SENTINEL`] も含まれないため、後段の
+/// [`sanitize_body_of_meta_fragments`](番兵文字列一致による最終防御)も素通りし、JSON テキスト
+/// がそのまま顧客向け本文に残っていた。
+///
+/// [`strip_first_recoverable_meta_json_object`] との違い: あちらは [`parse_draft_meta_prefix`]
+/// (`RawDraftMeta` へのデシリアライズ + `closing` の3値検証まで要求する厳密パーサ)を使うため、
+/// `DraftMeta` として不正な JSON は検出できない。この関数はパース可否を一切問わず、[`DraftMeta`]
+/// の署名キー(`"featured"` / `"closing"` / `"choices"`)が字句的に出現する位置([`draft_meta_signature_key_positions`])
+/// を探し、そのうちの1つより前(同じか手前)にある `{` のうち最も後ろのものを切り捨て開始位置に
+/// 使う。
+///
+/// **判定基準の変遷(4次 codex レビュー 指摘1・2 是正)**: 旧実装は「`{` からの JSON が
+/// `serde_json` でパース可能」かつ「本文の末尾ちょうどまでを占める」ことを要求していた。この
+/// 基準は2方向に外れていた:
+///
+/// - false negative(指摘1): 末尾のメタ JSON にカンマ欠落等の構文エラーがあると、パースが
+///   失敗してこの関数が何も検出できず、壊れたメタ JSON がそのまま顧客向け本文に残っていた。
+/// - false positive(指摘2): featured/closing と無関係な、顧客向けの正当な JSON 例文
+///   (設定例など)がたまたま本文末尾に来ると、「妥当な JSON というだけ」で無条件に除去されて
+///   いた。DraftMeta のメタ情報かどうかを一切見ていなかったことが原因。
+///
+/// **切り捨て位置の選び方(reviewer 一次レビュー Critical 1 是正)**: 指摘1・2 の是正で
+/// 「署名キーを含むかどうか」に基準を変えた際、当初は「先頭側から `{` を走査し、その `{` から
+/// **本文末尾まで**の全域に署名キーがあるか」を見ていた。しかしこれでは、本文中の最初の `{`
+/// より後ろのどこかに署名キーが1つでもあれば、最初の `{` 以降が丸ごと切り捨てられてしまう
+/// (本文中に無関係な正当な JSON 例文があり、そのさらに後ろに不正メタ JSON が続く場合、
+/// 正当な JSON 例文ごと本文が削られる = 指摘2 が場所を変えて再発する)。旧実装(この関数の
+/// 前身)が持っていた「JSON が本文末尾ちょうどまでを占める」という位置制約は、実質的に
+/// 「切り捨て位置は署名キーに一番近い `{`」を強制していたので、これと同じ効果を「署名キーの
+/// 出現位置 `k` を求め、`k` 以前(`start <= k`)にある `{` のうち最も後ろのもの」を切り捨て
+/// 開始位置とすることで復元する。
+///
+/// **複数の署名位置を昇順に試す理由(Issue #47 フォローアップ、reviewer 一次レビュー・codex
+/// レビューで発見された fail-open の是正)**: この関数の前身は、署名キーが成立する位置のうち
+/// **最小のもの1件だけ**([`draft_meta_signature_key_positions`] の前身が `.min()` で返していた)
+/// にしか先行する `{` を探しに行かなかった。本文の先頭側に署名語らしき散文の断片(例: 顧客の
+/// 発話やログを引用した `"closing": と表示されます` という一文)があると、その位置が最小値
+/// として選ばれてしまい、その手前に `{` が無いために関数全体が `None` を返して早期終了して
+/// いた — 本文の後方に実在する、先行する `{` を伴う本物の不正メタ JSON が一度も検査されず、
+/// そのままメタ JSON が顧客へ漏洩していた(応答本文の内容は顧客の発話に影響されうるため、
+/// 顧客が署名語を含む文を送っただけでそのターンの防御が無効化されうる —
+/// [`sanitize_body_of_meta_fragments`] の doc comment が番兵文字列について認める顧客起因
+/// シナリオと同じクラス)。
+///
+/// 現在は [`draft_meta_signature_key_positions`] が返す全ての署名位置を**昇順に**順に試し、
+/// 「先行する `{` が見つかった最初の署名位置」で切り捨てを確定する。先行する `{` を持たない
+/// 位置(散文中の署名語らしき断片とみなす)はスキップして次の位置へ進む。全ての位置に先行する
+/// `{` が無ければ、従来どおり本文には一切触れず `None` を返す。**この変更は既存の成功ケースの
+/// 挙動を一切変えない**: 先行する `{` を持つ最初の署名位置は、旧 `.min()` が返していた位置
+/// (先行する `{` を持つ唯一の候補として採用されていた位置)と常に一致するため、純粋に
+/// 「従来 `None` を返して取りこぼしていたケース」だけを新たに拾うようになる。固定テスト:
+/// `separate_draft_meta_strips_a_malformed_meta_json_that_follows_a_signature_looking_prose_fragment`
+/// (取りこぼしの是正)、
+/// `separate_draft_meta_keeps_prose_with_a_signature_looking_fragment_when_the_body_has_no_brace_at_all`
+/// (既存挙動が変わらないことの固定)。
+///
+/// **既知の限界(受容する)**: 署名キーより前に入れ子の `{` がある壊れた JSON
+/// (例 `{"a": {"b": 1}, "closing": "x"}`)では、切り捨て位置が内側の `{`(`{"b": 1}` の方)に
+/// なり、`{"a": ` という断片が本文に残りうる。これは受容する — 漏洩するのはメタ JSON の全量
+/// ではなく断片に留まり(`featured`/`closing`/その値そのものは依然として除去される)、かつ
+/// LLM がこの形の壊れ方をする蓋然性は低いため。
+///
+/// **意図的な非対称性(reviewer 是正)**: [`recover_meta_from_body_json`] が成功する経路
+/// (`closing` が3値語彙内で妥当な `DraftMeta` が復元できる)では、末尾の JSON 値だけを
+/// `serde_json::Deserializer` のストリーミング API で正確にパースして終端位置を得られるため、
+/// JSON より後ろに続く散文は本文に残る
+/// (`separate_draft_meta_recovers_meta_and_keeps_the_prose_that_follows_the_json_when_the_marker_is_missing`
+/// で固定済み)。一方この関数(`closing` が語彙外、または JSON が構文的に壊れている経路)は、
+/// パース可否を問わずに検出する設計上、対応する閉じ `}` を安全に特定する手段を持たない
+/// (壊れた JSON はそもそもパースできず、字句走査だけで入れ子の `{}` の対応を安全に追うには
+/// 引用符状態・エスケープ・波括弧深度を追跡する寛容な JSON スキャナが要る。これはこの是正の
+/// スコープ外)。そのため開始位置から本文末尾までを丸ごと切り捨てる。結果として、JSON の後ろに
+/// 続く散文が「残るか消えるか」が `closing` の値が3値語彙内かどうかだけで変わるという非対称性が
+/// 生まれる。**これは意図した挙動である**: メタ漏洩の防止を本文の完全性より優先するという、
+/// このモジュール既定のトレードオフ([`sanitize_body_of_meta_fragments`] も番兵文字列以降を
+/// 全て切り捨てる同じ方針)に沿っている。固定テスト:
+/// `separate_draft_meta_strips_trailing_prose_along_with_a_malformed_meta_json_when_the_marker_is_missing`。
+fn strip_body_from_meta_signature_region(body: &str) -> Option<String> {
+    let trimmed = body.trim_end();
+    for signature_pos in draft_meta_signature_key_positions(trimmed) {
+        // `match_indices('{')` は昇順を返す。`signature_pos` 以前の最後(=最も後ろ)の `{` を選ぶ。
+        let mut start = None;
+        for (candidate, _) in trimmed.match_indices('{') {
+            if candidate > signature_pos {
+                break;
+            }
+            // `match_indices('{')` は常に char 境界を返すが、
+            // `strip_first_recoverable_meta_json_object` と同じ防御パターンをここでも踏襲する。
+            if trimmed.is_char_boundary(candidate) {
+                start = Some(candidate);
+            }
+        }
+        if let Some(start) = start {
+            return Some(trimmed[..start].trim().to_string());
+        }
+        // この署名位置に先行する `{` が無い(散文中の署名語らしき断片とみなす)。次の署名位置を
+        // 試す。
+    }
+    None
+}
+
+/// `candidate` 内で [`DraftMeta`] の署名キー(`"featured"` / `"closing"` / `"choices"`)らしき
+/// バイト列が出現する**全ての**位置(バイトオフセット)を昇順・重複除去して返す。
+///
+/// **これは字句的な部分文字列走査であり、JSON の構造上の位置(実際にキーの位置にあるか)は
+/// 一切見ていない**(reviewer 是正: 以前の doc comment は「JSON キーとして」と断定していたが、
+/// 実装の実態(構造を無視した文字列走査)と食い違っていた)。判定は「ダブルクオートで囲まれた
+/// 完全一致の語の直後に、任意の空白を挟んで `:` が続く」というバイト列パターンの一致だけで
+/// 行う(例: `"closing": "proposal"` は一致するが、値としての `"...featured..."` のような
+/// 単なる部分文字列は一致しない)。
+///
+/// 厳密な JSON パーサは意図的に使わない — 構文エラーを含む壊れた JSON でも判定できることが
+/// [`strip_body_from_meta_signature_region`] の目的そのものであるため。
+///
+/// **全件を返す理由(Issue #47 フォローアップ、reviewer 一次レビュー・codex レビューで発見
+/// された fail-open の是正)**: 以前はこの関数(改名前)が、
+/// 各署名キーについて `match_indices` で最初に成立した1件だけを `find_map` で採用し、
+/// さらに複数キー間でも `.min()` で最小位置1件だけを返していた。本文の先頭側に署名語らしき
+/// 散文の断片(例: 顧客の発話を引用した `"closing": と表示されます`)があると、その位置が
+/// 最小値として選ばれ、呼び出し元([`strip_body_from_meta_signature_region`])はその1点にしか
+/// 先行する `{` を探しに行かなかった。手前に `{` が無ければ関数全体が `None` を返して早期
+/// 終了し、本文の後方に実在する本物の署名位置(不正メタ JSON の一部)が一度も検査されない
+/// まま、そのメタ JSON がそのまま顧客へ漏洩していた。現在は各署名キーについて `match_indices`
+/// の全出現を評価し、複数キーの結果をマージして昇順ソート・重複除去した `Vec` を返す。
+/// 呼び出し元がこれを先頭(=本文中で最も手前)から順に試すことで、散文中の断片はスキップし
+/// つつ、後方の本物の署名位置まで検査できるようになる。
+///
+/// **既知の誤検出(受容する)**: JSON の構造を見ないため、文字列値の内側にエスケープされた
+/// 署名キー相当のバイト列があると誤検出する。例えば
+/// `{"message": "内部形式は \"closing\": value と表記します"}` は、生の文字列中に `"closing"`
+/// に一致するバイト列(エスケープされた `\"` から始まる)とその直後の `:` が存在するため、
+/// 実際には文字列値の内部でありキーの位置ではないにもかかわらず署名キーと判定される。
+/// エスケープ状態・引用符状態を追跡する寛容な JSON スキャナの実装はこの是正のスコープ外
+/// (別 Issue 送りと判断済み)。本番の利用シーン(日本語のホームセキュリティ相談応答)で、
+/// 顧客向け本文にこの形のエスケープされた JSON 表記が現れる蓋然性は低いため、この誤検出は
+/// 受容する。
+///
+/// **`"choices"` を追加したトレードオフ(修正2、Issue #47 フォローアップ)**: [`RawDraftMeta`]
+/// は `closing` のみ required で `featured`/`choices` は `#[serde(default)]`。LLM が `closing`
+/// を落として `{"choices": [...]}` だけを末尾に出力した場合、[`recover_meta_from_body_json`]
+/// は `closing` 欠落で復旧できず、旧来の2キー(`featured`/`closing`)だけの署名キー集合では
+/// この関数も検出できなかった(内部メタの `choices` が JSON のまま顧客へ届いていた)。
+/// 署名キーを増やすほど、顧客向けの正当な JSON 例文にたまたま `"choices":` が含まれる場合の
+/// 誤除去(false positive)の余地は広がるが、それでも追加するのは、`choices` が [`DraftMeta`]
+/// の実フィールドであり、漏洩防止をわずかな誤除去リスクより優先するというこのモジュール
+/// 既定の方針([`strip_body_from_meta_signature_region`] の doc comment 参照)に沿うためである。
+fn draft_meta_signature_key_positions(candidate: &str) -> Vec<usize> {
+    const SIGNATURE_KEYS: [&str; 3] = ["\"featured\"", "\"closing\"", "\"choices\""];
+    let mut positions: Vec<usize> = SIGNATURE_KEYS
+        .iter()
+        .flat_map(|key| {
+            candidate.match_indices(key).filter_map(|(idx, _)| {
+                candidate[idx + key.len()..]
+                    .trim_start()
+                    .starts_with(':')
+                    .then_some(idx)
+            })
+        })
+        .collect();
+    positions.sort_unstable();
+    positions.dedup();
+    positions
 }
 
 /// [`separate_draft_meta`]・[`recover_meta_from_body_json`] が共有する、JSON デシリアライズ
@@ -843,6 +1076,22 @@ fn warn_on_meta_separation_outcome(outcome: MetaSeparationOutcome, mode: &DraftM
                  valid DraftMeta anyway; recovered the meta and stripped that line from the \
                  customer-facing body before it could reach the customer. This indicates the \
                  LLM is not following the meta-output instruction and should be investigated"
+            );
+        }
+        MetaSeparationOutcome::TailJsonStrippedInvalidMeta => {
+            tracing::warn!(
+                route = ADVISOR_DRAFT_ROUTE,
+                marker = ADVISOR_META_MARKER,
+                "advisor draft omitted the meta marker, and its tail contained a DraftMeta \
+                 signature key (\"featured\", \"closing\", or \"choices\") followed by a colon; \
+                 this is detected by a lexical substring scan with no syntactic JSON validation \
+                 (not verified to be at an actual JSON key position), so a malformed JSON value \
+                 (e.g. a missing comma) is caught just as well as a well-formed one with a \
+                 closing value outside the 3-value vocabulary. Stripped everything from the \
+                 nearest preceding open-brace through the end of the body (not just a single \
+                 trailing JSON value) and continued without meta (no cards/chips, \
+                 question_streak unchanged). This indicates the LLM is not following the \
+                 meta-output instruction and should be investigated"
             );
         }
     }
@@ -2008,17 +2257,147 @@ mod tests {
     }
 
     #[test]
-    fn separate_draft_meta_does_not_strip_a_malformed_multiline_trailing_json_block() {
-        // マーカー無し + 複数行の壊れた JSON(closing が3値以外)→ 本文はそのまま・メタ None。
+    fn separate_draft_meta_strips_a_malformed_multiline_trailing_json_block_but_yields_no_meta() {
+        // Issue #47 Critical 1 是正: マーカー無し + 複数行の壊れた JSON(closing が3値以外)は
+        // recover_meta_from_body_json では取り除けない(DraftMeta として不正なため)。旧実装は
+        // ここで諦めて本文をそのまま返し、JSON テキストが顧客向け本文に残っていた。新実装は
+        // strip_body_from_meta_signature_region でもう1段フォールバックし、DraftMeta として妥当か
+        // どうかに関わらず「本文末尾を占める構文的に妥当な JSON 値」を除去する。メタは採用しない
+        // (None のまま fail-soft 継続)。
         let raw = "施錠の徹底をご検討ください。\n\
                    {\n  \"featured\": [],\n  \"closing\": \"not_a_real_value\",\n  \"choices\": []\n}";
         let (body, meta, outcome) = separate_draft_meta(raw);
         assert_eq!(
+            body, "施錠の徹底をご検討ください。",
+            "the malformed multi-line trailing JSON block must be stripped from the body"
+        );
+        assert!(!body.contains("closing"), "body: {body}");
+        assert!(!body.contains("featured"), "body: {body}");
+        assert!(!body.contains("choices"), "body: {body}");
+        assert!(!body.contains("not_a_real_value"), "body: {body}");
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::TailJsonStrippedInvalidMeta);
+    }
+
+    // --- Issue #47 Critical 1: マーカー無し + 番兵文字列 "ADVISOR_META" も含まない、単一行の
+    // 末尾 JSON(closing が3値語彙外)の再現テスト。この経路は recover_meta_from_body_json にも
+    // sanitize_body_of_meta_fragments(番兵一致による最終防御)にも一切引っかからず、旧実装では
+    // JSON テキストがそのまま顧客向け本文に残っていた。 ---
+
+    #[test]
+    fn separate_draft_meta_strips_a_single_line_trailing_json_with_an_out_of_vocabulary_closing_and_no_marker(
+    ) {
+        let raw = "承知しました。ご相談内容を確認しました。\n\
+                   {\"featured\": [], \"closing\": \"maybe\", \"choices\": []}";
+        assert!(
+            !raw.contains(ADVISOR_META_MARKER),
+            "test setup must not contain the marker"
+        );
+        assert!(
+            !raw.contains("ADVISOR_META"),
+            "test setup must not contain the sentinel substring either, so the final \
+             sanitize_body_of_meta_fragments defense cannot be the one catching this"
+        );
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(body, "承知しました。ご相談内容を確認しました。");
+        assert!(!body.contains("closing"), "body: {body}");
+        assert!(!body.contains("featured"), "body: {body}");
+        assert!(!body.contains("choices"), "body: {body}");
+        assert!(!body.contains("maybe"), "body: {body}");
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::TailJsonStrippedInvalidMeta);
+    }
+
+    // --- 4次 codex レビュー 指摘1・2: strip_body_from_meta_signature_region の判定基準を
+    // 「serde でパース可能か」から「DraftMeta 署名キー(featured/closing)を字句的に含むか」へ
+    // 変更したことを固定する。 ---
+
+    #[test]
+    fn separate_draft_meta_strips_a_syntactically_malformed_trailing_meta_json_with_a_signature_key(
+    ) {
+        // 指摘1(false negative)是正: 末尾のメタ JSON が構文エラー(ここでは "[]" の直後に
+        // カンマが無い)を含んでいても、serde_json ではパースできないので旧実装は何も
+        // 除去できず、壊れたメタ JSON がそのまま顧客向け本文に残っていた。新実装は
+        // "featured"/"closing" が JSON キーとして含まれてさえいれば、パース可否を問わずに
+        // その位置から本文を切り捨てる。
+        let raw = "承知しました。ご相談内容を確認しました。\n\
+                   {\"featured\": [] \"closing\": \"proposal\", \"choices\": []}";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
+            body, "承知しました。ご相談内容を確認しました。",
+            "the syntactically malformed trailing meta JSON must still be stripped: {body}"
+        );
+        assert!(!body.contains("featured"), "body: {body}");
+        assert!(!body.contains("closing"), "body: {body}");
+        assert!(!body.contains("choices"), "body: {body}");
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::TailJsonStrippedInvalidMeta);
+    }
+
+    #[test]
+    fn separate_draft_meta_keeps_a_valid_trailing_json_example_that_has_no_meta_signature_key() {
+        // 指摘2(false positive)是正: featured/closing と無関係な、顧客向けの正当な JSON 例文
+        // (設定例など)がたまたま本文末尾に来ても、DraftMeta の署名キーを含まない限り
+        // 除去してはならない。旧実装は「妥当な JSON というだけ」で無条件に除去していた。
+        let raw = "設定例はこちらです。\n{\"api_key\": \"xxxxx\", \"timeout\": 30}";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
             body, raw,
-            "a malformed multi-line trailing JSON block must not be stripped"
+            "a legitimate trailing JSON example with no DraftMeta signature key must be kept \
+             verbatim: {body}"
         );
         assert_eq!(meta, None);
         assert_eq!(outcome, MetaSeparationOutcome::NoMarker);
+    }
+
+    #[test]
+    fn separate_draft_meta_keeps_prose_json_that_precedes_a_malformed_trailing_meta_json() {
+        // reviewer 一次レビュー Critical 1 是正: 「最初の '{' から本文末尾まで」に署名キーが
+        // あるかどうかで判定すると、本文中の正当な散文 JSON(署名キーとは無関係)より後ろに
+        // 不正メタ JSON があるだけで、その正当な JSON ごと本文が切り捨てられてしまっていた。
+        // 新しい基準(署名キーの最初の出現位置から前方向に最も近い '{' で切り捨てる)では、
+        // 本文中の正当な JSON 例文とその前後の散文は残り、末尾の不正メタ JSON だけが除去される。
+        let raw = "ご相談ありがとうございます。設定値は {\"mode\": \"night\"} をお使いください。\n\
+                   {\"featured\": [], \"closing\": \"unknown_value\"}";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
+            body, "ご相談ありがとうございます。設定値は {\"mode\": \"night\"} をお使いください。",
+            "the prose and the unrelated example JSON that precede the malformed trailing meta \
+             JSON must be kept: {body}"
+        );
+        assert!(!body.contains("featured"), "body: {body}");
+        assert!(!body.contains("closing"), "body: {body}");
+        assert!(!body.contains("unknown_value"), "body: {body}");
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::TailJsonStrippedInvalidMeta);
+    }
+
+    #[test]
+    fn separate_draft_meta_strip_of_tail_json_that_leaves_an_empty_body_falls_back_via_output_gates(
+    ) {
+        // 除去後に本文が空になるケース: 前置き文が無く、不正メタ JSON だけが raw だった場合、
+        // separate_draft_meta の body は空文字列になる。この空文字はそのまま
+        // apply_advisor_output_gates へ渡され、既存の空文字ガード(このファイルの
+        // output_gates_falls_back_when_the_draft_is_an_empty_string と同じ経路)によって
+        // canned::FALLBACK_TEXT に倒れることを固定する。
+        let raw = "{\"featured\": [], \"closing\": \"maybe\", \"choices\": []}";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
+            body, "",
+            "no prose precedes the malformed JSON, so the body must be empty"
+        );
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::TailJsonStrippedInvalidMeta);
+
+        let gated = apply_advisor_output_gates(
+            crate::llm::ReplyDraft {
+                text: body,
+                truncated: false,
+            },
+            &[],
+            &no_ng_hits(),
+        );
+        assert_eq!(gated, canned::FALLBACK_TEXT);
     }
 
     // --- 3次 codex レビュー Critical F1: マーカー欠落時、JSON の後ろに何かが続くケースの
@@ -2066,6 +2445,39 @@ mod tests {
         assert_eq!(outcome, MetaSeparationOutcome::RecoveredWithoutMarker);
         let meta = meta.expect("meta must be recovered even with trailing prose after the JSON");
         assert_eq!(meta.closing, ClosingKind::Proposal);
+    }
+
+    #[test]
+    fn separate_draft_meta_strips_trailing_prose_along_with_a_malformed_meta_json_when_the_marker_is_missing(
+    ) {
+        // reviewer 是正: 上のテスト(closing が有効な語彙内 → 後続散文は残る)と対になる、
+        // closing が語彙外(不正メタ)の場合の挙動を固定する。strip_body_from_meta_signature_region
+        // は対応する閉じ '}' を安全に特定できないため本文末尾まで丸ごと切り捨てる。したがって
+        // JSON の後ろに続く散文も意図的に失われる(バグではない — メタ漏洩防止を本文保持より
+        // 優先したこのモジュール既定のトレードオフ。strip_body_from_meta_signature_region の
+        // doc comment 参照)。
+        let raw = "施錠の徹底をご検討ください。\n\
+                   {\"featured\": [], \"closing\": \"maybe\", \"choices\": []}\n\
+                   ご不明な点があればいつでもご相談ください。";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
+            body, "施錠の徹底をご検討ください。",
+            "the trailing prose after the malformed meta JSON must also be dropped \
+             (intentional trade-off, not a bug): {body}"
+        );
+        assert!(!body.contains("featured"), "body: {body}");
+        assert!(!body.contains("closing"), "body: {body}");
+        assert!(!body.contains("maybe"), "body: {body}");
+        assert!(!body.contains("choices"), "body: {body}");
+        assert!(
+            !body.contains("ご不明な点があればいつでもご相談ください"),
+            "the prose that follows the JSON is intentionally lost here, unlike the \
+             valid-meta recovery path exercised by \
+             separate_draft_meta_recovers_meta_and_keeps_the_prose_that_follows_the_json_when_the_marker_is_missing: \
+             {body}"
+        );
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::TailJsonStrippedInvalidMeta);
     }
 
     #[test]
@@ -2235,6 +2647,100 @@ mod tests {
         assert_eq!(rescanned_body2, trailing_body);
         assert_eq!(rescanned_meta2, None);
         assert_eq!(rescanned_outcome2, MetaSeparationOutcome::NoMarker);
+    }
+
+    // --- Issue #47 レビュー指摘1: 復旧成功経路(RecoveredWithoutMarker)に残っていた同クラスの
+    // メタ漏洩。recover_meta_from_body_json は DraftMeta として「妥当な」JSON しか取り除かない
+    // ため、妥当なメタの直後に DraftMeta としては不正な JSON(closing が3値語彙外)がもう1つ
+    // 続く入力では、復旧自体は成功する(meta は Some)のにその不正 JSON が本文に残ったまま
+    // 顧客へ届いていた。 ---
+
+    #[test]
+    fn separate_draft_meta_strips_a_trailing_invalid_meta_json_left_after_successful_recovery() {
+        let raw = "本文です。{\"featured\":[],\"closing\":\"proposal\",\"choices\":[]}\
+                   {\"featured\":[],\"closing\":\"maybe\",\"choices\":[]}";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
+            body, "本文です。",
+            "the leading prose must remain, and both the recovered meta JSON and the trailing \
+             invalid-meta JSON must be gone: {body}"
+        );
+        assert!(!body.contains("closing"), "body: {body}");
+        assert!(!body.contains("featured"), "body: {body}");
+        assert!(!body.contains("choices"), "body: {body}");
+        assert!(!body.contains("maybe"), "body: {body}");
+        assert_eq!(outcome, MetaSeparationOutcome::RecoveredWithoutMarker);
+        let meta = meta.expect("the valid meta JSON must still be recovered");
+        assert_eq!(meta.closing, ClosingKind::Proposal);
+    }
+
+    // --- Issue #47 フォローアップ(reviewer 一次レビュー・codex レビューで発見された
+    // fail-open 退行の是正): draft_meta_signature_key_positions が署名キーの最初の1件
+    // (`.min()`)しか返さなかったため、本文の先頭側に署名語らしき散文の断片があると、その後ろに
+    // 実在する不正メタ JSON を一切検査できず本文にそのまま残っていた。 ---
+
+    #[test]
+    fn separate_draft_meta_strips_a_malformed_meta_json_that_follows_a_signature_looking_prose_fragment(
+    ) {
+        // 修正1の固定: 1行目の散文中に署名語らしき断片("closing": という字句)があり、その
+        // 直後に `{` が無い(先行する開き括弧が無いので旧実装なら None を返して取りこぼす位置)。
+        // 2行目に実際の不正メタ JSON(closing が語彙外)がある。旧実装は `.min()` で1行目の
+        // 断片の位置を返してしまい、その位置より手前に `{` が無いため関数全体が None を返し、
+        // 2行目のメタ JSON がそのまま顧客向け本文に残っていた。新実装は署名位置を昇順に
+        // 全て試し、先行する `{` が無い位置はスキップして次の位置(2行目)を試すため、2行目の
+        // メタ JSON だけが正しく除去される。
+        let raw = "ログには \"closing\": と表示されます。\n\
+                   {\"featured\":[],\"closing\":\"maybe\",\"choices\":[]}";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
+            body, "ログには \"closing\": と表示されます。",
+            "only the malformed trailing meta JSON must be stripped; the leading prose \
+             (including its signature-looking fragment) must remain: {body}"
+        );
+        assert!(!body.contains("featured"), "body: {body}");
+        assert!(!body.contains("maybe"), "body: {body}");
+        assert!(!body.contains("choices"), "body: {body}");
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::TailJsonStrippedInvalidMeta);
+    }
+
+    #[test]
+    fn separate_draft_meta_keeps_prose_with_a_signature_looking_fragment_when_the_body_has_no_brace_at_all(
+    ) {
+        // 修正1が新たな誤除去を生まないことの固定: 署名語らしき断片が散文中にあっても、
+        // 本文全体に `{` が1つも無ければ、どの署名位置についても先行する `{` が見つからず
+        // 全件スキップされ、最終的に None を返して本文は一切削られない。
+        let raw = "ログには \"closing\": と表示されます。設定はこのままで問題ありません。";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
+            body, raw,
+            "with no '{{' anywhere in the body, nothing must be stripped even though a \
+             signature-looking fragment is present: {body}"
+        );
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::NoMarker);
+    }
+
+    #[test]
+    fn separate_draft_meta_strips_a_trailing_json_that_has_choices_but_lacks_closing() {
+        // 修正2の固定: RawDraftMeta は closing のみ required で featured/choices は
+        // #[serde(default)]。LLM が closing を落として choices だけを末尾に出力した場合、
+        // recover_meta_from_body_json は closing 欠落で復旧できない。旧実装は署名キー集合に
+        // "choices" が無かったため検出もできず、内部メタの choices が JSON のまま顧客へ届いて
+        // いた。SIGNATURE_KEYS に "choices" を追加したことで、closing を欠く末尾 JSON でも
+        // 検出・除去できることを固定する。
+        let raw = "ご案内は以上です。\n{\"choices\": [\"はい\", \"いいえ\"]}";
+        let (body, meta, outcome) = separate_draft_meta(raw);
+        assert_eq!(
+            body, "ご案内は以上です。",
+            "the trailing JSON that only has 'choices' (no 'closing') must still be stripped: \
+             {body}"
+        );
+        assert!(!body.contains("choices"), "body: {body}");
+        assert!(!body.contains("はい"), "body: {body}");
+        assert!(!body.contains("いいえ"), "body: {body}");
+        assert_eq!(meta, None);
+        assert_eq!(outcome, MetaSeparationOutcome::TailJsonStrippedInvalidMeta);
     }
 
     // --- parse_draft_meta_prefix: byte_offset() の意味論を実測して固定する ---
