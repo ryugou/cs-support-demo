@@ -14,7 +14,7 @@
 - **分離**: 別 LINE 公式アカウント、別 Cloud Run service(`homesec-advisor` / `homesec-line`)、別 vegapunk schema(`homesec`)。現行 CS のコード経路・挙動は変更しない
 - **共有**: 同一リポジトリ・同一 crate・同一 Docker イメージ。LINE アダプタ、会話状態、ターン永続化、管理画面、出口関門(プレーンテキスト正規化)、時間帯受付・営業時間、vegapunk 接続層、known_resolution ループを流用する
 - **差し替え**: 判定ポリシー(三層 fail-closed → 接地 2 層)、プロンプト、条件語彙、データ
-- **最終形**(本デモのスコープ外): アドバイザが外側の会話ループを持ち、自社取扱製品の個別サポートと判明した時点で既存 CS フローへルーティングする composition で統合する
+- **CS サポートモード(composition、第 13 節)**: アドバイザが外側の会話ループを持ち、自社取扱製品の個別サポートと判明したターンは既存 CS パイプライン(urtect schema のマニュアル・三層 fail-closed 判定)をその場で実行して回答する。CS Support Demo(既存 OA・service・挙動)は一切変更しない
 
 ## 2. 回答ポリシー
 
@@ -337,3 +337,44 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 - 人間サポートエスカレーション(リード獲得の担当者連絡は本 spec の範囲内)
 - リードの通知連携(メール・Slack 等。デモは管理画面での確認のみ)
 - スケール(homesec-line の複数インスタンス化、セッション永続化)
+
+## 13. CS サポートモード(composition)
+
+アドバイザに既存 CS パイプラインを組み込み、「ホームセキュリティ相談 + 自社製品サポート」を 1 つの OA で成立させる。**CS Support Demo(既存 OA・`cs-support-mcp` / `cs-support-line` service・挙動・データ投入・デプロイ運用)は一切変更しない。** 共有コードへ変更が必要な場合は加算のみとし、既存(urtect)テストが無変更で PASS することを機械的条件とする。
+
+### 13.1 原則
+
+- **urtect schema は完全読み取り専用**: サポートモードが urtect から読むのはマニュアルコーパス・既存 KnownResolution・rules(EscalationRule / ProhibitedDomain)・製品マスタのみ。**urtect への書き込みは一切行わない**(support_case・ConversationTurn・KR・監査のいずれも)。これにより CS Demo の管理画面・検索・挙動にアドバイザの会話が一切現れない
+- **会話状態はすべて homesec 側**: サポートモード中の case 状態(signal 累積・聞き返し予算・時間帯受付)・ターン永続化・監査は、アドバイザの既存機構(homesec schema + advisor の WORM ログ)に保存する
+- **訂正学習はこの期間行わない(運用ルール)**: システム側の抑止は作らない。この期間、アドバイザ管理画面は閲覧を含め触らない運用とする。urtect の KR は読み取るため、CS Demo 側で登録された訂正はサポートモードにも自然に反映される。KR の相互書き込み(アドバイザ→urtect)は将来のプロダクト統合時の明示オプトイン項目として保留
+
+### 13.2 パイプラインの二重 schema 化(共有コードへの加算)
+
+CS パイプライン(`Harness::evaluate` と応答決定)は現在、材料と会話状態を同一 `ctx.schema` から読む。サポートモードのために **material schema(urtect)と state schema(homesec)を分離できるようにする**(加算のパラメータ化。既定は従来どおり同一 schema で、CS Demo の経路は無変更)。
+
+### 13.3 モード遷移(決定論)
+
+advisor case に `support_mode`(bool)を加算し、次の遷移で管理する:
+
+1. **入場**: `understanding.urtect_support == true` のターンで ON(handoff 定型は廃止し、その場で CS パイプラインを実行)
+2. **継続**: `support_mode == true` かつ (a) サポート側が継続状態(聞き返し中・時間帯受付中)にある、または (b) 今ターンの発話がサポート文脈(urtect_support、または直前サポート質問への応答)である間は継続
+3. **退場**: 発話がホームセキュリティ相談のトピック(understanding が in_domain の相談内容で urtect_support ではなく、サポート継続状態も無い)なら OFF にして通常モードへ。emergency は常に最優先(safety 定型)
+4. モード境界でも挨拶抑制・継続会話の扱いは通常どおり(1 つの会話として連続)
+
+### 13.4 応答とエスカレーション
+
+- サポートモードの応答は CS の三層 fail-closed 判定の結果に従う: 回答可能なら材料接地の回答、聞き返し(CS の signal ベース)、不可ならエスカレーション
+- エスカレーションは CS の機構(受付番号 = case_ref・希望時間帯受付・営業時間案内)を流用し、**文言だけアドバイザーの口調**にする(「担当の者から折り返します」系。企業 CS 定型句の禁止は維持)
+- 受付番号は homesec 側 case の case_ref を使う(urtect へ書かないため)
+- サポートモードの製品カード・クイックリプライは第 2.4 節の締めの動作ルールに従う(CS 回答は原則カード無し。聞き返しが選択式ならチップ可)
+
+### 13.5 ターン記録と reply_kind
+
+`reply_kind` に `support_answer` / `support_clarify` / `support_escalation` を追加する(時間帯受付は既存 `time_pref` / `lead` を流用せず、サポート起因は `support_escalation` の流れの中で既存 CS と同じ属性で管理する)。管理画面バッジへの追加は行うが、この期間は管理画面を触らない運用のため表示確認はプロダクト統合時に行う。
+
+### 13.6 テスト(加算)
+
+- モード遷移の全分岐(入場・継続・退場・emergency 優先・境界での挨拶抑制)
+- 二重 schema 化: material=urtect / state=homesec の分離が効き、**urtect への書き込みが一切発生しない**ことをスタブのカウンタで固定
+- CS Demo 経路の無変更: 既存 urtect テストが無変更で PASS(単一 schema の既定動作)
+- E2E(デプロイ後): アドバイザ OA で「ADC-V523 の録画が再生できない」→ マニュアル接地のサポート回答(または CS 流の聞き返し)→ 続けて「ところで空き巣対策は?」→ 通常モードへ復帰
