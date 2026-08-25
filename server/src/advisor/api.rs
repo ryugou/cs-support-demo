@@ -44,11 +44,22 @@ const CONVERSATION_TURN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `/{project_id}/api/reply` が共有する状態（design doc §3.1・Task 6 スコープ）。
 ///
-/// CS の `crate::api::ApiState` とは別物: `Harness.reply_drafter` / `Harness.ng` は homesec
-/// では常に使わない（`config.homesec.toml` は `customer_reply_draft_enabled` を立てておらず、
-/// advisor 固有の NG 辞書は CS 用と語彙が異なるため）。そのため `llm` / `ng` を専用フィールドに
-/// 分離して持つ。`vegapunk` は `materials::gather_materials` が直接必要とする（`Harness` は
+/// CS の `crate::api::ApiState` とは別物: advisor 自身の通常パイプライン
+/// （`understand`/`draftgen`/`decide`）は `Harness.reply_drafter` / `Harness.ng` を使わない。
+/// advisor 固有の NG 辞書は CS 用と語彙が異なるため、`llm` / `ng` を専用フィールドに分離して
+/// 持つ。`vegapunk` は `materials::gather_materials` が直接必要とする（`Harness` は
 /// `VegapunkClient` を公開しないため、呼び出し元 `bin/homesec_advisor.rs` から別途渡す）。
+///
+/// **Issue #50 バッチ1（design doc §13、CS サポートモード）**: `support_harness` は上記
+/// `harness` とは別の `Harness` インスタンスで、`[[projects]]` を `support_schema` 1 件だけに
+/// 差し替えた `AppConfig` から構築する（`harness` は homesec 1 projectのまま、`support_harness`
+/// の `Authenticator.allowed_schemas` だけが urtect を許可する。`bin/homesec_advisor.rs` の
+/// doc コメント参照）。**`[harness]` セクション自体は `harness` と共有**のため、
+/// `config.homesec.toml` が `customer_reply_draft_enabled = true` を立てて以降、`harness`
+/// （admin 用）の `reply_drafter` も `Some` になるが、admin 経路（`admin.rs`）は
+/// `Harness::evaluate` を一切呼ばないため実害は無い。`support_harness.reply_drafter` は
+/// `crate::advisor::cs_support::run_support_turn` が CS と同じ聞き返し・受け止め文の下書き
+/// 生成に使う（今回のバッチではフィールドを構築するのみで、実ハンドラへの配線はしない）。
 #[derive(Clone)]
 pub struct AdvisorApiState {
     pub config: Arc<AppConfig>,
@@ -70,6 +81,18 @@ pub struct AdvisorApiState {
     /// `ProductCard.image_url` へホストを付与するための、advisor 自身の公開ホスト名
     /// （`CS_SUPPORT_PUBLIC_DOMAIN`）。
     pub public_host: String,
+    /// CS サポートモード（design doc §13）専用の `Harness`。`[[projects]]` を
+    /// `support_schema` 1 件だけに差し替えた `AppConfig` から構築する（上記構造体 doc
+    /// コメント参照）。`crate::advisor::cs_support::run_support_turn` の第一引数。
+    pub support_harness: Arc<Harness>,
+    /// `crate::advisor::cs_support::run_support_turn` に渡す `ToolService`
+    /// （`ToolService::new(vegapunk.clone())`）。
+    pub support_tools: crate::mcp::ToolService,
+    /// CS サポートモードが実行する vegapunk schema（`AdvisorConfig.support_schema`、通常
+    /// `"urtect"`）。
+    pub support_schema: String,
+    /// 上記 schema の manual 取得経路種別（`AdvisorConfig.support_manual_schema`）。
+    pub support_manual_schema: crate::config::ManualSchemaKind,
 }
 
 /// `POST /{project_id}/api/reply` のレスポンス（design doc §3.3）。
@@ -1773,6 +1796,10 @@ clarify_max_turns = 3
         let images_dir =
             std::env::temp_dir().join(format!("advisor-api-test-images-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&images_dir).expect("create temp images dir");
+        // Issue #50 バッチ1: support_harness / support_tools は `vegapunk.clone()` を先に
+        // 済ませておく(下の struct literal で `vegapunk,` フィールドが値を move するため、
+        // それより後ろで clone しようとすると borrow checker に弾かれる)。
+        let support_tools = crate::mcp::ToolService::new(vegapunk.clone());
         AdvisorApiState {
             config: Arc::new(config),
             harness: Arc::new(advisor_test_harness(knowledge)),
@@ -1785,6 +1812,10 @@ clarify_max_turns = 3
             handoff_contact_text: "テスト用の案内文です。".to_string(),
             images_dir,
             public_host: "advisor.example.com".to_string(),
+            support_harness: Arc::new(advisor_test_harness(None)),
+            support_tools,
+            support_schema: "urtect".to_string(),
+            support_manual_schema: crate::config::ManualSchemaKind::ManualV1,
         }
     }
 

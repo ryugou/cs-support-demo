@@ -1,6 +1,7 @@
 pub mod api;
 pub mod canned;
 pub mod cards;
+pub mod cs_support;
 pub mod decide;
 pub mod draftgen;
 pub mod materials;
