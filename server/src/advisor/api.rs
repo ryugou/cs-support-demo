@@ -180,12 +180,22 @@ fn append_shown_product_cards(existing_csv: &str, new_keys: &[&str]) -> String {
 /// 落ちなかった)。`match` 自体は応答文・`reply_kind`・materials の決定だけを担う。
 ///
 /// **Issue #50 バッチ2(design doc §13.2)**: `support_mode` の書き戻しもここに集約する。
-/// `AdvisorAction::SupportMode` は `support_mode = true`(入場・継続)。`Safety` /
-/// `TimePrefContinue` は触れない(emergency 応答・advisor 自身のリード時間帯受付は CS
-/// 継続性を壊さない設計)。それ以外の全アクション(`OutOfDomain` / `LeadSolicit` / `Clarify` /
-/// `LeadConfirmed` / `Answer`)は退場とみなし `support_mode = false` に落とす
-/// (`support_case_id` はどのアクションでもクリアしない。design doc §13.2: 退場後に再入場した
-/// とき、同じ CS case を再利用して会話を継続できるようにするため)。
+/// `AdvisorAction::SupportMode` は `support_mode = true`(入場・継続)。`TimePrefContinue` は
+/// 触れない(advisor 自身のリード時間帯受付は CS 継続性を壊さない設計)。それ以外の全
+/// アクション(`Safety` / `OutOfDomain` / `LeadSolicit` / `Clarify` / `LeadConfirmed` /
+/// `Answer`)は退場とみなし `support_mode = false` に落とす(`support_case_id` はどの
+/// アクションでもクリアしない。design doc §13.2: 退場後に再入場したとき、同じ CS case を
+/// 再利用して会話を継続できるようにするため)。
+///
+/// **codex レビュー指摘 High(コミット 18f421d)**: 当初 `Safety` は `TimePrefContinue` と
+/// 同様に触れない設計だった。これは誤りだった: `advisor_reply_handler` の `cs_continuing`
+/// 計算は `advisor_attrs.support_mode` を起点にゲートしており、emergency ターンで
+/// `support_mode` が true のまま残ると、次ターンが in_domain でない発話のとき
+/// (`decide::decide` 優先順1)、または `support_last_reply_kind == "support_clarify"` が
+/// 残ったまま次ターンで `cs_continuing` が短絡的に true になるとき(優先順4)、緊急案内の
+/// 直後にもかかわらず advisor が誤って CS サポートモードへ迂回してしまう(「緊急案内後の
+/// 次ターンは通常の入場判定からやり直す」という状態不変条件の違反)。そのため `Safety` も
+/// 退場アクションに含める。
 ///
 /// **Issue #50 バッチ2 レビュー修正 Critical 1**: `support_mode` を false に落とす同じ
 /// アクションで `support_last_reply_kind` も空文字列にクリアする。退場時に stale な値
@@ -202,6 +212,8 @@ fn apply_action_contract(
         AdvisorAction::Safety => {
             conv.awaiting_time_pref = false;
             conv.time_pref_false_count = 0;
+            advisor_attrs.support_mode = false;
+            advisor_attrs.support_last_reply_kind = String::new();
         }
         AdvisorAction::TimePrefContinue => {}
         AdvisorAction::SupportMode => {
@@ -375,6 +387,55 @@ fn internal_error_response(err: &anyhow::Error, request_id: &str, step: &str) ->
     )
 }
 
+/// `AdvisorAction::SupportMode` 経路(`run_cs_support_mode_turn` → `cs_support::run_support_turn`、
+/// `harness.begin` / `harness.product_allowlist` / `harness.load_conv_state` /
+/// `harness.save_conv_state` / `Harness::evaluate` の vegapunk gRPC 呼び出しを含む)の失敗を
+/// HTTP へ変換する。
+///
+/// codex レビュー指摘 Medium(コミット 18f421d): 当初は `internal_error_response` で一律 500 に
+/// 倒しており、vegapunk 到達不能(tonic エラー)でも 500 になっていた。運用者が「vegapunk 障害」と
+/// 「advisor 自身のバグ」を切り分けられるよう、分類関数そのものは CS 側 `crate::api::reply_handler`
+/// と共有する(同一 crate 内に公開された `crate::api::classify_evaluate_error`(`pub fn`)と
+/// `crate::api::error_response`(`pub(crate) fn`)をそのまま呼ぶ。CS ファイルは変更しない)。
+///
+/// **ただし適用範囲は CS 側と非対称**。CS 側 `reply_handler`(`server/src/api.rs` の
+/// `Err(err) =>` 分岐)は `classify_evaluate_error` を `evaluate` の失敗にだけ適用し、
+/// `conv_state_load_failed` / `conv_state_save_failed` / `product_allowlist_fetch_failed` は
+/// 呼び出し元で常に 500 に倒している。一方 `run_cs_support_mode_turn` →
+/// `cs_support::run_support_turn` は `harness.begin` / `harness.product_allowlist` /
+/// `harness.load_conv_state` / `harness.save_conv_state` / `evaluate` の**すべての失敗**を `?`
+/// で素通し伝播するため、この関数にはそれら全段階のエラーが届く。方針は「vegapunk 到達不能は
+/// 段階を問わず 503 に倒す(運用者が『vegapunk 障害』と『advisor 自身のバグ』を切り分けられる
+/// ことを優先する)」。CS 側 `reply_handler` が evaluate 以外を常に 500 にしているのは意図的な
+/// 実装であり、ここではそれに揃えていない(揃える場合は CS 側の変更を要するため今回のスコープ外)。
+fn support_turn_error_response(err: &anyhow::Error, request_id: &str) -> Response {
+    let (status, code) = crate::api::classify_evaluate_error(err);
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        tracing::warn!(
+            request_id = %request_id,
+            error = ?err,
+            "homesec advisor answer api: cs support turn failed due to upstream (vegapunk) \
+             unavailability"
+        );
+        crate::api::error_response(
+            status,
+            code,
+            format!("vegapunk is unavailable (request_id={request_id}); please retry"),
+        )
+    } else {
+        tracing::error!(
+            request_id = %request_id,
+            error = ?err,
+            "homesec advisor answer api: cs support turn failed"
+        );
+        crate::api::error_response(
+            status,
+            code,
+            format!("internal error (request_id={request_id}); see server logs"),
+        )
+    }
+}
+
 /// design doc §13.3: CS 応答種別(`cs_support::SupportReplyKind`)を advisor 自身の
 /// `ConversationTurn.reply_kind` へ写像する。catch-all を書かない(将来 variant が増えたときに
 /// コンパイルエラーで気づけるようにするため。このファイルの他の網羅的 match と同じ流儀)。
@@ -438,7 +499,7 @@ fn convert_history_for_support(history: &[HistoryEntry]) -> Vec<ReplyHistoryTurn
 /// 非空ならその case を継続する `Some(&str)` を渡す。呼び出しが成功したら、返ってきた
 /// `outcome.case_id` を `advisor_attrs.support_case_id` へ**常に**書き戻す(同じ値でも冪等)。
 /// 失敗時は `advisor_attrs` を一切変更せず、そのまま `Err` を呼び出し元へ伝播する
-/// (呼び出し元 `advisor_reply_handler` が `internal_error_response` へ変換する)。
+/// (呼び出し元 `advisor_reply_handler` が `support_turn_error_response` へ変換する)。
 async fn run_cs_support_mode_turn(
     state: &AdvisorApiState,
     identity: &VerifiedIdentity,
@@ -804,11 +865,7 @@ async fn advisor_reply_handler(
                 {
                     Ok(outcome) => support_mode_reply_parts(outcome),
                     Err(err) => {
-                        return internal_error_response(
-                            &err,
-                            &ctx.request_id,
-                            "cs_support_run_support_turn",
-                        );
+                        return support_turn_error_response(&err, &ctx.request_id);
                     }
                 },
                 AdvisorAction::LeadSolicit => (
@@ -1181,7 +1238,10 @@ mod tests {
         assert_eq!(
             attrs,
             base_advisor_attrs(),
-            "Safety must not touch advisor attrs"
+            "Safety must leave lead_offered / lead_requested / shown_product_cards / \
+             question_streak / support_case_id untouched (support_mode and \
+             support_last_reply_kind are already false/empty in base_advisor_attrs, so \
+             equality still holds)"
         );
     }
 
@@ -1203,7 +1263,10 @@ mod tests {
         assert_eq!(
             attrs,
             base_advisor_attrs(),
-            "LeadSolicit must not touch advisor attrs"
+            "LeadSolicit must leave lead_offered / lead_requested / shown_product_cards / \
+             question_streak / support_case_id untouched (support_mode and \
+             support_last_reply_kind are already false/empty in base_advisor_attrs, so \
+             equality still holds)"
         );
     }
 
@@ -1289,21 +1352,172 @@ mod tests {
     // ---- apply_action_contract: Issue #50 バッチ2(design doc §13.2)の support_mode 契約 ----
 
     #[test]
-    fn apply_action_contract_safety_does_not_touch_support_mode_when_already_true() {
-        // decide::AdvisorAction::Safety の doc comment: emergency 応答は CS 継続性を壊さない
-        // 設計(support_mode に一切触れない)。false からの不変は既存の
-        // apply_action_contract_safety_disarms_time_pref_and_resets_false_count が固定済みなので、
-        // ここでは true からの不変を固定する。
+    fn apply_action_contract_safety_clears_support_mode_after_clarify_continuation() {
+        // codex レビュー指摘 High(コミット 18f421d): 「サポート聞き返し中 → emergency」
+        // シナリオ。当初の実装は Safety で support_mode / support_last_reply_kind に一切
+        // 触れず、emergency 後も CS サポート継続状態が残っていた。advisor_reply_handler の
+        // cs_continuing 計算は support_mode を起点にゲートしているため、次ターンが in_domain
+        // でない発話のとき(decide::decide 優先順1)、あるいは support_last_reply_kind ==
+        // "support_clarify" が残ったまま cs_continuing が短絡的に true になるとき(優先順4)、
+        // 緊急案内の直後にもかかわらず advisor が誤って CS サポートモードへ迂回してしまう
+        // (「緊急案内後の次ターンは通常の入場判定からやり直す」という状態不変条件の違反)。
         let mut conv = base_conv();
         let mut attrs = base_advisor_attrs();
         attrs.support_mode = true;
-        let attrs_before = attrs.clone();
+        attrs.support_last_reply_kind = "support_clarify".to_string();
+        attrs.support_case_id = "case-123".to_string();
 
         apply_action_contract(&AdvisorAction::Safety, &mut conv, &mut attrs);
 
+        assert!(
+            !attrs.support_mode,
+            "Safety must clear support_mode after a support-clarify continuation"
+        );
+        assert!(
+            attrs.support_last_reply_kind.is_empty(),
+            "Safety must clear support_last_reply_kind after a support-clarify continuation"
+        );
         assert_eq!(
-            attrs, attrs_before,
-            "Safety must not touch support_mode either way"
+            attrs.support_case_id, "case-123",
+            "support_case_id must be preserved (unlike support_mode) so a later re-entry can \
+             reuse the same CS case"
+        );
+    }
+
+    #[test]
+    fn apply_action_contract_safety_clears_support_mode_after_time_pref_continuation() {
+        // 「サポート時間帯受付中 → emergency」シナリオ。上のテストと同じ不変条件を
+        // support_last_reply_kind == "support_time_pref" で固定する。
+        let mut conv = base_conv();
+        let mut attrs = base_advisor_attrs();
+        attrs.support_mode = true;
+        attrs.support_last_reply_kind = "support_time_pref".to_string();
+        attrs.support_case_id = "case-456".to_string();
+
+        apply_action_contract(&AdvisorAction::Safety, &mut conv, &mut attrs);
+
+        assert!(
+            !attrs.support_mode,
+            "Safety must clear support_mode after a support-time_pref continuation"
+        );
+        assert!(
+            attrs.support_last_reply_kind.is_empty(),
+            "Safety must clear support_last_reply_kind after a support-time_pref continuation"
+        );
+        assert_eq!(
+            attrs.support_case_id, "case-456",
+            "support_case_id must be preserved so a later re-entry can reuse the same CS case"
+        );
+    }
+
+    // codex レビュー指摘 High の回帰テスト本体: apply_action_contract(Safety, ...) が
+    // support_mode を false に落とした結果を実際に decide::decide まで通し、次ターンが
+    // decide_in_domain_flow の優先順1・優先順4 のどちらからも SupportMode へ迂回しないことを
+    // 証明する。1 件のテストで両方の優先順を同時に踏むと、片方の分岐だけが実装 2 行の削除に
+    // 反応しない(=判別できない)組み合わせを見落とすため、優先順ごとに分ける。
+
+    #[test]
+    fn apply_action_contract_safety_after_support_mode_prevents_priority1_reroute_into_support_mode(
+    ) {
+        // 優先順1(decide_in_domain_flow: `!in_domain && support_mode` → SupportMode)の判別。
+        // 「emergency 直後の、advisor の in_domain 判定に載らない発話」を模して in_domain =
+        // false にする。cs_continuing はこの分岐の条件に含まれないため false を渡す
+        // (advisor_reply_handler の契約上も、support_mode が false のときは常に false で
+        // 決定される)。
+        //
+        // 判別性: apply_action_contract の Safety アームから
+        // `advisor_attrs.support_mode = false;` を revert すると、attrs.support_mode が true の
+        // まま decide::decide に渡り、優先順1 が成立して SupportMode が返る → 末尾の assert_eq!
+        // が red になる。
+        let mut conv = base_conv();
+        let mut attrs = base_advisor_attrs();
+        attrs.support_mode = true;
+        attrs.support_last_reply_kind = "support_clarify".to_string();
+
+        apply_action_contract(&AdvisorAction::Safety, &mut conv, &mut attrs);
+        // 注意: ここで `!attrs.support_mode` を先に precondition assert すると、実装 2 行を
+        // revert したときにその assert が真っ先に red になり、下の decide::decide 経由の
+        // assert_eq! が一度も評価されず「判別できたつもり」になる(codex レビュー指摘の再現)。
+        // そのため precondition を置かず、attrs.support_mode をそのまま decide::decide へ渡す。
+
+        let next_turn_understanding = understand::Understanding {
+            in_domain: false,
+            emergency: false,
+            urtect_support: false,
+            lead_interest: false,
+            product_intent: false,
+            summary_ja: "テスト用の要約".to_string(),
+            conditions: Vec::new(),
+        };
+        let next_conv = base_conv();
+
+        let action = decide::decide(
+            &next_turn_understanding,
+            &next_conv,
+            attrs.lead_offered,
+            attrs.lead_requested,
+            3,
+            attrs.support_mode,
+            false,
+        );
+
+        assert_eq!(
+            action,
+            AdvisorAction::OutOfDomain,
+            "emergency 応答の直後、in_domain でない次ターンの発話は優先順1で SupportMode へ \
+             迂回せず OutOfDomain になること"
+        );
+    }
+
+    #[test]
+    fn apply_action_contract_safety_after_support_mode_prevents_priority4_reroute_into_support_mode(
+    ) {
+        // 優先順4(decide_in_domain_flow: `support_mode && cs_continuing` → SupportMode)の
+        // 判別。次ターンは in_domain な通常相談とし、conditions に concern を積んで
+        // missing_conditions を空にすることで、優先順4 を通過すれば手順7(Answer)まで落ちる形に
+        // する。cs_continuing = true を明示的に渡し、優先順4 の右辺を成立させる。
+        //
+        // 判別性: apply_action_contract の Safety アームから
+        // `advisor_attrs.support_mode = false;` を revert すると、attrs.support_mode が true の
+        // まま decide::decide に渡り、`support_mode && cs_continuing`(true && true)が成立して
+        // SupportMode が返る → 末尾の assert_eq! が red になる。
+        let mut conv = base_conv();
+        let mut attrs = base_advisor_attrs();
+        attrs.support_mode = true;
+        attrs.support_last_reply_kind = "support_clarify".to_string();
+
+        apply_action_contract(&AdvisorAction::Safety, &mut conv, &mut attrs);
+        // 注意: ここで `!attrs.support_mode` を先に precondition assert すると、実装 2 行を
+        // revert したときにその assert が真っ先に red になり、下の decide::decide 経由の
+        // assert_eq! が一度も評価されず「判別できたつもり」になる(codex レビュー指摘の再現)。
+        // そのため precondition を置かず、attrs.support_mode をそのまま decide::decide へ渡す。
+
+        let next_turn_understanding = understand::Understanding {
+            in_domain: true,
+            emergency: false,
+            urtect_support: false,
+            lead_interest: false,
+            product_intent: false,
+            summary_ja: "テスト用の要約".to_string(),
+            conditions: vec![(ConditionKey::Concern, "monitoring".to_string())],
+        };
+        let next_conv = base_conv();
+
+        let action = decide::decide(
+            &next_turn_understanding,
+            &next_conv,
+            attrs.lead_offered,
+            attrs.lead_requested,
+            3,
+            attrs.support_mode,
+            true,
+        );
+
+        assert_eq!(
+            action,
+            AdvisorAction::Answer,
+            "emergency 応答の直後、CS 側が継続状態(cs_continuing=true)でも支援モードには \
+             優先順4で迂回せず通常の Answer になること"
         );
     }
 
@@ -1427,6 +1641,43 @@ mod tests {
             false,
             "警備会社の担当者が駆けつけるサービスもあります。"
         ));
+    }
+
+    // --- support_turn_error_response(codex レビュー指摘 Medium、コミット 18f421d) ---
+    // run_cs_support_mode_turn の失敗を一律 500 に倒していたのを、CS 側
+    // crate::api::classify_evaluate_error と同じ 503 upstream_unavailable / 500 internal の
+    // 分類に揃える(vegapunk 到達不能を internal 扱いすると運用者が障害箇所を切り分けられない)。
+    // server/src/api.rs の classify_evaluate_error テスト(2317〜2346行付近)と同じ入力パターンを
+    // support_turn_error_response 経由で固定する。
+
+    #[tokio::test]
+    async fn support_turn_error_response_maps_tonic_status_to_503() {
+        let err = anyhow::Error::from(tonic::Status::unavailable("vegapunk down"));
+        let response = support_turn_error_response(&err, "req-1");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error responses are always JSON");
+        assert_eq!(
+            value["error"], "upstream_unavailable",
+            "503 でも error コードが internal のままだと運用者が vegapunk 障害と advisor 自身の \
+             バグを切り分けられない"
+        );
+    }
+
+    #[tokio::test]
+    async fn support_turn_error_response_maps_plain_error_to_500() {
+        let err = anyhow::anyhow!("boom");
+        let response = support_turn_error_response(&err, "req-1");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error responses are always JSON");
+        assert_eq!(value["error"], "internal");
     }
 
     // --- clarify_meta_for_upstream(2次 codex レビュー Warning B) ---

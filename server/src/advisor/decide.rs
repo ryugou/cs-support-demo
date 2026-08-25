@@ -15,6 +15,15 @@ pub enum AdvisorAction {
     /// `is_time_preference = true` に倒れ、110番案内の直後に時間帯の再質問が出る)。
     /// リード獲得は失われない(`lead_requested` は false のままなので、顧客が改めて連絡を
     /// 希望すれば手順5が再び成立する)。
+    ///
+    /// 同じ理由で `AdvisorCaseAttrs.support_mode = false` と
+    /// `AdvisorCaseAttrs.support_last_reply_kind` の空文字列クリアも必須(`api.rs` の
+    /// `apply_action_contract` が両方まとめて書き戻す)。忘れると、緊急対応中に armed のまま
+    /// 残った `support_mode` により、次ターンの発話が in_domain でない場合
+    /// (`decide_in_domain_flow` 優先順1: `!in_domain && support_mode` → `SupportMode`)、または
+    /// stale な `support_last_reply_kind` が残ったまま `cs_continuing` が短絡的に true になる
+    /// 場合(優先順4: `support_mode && cs_continuing` → `SupportMode`)に、緊急案内の直後にも
+    /// かかわらず advisor が誤って CS サポートモードへ迂回してしまう。
     Safety,
     TimePrefContinue,
     OutOfDomain,
@@ -552,7 +561,7 @@ pub struct AdvisorCaseAttrs {
     pub question_streak: i32,
     /// design doc §13.2: CS サポートモード(composition)が ON かどうか。既定 false。
     /// `crate::advisor::api::apply_action_contract` が `AdvisorAction::SupportMode` で
-    /// true に、それ以外の大半のアクション(`Safety` / `TimePrefContinue` を除く)で
+    /// true に、それ以外の大半のアクション(`TimePrefContinue` を除く)で
     /// false に書き戻す。
     pub support_mode: bool,
     /// urtect 側 CS case(`crate::advisor::cs_support::run_support_turn` が返す `case_id`)
@@ -570,8 +579,8 @@ pub struct AdvisorCaseAttrs {
     /// ときだけ「直前が聞き返しだった」ことを表す。
     /// `crate::advisor::api::run_cs_support_mode_turn` が CS 応答成功時に書き戻し、
     /// `crate::advisor::api::apply_action_contract` が `support_mode` を false に落とす
-    /// アクション(`OutOfDomain` / `LeadSolicit` / `Clarify` / `LeadConfirmed` / `Answer`)で
-    /// 空文字列にクリアする(`support_mode` と同じ退場タイミング)。
+    /// アクション(`Safety` / `OutOfDomain` / `LeadSolicit` / `Clarify` / `LeadConfirmed` /
+    /// `Answer`)で空文字列にクリアする(`support_mode` と同じ退場タイミング)。
     pub support_last_reply_kind: String,
 }
 
