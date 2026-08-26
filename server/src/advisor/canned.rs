@@ -1,12 +1,17 @@
 //! 定型文(design doc `2026-08-17-homesec-advisor-design.md` §4.3, §4.4 の canned 応答)。
 //!
 //! `safety` / `out_of_domain` / `fallback` は引数を取らないため定数として持つ。
-//! `handoff` / `lead_solicit` / `lead_time_pref_reask` は config 由来の値を埋め込むため関数として
+//! `lead_solicit` / `lead_time_pref_reask` は config 由来の値を埋め込むため関数として
 //! 持つ。`lead_confirmed` も同様に関数として持つが、埋め込むのは顧客発話の原文ではなく
 //! `decide::format_confirmed_slot` が組み立てた正規化済みの値である(`lead_confirmed` の doc
 //! comment 参照。顧客発話をそのまま埋め込むと NG 辞書・出口関門を経由しない経路になる)。
 //! `clarify` / `answer` の定型文はここに置かない(LLM Call #2 で生成する。design doc §4.3
 //! 手順6・7、Task 5 の範囲)。
+//!
+//! **Issue #50 バッチ2**: design doc §13.2 のモード遷移で `AdvisorAction::Handoff` を廃止した
+//! ことに伴い、旧 handoff 定型文(`handoff` 関数)は削除した。`urtect_support` はその場で
+//! `crate::advisor::cs_support::run_support_turn` を呼び、CS の応答をそのまま返す
+//! (`crate::advisor::api::support_mode_reply_parts` 参照)。
 
 use crate::harness::hours;
 
@@ -23,23 +28,6 @@ pub const OUT_OF_DOMAIN_TEXT: &str = "ごめんなさい、私はホームセキ
 /// ペルソナ(専属アドバイザー、企業 CS 定型句を使わない)を保った一般的な文言として新規に定めた。
 pub const FALLBACK_TEXT: &str =
     "うまく答えを整理できませんでした。もう一度、状況を教えてもらえますか?";
-
-/// urtect_support(design doc §4.3 手順4)の定型文。案内文面は呼び出し元が config
-/// `handoff_contact_text` から読んで渡す。dialogue-examples パターン 8 の AI 初回応答が
-/// `handoff_contact_text` 相当の文 + 継続を誘う一文の 2 文構成なので、その形を再現する。
-///
-/// `handoff_contact_text` は先頭・末尾の空白を trim してから連結する(config 値の末尾に
-/// 空白が付いていた場合の二重空白、空文字列だった場合の不要な先頭空白を防ぐ)。空文字列
-/// (trim 後)の場合は継続文だけを返す。
-pub fn handoff(handoff_contact_text: &str) -> String {
-    let contact_text = handoff_contact_text.trim();
-    const CONTINUATION: &str = "私のほうでは、住まいの防犯全般の相談をいつでも受けられますよ。";
-    if contact_text.is_empty() {
-        CONTINUATION.to_string()
-    } else {
-        format!("{contact_text} {CONTINUATION}")
-    }
-}
 
 /// 時間帯受付モードの初回の呼びかけ(design doc §4.3 手順5)。dialogue-examples パターン 11 の
 /// 3 ターン目 AI 応答をそのまま使うが、営業時間は `hours::business_hours_label` で動的に埋め込む。
@@ -134,13 +122,6 @@ mod tests {
     }
 
     #[test]
-    fn handoff_text_passes_ng_gate() {
-        assert_passes_ng_gate(&handoff(
-            "URTECT製品の操作や不具合は、URTECT公式LINEアカウントで詳しくサポートしています。",
-        ));
-    }
-
-    #[test]
     fn lead_solicit_text_passes_ng_gate() {
         assert_passes_ng_gate(&lead_solicit(&BusinessHoursConfig::default()));
     }
@@ -156,37 +137,6 @@ mod tests {
     }
 
     // --- 文言の内容 ---
-
-    #[test]
-    fn handoff_includes_the_configured_contact_text() {
-        let text = handoff("設定された案内文そのもの");
-        assert!(
-            text.contains("設定された案内文そのもの"),
-            "handoff text: {text}"
-        );
-    }
-
-    #[test]
-    fn handoff_returns_continuation_only_when_contact_text_is_empty() {
-        let text = handoff("");
-        assert_eq!(
-            text, "私のほうでは、住まいの防犯全般の相談をいつでも受けられますよ。",
-            "an empty configured contact text must not leave a stray leading space: {text}"
-        );
-    }
-
-    #[test]
-    fn handoff_trims_trailing_whitespace_before_concatenation() {
-        let text = handoff("設定された案内文   ");
-        assert!(
-            !text.contains("  "),
-            "trailing whitespace in the configured text must not produce a double space: {text}"
-        );
-        assert_eq!(
-            text,
-            "設定された案内文 私のほうでは、住まいの防犯全般の相談をいつでも受けられますよ。"
-        );
-    }
 
     #[test]
     fn lead_solicit_includes_the_business_hours_label_and_follows_config_changes() {

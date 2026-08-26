@@ -65,6 +65,43 @@ pub struct AdvisorConfig {
     pub images_dir: String,
     /// advisor 固有 NG 辞書のパス（design doc §7.1）。
     pub ng_dictionary_path: String,
+    /// CS サポートモード（design doc §13）が既存 CS パイプラインを実行する先の vegapunk schema
+    /// （例: `"urtect"`）。`crate::advisor::cs_support::run_support_turn` へそのまま渡す。
+    pub support_schema: String,
+    /// 上記 schema の manual 取得経路種別。`#[serde(default)]` は `ManualSchemaKind::default()`
+    /// （`LegacySection`）に倒れるが、CS（urtect）は `manual_v1` を使うため config では明示設定する
+    /// 運用にする。
+    #[serde(default)]
+    pub support_manual_schema: ManualSchemaKind,
+    /// CS サポートモード専用の WORM 監査ログパス（Issue #50 レビュー指摘1）。
+    ///
+    /// `bin/homesec_advisor.rs` は `[harness]` を共有する 2 つの `Harness`（advisor 本体用、
+    /// CS サポートモード用）を同一プロセスで構築する。`harness::audit::WormAuditLog` の
+    /// hash chain はプロセスメモリ上の `Mutex<(File, String)>` の `prev_hash` にしか依存せず、
+    /// 同一ファイルへ 2 つの独立した `Mutex` から交互に追記すると chain が破損し、次回起動時に
+    /// `WormAuditLog::open` の整合性検証（fail closed）でプロセス起動自体が失敗する。
+    /// このフィールドを必須（デフォルト無し）にしているのは、`[harness].audit_log_path` と
+    /// 同じ値を書いてしまう事故を config の記述時点で防ぐため（暗黙のデフォルト値に頼ると、
+    /// 気づかないまま両方が同じパスを指し続ける）。
+    pub support_audit_log_path: String,
+    /// CS サポートモード専用の検索改善キューパス。上記と同じ理由で分離する
+    /// （こちらは hash chain を持たないため衝突しても即座には壊れないが、監査系統を
+    /// 混ぜないという運用方針は audit_log_path と揃える）。
+    pub support_search_improvement_queue_path: String,
+    /// CS サポートモード専用の signal lexicon パス（Issue #50 バッチ2 レビュー指摘）。
+    ///
+    /// `bin/homesec_advisor.rs` は `[harness]` を共有する 2 つの `Harness`（advisor 本体用、
+    /// CS サポートモード用）を同一プロセスで構築する。`Harness::admit_known_resolution`
+    /// （admin 画面の KR 登録経路）は `self.lexicon.class_of()` で `[harness].signal_lexicon_path`
+    /// を参照するため、`[harness]` をそのまま support 用（urtect 向け）辞書で上書きすると、
+    /// advisor 本体の KR 登録まで urtect 向け語彙で検査されてしまう。このフィールドを必須
+    /// （デフォルト無し）にしているのは、`[harness].signal_lexicon_path` と同じ値を書いて
+    /// しまう事故を config の記述時点で防ぐため（暗黙のデフォルト値に頼ると、気づかないまま
+    /// 両方が同じパスを指し続ける）。`support_audit_log_path` と同じ理由・同じパターン。
+    pub support_signal_lexicon_path: String,
+    /// CS サポートモード専用の NG 辞書パス。上記と同じ理由で分離する
+    /// （`Harness::admit_known_resolution` の `egress_gate(..., &self.ng)` が使う）。
+    pub support_ng_dictionary_path: String,
 }
 
 fn default_admin_static_dir() -> String {
@@ -570,6 +607,12 @@ schema = "s"
 handoff_contact_text = "URTECT製品の操作や不具合は、URTECT公式LINEアカウントで詳しくサポートしています。"
 images_dir = "data/homesec/images"
 ng_dictionary_path = "data/homesec/ng.json"
+support_schema = "urtect"
+support_manual_schema = "manual_v1"
+support_audit_log_path = "/data/audit/audit-support.jsonl"
+support_search_improvement_queue_path = "/data/audit/search-improvement-queue-support.jsonl"
+support_signal_lexicon_path = "data/urtect/signal-lexicon.json"
+support_ng_dictionary_path = "data/urtect/ng-dictionary.json"
 "#;
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         let advisor = cfg.advisor.expect("[advisor] section must parse to Some");
@@ -579,13 +622,63 @@ ng_dictionary_path = "data/homesec/ng.json"
         );
         assert_eq!(advisor.images_dir, "data/homesec/images");
         assert_eq!(advisor.ng_dictionary_path, "data/homesec/ng.json");
+        assert_eq!(advisor.support_schema, "urtect");
+        assert!(matches!(
+            advisor.support_manual_schema,
+            ManualSchemaKind::ManualV1
+        ));
+        assert_eq!(
+            advisor.support_audit_log_path,
+            "/data/audit/audit-support.jsonl"
+        );
+        assert_eq!(
+            advisor.support_search_improvement_queue_path,
+            "/data/audit/search-improvement-queue-support.jsonl"
+        );
+        assert_eq!(
+            advisor.support_signal_lexicon_path,
+            "data/urtect/signal-lexicon.json"
+        );
+        assert_eq!(
+            advisor.support_ng_dictionary_path,
+            "data/urtect/ng-dictionary.json"
+        );
+    }
+
+    #[test]
+    fn advisor_config_support_manual_schema_defaults_when_absent() {
+        // Issue #50 バッチ1: `support_manual_schema` は加算フィールドで、欠落時は
+        // `ManualSchemaKind::default()`（`LegacySection`）に倒れる（後方互換）。
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+[advisor]
+handoff_contact_text = "案内文"
+images_dir = "data/homesec/images"
+ng_dictionary_path = "data/homesec/ng.json"
+support_schema = "urtect"
+support_audit_log_path = "/data/audit/audit-support.jsonl"
+support_search_improvement_queue_path = "/data/audit/search-improvement-queue-support.jsonl"
+support_signal_lexicon_path = "data/urtect/signal-lexicon.json"
+support_ng_dictionary_path = "data/urtect/ng-dictionary.json"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        let advisor = cfg.advisor.expect("[advisor] section must parse to Some");
+        assert!(matches!(
+            advisor.support_manual_schema,
+            ManualSchemaKind::LegacySection
+        ));
     }
 
     #[test]
     fn config_homesec_toml_loads_and_declares_advisor_section() {
-        // 実ファイルを読む統合テスト（plan `2026-08-17-homesec-advisor.md` Task 1 Step 5）。
+        // 実ファイルを読む統合テスト（plan `2026-08-17-homesec-advisor.md` Task 1 Step 5、
+        // Issue #50 バッチ1で support_schema / support_manual_schema を追加検証）。
         // CI・本番デプロイが実際に読む config.homesec.toml がパース可能で、[advisor] の
-        // 3 キーが期待どおりに読めることを固定する。
+        // キーが期待どおりに読めることを固定する。
         let path =
             std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.homesec.toml"));
         let cfg = AppConfig::load(path).expect("config.homesec.toml must parse");
@@ -605,8 +698,85 @@ ng_dictionary_path = "data/homesec/ng.json"
         );
         assert_eq!(advisor.images_dir, "data/homesec/images");
         assert_eq!(advisor.ng_dictionary_path, "data/homesec/ng.json");
+        assert_eq!(advisor.support_schema, "urtect");
+        assert!(matches!(
+            advisor.support_manual_schema,
+            ManualSchemaKind::ManualV1
+        ));
+        // Issue #50 レビュー指摘1: support_harness 用の監査パスは [harness] のそれと
+        // 必ず異なる（同一プロセス内 2 Harness の hash chain 破損を防ぐ、
+        // `bin/homesec_advisor.rs::build_support_config` が実際に使う値）。
+        assert_ne!(advisor.support_audit_log_path, cfg.harness.audit_log_path);
+        assert_ne!(
+            advisor.support_search_improvement_queue_path,
+            cfg.harness.search_improvement_queue_path
+        );
+        assert_eq!(
+            advisor.support_audit_log_path,
+            "/data/audit/audit-support.jsonl"
+        );
+        assert_eq!(
+            advisor.support_search_improvement_queue_path,
+            "/data/audit/search-improvement-queue-support.jsonl"
+        );
+        // Issue #50 バッチ2 レビュー指摘: support_harness 用の signal_lexicon_path /
+        // ng_dictionary_path も [harness]（advisor 本体用）のそれと必ず異なる（`[harness]` を
+        // urtect 用辞書で上書きしてしまうと、advisor 本体の Harness::admit_known_resolution
+        // （admin 画面の KR 登録経路）まで urtect 向け語彙・NG 辞書で検査されてしまう）。
+        assert_ne!(
+            advisor.support_signal_lexicon_path,
+            cfg.harness.signal_lexicon_path
+        );
+        assert_ne!(
+            advisor.support_ng_dictionary_path,
+            cfg.harness.ng_dictionary_path
+        );
+        assert_eq!(
+            advisor.support_signal_lexicon_path,
+            "data/urtect/signal-lexicon.json"
+        );
+        assert_eq!(
+            advisor.support_ng_dictionary_path,
+            "data/urtect/ng-dictionary.json"
+        );
         assert!(cfg.api.enabled);
         assert!(cfg.llm.enabled);
+        // [[projects]] は homesec 1 件のまま（admin alias が project_count == 1 を前提にする
+        // ため、Issue #34 の制約を崩さない）。
+        assert_eq!(cfg.projects[0].project_id, "homesec");
+    }
+
+    /// Issue #50 バッチ2 レビュー指摘: `support_signal_lexicon_path` / `support_ng_dictionary_path`
+    /// は `support_audit_log_path` と同じ理由（config 記述時点で `[harness]` の値を書き写す
+    /// 事故を防ぐ）で必須（デフォルト無し）にした。欠落時に TOML パース自体が失敗することを
+    /// 固定する（`advisor_config_parses_section` の正常系に対する異常系）。
+    #[test]
+    fn advisor_config_missing_support_lexicon_paths_fails_to_parse() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+[advisor]
+handoff_contact_text = "案内文"
+images_dir = "data/homesec/images"
+ng_dictionary_path = "data/homesec/ng.json"
+support_schema = "urtect"
+support_manual_schema = "manual_v1"
+support_audit_log_path = "/data/audit/audit-support.jsonl"
+support_search_improvement_queue_path = "/data/audit/search-improvement-queue-support.jsonl"
+"#;
+        let result: std::result::Result<AppConfig, _> = toml::from_str(toml);
+        let err = result.expect_err(
+            "support_signal_lexicon_path / support_ng_dictionary_path 欠落時は \
+             パース失敗するはず",
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("support_signal_lexicon_path") || message.contains("missing field"),
+            "unexpected parse error: {message}"
+        );
     }
 
     #[test]

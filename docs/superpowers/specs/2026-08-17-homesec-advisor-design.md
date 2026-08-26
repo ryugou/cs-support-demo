@@ -14,7 +14,7 @@
 - **分離**: 別 LINE 公式アカウント、別 Cloud Run service(`homesec-advisor` / `homesec-line`)、別 vegapunk schema(`homesec`)。現行 CS のコード経路・挙動は変更しない
 - **共有**: 同一リポジトリ・同一 crate・同一 Docker イメージ。LINE アダプタ、会話状態、ターン永続化、管理画面、出口関門(プレーンテキスト正規化)、時間帯受付・営業時間、vegapunk 接続層、known_resolution ループを流用する
 - **差し替え**: 判定ポリシー(三層 fail-closed → 接地 2 層)、プロンプト、条件語彙、データ
-- **最終形**(本デモのスコープ外): アドバイザが外側の会話ループを持ち、自社取扱製品の個別サポートと判明した時点で既存 CS フローへルーティングする composition で統合する
+- **CS サポートモード(composition、第 13 節)**: アドバイザが外側の会話ループを持ち、自社取扱製品の個別サポートと判明したターンは既存 CS パイプライン(urtect schema のマニュアル・三層 fail-closed 判定)をその場で実行して回答する。CS Support Demo(既存 OA・service・挙動)は一切変更しない
 
 ## 2. 回答ポリシー
 
@@ -337,3 +337,35 @@ LLM 呼び出しはターンあたり最大 2 回(理解 + 生成)。定型応�
 - 人間サポートエスカレーション(リード獲得の担当者連絡は本 spec の範囲内)
 - リードの通知連携(メール・Slack 等。デモは管理画面での確認のみ)
 - スケール(homesec-line の複数インスタンス化、セッション永続化)
+
+## 13. CS サポートモード(composition)
+
+アドバイザに既存 CS パイプラインを組み込み、「ホームセキュリティ相談 + 自社製品サポート」を 1 つの OA で成立させる。**CS Support Demo(既存 OA・`cs-support-mcp` / `cs-support-line` service・挙動・データ投入・デプロイ運用)は一切変更しない。**
+
+### 13.1 呼び出し形
+
+- **CS 側のコード(`server/src/api.rs`・`server/src/harness/` ほか既存 CS 経路のファイル)は変更しない。** advisor 側に、CS の `/api/reply` ハンドラと同じ順序で既存の公開部品(`Harness::evaluate`・`decide_reply_action`・質問側ゲート・time_pref・エスカレーション組み立て・case/ターン記録)を呼ぶ薄いオーケストレーションを持つ(部品の複製はしない。呼び出し順だけを advisor 側に持つ)
+- サポートモードのターンは schema = urtect・既存 CS と同一構成で実行され、マニュアル検索・三層 fail-closed 判定・KR 照合・signal 蓄積・聞き返し・エスカレーション・case/ターンの記録まで、既存 CS の 1 会話と同じ動作になる
+- 応答文はエスカレーション(受付番号 = urtect 側 case の case_ref・希望時間帯受付・営業時間案内)含めて CS の出力をそのまま返す
+- 受容するトレードオフ: 呼び出し順が advisor 側に複製されるため、CS ハンドラ側の将来変更には advisor 側の追随が必要(プロダクト統合時に一本化)。実装中に CS 側ファイルへの変更がどうしても必要と判明した場合は、実装を止めてユーザーへ報告し判断を仰ぐ
+- 運用前提: この期間、管理画面は使わない運用のため、アドバイザ経由のサポート会話が urtect 側に記録されても運用に影響しない
+
+### 13.2 モード遷移(決定論)
+
+advisor case(homesec 側)に `support_mode`(bool)と `support_case_id`(string、urtect 側の CS case への参照)を加算し、次の遷移で管理する:
+
+1. **入場**: `understanding.urtect_support == true` のターンで ON(handoff 定型は廃止し、その場で CS パイプラインを実行。CS case を新規作成し `support_case_id` に保持)
+2. **継続**: `support_mode == true` かつ (a) CS 側が継続状態(聞き返し中・時間帯受付中)にある、または (b) 今ターンの発話がサポート文脈(urtect_support、または直前サポート質問への応答)である間は、同じ `support_case_id` で CS パイプラインを継続
+3. **退場**: 発話がホームセキュリティ相談のトピック(in_domain の相談で urtect_support ではなく、CS 側の継続状態も無い)なら OFF にして通常モードへ。emergency は常に最優先(safety 定型)
+4. サポートモードのターンでは製品カード・チップ・リード提案は出さない(CS の応答をそのまま返す)
+
+### 13.3 ターン記録
+
+アドバイザは自身のターン永続化(homesec 側 ConversationTurn)を通常どおり行い、`reply_kind` に `support_answer` / `support_clarify` / `support_escalation` / `support_time_pref` / `support_out_of_scope` を追加する(CS 応答の種別をそのまま写像)。これはアドバイザ側の既存記録機構の値追加であり、CS 側には触れない。
+
+### 13.4 テスト(加算)
+
+- モード遷移の全分岐(入場・継続・退場・emergency 優先)
+- サポートモードのターンで CS オーケストレーション関数が urtect schema・`support_case_id` で呼ばれること(スタブ)
+- CS 経路の無変更: 既存 urtect テストが無変更で PASS(関数切り出しの挙動不変の証明)
+- E2E(デプロイ後): アドバイザ OA で「ADC-V523 の録画が再生できない」→ urtect マニュアル接地のサポート応答(または CS 流の聞き返し)→ 続けて「ところで空き巣対策は?」→ 通常モードへ復帰

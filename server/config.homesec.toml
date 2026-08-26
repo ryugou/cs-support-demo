@@ -11,11 +11,69 @@ project_id = "homesec"
 schema = "homesec"
 manual_schema = "manual_v1"
 
-# [harness] は AppConfig 共通の必須セクション。advisor パイプライン(Task 3 以降)は
-# 専用の [advisor] セクションのみを読み、この節の値には依存しない。既定値のままでよい。
+# [harness] は AppConfig 共通の必須セクション。この節は advisor 本体用の Harness
+# （admin 画面の KR 登録が使う `Harness::admit_known_resolution` を含む）が使う。
+#
+# Issue #50 CS サポートモード(design doc §13): `bin/homesec_advisor.rs` はこの [harness] を
+# 元にした config を clone して、支援用の `support_harness`(urtect schema 向け、
+# `crate::advisor::cs_support` 経由で既存 CS パイプラインを実行する)を追加で構築する。CS 側の
+# 実挙動(検索スコア v2・エスカレーション既定 route・下書き生成)と一致させるため、
+# policy/thresholds/grading 等は `config.cloudrun.toml` の値と揃えてある。
+#
+# ただし signal_lexicon_path / ng_dictionary_path は揃えない（Issue #50 バッチ2 レビュー
+# 指摘）。この節は advisor 本体用 Harness にも使われ、`Harness::admit_known_resolution`
+# （admin 画面の KR 登録経路）が `self.lexicon.class_of()` / `egress_gate(..., &self.ng)` で
+# 参照する。ここを urtect 向け辞書で上書きすると、homesec advisor 本体の KR 登録まで
+# urtect 向け語彙・NG 辞書で検査されてしまう。既定値（`data/signal-lexicon.json` /
+# `data/ng-dictionary.json`）のまま省略するが、これは「homesec 向けとして妥当だから」では
+# ない。実体は旧 sivira-cs-demo（食品・サプリメント・化粧品ドメイン）向けの fixture
+# （`server/src/harness/signal.rs` の `bundled_urtect_lexicon_path` doc コメント参照）で、
+# homesec（ホームセキュリティ機器）向けでも urtect（防犯カメラ）向けでもない。
+# 既知の制約: `Harness::admit_known_resolution` は語彙外の signal を
+# "unknown signal (not in vocabulary)" で拒否するため、admin 画面から homesec 固有の
+# signal 語彙で KR 登録すると弾かれうる（通るのは `human_handoff_request` /
+# `unclassified_risk` など語彙非依存のものに限られる）。NG 辞書も食品向けの禁止表現
+# （「完治します」等）のみで、homesec 固有の禁止表現チェックとしては機能しない。
+# それでも urtect 向け辞書で上書きするよりは安全（urtect 向けデータで検査してしまう
+# 事故は避けられる）という消極的な理由でこの既定値を使う。homesec 専用辞書の新規作成は
+# このバッチのスコープ外の既知の制約として残す。support_harness 専用の urtect 向け値は
+# 下の [advisor] セクションの support_signal_lexicon_path / support_ng_dictionary_path へ
+# 分離する。
+#
+# advisor 自身のパイプライン(understand.rs/draftgen.rs/decide.rs)はこの節の値を一切読まない
+# (専用の [advisor] セクションと専用の AnthropicClient/NgDictionary を使う)ため、この節は
+# advisor 自身の応答生成の挙動には影響しない。
+#
+# audit_log_path / search_improvement_queue_path が config.cloudrun.toml とバイト単位で
+# 同一なのは意図的で問題ない: `cs-support-mcp`(CS 本体)と `homesec-advisor` は別 Cloud Run
+# service = 別コンテナ・別ファイルシステムなので、同じパス文字列でも実体は衝突しない。
+# 衝突するのは「同一プロセス内」の advisor 本体 Harness と support_harness の組で、
+# こちらは `[advisor] support_audit_log_path` / `support_search_improvement_queue_path`
+# (このファイル末尾)で明示的に別パスへ分けている
+# (`bin/homesec_advisor.rs::build_support_config` が `Harness::build` 呼び出し前に
+# `[harness]` の値をこれらへ上書きする。理由: `harness::audit::WormAuditLog` の hash chain は
+# プロセスメモリ上の `Mutex<(File, String)>` にしか依存せず、同一ファイルへ 2 つの独立した
+# `Harness` が交互に追記すると chain が壊れ、次回起動の整合性検証で fail closed する)。
+# signal_lexicon_path / ng_dictionary_path の分離も同じ上書きパターンを踏襲する。
 [harness]
 audit_log_path = "/data/audit/audit.jsonl"
 search_improvement_queue_path = "/data/audit/search-improvement-queue.jsonl"
+policy = "escalate_unless_answerable"
+default_escalation_route = "support_desk"
+vector_route_enabled = true
+manual_scoring_v2_enabled = true
+customer_reply_draft_enabled = true
+
+[harness.thresholds]
+low = 0.6
+mid = 0.8
+high = 0.95
+
+[harness.grading]
+promote_approvals = 3
+promote_approvers = 2
+promote_max_rejection_rate = 0.2
+demote_rejections = 2
 
 [llm]
 enabled = true
@@ -32,7 +90,22 @@ end = "18:00"
 tz = "Asia/Tokyo"
 
 # advisor 固有設定(design doc §4.3 手順4、§5.2、§7.2)。
+# support_schema / support_manual_schema は design doc §13(CS サポートモード、Issue #50)。
+# CS サポートモードは既存 CS(urtect)パイプラインをそのまま実行するため urtect schema を指す。
+# support_audit_log_path / support_search_improvement_queue_path はレビュー指摘1の対応:
+# 同一プロセス内で advisor 本体用 Harness と support_harness の 2 つを構築するため、
+# [harness] の audit_log_path / search_improvement_queue_path をそのまま使うと
+# WORM 監査ログの hash chain が壊れる(上の [harness] 節のコメント参照)。
+# support_signal_lexicon_path / support_ng_dictionary_path はバッチ2 レビュー指摘の対応:
+# 同じ理由で、advisor 本体用 Harness の KR 登録検査（Harness::admit_known_resolution）が
+# urtect 向け辞書を見てしまわないよう、support_harness 専用の urtect 向け値をここへ分離する。
 [advisor]
 handoff_contact_text = "URTECT製品の操作や不具合は、URTECT公式LINEアカウントで詳しくサポートしています。"
 images_dir = "data/homesec/images"
 ng_dictionary_path = "data/homesec/ng.json"
+support_schema = "urtect"
+support_manual_schema = "manual_v1"
+support_audit_log_path = "/data/audit/audit-support.jsonl"
+support_search_improvement_queue_path = "/data/audit/search-improvement-queue-support.jsonl"
+support_signal_lexicon_path = "data/urtect/signal-lexicon.json"
+support_ng_dictionary_path = "data/urtect/ng-dictionary.json"

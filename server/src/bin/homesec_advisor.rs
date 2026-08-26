@@ -14,9 +14,10 @@ use clap::Parser;
 use cs_support_mcp::{
     admin::{admin_router, mount_admin_api, AdminState},
     advisor::api::{advisor_api_router, AdvisorApiState},
-    config::AppConfig,
+    config::{AdvisorConfig, AppConfig, ProjectConfig},
     harness::{egress::NgDictionary, Harness},
     llm::AnthropicClient,
+    mcp::ToolService,
     oauth::{middleware::AuthState, verifier::GoogleTokenVerifier},
     staticui,
     vegapunk::VegapunkClient,
@@ -122,6 +123,42 @@ async fn main() -> Result<()> {
             .context("build harness")?,
     );
 
+    // Issue #50 CS サポートモード(design doc §13.1)。`Harness::build` は内部で
+    // `authn::Authenticator::new(config.projects.iter().map(|p| p.schema.clone()).collect())`
+    // を呼ぶ(`harness/mod.rs`、変更不可)。上の `harness` は `config.projects`(homesec 1件)
+    // から構築されているため、これへ urtect schema で `Harness::begin` すると
+    // `scope::resolve_scope` が権限エラーになる。対処: ロード済みの `config` を clone し、
+    // `.projects` だけを `support_schema` 1 件に差し替えた別の `AppConfig` を作り、それで
+    // もう一度 `Harness::build` を呼ぶ(上の `harness` は admin/advisor 本来のパイプライン用に
+    // そのまま残す)。`[harness]`/`[llm]` セクションは `config` と共有するため、CS(cloudrun)と
+    // 揃えた検索スコア v2・下書き生成設定がそのまま support_harness にも適用される
+    // (`config.homesec.toml` の `[harness]` コメント参照)。
+    //
+    // 追記(レビュー指摘1、Critical): `[harness]` セクションをそのまま clone すると、
+    // `harness`(advisor 本体用)と `support_harness` が同一の `audit_log_path` /
+    // `search_improvement_queue_path` を指してしまう。`harness::audit::WormAuditLog`
+    // (`server/src/harness/audit.rs`、変更不可)は `state: Mutex<(File, String)>` の
+    // `prev_hash` をプロセスメモリ上でだけ管理する append-only hash chain で、この `Mutex` は
+    // `WormAuditLog` インスタンスごとに独立している。同じファイルへ 2 インスタンスが交互に
+    // 追記すると、互いの追記が相手の `prev_hash` 更新を知らないまま次の行を書くため
+    // chain が破綻する。`WormAuditLog::open` は起動のたびに全行の chain を検証する
+    // fail closed 実装なので、一度壊れると次回起動から `Harness::build` が恒久的に
+    // 失敗するようになる(audit.rs のコメントが明記する GCS FUSE 永続マウント運用では、
+    // 壊れた chain は再起動をまたいで残り続ける)。今はまだ `run_support_turn` の
+    // 呼び出し元が無いため support_harness 側は書き込みを行わず発火していないが、
+    // 実ハンドラへ配線した瞬間に両方が書き込むようになる。
+    //
+    // 対処: `support_audit_log_path` / `support_search_improvement_queue_path` を
+    // `[advisor]` の必須キーとして追加し(`config::AdvisorConfig`)、
+    // `config.homesec.toml` で `[harness]` とは別のパスを明示設定させる
+    // (`Harness::build` に渡す前に上書きする。パスをここで暗黙に導出せず設定ファイルへ
+    // 必須化したのは、運用者が値を目で確認できるようにするため)。
+    let support_config = build_support_config(&config, &advisor_cfg);
+    let support_harness = Arc::new(
+        Harness::build(&support_config, Arc::new(vegapunk.clone()), &config_dir)
+            .context("build CS support-mode harness (design doc §13.1)")?,
+    );
+
     // `CS_SUPPORT_GOOGLE_OAUTH_CLIENT_SECRET` と署名鍵は要求しない(advisor は OAuth AS を
     // 持たない。管理画面のトークン検証は Google tokeninfo 照会のみで完結する)。
     let public_host = require_nonempty_env(
@@ -137,8 +174,14 @@ async fn main() -> Result<()> {
     )?;
     let verifier = Arc::new(GoogleTokenVerifier::new(google_client_id));
 
-    // advisor 専用の LLM クライアント(`Harness.reply_drafter` は homesec では常に `None`。
-    // config.homesec.toml が `customer_reply_draft_enabled` を立てていないため)。
+    // advisor 専用の LLM クライアント(`AdvisorApiState.llm`、advisor 自身の
+    // understand/draftgen パイプライン用)。`Harness.reply_drafter` とは別物: こちらは
+    // `config.homesec.toml` の `[harness] customer_reply_draft_enabled = true`(Issue #50
+    // CS サポートモードで CS(cloudrun)と揃えた)により `Some` になる。`[harness]` は
+    // `harness`(admin 用)/`support_harness` の両方で共有しているため両方の `reply_drafter`
+    // が `Some` になるが、admin 経路(`admin.rs`)は `Harness::evaluate` を呼ばないため
+    // `harness.reply_drafter` が `Some` でも実害は無い(詳細: `advisor/api.rs` の
+    // `AdvisorApiState` doc コメント)。
     let llm = AnthropicClient::from_config(&config.llm)
         .context("configure llm client")?
         .ok_or_else(|| {
@@ -246,6 +289,9 @@ async fn main() -> Result<()> {
         "invariant violated: CS_SUPPORT_ANSWER_API_KEY was not resolved at startup (the \
          fail-closed check above should have aborted first)",
     );
+    // Issue #50 バッチ1: `support_tools` は `vegapunk.clone()` を先に済ませておく(下の
+    // struct literal で `vegapunk,` フィールドが値を move するため)。
+    let support_tools = ToolService::new(vegapunk.clone());
     let state = AdvisorApiState {
         config: config.clone(),
         harness: harness.clone(),
@@ -253,9 +299,12 @@ async fn main() -> Result<()> {
         ng,
         vegapunk,
         api_key,
-        handoff_contact_text: advisor_cfg.handoff_contact_text,
         images_dir,
         public_host,
+        support_harness,
+        support_tools,
+        support_schema: advisor_cfg.support_schema,
+        support_manual_schema: advisor_cfg.support_manual_schema,
     };
     app = app.merge(advisor_api_router(state));
 
@@ -284,6 +333,42 @@ async fn main() -> Result<()> {
         axum::serve(listener, app).await?;
     }
     Ok(())
+}
+
+/// support_harness 用の `AppConfig` を組み立てる(Issue #50 design doc §13.1、レビュー指摘1)。
+///
+/// `.projects` を `advisor_cfg.support_schema` 1 件に差し替えるのに加えて、
+/// `[harness].audit_log_path` / `search_improvement_queue_path` を
+/// `advisor_cfg.support_audit_log_path` / `support_search_improvement_queue_path` へ
+/// 上書きする。これを怠ると、同一プロセス内の advisor 本体用 `Harness` と
+/// `support_harness` が同じ WORM 監査ログファイルへ別々の `Mutex` から追記することになり、
+/// `harness::audit::WormAuditLog` の hash chain が破損する(呼び出し元の doc コメント、
+/// および `server/src/harness/audit.rs` 参照)。
+///
+/// 同じ理由で `[harness].signal_lexicon_path` / `ng_dictionary_path` も
+/// `advisor_cfg.support_signal_lexicon_path` / `support_ng_dictionary_path` へ上書きする
+/// (Issue #50 バッチ2 レビュー指摘)。これらは `Harness::admit_known_resolution`
+/// (admin 画面の KR 登録経路)が `self.lexicon.class_of()` / `egress_gate(..., &self.ng)` で
+/// 参照する。上書きを怠ると、advisor 本体用 `Harness` の KR 登録検査までこの support 用
+/// (urtect 向け)辞書を見てしまい、homesec 向けの KR 登録が urtect 向け語彙・NG 辞書で
+/// 検査される。
+///
+/// 純関数として切り出しているのは、実ファイル・vegapunk 接続を要する `Harness::build` を
+/// 呼ばずにこのパス導出だけを単体テストできるようにするため。
+fn build_support_config(config: &AppConfig, advisor_cfg: &AdvisorConfig) -> AppConfig {
+    let mut support_config = config.clone();
+    support_config.projects = vec![ProjectConfig {
+        project_id: advisor_cfg.support_schema.clone(),
+        schema: advisor_cfg.support_schema.clone(),
+        bearer_token: None,
+        manual_schema: advisor_cfg.support_manual_schema,
+    }];
+    support_config.harness.audit_log_path = advisor_cfg.support_audit_log_path.clone();
+    support_config.harness.search_improvement_queue_path =
+        advisor_cfg.support_search_improvement_queue_path.clone();
+    support_config.harness.signal_lexicon_path = advisor_cfg.support_signal_lexicon_path.clone();
+    support_config.harness.ng_dictionary_path = advisor_cfg.support_ng_dictionary_path.clone();
+    support_config
 }
 
 /// `server/src/main.rs::read_bearer_token` の複製(423行目付近)。
@@ -623,5 +708,153 @@ schema = "s"
             .ok_or_else(|| anyhow::anyhow!("[advisor] section is required for homesec_advisor"));
         let err = result.unwrap_err();
         assert!(err.to_string().contains("[advisor] section is required"));
+    }
+
+    /// レビュー指摘1(Critical): 同一プロセス内の 2 つの `Harness` が同じ WORM 監査ログ
+    /// ファイルを共有すると hash chain が壊れる(`Harness::build` 呼び出し元の doc コメント、
+    /// `server/src/harness/audit.rs` 参照)。`build_support_config` が
+    /// `[harness].audit_log_path` / `search_improvement_queue_path` を
+    /// `[advisor].support_audit_log_path` / `support_search_improvement_queue_path` へ
+    /// 確実に上書きすることを、実ファイル・vegapunk 接続を要さない純関数テストで固定する。
+    #[test]
+    fn build_support_config_uses_distinct_audit_and_queue_paths() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+
+[[projects]]
+project_id = "homesec"
+schema = "homesec"
+manual_schema = "manual_v1"
+
+[harness]
+audit_log_path = "/data/audit/audit.jsonl"
+search_improvement_queue_path = "/data/audit/search-improvement-queue.jsonl"
+
+[advisor]
+handoff_contact_text = "案内文"
+images_dir = "data/homesec/images"
+ng_dictionary_path = "data/homesec/ng.json"
+support_schema = "urtect"
+support_manual_schema = "manual_v1"
+support_audit_log_path = "/data/audit/audit-support.jsonl"
+support_search_improvement_queue_path = "/data/audit/search-improvement-queue-support.jsonl"
+support_signal_lexicon_path = "data/urtect/signal-lexicon.json"
+support_ng_dictionary_path = "data/urtect/ng-dictionary.json"
+"#;
+        let config: cs_support_mcp::config::AppConfig = toml::from_str(toml).unwrap();
+        let advisor_cfg = config
+            .advisor
+            .clone()
+            .expect("[advisor] section must parse to Some");
+
+        let support_config = build_support_config(&config, &advisor_cfg);
+
+        // 本体: support_harness 用パスは advisor 本体用パスと必ず異なる。
+        assert_ne!(
+            support_config.harness.audit_log_path, config.harness.audit_log_path,
+            "support_harness と advisor 本体の Harness が同じ audit_log_path を指すと \
+             WORM 監査ログの hash chain が壊れる"
+        );
+        assert_ne!(
+            support_config.harness.search_improvement_queue_path,
+            config.harness.search_improvement_queue_path
+        );
+        // support_harness 用パスは [advisor] の support_* 値そのもの。
+        assert_eq!(
+            support_config.harness.audit_log_path,
+            "/data/audit/audit-support.jsonl"
+        );
+        assert_eq!(
+            support_config.harness.search_improvement_queue_path,
+            "/data/audit/search-improvement-queue-support.jsonl"
+        );
+        // projects は support_schema 1 件に差し替わる(既存の呼び出し元と同じ契約)。
+        assert_eq!(support_config.projects.len(), 1);
+        assert_eq!(support_config.projects[0].project_id, "urtect");
+        assert_eq!(support_config.projects[0].schema, "urtect");
+    }
+
+    /// Issue #50 バッチ2 レビュー指摘: `[harness].signal_lexicon_path` /
+    /// `ng_dictionary_path` を support 用の urtect 辞書で丸ごと上書きしてしまうと、
+    /// advisor 本体の `Harness::admit_known_resolution`（admin 画面の KR 登録経路）まで
+    /// urtect 向け語彙・NG 辞書で検査されてしまう。`build_support_config` が
+    /// `[harness].signal_lexicon_path` / `ng_dictionary_path` を
+    /// `[advisor].support_signal_lexicon_path` / `support_ng_dictionary_path` へ確実に
+    /// 上書きし、advisor 本体用の値（config.homesec.toml の既定値のまま）とは別になることを
+    /// 純関数テストで固定する（`build_support_config_uses_distinct_audit_and_queue_paths` と
+    /// 同じパターン）。
+    #[test]
+    fn build_support_config_uses_distinct_lexicon_and_ng_paths() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+
+[[projects]]
+project_id = "homesec"
+schema = "homesec"
+manual_schema = "manual_v1"
+
+[harness]
+audit_log_path = "/data/audit/audit.jsonl"
+search_improvement_queue_path = "/data/audit/search-improvement-queue.jsonl"
+
+[advisor]
+handoff_contact_text = "案内文"
+images_dir = "data/homesec/images"
+ng_dictionary_path = "data/homesec/ng.json"
+support_schema = "urtect"
+support_manual_schema = "manual_v1"
+support_audit_log_path = "/data/audit/audit-support.jsonl"
+support_search_improvement_queue_path = "/data/audit/search-improvement-queue-support.jsonl"
+support_signal_lexicon_path = "data/urtect/signal-lexicon.json"
+support_ng_dictionary_path = "data/urtect/ng-dictionary.json"
+"#;
+        let config: cs_support_mcp::config::AppConfig = toml::from_str(toml).unwrap();
+        let advisor_cfg = config
+            .advisor
+            .clone()
+            .expect("[advisor] section must parse to Some");
+
+        // advisor 本体用 Harness は [harness] にこれらのキーを書いていないので、
+        // AppConfig 全体のデフォルトに倒れる。ただしこのデフォルト
+        // （`data/signal-lexicon.json` / `data/ng-dictionary.json`）は「homesec 向けとして
+        // 妥当だから」使うわけではない。実体は旧 sivira-cs-demo（食品・サプリメント・化粧品
+        // ドメイン）向けの fixture であり、homesec（ホームセキュリティ機器）向けでも
+        // urtect（防犯カメラ）向けでもない（`server/src/harness/signal.rs` の
+        // `bundled_urtect_lexicon_path` doc コメント参照）。`Harness::admit_known_resolution`
+        // は語彙外の signal を "unknown signal (not in vocabulary)" で拒否するため、admin
+        // 画面から homesec 固有の signal 語彙で KR 登録すると弾かれうる既知の制約が残る
+        // （通るのは `human_handoff_request` / `unclassified_risk` など語彙非依存のものに
+        // 限られる）。それでも urtect 向け辞書で検査してしまう事故よりは安全という消極的な
+        // 理由でこの既定値を使う。homesec 専用辞書の新規作成は本バッチのスコープ外。
+        assert_eq!(
+            config.harness.signal_lexicon_path,
+            "data/signal-lexicon.json"
+        );
+        assert_eq!(config.harness.ng_dictionary_path, "data/ng-dictionary.json");
+
+        let support_config = build_support_config(&config, &advisor_cfg);
+
+        // support_harness 用パスは advisor 本体用パスと必ず異なる。
+        assert_ne!(
+            support_config.harness.signal_lexicon_path, config.harness.signal_lexicon_path,
+            "support_harness と advisor 本体の Harness が同じ signal_lexicon_path を指すと \
+             homesec 向け KR 登録が urtect 向け語彙で検査されてしまう"
+        );
+        assert_ne!(
+            support_config.harness.ng_dictionary_path, config.harness.ng_dictionary_path,
+            "support_harness と advisor 本体の Harness が同じ ng_dictionary_path を指すと \
+             homesec 向け KR 登録が urtect 向け NG 辞書で検査されてしまう"
+        );
+        // support_harness 用パスは [advisor] の support_* 値そのもの（urtect 用）。
+        assert_eq!(
+            support_config.harness.signal_lexicon_path,
+            "data/urtect/signal-lexicon.json"
+        );
+        assert_eq!(
+            support_config.harness.ng_dictionary_path,
+            "data/urtect/ng-dictionary.json"
+        );
     }
 }
