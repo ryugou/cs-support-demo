@@ -372,7 +372,8 @@ impl ProductAllowlist {
     }
 }
 
-/// LLM（signal 抽出の同乗呼び出し）が抽出した 1 件の製品参照（Issue #28 §3.1 二段目）。
+/// LLM（製品参照抽出専用の呼び出し。Issue #52 で signal 抽出への同乗から分離した）が
+/// 抽出した 1 件の製品参照（Issue #28 §3.1 二段目）。
 ///
 /// `surface` は発話中の表層表記（型番そのままとは限らない。略記・俗称・カテゴリ的言及もありうる）、
 /// `resolution` は取扱一覧との関係、`matched_model` は `resolution == Matched` のときにモデルが

@@ -40,6 +40,11 @@ pub struct Harness {
     /// signal 抽出の入口（lexicon ∪ LLM のハイブリッド、LLM 不達時は lexicon フォールバック）。
     /// `evaluate` / `root_cause_probe` はここ経由で signal を得る（S1-11 改訂）。
     pub extractor: Arc<dyn extraction::AsyncSignalExtractor>,
+    /// 取扱製品への言及抽出の入口（Issue #52: signals 抽出から分離した独立コンポーネント）。
+    /// `evaluate` のみが使う（catalog 注入が必要なのは質問側ゲート二段目のみのため）。
+    /// LLM 未設定・呼び出し失敗のいずれでも空配列に degrade する（`extractor` が lexicon
+    /// フォールバックへ倒れるのと同じ decision-safe な扱いだが、signals とは独立に失敗する）。
+    pub product_reference_extractor: extraction::ProductReferenceExtractor,
     pub ng: egress::NgDictionary,
     pub worm: Arc<audit::WormAuditLog>,
     pub knowledge: Option<knowledge::KnowledgeStore>,
@@ -114,9 +119,18 @@ pub struct EvaluationOutcome {
     /// 伝えないと、**末尾の注意書きだけが落ちた案内**がそのまま顧客へ送られうる。
     /// 下書きが無いとき（`customer_reply_draft` が `None`）は常に `false`。
     pub customer_reply_draft_truncated: bool,
-    /// 今ターンでLLMが抽出した製品参照（Issue #28 §3.1 二段目）。追加のLLM呼び出しは発生させず、
-    /// 既存のsignal抽出に同乗させて取得する。ここでの判定（foreign→取扱外）は行わない
-    /// （判定はapi.rs側。MCP経由の呼び出しでは何も強制しない。design doc §3.1）。
+    /// 今ターンでLLMが抽出した製品参照（Issue #28 §3.1 二段目）。Issue #52 で signal 抽出とは
+    /// 独立した専用のLLM呼び出し（`product_reference_extractor`）へ分離した（両者は
+    /// `tokio::join!` で並列発行され、抽出層の中では一方の失敗はもう一方に影響しない）。
+    /// ここでの判定（foreign→取扱外）は行わない（判定はapi.rs側。MCP経由の呼び出しでは
+    /// 何も強制しない。design doc §3.1）。
+    ///
+    /// **`extraction_mode == LexiconFallback` のターンは常に空になる**（Issue #52
+    /// フォローアップの Critical 是正）。signals 抽出が lexicon フォールバックへ落ちている
+    /// 状態で、独立した LLM 呼び出しの foreign 判定だけを根拠に質問側ゲート二段目が
+    /// `evaluate()` の fail-closed 判定（全件エスカレーション）を破棄することを防ぐための
+    /// harness 側 policy。詳細は本ファイルの `adopt_product_references_for_extraction_mode`
+    /// を参照。
     pub product_references: Vec<product_gate::ProductReference>,
     /// 今ターンに新規追加された signal（累積 signal 集合への差分）。Issue #28 C1 是正:
     /// 二段目(foreign)確定時に `Harness::demote_case_to_out_of_scope` へ渡し、破棄した
@@ -419,6 +433,56 @@ fn filter_out_of_scope_hits(
         .collect()
 }
 
+/// Issue #52 フォローアップ（signals/product_references 分離時の Critical 是正）: signals 抽出が
+/// `ExtractionMode::LexiconFallback` に落ちたターンは、独立した LLM 呼び出しで得た
+/// `product_references` を採用しない。戻り値は `(採用する product_references, 捨てた件数)`。
+///
+/// 抽出の 2 呼び出し（signals / product_references）は互いに独立している
+/// （`extraction::extract_signals_and_product_references` の doc、Issue #52 要件3）。しかし
+/// signals 抽出が LexiconFallback へ落ちている＝今ターンの理解が lexicon の床しか無い状態で
+/// あり、その状態で「別の LLM 呼び出しの foreign 判定」だけを根拠に `evaluate()` の
+/// fail-closed 判定（全件エスカレーション）を破棄させてはならない。質問側ゲート二段目
+/// （`api.rs::second_stage_short_circuit` / `advisor/cs_support.rs` の同等処理）は
+/// `product_references` に確信度の高い foreign 参照があると `evaluate()` のエスカレーション
+/// 判定を破棄して取扱外の定型応答を返すため、signals が劣化したターンではこの短絡を
+/// 起こさせない。これは PR #30 が product_references を signal 抽出へ同乗させていた頃と
+/// 同一の end-to-end 挙動（signals 抽出失敗時は product_references が必ず空だった）であり、
+/// Issue #52 は挙動を変えない refactor である。
+///
+/// この関数は allow-list である: `product_references` を採用してよいのは、signals 抽出が
+/// LLM で成功した（`ExtractionMode::Hybrid`）ターンだけだと**この関数自身**が表明する。他の
+/// すべてのモードでは discard する。
+///
+/// `ExtractionMode::LexiconOnly`（LLM 未設定）は、現状 `ProductReferenceExtractor::extract`
+/// が `llm: None` のとき既に空配列を返すため、この関数を通す前から実害は無い。しかしそれは
+/// **呼び出し元という別コンポーネントの実装詳細**であり、`Harness` は `extractor` /
+/// `product_reference_extractor` をどちらも `pub` フィールドとして持つ（本ファイル冒頭の
+/// struct 定義参照）。将来「`extractor` は LLM 無しで `ExtractionMode::LexiconOnly` を返す
+/// 一方、`product_reference_extractor` には LLM を設定する」という組み合わせで `Harness` が
+/// 構築されると、この関数を変更していなくても `LexiconOnly` の下で非空の
+/// `product_references` が質問側ゲート二段目まで到達しうる。安全境界は他コンポーネントの
+/// 実装保証に委ねず、この関数自身で閉じる。
+///
+/// PR #30 以前（signals 抽出への同乗時代）は LLM 未設定時も `product_references` は必ず
+/// 空だった。deny-list（`LexiconFallback` だけを弾く）ではなく allow-list（`Hybrid` だけを
+/// 通す）にするのは、この過去挙動への復元としても忠実な表現だからである。
+///
+/// `match` に `_ =>` のワイルドカードを使わない: `ExtractionMode` に将来バリアントが増えたとき、
+/// 網羅性検査でコンパイルエラーにして「新しいモードで product_references を採用してよいか」の
+/// 再検討をこの関数の変更者に強制するため。
+fn adopt_product_references_for_extraction_mode(
+    extraction_mode: extraction::ExtractionMode,
+    product_references: Vec<product_gate::ProductReference>,
+) -> (Vec<product_gate::ProductReference>, usize) {
+    match extraction_mode {
+        extraction::ExtractionMode::Hybrid => (product_references, 0),
+        extraction::ExtractionMode::LexiconOnly | extraction::ExtractionMode::LexiconFallback => {
+            let discarded = product_references.len();
+            (Vec::new(), discarded)
+        }
+    }
+}
+
 /// `Harness::evaluate()` に渡された case_id が既存 case として解決できなかった場合の挙動。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownCaseIdPolicy {
@@ -474,7 +538,7 @@ impl Harness {
             None
         };
         let llm_classifier: Option<Arc<dyn extraction::ClassifyLlm>> =
-            anthropic_client.map(|client| {
+            anthropic_client.clone().map(|client| {
                 Arc::new(extraction::AnthropicSignalClassifier::new(
                     client,
                     lexicon.vocabulary_for_prompt(),
@@ -483,6 +547,17 @@ impl Harness {
         let extractor: Arc<dyn extraction::AsyncSignalExtractor> = Arc::new(
             extraction::HybridExtractor::new(lexicon.clone(), llm_classifier),
         );
+        // 製品参照抽出（Issue #52: signals 抽出から分離した独立コンポーネント）。同じ
+        // AnthropicClient を使い回す（signal 抽出・返信文下書きと同じ「クライアントは共有し、
+        // 呼び出しごとに system prompt を分ける」設計）。`enabled = false` なら signals と
+        // 同じく `None` になり、evaluate は製品参照抽出を試みず常に空配列を返す。
+        let product_reference_classifier: Option<Arc<dyn extraction::ClassifyProductReferences>> =
+            anthropic_client.map(|client| {
+                Arc::new(extraction::AnthropicProductReferenceClassifier::new(client))
+                    as Arc<dyn extraction::ClassifyProductReferences>
+            });
+        let product_reference_extractor =
+            extraction::ProductReferenceExtractor::new(product_reference_classifier);
         // 材料 corpus ローダは 1 インスタンスを ManualStore と evaluate で共有し、
         // manual_corpus の TTL キャッシュを read 経路・評価経路の双方で使い回す。
         let corpus = Arc::new(crate::corpus::CorpusLoader::new(client.clone()));
@@ -493,6 +568,7 @@ impl Harness {
             normalizer: lexicon.clone(),
             lexicon,
             extractor,
+            product_reference_extractor,
             ng: egress::NgDictionary::from_path(&resolve_path(&config.harness.ng_dictionary_path))?,
             worm: Arc::new(audit::WormAuditLog::open(&resolve_path(
                 &config.harness.audit_log_path,
@@ -940,21 +1016,44 @@ impl Harness {
         // manual 検索は accumulated signal 集合（会話層）を使うため、hits の取得は
         // accumulated が確定した後ろに回す（下記 manual 取得ブロック）。
         // [正規化] lexicon ∪ LLM のハイブリッド抽出（S1-11 改訂）。今ターン分。
-        // Issue #28 §3.1 二段目: catalog（取扱一覧）を signal 抽出 LLM 呼び出しに同乗させる
-        // ため、抽出より前に allowlist を取得する（§3.2 の材料選別直前で取得していた従来位置
-        // から前倒し。以降の参照はすべてこの束縛を使い回し、二重取得しない）。
+        // Issue #28 §3.1 二段目: catalog（取扱一覧）を製品参照抽出 LLM 呼び出しに渡すため、
+        // 抽出より前に allowlist を取得する（§3.2 の材料選別直前で取得していた従来位置から
+        // 前倒し。以降の参照はすべてこの束縛を使い回し、二重取得しない）。
         let allowlist = self.product_allowlist(&ctx.schema).await?;
-        // KR 読み込み（gRPC）と signal 抽出（LLM 有効時は HTTP 往復を伴う）は互いに
-        // 依存しないため並列発行し、LLM 往復レイテンシを KR 読み込みの裏に隠す。
-        let (resolutions, extraction_outcome) = tokio::join!(
+        // KR 読み込み（gRPC）・signal 抽出・製品参照抽出（いずれも LLM 有効時は HTTP 往復を
+        // 伴う）は互いに依存しないため並列発行し、往復レイテンシを重ねて隠す。signal 抽出と
+        // 製品参照抽出は Issue #52 で別々の LLM 呼び出しに分離した独立コンポーネントであり
+        // （`extraction::extract_signals_and_product_references`）、一方の失敗がもう一方に
+        // 波及することはない。
+        let (resolutions, (extraction_outcome, product_references)) = tokio::join!(
             knowledge.load_known_resolutions_with(&ctx.schema, &live_snapshot),
-            self.extractor
-                .extract(question, Some(allowlist.display_list())),
+            extraction::extract_signals_and_product_references(
+                self.extractor.as_ref(),
+                &self.product_reference_extractor,
+                question,
+                allowlist.display_list(),
+            ),
         );
         let resolutions = resolutions?;
         let signals = extraction_outcome.signals;
         let extraction_mode = extraction_outcome.mode;
-        let product_references = extraction_outcome.product_references;
+        // Issue #52 フォローアップ（Critical 是正）: signals 抽出が lexicon フォールバックへ
+        // 落ちたターンは product_references を採用しない
+        // （`adopt_product_references_for_extraction_mode` の doc を参照）。
+        let (product_references, discarded_product_references) =
+            adopt_product_references_for_extraction_mode(extraction_mode, product_references);
+        if discarded_product_references > 0 {
+            tracing::warn!(
+                request_id = %ctx.request_id,
+                discarded_count = discarded_product_references,
+                extraction_mode = extraction_mode.as_str(),
+                "signals extraction was not ExtractionMode::Hybrid this turn (LLM signal \
+                 extraction did not succeed); discarding product references from the \
+                 independent product reference extraction call so the question-side gate \
+                 stage 2 cannot short-circuit evaluate()'s fail-closed escalation decision \
+                 (Issue #52 followup; pre-PR#30 parity)"
+            );
+        }
         // [会話層] 累積 signal 集合の維持。client 供給の prior signals は受けない（入力不信）。
         // 既存 case_id は存在を確認する。存在すれば復元する。存在しない（未知の id）場合の
         // 扱いは `unknown_case_id_policy` で経路ごとに分ける:
@@ -1471,7 +1570,7 @@ impl Harness {
                     .manual
                     .as_ref()
                     .ok_or_else(|| anyhow!("manual store not configured"))?;
-                let extraction_outcome = self.extractor.extract(corrected_answer, None).await;
+                let extraction_outcome = self.extractor.extract(corrected_answer).await;
                 tracing::debug!(
                     mode = extraction_outcome.mode.as_str(),
                     "root_cause_probe signal extraction mode"
@@ -1867,6 +1966,7 @@ mod tests {
             normalizer: lexicon.clone(),
             // LLM 未設定（enabled = false 相当）→ lexicon 単独の extractor。
             extractor: Arc::new(extraction::HybridExtractor::new(lexicon.clone(), None)),
+            product_reference_extractor: extraction::ProductReferenceExtractor::new(None),
             lexicon,
             ng: egress::NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#)
                 .unwrap(),
@@ -2820,6 +2920,105 @@ mod tests {
             !matches!(d, decision::AnswerDecision::Allowed { .. }),
             "hits that mention only out-of-scope models must not survive into an Allowed \
              decision once the Issue #28 fix filters them out before decide(): {d:?}"
+        );
+    }
+
+    // ---- adopt_product_references_for_extraction_mode（Issue #52 フォローアップ、Critical 是正）----
+    //
+    // PR #30 以前と同じ end-to-end 挙動（signals 抽出失敗時は product_references が必ず空だった）
+    // への回帰テスト。signals/product_references を別々のLLM呼び出しへ分離した結果、
+    // 「signals だけ失敗し product_references だけ成功する」組み合わせが新たに起こりうるように
+    // なった。この関数を経由しないと、質問側ゲート二段目が signals 劣化時にも
+    // evaluate() の fail-closed 判定（全件エスカレーション）を破棄してしまう。
+
+    fn sample_product_reference() -> product_gate::ProductReference {
+        product_gate::ProductReference {
+            surface: "ADC-VDB101".to_string(),
+            resolution: product_gate::ProductReferenceResolution::Foreign,
+            matched_model: None,
+        }
+    }
+
+    #[test]
+    fn adopt_product_references_drops_them_when_signals_degraded_to_lexicon_fallback() {
+        let (adopted, discarded) = adopt_product_references_for_extraction_mode(
+            extraction::ExtractionMode::LexiconFallback,
+            vec![sample_product_reference()],
+        );
+        assert!(
+            adopted.is_empty(),
+            "a LexiconFallback turn must never surface product references to the caller, or \
+             the question-side gate stage 2 would short-circuit evaluate()'s fail-closed \
+             escalation decision using foreign-product judgment from an independent llm call \
+             that has no bearing on the failed signals extraction"
+        );
+        assert_eq!(discarded, 1);
+    }
+
+    #[test]
+    fn adopt_product_references_keeps_them_when_signals_extraction_succeeded() {
+        let refs = vec![sample_product_reference()];
+        let (adopted, discarded) = adopt_product_references_for_extraction_mode(
+            extraction::ExtractionMode::Hybrid,
+            refs.clone(),
+        );
+        assert_eq!(
+            adopted, refs,
+            "a successful (Hybrid) signals extraction must not affect the independently \
+             extracted product references"
+        );
+        assert_eq!(discarded, 0);
+    }
+
+    #[test]
+    fn adopt_product_references_is_a_no_op_when_there_is_nothing_to_discard() {
+        // LexiconOnly（LLM未設定）時、ProductReferenceExtractor は既に空配列を返す
+        // （llm: None の分岐）。この関数がそれを再確認しても壊さないことを確認する。
+        let (adopted, discarded) = adopt_product_references_for_extraction_mode(
+            extraction::ExtractionMode::LexiconOnly,
+            Vec::new(),
+        );
+        assert!(adopted.is_empty());
+        assert_eq!(discarded, 0);
+    }
+
+    /// `ProductReferenceExtractor::extract` は `llm: None`（`LexiconOnly`）のとき既に空配列を
+    /// 返すため、通常この組み合わせ（`LexiconOnly` + 非空 `product_references`）は実運用では
+    /// 起こらない。しかしそれは呼び出し元コンポーネントの実装詳細であり、`Harness` は
+    /// `extractor` / `product_reference_extractor` の両方を `pub` フィールドとして持つため、
+    /// 将来「`extractor` が LLM 無しで `LexiconOnly` を返す一方、`product_reference_extractor`
+    /// は LLM 有りで非空を返す」という組み合わせで `Harness` が構築される可能性を排除できない。
+    /// `ProductReferenceExtractor` 側の実装保証に依存せず、`adopt_product_references_for_extraction_mode`
+    /// 自身が allow-list として安全境界を閉じていることをこのテストで固定する。
+    #[test]
+    fn adopt_product_references_drops_them_for_lexicon_only_even_if_not_actually_empty() {
+        let (adopted, discarded) = adopt_product_references_for_extraction_mode(
+            extraction::ExtractionMode::LexiconOnly,
+            vec![sample_product_reference()],
+        );
+        assert!(
+            adopted.is_empty(),
+            "LexiconOnly must discard product references regardless of whether the caller \
+             actually supplied any, because this function is an allow-list keyed on \
+             ExtractionMode::Hybrid alone, not a check for what ProductReferenceExtractor \
+             happens to return today"
+        );
+        assert_eq!(discarded, 1);
+    }
+
+    #[test]
+    fn adopt_product_references_warns_only_when_something_was_actually_discarded() {
+        // `evaluate()` はこの関数の戻り値 discarded_count > 0 のときだけ tracing::warn! を
+        // 出す。LexiconFallback かつ product_references が最初から空なら、捨てるものが無い
+        // ので warn 条件（discarded > 0）を満たさないことを固定する。
+        let (adopted, discarded) = adopt_product_references_for_extraction_mode(
+            extraction::ExtractionMode::LexiconFallback,
+            Vec::new(),
+        );
+        assert!(adopted.is_empty());
+        assert_eq!(
+            discarded, 0,
+            "nothing was discarded, so evaluate() must not emit the discard warning"
         );
     }
 

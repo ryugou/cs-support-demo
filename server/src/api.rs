@@ -2550,6 +2550,9 @@ mod tests {
                 lexicon.clone(),
                 None,
             )),
+            product_reference_extractor: crate::harness::extraction::ProductReferenceExtractor::new(
+                None,
+            ),
             lexicon,
             ng: crate::harness::egress::NgDictionary::from_json(
                 r#"{"block_terms":[],"abstain_terms":[]}"#,

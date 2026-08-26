@@ -122,8 +122,11 @@ pub struct EvaluateAnswerabilityResponse {
     /// `customer_reply_draft` の注記のとおり、判定そのものを無効化するため。
     /// 切れた下書きは破棄し、取り次ぐ旨だけを書く。
     pub customer_reply_draft_truncated: bool,
-    /// 今ターンでLLMが抽出した製品参照（Issue #28 §3.1 二段目。追加のLLM呼び出しは発生させない）。
-    /// MCP側ではこの判定（foreign→取扱外）は行わない。
+    /// 今ターンにLLMが抽出した製品参照（Issue #28 §3.1 二段目）。Issue #52 で signals 抽出とは
+    /// 独立した専用のLLM呼び出しへ分離した（evaluate 1 回あたりの Anthropic 呼び出しが
+    /// signals 抽出用と合わせて2回になる）。signals 抽出が lexicon フォールバックへ落ちた
+    /// ターンは常に空になる（質問側ゲート二段目が signals 劣化時の fail-closed 判定を
+    /// 破棄しないための措置）。MCP側ではこの判定（foreign→取扱外）は行わない。
     pub product_references: Vec<ProductReferenceJson>,
 }
 
@@ -464,8 +467,7 @@ impl CsSupportRmcpServer {
                 let crate::harness::extraction::ExtractionResult {
                     signals: query_signals,
                     mode: query_extraction_mode,
-                    ..
-                } = self.harness.extractor.extract(&req.query_ja, None).await;
+                } = self.harness.extractor.extract(&req.query_ja).await;
                 let top_k = req.top_k.unwrap_or(5).max(1) as usize;
                 // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
                 // 決定論の search が握る。ここでは候補材料を用意するだけ。
@@ -736,8 +738,7 @@ impl CsSupportRmcpServer {
         let crate::harness::extraction::ExtractionResult {
             signals: question_signals,
             mode: extraction_mode,
-            ..
-        } = self.harness.extractor.extract(&req.question, None).await;
+        } = self.harness.extractor.extract(&req.question).await;
         let resolutions = store
             .load_known_resolutions(&ctx.schema)
             .await

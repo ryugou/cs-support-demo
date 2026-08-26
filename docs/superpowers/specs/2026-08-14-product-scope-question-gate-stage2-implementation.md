@@ -10,6 +10,11 @@
 evaluate 完了後にコード側で「foreign かつ実在確認済み」の場合だけ取扱外定型応答へ倒す。
 **追加の LLM 呼び出しは作らない**（既存呼び出しに同乗させる）。
 
+> **Issue #52 により supersede された（2026-08-26）。** 上記の「既存呼び出しに同乗させる」
+> 方針は撤回した。現行は `server/src/harness/extraction.rs` の `ProductReferenceExtractor`
+> による専用の LLM 呼び出しを、signals 抽出（`HybridExtractor`）と `tokio::join!` で並列発行する
+> 構成に置き換わっている。詳細は本ファイル末尾の「Issue #52 による変更点」を参照。
+
 作業ブランチは `feat/28-product-scope`（既に切り替わっているはずなのでブランチ操作は不要）。
 
 以下は6ファイルへの変更点を、既存コードを実際に読んだ上で具体的に指示する。指示にない非自明な
@@ -89,6 +94,11 @@ evaluate 完了後にコード側で「foreign かつ実在確認済み」の場
 
 ### 4. `server/src/harness/mod.rs`
 
+> **Issue #52 により supersede された。** 下記コード例の「追加のLLM呼び出しは発生させず、既存の
+> signal抽出に同乗させて取得する」は撤回済み。現行の型・doc は `server/src/harness/mod.rs` の
+> `EvaluationOutcome::product_references` を正本とする（本ファイル末尾「Issue #52 による
+> 変更点」参照）。
+
 - `EvaluationOutcome`（88行目付近）に以下を追加（既存フィールドは一切変更しない）:
   ```rust
   /// 今ターンでLLMが抽出した製品参照（Issue #28 §3.1 二段目）。追加のLLM呼び出しは発生させず、
@@ -111,6 +121,11 @@ evaluate 完了後にコード側で「foreign かつ実在確認済み」の場
 - `root_cause_probe`内（1367行目付近）の `self.extractor.extract(corrected_answer).await` は今回のスコープ外（§3.1と無関係）。catalogに `None` を渡すだけに留める: `self.extractor.extract(corrected_answer, None).await`。
 
 ### 5. `server/src/rmcp_server.rs`
+
+> **Issue #52 により supersede された。** 下記コード例の「追加のLLM呼び出しは発生させない」は
+> 撤回済み。現行の doc は `server/src/rmcp_server.rs` の
+> `EvaluateAnswerabilityResponse::product_references` を正本とする（本ファイル末尾
+> 「Issue #52 による変更点」参照）。
 
 - `EvaluateAnswerabilityResponse`（71行目付近）に以下を追加:
   ```rust
@@ -227,3 +242,26 @@ cargo fmt --manifest-path server/Cargo.toml -- --check
 - `cargo test`の合否件数（新規テスト名を含む一覧）
 - `cargo fmt --check`の結果
 - 上記「明確な境界」を超える判断が必要になった箇所があれば、実装せずにその内容を報告すること
+
+## Issue #52 による変更点（2026-08-26、supersede 注記）
+
+本ファイルの「追加の LLM 呼び出しは作らない（既存呼び出しに同乗させる）」という結論は、
+Issue #52 で覆った。現行実装（正本は `server/src/harness/extraction.rs` /
+`server/src/harness/mod.rs`）は以下のとおりで、本ファイルの該当コード例は歴史的記録として
+残すが、現在の実装を表さない。
+
+- **同乗をやめた理由**: signals 抽出単体のタスクに catalog（取扱一覧）が混入し、system
+  prompt の再構築・出力形式・パース処理・truncation 扱いにまで影響していたため。
+- **現行構成**: signals 抽出（`extraction::HybridExtractor`）と製品参照抽出
+  （`extraction::ProductReferenceExtractor`、専用の LLM 呼び出し）を別コンポーネントとして
+  分離し、`extraction::extract_signals_and_product_references` が両者を `tokio::join!` で
+  並列発行する。
+- **Anthropic 呼び出し回数への影響**: evaluate 1 回あたりの呼び出しが 1 回 → 2 回になった
+  （`harness.customer_reply_draft_enabled = true` の構成では 3 回）。**顧客問い合わせ本文が
+  Anthropic へ 2 回送信される。**
+- **劣化時の対応（Critical 是正）**: signals 抽出が `ExtractionMode::LexiconFallback` へ
+  落ちたターンは、製品参照抽出が独立して成功していても `product_references` を採用しない
+  （`Harness::evaluate` 内 `adopt_product_references_for_extraction_mode`）。質問側ゲート
+  二段目が、signals 抽出の失敗とは無関係な foreign 判定だけを根拠に `evaluate()` の
+  fail-closed 判定（全件エスカレーション）を破棄しないための対応であり、PR #30 以前と同一の
+  end-to-end 挙動を維持する。
