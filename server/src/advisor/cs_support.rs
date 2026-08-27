@@ -41,7 +41,8 @@
 //! | 9 | `outcome`/`conv`/`api_cfg` | 常に | [`crate::api::decide_reply_action`] | `ReplyAction::{Answer,Clarify,EscalationReply}` |
 //! | 10a | `Answer(text)` | `Allowed` かつ下書きあり・非truncated(`LexiconFallback` でない) | そのまま | [`SupportReplyKind::Answer`] |
 //! | 10b | `Clarify` | `Escalate` かつ `clarification_allowed` かつ `clarify_turns < max` | `clarify::draft_clarify_question`(または `FALLBACK_CLARIFY_TEXT`)→ ゲート → `append_final_turn_suffix`。`conv.clarify_turns += 1` | [`SupportReplyKind::Clarify`] |
-//! | 10c | `EscalationReply` | それ以外すべて(`extraction_mode == LexiconFallback` の fail-closed を含む) | `escalation_reply::draft_ack_text`(または `fallback_ack`)→ ゲート → `build_deterministic_block` → `assemble_escalation_reply`。`arm_time_pref_solicitation(&mut conv)` | [`SupportReplyKind::Escalation`] |
+//! | 10c | `EscalationReply` | それ以外すべて(`extraction_mode == LexiconFallback` の fail-closed を含む)。`conv.is_already_escalated()`(Issue #54)が false のとき | `escalation_reply::draft_ack_text`(または `fallback_ack`)→ ゲート → `build_deterministic_block` → `assemble_escalation_reply`。`arm_time_pref_solicitation(&mut conv)` | [`SupportReplyKind::Escalation`] |
+//! | 10c' | `EscalationReply` | `conv.is_already_escalated()`(Issue #54: 受付番号発行済みの後続ターン)が true のとき | `escalation_reply::build_already_escalated_reply`(LLM 不使用・`conv` 変更なし) | [`SupportReplyKind::Escalation`] |
 //! | 11 | 上記の結果 | 常に | [`crate::harness::Harness::record_conversation_turn`](5秒 timeout、失敗は warn のみで応答は止めない) | [`SupportReplyOutcome`] |
 
 use crate::config::{ApiConfig, ManualSchemaKind};
@@ -277,8 +278,19 @@ pub async fn run_support_turn(
     .await;
 
     // `Answer` は conv 状態を変更しない(元の `reply_handler` も Answer 分岐で
-    // `save_conv_state` を呼ばない)。`Clarify` / `Escalation` は `build_post_evaluate_reply`
-    // が `conv` を書き換えているので保存する。
+    // `save_conv_state` を呼ばない)。`Clarify` は常に `conv.clarify_turns` を書き換える。
+    // `Escalation` は新規確定ターンでは `conv` を書き換える（`arm_time_pref_solicitation`）が、
+    // 確定済み(`conv.is_already_escalated()`)の後続ターンでは `build_post_evaluate_reply` の
+    // `ReplyAction::EscalationReply` 分岐（`conv.is_already_escalated()` が true の枝）が
+    // `conv` を一切変更しない。
+    //
+    // **`api.rs::reply_handler` との非対称（意図的・挙動は同値）**: `api.rs` は
+    // `build_escalation_reply_text` が返す `conv_mutated`（Warning 1 是正、reviewer 第2ラウンド）
+    // を見て、確定済み後続ターンでは `save_conv_state` 自体をスキップする。ここではスキップせず
+    // 常に保存する。どちらの実装でも書き戻される `conv` の内容は変更前と同一（read した値を
+    // そのまま re-serialize するだけ）なので、外から見える結果（support_case の属性値）に差は
+    // 無い。差は「変更が無いときに無用な write を発行するかどうか」だけであり、正しさには
+    // 影響しない。
     if matches!(
         reply_kind,
         SupportReplyKind::Clarify | SupportReplyKind::Escalation
@@ -354,10 +366,12 @@ pub async fn peek_conv_state(
 ///
 /// **`conv.clarify_turns > 0` は使わない(Issue #50 バッチ2 レビュー修正 Critical 1)。**
 /// `clarify_turns` はその CS case で累積した聞き返し回数のカウンタであり、「今まさに聞き返し
-/// 中」を表す transient なフラグではない: `Clarify` 分岐が `+= 1` する(本ファイル439行目)一方、
-/// 0 に戻すのは `arm_time_pref_solicitation`(= `EscalationReply` 経路、583行目)だけで、
-/// `Answer` は conv 状態を一切変更しない(`save_conv_state` すら呼ばない。279〜289行目の
-/// コメント参照)。そのため `clarify_turns > 0` を継続条件に使うと、**CS が一度でも聞き返しを
+/// 中」を表す transient なフラグではない: `build_post_evaluate_reply` の
+/// `ReplyAction::Clarify` 分岐が `+= 1` する一方、0 に戻すのは `arm_time_pref_solicitation`
+/// (`ReplyAction::EscalationReply` の新規確定パスのみが呼ぶ)だけで、`Answer` は conv 状態を
+/// 一切変更しない(`save_conv_state` すら呼ばない。`run_support_turn` 内の
+/// `save_conv_state` 呼び出し条件のコメント参照)。そのため `clarify_turns > 0` を継続条件に
+/// 使うと、**CS が一度でも聞き返しを
 /// した case は、その後 CS が正常に `Answer` を返しても `clarify_turns` が 1 以上のまま残り、
 /// 客が話題を変えても永久にサポートモードから出られなくなる**(design doc §13.2 rule 3 の
 /// 退場条件、§13.4 の E2E 受け入れ条件「続けて『ところで空き巣対策は?』→ 通常モードへ復帰」
@@ -453,47 +467,69 @@ async fn build_post_evaluate_reply(
             (SupportReplyKind::Clarify, reply_text)
         }
         crate::api::ReplyAction::EscalationReply => {
-            let ack_text = match harness.reply_drafter.as_ref() {
-                Some(drafter) => {
-                    escalation_reply::draft_ack_text(
-                        drafter,
-                        &harness.ng,
-                        harness.reply_draft_max_tokens,
-                        message,
-                        is_continuation,
-                    )
-                    .await
-                }
-                None => escalation_reply::fallback_ack(is_continuation)
-                    .0
-                    .to_string(),
-            };
-            let ack_text = gate_generated_text(
-                ack_text,
-                allowlist,
-                request_id,
-                &outcome.case_id,
-                "escalation_ack",
-                "escalation ack text mentions an out-of-scope product model; falling back to \
-                 the deterministic ack fallback",
-                || {
-                    escalation_reply::fallback_ack(is_continuation)
+            // Issue #54: 確定済み(受付番号発行済み)case の後続ターンでは、フルブロック
+            // (受け止め文の LLM 生成 + `build_deterministic_block` の再掲)を作らず、簡潔な
+            // 確定済み応答に倒す。LLM を一切呼ばないため、A-2 (a) の「質問しない」制約は
+            // そもそも LLM 生成物にしないことで構造的に満たす。`conv` も一切変更しない
+            // (`api.rs::build_escalation_reply_text` と同じ設計)。
+            if conv.is_already_escalated() {
+                // reviewer 第2ラウンド Critical 6: 確定済み分岐でも else 分岐と同じ
+                // `out_of_hours_now` を計算して渡す。以前はここで計算しておらず、深夜の
+                // 危険事象報告（第1層 mandatory）等で「いつ連絡が来るか」の時間外案内が
+                // 確定後は永久に出なくなっていた。
+                let out_of_hours_now =
+                    !hours::is_within_business_hours(&api_cfg.business_hours, chrono::Utc::now());
+                let hours_label = hours::business_hours_label(&api_cfg.business_hours);
+                let reply_text = escalation_reply::build_already_escalated_reply(
+                    &outcome.case_id,
+                    &hours_label,
+                    conv.awaiting_time_pref,
+                    out_of_hours_now,
+                );
+                (SupportReplyKind::Escalation, reply_text)
+            } else {
+                let ack_text = match harness.reply_drafter.as_ref() {
+                    Some(drafter) => {
+                        escalation_reply::draft_ack_text(
+                            drafter,
+                            &harness.ng,
+                            harness.reply_draft_max_tokens,
+                            message,
+                            is_continuation,
+                        )
+                        .await
+                    }
+                    None => escalation_reply::fallback_ack(is_continuation)
                         .0
-                        .to_string()
-                },
-            );
-            let out_of_hours_now =
-                !hours::is_within_business_hours(&api_cfg.business_hours, chrono::Utc::now());
-            let hours_label = hours::business_hours_label(&api_cfg.business_hours);
-            let block = escalation_reply::build_deterministic_block(
-                &outcome.case_id,
-                &hours_label,
-                out_of_hours_now,
-            );
-            let reply_text = escalation_reply::assemble_escalation_reply(&ack_text, &block);
+                        .to_string(),
+                };
+                let ack_text = gate_generated_text(
+                    ack_text,
+                    allowlist,
+                    request_id,
+                    &outcome.case_id,
+                    "escalation_ack",
+                    "escalation ack text mentions an out-of-scope product model; falling back \
+                     to the deterministic ack fallback",
+                    || {
+                        escalation_reply::fallback_ack(is_continuation)
+                            .0
+                            .to_string()
+                    },
+                );
+                let out_of_hours_now =
+                    !hours::is_within_business_hours(&api_cfg.business_hours, chrono::Utc::now());
+                let hours_label = hours::business_hours_label(&api_cfg.business_hours);
+                let block = escalation_reply::build_deterministic_block(
+                    &outcome.case_id,
+                    &hours_label,
+                    out_of_hours_now,
+                );
+                let reply_text = escalation_reply::assemble_escalation_reply(&ack_text, &block);
 
-            arm_time_pref_solicitation(conv);
-            (SupportReplyKind::Escalation, reply_text)
+                arm_time_pref_solicitation(conv);
+                (SupportReplyKind::Escalation, reply_text)
+            }
         }
     }
 }
@@ -590,10 +626,14 @@ fn note_time_pref_extraction_failure(conv: &mut CaseConvState) {
 /// 希望時間帯の伺いを立てる。`time_pref_extraction_error_count` はここでは変更しない
 /// (3 回連続到達による自動解除を永久に到達不能にしないため。`api.rs` 側の doc コメントが
 /// 明記する理由と同じ)。
+///
+/// reviewer 一次レビュー Critical 2: `escalation_confirmed = true` を立てる唯一の場所
+/// (`api.rs::arm_time_pref_solicitation` の doc コメント参照)。
 fn arm_time_pref_solicitation(conv: &mut CaseConvState) {
     conv.awaiting_time_pref = true;
     conv.time_pref_false_count = 0;
     conv.clarify_turns = 0;
+    conv.escalation_confirmed = true;
 }
 
 /// `api.rs::is_final_clarify_turn` と同じ契約。**前提**: `decide_reply_action` が
@@ -882,6 +922,7 @@ mod tests {
             time_pref_false_count: 0,
             preferred_contact_time: None,
             time_pref_extraction_error_count: 0,
+            escalation_confirmed: false,
         }
     }
 
@@ -1117,7 +1158,8 @@ mod tests {
         let allowlist = harness.product_allowlist(TEST_SCHEMA).await.unwrap();
         let api_cfg = default_api_config();
         let mut conv = default_conv_state();
-        // 第1・2層起因の escalate は clarification_allowed = false(決定論)。
+        // Issue #54: 第2層、または第1層で情報が十分な場合の escalate は
+        // clarification_allowed = false(決定論)。
         let mut outcome = base_outcome(escalate_decision(), false);
 
         let (kind, _text) = build_post_evaluate_reply(
@@ -1134,6 +1176,138 @@ mod tests {
         .await;
 
         assert_eq!(kind, SupportReplyKind::Escalation);
+    }
+
+    // ---- Issue #54 A-2 (b): 確定済み case の後続ターン向け簡潔な応対 ----
+
+    /// `crate::llm::AnthropicClient` を stub エンドポイントへ向けて組み立てる
+    /// （`escalation_reply.rs::draft_ack_text_via_stub` / `api.rs::stub_drafter` と同じ構成）。
+    async fn stub_drafter(
+        draft_text: &str,
+    ) -> (
+        crate::llm::AnthropicClient,
+        crate::llm::test_support::RequestLog,
+    ) {
+        let body = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": draft_text}],
+        })
+        .to_string();
+        let (endpoint, log) = crate::llm::test_support::spawn_messages_stub(body).await;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cs-support-escalation-reply-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let key_path = dir.join("llm-api-key");
+        std::fs::write(&key_path, "test-key\n").expect("write api key file");
+        let drafter = crate::llm::AnthropicClient::from_config(&crate::config::LlmConfig {
+            enabled: true,
+            endpoint,
+            api_key_file: Some(key_path.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .expect("llm client must build from the stub config")
+        .expect("enabled = true with a readable key file must yield a client");
+        (drafter, log)
+    }
+
+    #[tokio::test]
+    async fn build_post_evaluate_reply_uses_the_already_escalated_reply_when_already_escalated() {
+        let mut harness = test_harness(vec!["ADC-V724"]);
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        harness.reply_drafter = Some(drafter);
+        let allowlist = harness.product_allowlist(TEST_SCHEMA).await.unwrap();
+        let api_cfg = default_api_config();
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true; // 受付番号発行済みの後続ターンを模す
+        let mut outcome = base_outcome(escalate_decision(), false);
+
+        let (kind, text) = build_post_evaluate_reply(
+            &harness,
+            &api_cfg,
+            &allowlist,
+            "req-1",
+            "追加の補足です",
+            &[],
+            true,
+            &mut outcome,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(kind, SupportReplyKind::Escalation);
+        assert_eq!(
+            text,
+            escalation_reply::build_already_escalated_reply(
+                &outcome.case_id,
+                &hours::business_hours_label(&api_cfg.business_hours),
+                true,
+                !hours::is_within_business_hours(&api_cfg.business_hours, chrono::Utc::now()),
+            ),
+            "reviewer 第2ラウンド Critical 6: 確定済み分岐も現在時刻に応じた out_of_hours_now \
+             を計算して渡さなければならない"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "an already-escalated case must not call draft_ack_text (A-2 (a): no LLM, so no \
+             question can leak through)"
+        );
+        assert!(
+            conv.awaiting_time_pref,
+            "an already-escalated case must not be re-armed or otherwise mutated"
+        );
+    }
+
+    // reviewer 一次レビュー Critical 2 の回帰テスト。`awaiting_time_pref` が false 分類 2 連続 /
+    // 抽出インフラ失敗 3 連続のいずれかで自動解除された直後（まだ `preferred_contact_time` は
+    // 未確定）を模す。旧 `is_already_escalated()` はこの状態を「未確定」と誤判定し、2 ターンごとに
+    // フルブロックを再掲していた。`escalation_confirmed` フラグが正本になったことで、この状態
+    // でも確定済みと判定できることを固定する（`api.rs` 側の同名テストと対）。
+    #[tokio::test]
+    async fn build_post_evaluate_reply_treats_escalation_confirmed_alone_as_already_escalated() {
+        let mut harness = test_harness(vec!["ADC-V724"]);
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        harness.reply_drafter = Some(drafter);
+        let allowlist = harness.product_allowlist(TEST_SCHEMA).await.unwrap();
+        let api_cfg = default_api_config();
+        let mut conv = default_conv_state();
+        conv.escalation_confirmed = true;
+        // awaiting_time_pref / preferred_contact_time はどちらも未設定のまま
+        // (自動解除された直後・時間帯はまだ確定していない状態)。
+        let mut outcome = base_outcome(escalate_decision(), false);
+
+        let (kind, text) = build_post_evaluate_reply(
+            &harness,
+            &api_cfg,
+            &allowlist,
+            "req-1",
+            "追加の補足です",
+            &[],
+            true,
+            &mut outcome,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(kind, SupportReplyKind::Escalation);
+        assert_eq!(
+            text,
+            escalation_reply::build_already_escalated_reply(
+                &outcome.case_id,
+                &hours::business_hours_label(&api_cfg.business_hours),
+                false,
+                !hours::is_within_business_hours(&api_cfg.business_hours, chrono::Utc::now()),
+            ),
+            "awaiting_time_pref = false のままなので時間帯依頼の行は付かない"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "escalation_confirmed だけが立っている状態でも LLM を一切呼んではならない"
+        );
     }
 
     #[tokio::test]
@@ -1216,6 +1390,11 @@ mod tests {
         assert!(conv.awaiting_time_pref);
         assert_eq!(conv.time_pref_false_count, 0);
         assert_eq!(conv.clarify_turns, 0);
+        assert!(
+            conv.escalation_confirmed,
+            "エスカレーション応答を送ったら escalation_confirmed を立てる \
+             (reviewer 一次レビュー Critical 2)"
+        );
     }
 
     #[test]

@@ -806,6 +806,7 @@ mod tests {
             time_pref_false_count: 0,
             preferred_contact_time: None,
             time_pref_extraction_error_count: 0,
+            escalation_confirmed: false,
         }
     }
 

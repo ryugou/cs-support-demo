@@ -312,11 +312,16 @@ fn should_select_cards(reply_kind: &str) -> bool {
 /// - `created_at`: 既存に無ければ `now_rfc3339` を設定、あれば既存を保持（上書きしない）
 /// - `end_user_id`: 既存に無く、かつ `end_user_id` が `Some` のときだけ設定。それ以外は
 ///   既存を保持（上書きしない）
-/// - conv state 5 属性(`clarify_turns` / `awaiting_time_pref` / `time_pref_false_count` /
-///   `preferred_contact_time` / `time_pref_extraction_error_count`): 常に `conv` の値で上書き
-///   （`harness::mod::merge_conv_state_attributes` と同じキー・同じ形。あちらは `harness` に
-///   private なため advisor 側で複製する — 実装計画 Task 6 の指示どおり、1 回の `record()`
-///   呼び出しに全属性をまとめるため）
+/// - conv state 6 属性(`clarify_turns` / `awaiting_time_pref` / `time_pref_false_count` /
+///   `preferred_contact_time` / `time_pref_extraction_error_count` / `escalation_confirmed`):
+///   常に `conv` の値で上書き（`harness::mod::merge_conv_state_attributes` と同じキー・同じ形。
+///   あちらは `harness` に private なため advisor 側で複製する — 実装計画 Task 6 の指示どおり、
+///   1 回の `record()` 呼び出しに全属性をまとめるため）。**`escalation_confirmed` は reviewer
+///   第2ラウンド Warning 2 是正で追加した: advisor 自身のパイプライン（`apply_action_contract`）は
+///   このフラグを一度も立てない（`arm_time_pref_solicitation` は CS 側 conv state にのみ作用し、
+///   advisor 自身の conv には触れない）ため常に `"false"` を書くだけだが、`harness::mod::
+///   merge_conv_state_attributes` と「同じキー・同じ形」という契約を保つために揃えておく
+///   （キー集合を揃えておく方が、次に属性が増えたときに複製が2つあることへ気づきやすい）**
 /// - `decide::advisor_attr_updates` の3属性、`decide::accumulated_condition_updates` の
 ///   最大5属性: 常に上書き（後者は非空の値だけを書く契約は `accumulated_condition_updates`
 ///   自身が担保する）
@@ -358,6 +363,10 @@ fn merge_support_case_attrs(
     merged.insert(
         "time_pref_extraction_error_count".to_string(),
         conv.time_pref_extraction_error_count.to_string(),
+    );
+    merged.insert(
+        "escalation_confirmed".to_string(),
+        conv.escalation_confirmed.to_string(),
     );
     for (key, value) in decide::advisor_attr_updates(advisor_attrs) {
         merged.insert(key, value);
@@ -1759,6 +1768,7 @@ mod tests {
             time_pref_false_count: 0,
             preferred_contact_time: None,
             time_pref_extraction_error_count: 0,
+            escalation_confirmed: false,
         }
     }
 
@@ -1959,6 +1969,13 @@ mod tests {
             map.get("time_pref_extraction_error_count")
                 .map(String::as_str),
             Some("2")
+        );
+        assert_eq!(
+            map.get("escalation_confirmed").map(String::as_str),
+            Some("false"),
+            "reviewer 第2ラウンド Warning 2: escalation_confirmed も他の conv state 属性と \
+             同じキー・同じ形で書く（advisor 自身のパイプラインでは常に false のままだが、 \
+             harness::mod::merge_conv_state_attributes と揃えておく）"
         );
         assert_eq!(map.get("lead_offered").map(String::as_str), Some("true"));
         assert_eq!(map.get("lead_requested").map(String::as_str), Some("true"));

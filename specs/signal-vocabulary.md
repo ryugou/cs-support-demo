@@ -53,6 +53,8 @@ Production CS MCP の 3 層判定・照合・egress は全てこの語彙の上�
 
 両 lexicon に `human_handoff_request`（`class: context`）を追加し、`server/data/urtect/rules.json` の `escalation_rules` に `rule_id: "human-handoff"`（`condition: ["human_handoff_request"]`, `owner: "support_desk"`, `route: "support_desk"`, `binding: "mandatory"`）を追加した。聞き返し（clarification）中に顧客が「担当者につないでほしい」等の明示依頼をした場合、この signal が第一層マッチを成立させて `clarification_allowed = false` となり、ターン残数に関係なく第4節（エスカレーション）へ落ちる。安全 hazard ではなく業務都合の相談系 signal のため `class: context` とした。設計判断の詳細は `docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md` §3 を参照。
 
+**この保証が成立する根拠は `binding: "mandatory"` である（Issue #54 改訂、reviewer 一次レビュー Critical 1）**。`decision::decide()` は第1層マッチ時に `rule.binding` を見て分岐するようになっており、`binding = advisory` のルールは情報不足（マニュアル一致度が閾値未満）なら `clarification_allowed = true`（聞き返し許可）になりうる。`human-handoff` が `clarification_allowed = false` を保つのは、この signal 自体の性質ではなく `binding: "mandatory"` という設定値によるものであり、将来この値を `advisory` に変更すると「聞き返しループからの脱出手段」という設計意図（本節冒頭）が壊れる。変更する場合は `docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md` §2・§3 の再検討が必須。
+
 surface_forms の照合は正規化後の単純部分一致（`server/src/harness/signal.rs`）のため、`人に代わって` のような広い形を含めると「本人に代わって問い合わせています」のような代理問い合わせにも部分一致し、第一層 mandatory エスカレーションへ誤って落ちる（回答も聞き返しも行われず全件人手に回る）。このため `人に代わって` 単独は採用せず、`人に代わってください` / `人に代わってほしい` 等の依頼形に限定してある。
 
 **既知の限界（受容済みリスク）**: 対応する escalation_rule は `server/data/urtect/rules.json`（本番 urtect スキーマ）にのみ投入し、`server/data/rules.sample.json`（sivira-cs-demo 用）には追加していない。本番の project 定義は urtect の1件のみのため実害は無いが、local/demo 構成（`config.toml` 等が読む root `signal-lexicon.json`）で「担当者につないで」を試すと、第一層に落ちず第三層グレー（`UnknownAddedSignal` → `clarification_allowed = true`）へ回り、聞き返しループを誘発する逆挙動になる。demo 環境での動作確認結果を本番の参考にしないこと。

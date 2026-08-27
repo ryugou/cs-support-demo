@@ -24,7 +24,13 @@
 - `clarify_turns` の上限は config `[api] clarify_max_turns`（既定 `3`）
 - フォールバック規則（生成失敗・生成上限による途中切断・egress 却下時に定型文へ落とす）は v1 と同じ思想で、聞き返し・エスカレーションそれぞれに定型文を持つ（第 3・4 節）
 
-**`clarification_allowed` の定義（正本は実装: `server/src/harness/mod.rs` の設定条件）**: 第三層の Escalate かつ reason が `InsufficientDirectness` または `UnknownAddedSignal` のときのみ `true`。第一層（明示エスカレーションルール）・第二層（禁止ドメイン）起因の escalate は決定論で `false`（禁止ドメインの質問に確認質問を返すこと自体が「答えられる可能性」を示唆する漏洩経路になるため、聞き返しは第三層のグレーゾーンに限る）。本書はこの条件を契約として固定し、**第 1・2 層で false になることの退行防止テストを置く**（第 8 節）。
+**`clarification_allowed` の定義（正本は実装: `server/src/harness/decision.rs::decide()` の binding 分岐 + `server/src/harness/mod.rs::clarification_allowed()`）**:
+
+- 第三層の Escalate かつ reason が `InsufficientDirectness` または `UnknownAddedSignal` のときは `true`（変更なし）。
+- 第二層（禁止ドメイン）起因の escalate は決定論で `false`（変更なし。禁止ドメインの質問に確認質問を返すこと自体が「答えられる可能性」を示唆する漏洩経路になるため）。
+- 第一層（明示エスカレーションルール）は **`rule.binding` で分岐する（Issue #54 改訂、reviewer 一次レビュー Critical 1）**。`binding = mandatory`（担当者取次・安全事故・物理破損・工事リスク等、`server/data/urtect/rules.json` 参照）は初版どおり常に `false`。`binding = advisory`（契約・保証関連等）は第三層グレーと同じ `evidence_sufficient` 判定を通し、マニュアル一致度が閾値未満（製品未特定・症状要点不足）なら `true` になる。
+
+**改訂の理由**: 初版（第 1・2 層は常に `false`）は、第1層マッチ時に情報不足でも問答無用で確定してしまい、`human-handoff`（binding=mandatory、聞き返しループからの脱出手段として設計。第 3 節参照）自体が聞き返しに吸収される自己矛盾と、hazard signal で stakes が上がるほど threshold も上がり危険度の高い mandatory 事象ほど聞き返しに倒れて確定が遅延するという反転を生んでいた。`binding = mandatory` はこの反転の対象外のまま据え置く。本書はこの条件を契約として固定し、**第 1 層 binding=mandatory と第 2 層で false になること、第 1 層 binding=advisory で情報不足時に true になることの退行防止テストを置く**（第 8 節）。
 
 ## 3. 聞き返し（ヒアリングループ）
 
@@ -56,6 +62,8 @@
 3. 営業時間外の受付案内（受付時刻が営業時間外のときのみ）: 「現在は対応時間外のため、担当者からのご連絡は翌営業時間（{営業時間の表記}）以降となります。」
 
 期限の断定（「1 営業日以内」等の固定 SLA 文言）は置かない。
+
+**確定済み case 向けの簡潔形態（Issue #54 改訂）**: `conv.is_already_escalated()`（`escalation_confirmed` が正本、第 6 節）が true の後続ターンでは、上記の受け止め文の LLM 生成を行わず、`escalation_reply::build_already_escalated_reply` による簡潔形へ倒す。構成は「定型の受領文 1 文 + 受付番号の参照 1 行 +（`awaiting_time_pref` が true なら）希望時間帯の伺い 1 行 +（現在が時間外なら）営業時間外の受付案内 1 行」で、上記の決定的ブロックの全構成要素は再掲しない。この形態を採る理由は 2 点: (1) 確定済みの受付番号を毎ターン再掲すると、顧客が「別件として再受付された」と誤解しうる、(2) 受け止め文を LLM 生成物にしないことで、確定後に聞き返し（質問）が紛れ込む余地を構造的に無くす（受け止め文の「質問はしない」制約はプロンプト上の指示に過ぎないが、確定済み経路ではそもそも LLM を呼ばないためこの制約が構造的に保証される）。
 
 ## 5. 希望時間帯の受付
 
@@ -89,11 +97,12 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 | 属性 | 型 | 用途 |
 | --- | --- | --- |
-| `clarify_turns` | int（既定 0） | 聞き返し回数の上限判定。エスカレーション応答送信時に 0 へリセット |
+| `clarify_turns` | int（既定 0） | 聞き返し回数の上限判定。エスカレーション応答送信時に 0 へリセット。**`escalation_confirmed = true`（確定済み）の case では聞き返しを再開しないため、確定後はこのカウンタを増やす経路自体が無くなる（Issue #54 要件3 改訂、`decide_reply_action` が `!conv.is_already_escalated()` を条件に含む）** |
 | `awaiting_time_pref` | bool（既定 false） | 次発話を時間帯返信として解釈するか。false 分類 2 連続で自動解除、新エスカレーションで再セット |
 | `time_pref_false_count` | int（既定 0） | 自動解除用の連続 false カウント |
 | `preferred_contact_time` | string（任意） | 担当者への申し送り（時間外希望はその旨を付記） |
 | `time_pref_extraction_error_count` | int（既定 0） | 抽出インフラ失敗（`time_pref_false_count` とは別枠）の連続回数。3 回で自動解除 |
+| `escalation_confirmed` | bool（既定 false） | エスカレーション応答を実際に送ったか。`awaiting_time_pref` の自動解除から独立して残る。`CaseConvState::is_already_escalated()` の正本（Issue #54 改訂） |
 
 起動時検証: `[api] enabled = true` のとき、`business_hours.tz` / `start` / `end` / `days`（`"mon-fri"` または `"everyday"` のいずれかであること）はサーバ起動時に検証し、失敗したら `anyhow::bail!` で起動を止める（fail closed）。実行時に `hours.rs` が同じ値を fail-closed で「営業時間外」に倒す経路はあるが、設定ミスに気づかないまま「常に営業時間外」の案内が出続ける事故を起動時点で防ぐ。`days` を検証対象から外すと、`business_hours_label` が未知値を黙って「平日」表示に倒すため、「常に対応時間外」の案内がもっともらしいラベル付きで出続ける同種の事故が別経路から起きる。
 
@@ -107,7 +116,7 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 ## 8. テスト
 
-- `clarification_allowed` の契約テスト（退行防止）: 第 1 層・第 2 層起因の Escalate で false、第 3 層 InsufficientDirectness / UnknownAddedSignal で true
+- `clarification_allowed` の契約テスト（退行防止、Issue #54 改訂）: 第 1 層 binding=mandatory・第 2 層起因の Escalate で false、第 1 層 binding=advisory は情報充足時に false・情報不足時に true、第 3 層 InsufficientDirectness / UnknownAddedSignal で true
 - 応答決定（第 2 節の表）: clarify 条件成立 / clarify_turns=3 で枯渇 / clarification_allowed=false、の分岐を純関数で検証
 - 営業時間判定: 時間内 / 時間外（早朝・深夜・週末）/ 境界（10:00 ちょうど・18:00 ちょうど → 10:00 は内、18:00 は外）
 - 希望時間帯: 重なりあり / なし（時間外でも 1 回で受け付け、付記付きで保存されること）/ is_time_preference=false で evaluate へ流れること / false 2 連続で awaiting_time_pref が解除されること
