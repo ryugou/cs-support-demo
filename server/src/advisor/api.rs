@@ -2270,6 +2270,9 @@ mod tests {
                 lexicon.clone(),
                 None,
             )),
+            product_reference_extractor: crate::harness::extraction::ProductReferenceExtractor::new(
+                None,
+            ),
             lexicon,
             ng: NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).unwrap(),
             worm: Arc::new(
@@ -2634,6 +2637,9 @@ clarify_max_turns = 3
                 lexicon.clone(),
                 None,
             )),
+            product_reference_extractor: crate::harness::extraction::ProductReferenceExtractor::new(
+                None,
+            ),
             lexicon,
             ng: NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).unwrap(),
             worm: Arc::new(

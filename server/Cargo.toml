@@ -56,6 +56,11 @@ tonic-build = "0.12"
 # health_router のルーティングを HTTP レベルで検証するための `oneshot`。
 # axum 0.8 は tower 0.5 系の Service を使うため合わせる。
 tower = { version = "0.5", features = ["util"] }
+# Issue #52: `extract_signals_and_product_references` の並列発行を仮想時計
+# （`#[tokio::test(start_paused = true)]` / `tokio::time::sleep`）で決定論的に検証するため。
+# テストのみで使う機能なので `[dependencies]` 側の tokio には足さない
+# （本番バイナリへ test-util を持ち込まない）。
+tokio = { version = "1", features = ["test-util"] }
 
 [[bin]]
 name = "cs-support-mcp"

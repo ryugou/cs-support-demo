@@ -184,11 +184,17 @@ impl Default for LlmConfig {
             endpoint: "https://api.anthropic.com/v1/messages".to_string(),
             api_key_file: None,
             timeout_secs: 20,
-            // Issue #28 C2(a) レビュー指摘: catalog（取扱一覧）注入時は product_references 分の
-            // 出力が増えるため、300 のままだと [llm] enabled = true な新規 config が
-            // max_tokens を書き忘れた場合に stop_reason=max_tokens で LexiconFallback へ落ち、
-            // /api/reply が全件エスカレーションへ倒れる。本番 config.cloudrun.toml と同じ
-            // 600 を既定値にする。
+            // Issue #28 C2(a) レビュー指摘に由来する値（600）。Issue #52 で signals 抽出
+            // （`classify_signals`）と製品参照抽出（`extract_product_references`）を別々の
+            // LLM 呼び出しに分離したため、signals 呼び出し自体はもう catalog（取扱一覧）を
+            // 積まない。ただし両呼び出しはこの同じ [llm] max_tokens を共有しており、
+            // catalog を注入して product_references の出力を要求するのは製品参照抽出側に
+            // 移っただけである。300 のままだと、この製品参照抽出呼び出しが
+            // stop_reason=max_tokens で切り詰められやすくなる（切り詰められると parse に
+            // 失敗し、`ProductReferenceExtractor` は空配列へ degrade する。signals 抽出側への
+            // 波及は無い）。本番 config.cloudrun.toml と同じ 600 を既定値にする（値そのものは
+            // 変更しない。`extract_product_references` も同じ上限を使うため 600 の余裕は
+            // 引き続き必要）。
             max_tokens: 600,
         }
     }
