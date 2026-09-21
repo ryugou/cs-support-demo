@@ -98,7 +98,10 @@ pub struct EvaluationOutcome {
     pub accumulated_signals: signal::SignalSet,
     /// 会話の継続キー。新規作成時は採番して返す
     pub case_id: String,
-    /// 聞き返し可否（第3層グレーのみ true。第1・2層は問答無用でルーティング）
+    /// 聞き返し可否。第1層 binding=advisory かつ情報不足、または第3層グレー
+    /// （`InsufficientDirectness` / `UnknownAddedSignal`）のときのみ true。第1層
+    /// binding=mandatory と第2層（禁止ドメイン）は問答無用でルーティングし常に false
+    /// （契約の正本は `clarification_allowed()` 関数、Issue #54 + reviewer 一次レビュー Critical 1）
     pub clarification_allowed: bool,
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
@@ -189,6 +192,48 @@ pub struct CaseConvState {
     /// この判定自体は `Harness` ではなくオーケストレーション層（`api.rs`）の責務で、
     /// ここは読み書きの器のみを持つ。
     pub time_pref_extraction_error_count: u32,
+    /// エスカレーション応答（受付番号付き）を実際に顧客へ送ったか（reviewer 一次レビュー
+    /// Critical 2）。`awaiting_time_pref`（時間帯受付の帳簿フラグ）とは独立に永続する。
+    ///
+    /// `awaiting_time_pref` は「確定済みか」の代理指標として使えない: `time_pref.rs` の
+    /// false 分類 2 連続、および `api.rs` / `advisor/cs_support.rs` の抽出インフラ失敗 3 連続の
+    /// どちらでも `awaiting_time_pref = false` へ自動解除される（`time_pref_false_count = 0` は
+    /// 伴うが `preferred_contact_time` は設定されない）。この自動解除は「時間帯を聞くのをやめる」
+    /// だけの意味であり、「エスカレーション自体が確定していない」ことは意味しない。しかし
+    /// 旧 `is_already_escalated()` はこの解除をもって確定前に戻ったと誤判定し、2 ターンごとに
+    /// フルブロック（LLM 受け止め文 + 受付番号 + 時間帯依頼 + 時間外案内）を再掲していた。
+    /// このフラグはエスカレーション応答の送信そのものにのみ紐づき、時間帯受付の状態遷移からは
+    /// 一切影響を受けない。
+    pub escalation_confirmed: bool,
+}
+
+impl CaseConvState {
+    /// エスカレーション確定済み（受付番号発行済み）case かどうかを判定する（Issue #54、
+    /// reviewer 一次レビュー Critical 2 で `escalation_confirmed` を正本にした）。
+    ///
+    /// `escalation_confirmed` が正本: `api.rs::arm_time_pref_solicitation` /
+    /// `advisor/cs_support.rs::arm_time_pref_solicitation`（どちらもエスカレーション応答の
+    /// 送信時にのみ呼ばれる）が立てる。時間帯受付の帳簿フラグ（`awaiting_time_pref`）とは
+    /// 独立に永続するため、`awaiting_time_pref` が自動解除されても確定済み判定は揺らがない。
+    ///
+    /// 後半 2 項（`awaiting_time_pref` / `preferred_contact_time`）は、このフラグを導入する
+    /// 前に作られた既存 case（`escalation_confirmed` 属性を持たない）への後方互換としてのみ
+    /// 残す。新規 case は `escalation_confirmed` だけで判定が閉じる。
+    ///
+    /// **残存ギャップ（reviewer 第2ラウンド Suggestion 4、運用者向け）**: `awaiting_time_pref`
+    /// が既に自動解除済みで、かつ `preferred_contact_time` も未確定のまま `escalation_confirmed`
+    /// 属性を持たずにデプロイをまたいだ既存 case（Critical 2 が問題にしていたまさにその状態）は、
+    /// デプロイ直後は 3 項すべて false になる。この state のまま次に `EscalationReply` に落ちる
+    /// と、`is_already_escalated() == false` と誤判定されるため、フルブロック（受け止め文の
+    /// LLM 生成 + 決定的ブロック）が同じ受付番号で 1 回だけ再掲される。ただしその 1 回の送信で
+    /// `arm_time_pref_solicitation` が `escalation_confirmed = true` を立てるため、以後は収束し
+    /// 再発しない。「まだ直っていない」という誤認を避けるため、この 1 回限りの再掲は許容している
+    /// ことを明記する。
+    pub fn is_already_escalated(&self) -> bool {
+        self.escalation_confirmed
+            || self.awaiting_time_pref
+            || self.preferred_contact_time.is_some()
+    }
 }
 
 /// support_case の属性 map から [`CaseConvState`] を復元する純関数。
@@ -209,6 +254,7 @@ fn conv_state_from_attrs(attrs: &std::collections::HashMap<String, String>) -> C
         time_pref_extraction_error_count: get("time_pref_extraction_error_count")
             .parse()
             .unwrap_or(0),
+        escalation_confirmed: get("escalation_confirmed") == "true",
     }
 }
 
@@ -269,8 +315,8 @@ fn prune_excluded_signals(
 
 /// [`CaseConvState`] を support_case の属性 map へ書き戻す全属性を組み立てる純関数。
 ///
-/// read-merge-write: 既存属性（`question` / `actor` 等、この 4 キー以外)を土台に、
-/// 会話状態の 4 キーだけを重ねる（`merge_outcome_attributes` と同じ形。vegapunk の
+/// read-merge-write: 既存属性（`question` / `actor` 等、この 6 キー以外)を土台に、
+/// 会話状態の 6 キーだけを重ねる（`merge_outcome_attributes` と同じ形。vegapunk の
 /// `UpsertNodes` は全置換のため、部分送信すると既存属性が消える）。
 fn merge_conv_state_attributes(
     existing: &std::collections::HashMap<String, String>,
@@ -293,6 +339,10 @@ fn merge_conv_state_attributes(
     merged.insert(
         "time_pref_extraction_error_count".to_string(),
         state.time_pref_extraction_error_count.to_string(),
+    );
+    merged.insert(
+        "escalation_confirmed".to_string(),
+        state.escalation_confirmed.to_string(),
     );
     merged
 }
@@ -345,22 +395,34 @@ fn merge_outcome_attributes(
     merged
 }
 
-/// 聞き返し可否（決定論）: 第3層グレーのみ。第1・2層は問答無用でルーティング
-/// （会話フロー v1.1 design doc §2）。
+/// 聞き返し可否（決定論、Issue #54 で契約を更新）:
+/// - 第1層（明示エスカレーションルール）は `missing` が非空（情報不足）のときだけ許可する。
+///   `decision::decide` は第1層マッチ時にも `evidence_sufficient` で情報充足度を評価しており、
+///   製品未特定・症状要点不足などで `missing` が積まれた場合は、聞き返しを一切せず即時
+///   エスカレーションへ倒すべきではない。
+/// - 第3層グレー（`InsufficientDirectness` / `UnknownAddedSignal`）は常に許可（変更なし）。
+/// - 第2層（禁止ドメイン）は `missing` の値に関わらず常に不許可（fail-closed の核。第2層は
+///   `decide()` が `missing: Vec::new()` を返す不変条件と対で成立しているが、この関数側でも
+///   `layer: 2` を `_ => false` に明示的に落とすことで、万一 `missing` を持つようになっても
+///   揺るがないようにする）。
 ///
 /// **この関数が契約そのもの。** `evaluate()` はこの関数を呼ぶだけで、判定式をインラインに
 /// 複製しない。テスト（本ファイル `mod tests`）もこの関数を呼ぶこと。式をテスト側に複製すると、
-/// ここを書き換えて `matches!` の条件を変えてもテストが検出できなくなる（Critical 1 の回帰）。
+/// ここを書き換えて `match` の条件を変えてもテストが検出できなくなる（Critical 1 の回帰）。
 fn clarification_allowed(decision: &decision::AnswerDecision) -> bool {
-    matches!(
-        decision,
+    match decision {
+        decision::AnswerDecision::Escalate {
+            layer: 1, missing, ..
+        } => !missing.is_empty(),
         decision::AnswerDecision::Escalate {
             layer: 3,
-            reason: decision::EscalateReason::InsufficientDirectness
+            reason:
+                decision::EscalateReason::InsufficientDirectness
                 | decision::EscalateReason::UnknownAddedSignal,
             ..
-        }
-    )
+        } => true,
+        _ => false,
+    }
 }
 
 /// Issue #28 codex レビュー採用1(Critical): `hits` をカバレッジ判定(`decision::decide`)へ渡す
@@ -1271,8 +1333,10 @@ impl Harness {
             thresholds: &self.thresholds,
             default_route: &self.default_route,
         });
-        // 聞き返し可否（決定論）: 第3層グレーのみ。判定条件そのものは clarification_allowed()
-        // （本ファイル冒頭のモジュールレベル関数）が契約として持つ。ここでは呼ぶだけにする。
+        // 聞き返し可否（決定論）: 第1層 binding=advisory かつ情報不足、または第3層グレーのみ
+        // true（Issue #54 + reviewer 一次レビュー Critical 1）。判定条件そのものは
+        // clarification_allowed()（本ファイル冒頭のモジュールレベル関数）が契約として持つ。
+        // ここでは呼ぶだけにする。
         let clarification_allowed = clarification_allowed(&decision_result);
         // [記録] 判定結果を case に永続化する（record_answer_attempt の lineage 検証の根拠。
         // client の自己申告でなくサーバ側の記録と突合するため）。KR 由来の回答なら
@@ -2478,9 +2542,12 @@ mod tests {
     // テストが追随して緑になり続ける（退行を検出できない）状態だった。いまは本体の
     // `clarification_allowed()`（本ファイル冒頭のモジュールレベル関数）をそのまま呼ぶ。
 
+    /// Issue #54: `missing` を呼び出し側で指定できる（第1層の新契約 `!missing.is_empty()` を
+    /// 手組み Escalate でも検証できるようにするための拡張）。既存呼び出しは `Vec::new()` を渡す。
     fn escalate_for_contract_test(
         layer: u8,
         reason: decision::EscalateReason,
+        missing: Vec<decision::EvidenceRequirement>,
     ) -> decision::AnswerDecision {
         decision::AnswerDecision::Escalate {
             reason,
@@ -2488,39 +2555,85 @@ mod tests {
             route_to: "triage".to_string(),
             disclosure_scope: decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
-            missing: Vec::new(),
+            missing,
         }
     }
 
+    /// Issue #54 が入る前のダミー `missing` 値（「情報不足」を模すためだけの値。数値自体に
+    /// 意味は無い）。
+    fn dummy_missing() -> Vec<decision::EvidenceRequirement> {
+        vec![decision::EvidenceRequirement::DirectManualCoverage {
+            required: 0.8,
+            best: 0.1,
+        }]
+    }
+
     #[test]
-    fn clarification_is_denied_for_layer1_and_layer2_escalations() {
-        // 第1層（明示エスカレーションルール）・第2層（禁止ドメイン）は実際の `decide()` では
-        // 常に `RegulatedOrSafety` を返す（spec に明記）。第3層の reason 網羅としての価値が
-        // あるため、手組み Escalate に対する本テストは残す（`decide()` 経由の版は下に別途置く）。
-        let layer1 = escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety);
+    fn clarification_is_denied_for_layer1_when_evidence_is_sufficient() {
+        // 第1層（明示エスカレーションルール）は実際の `decide()` では常に `RegulatedOrSafety`
+        // を返す（spec に明記）。missing が空（情報充足）なら従来どおり聞き返し不許可
+        // （`decide()` 経由の版は下の `decide_layer1_escalation_denies_clarification_when_
+        // evidence_is_sufficient` に別途置く）。
+        let layer1 =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
         assert!(
             !clarification_allowed(&layer1),
-            "layer 1 escalation must never allow clarification"
+            "layer 1 escalation with sufficient evidence (missing empty) must not allow \
+             clarification"
         );
+    }
 
-        let layer2 = escalate_for_contract_test(2, decision::EscalateReason::RegulatedOrSafety);
+    #[test]
+    fn clarification_is_allowed_for_layer1_when_evidence_is_insufficient() {
+        // Issue #54: 第1層でも missing が非空（情報不足）なら聞き返しを許可する。
+        let layer1 = escalate_for_contract_test(
+            1,
+            decision::EscalateReason::RegulatedOrSafety,
+            dummy_missing(),
+        );
+        assert!(
+            clarification_allowed(&layer1),
+            "layer 1 escalation with insufficient evidence (missing non-empty) must allow \
+             clarification"
+        );
+    }
+
+    #[test]
+    fn clarification_is_denied_for_layer2_escalation() {
+        // 第2層（禁止ドメイン）は fail-closed の核。missing の値に関わらず常に不許可。
+        let layer2 =
+            escalate_for_contract_test(2, decision::EscalateReason::RegulatedOrSafety, Vec::new());
         assert!(
             !clarification_allowed(&layer2),
             "layer 2 escalation must never allow clarification"
+        );
+
+        let layer2_with_missing = escalate_for_contract_test(
+            2,
+            decision::EscalateReason::RegulatedOrSafety,
+            dummy_missing(),
+        );
+        assert!(
+            !clarification_allowed(&layer2_with_missing),
+            "layer 2 escalation must never allow clarification even if missing were non-empty \
+             (decide() never actually produces this, but the contract must not depend on it)"
         );
     }
 
     #[test]
     fn clarification_is_allowed_for_layer3_gray() {
-        let insufficient_directness =
-            escalate_for_contract_test(3, decision::EscalateReason::InsufficientDirectness);
+        let insufficient_directness = escalate_for_contract_test(
+            3,
+            decision::EscalateReason::InsufficientDirectness,
+            Vec::new(),
+        );
         assert!(
             clarification_allowed(&insufficient_directness),
             "layer 3 InsufficientDirectness must allow clarification"
         );
 
         let unknown_added_signal =
-            escalate_for_contract_test(3, decision::EscalateReason::UnknownAddedSignal);
+            escalate_for_contract_test(3, decision::EscalateReason::UnknownAddedSignal, Vec::new());
         assert!(
             clarification_allowed(&unknown_added_signal),
             "layer 3 UnknownAddedSignal must allow clarification"
@@ -2577,8 +2690,9 @@ mod tests {
     }
 
     #[test]
-    fn decide_layer1_escalation_denies_clarification() {
-        // decision.rs::layer1_short_circuits_everything と同じ入力形。
+    fn decide_layer1_escalation_denies_clarification_when_evidence_is_sufficient() {
+        // decision.rs::layer1_short_circuits_everything と同じ入力形
+        // （best_manual_score が閾値以上 = 情報充足）。
         let rules = vec![rules::EscalationRule {
             id: "r1".to_string(),
             condition: contract_test_signals(&["post_ingestion_symptom"]),
@@ -2606,7 +2720,84 @@ mod tests {
         );
         assert!(
             !clarification_allowed(&d),
-            "layer 1 escalation from decide() must never allow clarification"
+            "layer 1 escalation from decide() with sufficient evidence must not allow \
+             clarification"
+        );
+    }
+
+    #[test]
+    fn decide_layer1_advisory_escalation_allows_clarification_when_evidence_is_insufficient() {
+        // Issue #54 + reviewer Critical 1: decision.rs::
+        // layer1_advisory_escalation_carries_missing_when_evidence_is_insufficient と同じ入力形
+        // （binding=advisory、best_manual_score が閾値未満 = 製品未特定・症状要点不足を模す）。
+        let rules = vec![rules::EscalationRule {
+            id: "r1".to_string(),
+            condition: contract_test_signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: rules::Binding::Advisory,
+        }];
+        let q = contract_test_signals(&["post_ingestion_symptom"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &rules,
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d, decision::AnswerDecision::Escalate { layer: 1, .. }),
+            "precondition: decide() must actually take the layer 1 branch, got {d:?}"
+        );
+        assert!(
+            clarification_allowed(&d),
+            "layer 1 advisory escalation from decide() with insufficient evidence must allow \
+             clarification"
+        );
+    }
+
+    // reviewer 一次レビュー Critical 1: binding=mandatory は evidence が不足していても
+    // `missing` が空のまま(decision.rs 側で保証済み)なので、`clarification_allowed()` も
+    // 常に false のままであることをこの契約テスト側でも固定する。この関数の `match` の条件
+    // （`missing` の非空性だけを見る）を書き換えても、`decide()` 側で mandatory の `missing` が
+    // 空である限りここは検出できないが、`decide()` が誤って mandatory にも missing を積む
+    // ように壊れた場合はここで検出できる（二重の安全網）。
+    #[test]
+    fn decide_layer1_mandatory_escalation_denies_clarification_even_when_evidence_is_insufficient()
+    {
+        let rules = vec![rules::EscalationRule {
+            id: "r1".to_string(),
+            condition: contract_test_signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: rules::Binding::Mandatory,
+        }];
+        let q = contract_test_signals(&["post_ingestion_symptom"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &rules,
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d, decision::AnswerDecision::Escalate { layer: 1, .. }),
+            "precondition: decide() must actually take the layer 1 branch, got {d:?}"
+        );
+        assert!(
+            !clarification_allowed(&d),
+            "layer 1 mandatory escalation from decide() must deny clarification even when \
+             evidence is insufficient"
         );
     }
 
@@ -2641,6 +2832,41 @@ mod tests {
         assert!(
             !clarification_allowed(&d),
             "layer 2 escalation from decide() must never allow clarification"
+        );
+    }
+
+    #[test]
+    fn decide_layer2_escalation_denies_clarification_even_when_evidence_is_insufficient() {
+        // Issue #54: 第2層は fail-closed の核。best_manual_score を低くして情報不足を模しても、
+        // decide() は layer 2 では常に missing: Vec::new() を返し、聞き返しは許可されない。
+        let domains = vec![rules::ProhibitedDomain {
+            id: "d1".to_string(),
+            domain_signals: contract_test_signals(&["skin_irritation"]),
+            text_patterns: Vec::new(),
+            route: "derm_liaison".to_string(),
+            binding: rules::Binding::Mandatory,
+        }];
+        let q = contract_test_signals(&["skin_irritation"]);
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &q,
+            question_raw: "質問",
+            rules: &[],
+            domains: &domains,
+            resolutions: &[],
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+        });
+        assert!(
+            matches!(d, decision::AnswerDecision::Escalate { layer: 2, .. }),
+            "precondition: decide() must actually take the layer 2 branch, got {d:?}"
+        );
+        assert!(
+            !clarification_allowed(&d),
+            "layer 2 escalation from decide() must never allow clarification, even with \
+             insufficient evidence"
         );
     }
 
@@ -3037,6 +3263,7 @@ mod tests {
                 time_pref_false_count: 0,
                 preferred_contact_time: None,
                 time_pref_extraction_error_count: 0,
+                escalation_confirmed: false,
             }
         );
     }
@@ -3055,6 +3282,7 @@ mod tests {
                 "time_pref_extraction_error_count".to_string(),
                 "2".to_string(),
             ),
+            ("escalation_confirmed".to_string(), "true".to_string()),
         ]
         .into_iter()
         .collect();
@@ -3067,6 +3295,19 @@ mod tests {
             Some("平日午後（対応時間外の希望）")
         );
         assert_eq!(state.time_pref_extraction_error_count, 2);
+        assert!(state.escalation_confirmed);
+    }
+
+    #[test]
+    fn conv_state_from_attrs_defaults_escalation_confirmed_when_missing() {
+        // escalation_confirmed 追加前の既存 case はこのキーを持たない。欠落は false
+        // （他の属性と同じ後方互換の規律）。
+        let attrs: std::collections::HashMap<String, String> =
+            [("clarify_turns".to_string(), "1".to_string())]
+                .into_iter()
+                .collect();
+        let state = conv_state_from_attrs(&attrs);
+        assert!(!state.escalation_confirmed);
     }
 
     #[test]
@@ -3091,6 +3332,58 @@ mod tests {
         assert_eq!(state.preferred_contact_time, None);
     }
 
+    // ---- CaseConvState::is_already_escalated（Issue #54、reviewer 一次レビュー Critical 2） ----
+
+    fn conv_state_with(
+        awaiting_time_pref: bool,
+        preferred_contact_time: Option<&str>,
+    ) -> CaseConvState {
+        CaseConvState {
+            clarify_turns: 0,
+            awaiting_time_pref,
+            time_pref_false_count: 0,
+            preferred_contact_time: preferred_contact_time.map(str::to_string),
+            time_pref_extraction_error_count: 0,
+            escalation_confirmed: false,
+        }
+    }
+
+    #[test]
+    fn is_already_escalated_is_false_when_neither_field_is_set() {
+        assert!(!conv_state_with(false, None).is_already_escalated());
+    }
+
+    #[test]
+    fn is_already_escalated_is_true_while_awaiting_time_pref() {
+        assert!(conv_state_with(true, None).is_already_escalated());
+    }
+
+    #[test]
+    fn is_already_escalated_is_true_once_a_contact_time_is_recorded() {
+        // awaiting_time_pref は解決済み（false に戻った後）でも、preferred_contact_time が
+        // 残っていれば「エスカレーション確定済み」と判定できる。
+        assert!(conv_state_with(false, Some("平日午後")).is_already_escalated());
+    }
+
+    // reviewer 一次レビュー Critical 2 の核: `escalation_confirmed` だけが true で、
+    // `awaiting_time_pref` / `preferred_contact_time` がどちらも未設定の状態
+    // （= `awaiting_time_pref` が false 分類 2 連続・抽出インフラ失敗 3 連続のいずれかで
+    // 自動解除された後、`preferred_contact_time` はまだ確定していない状態を模す）でも
+    // 確定済みと判定できること。これが無いと、2 ターンごとにフルブロックが再掲される
+    // （失敗シナリオの回帰、`is_already_escalated_regression_*` 参照）。
+    #[test]
+    fn is_already_escalated_is_true_when_only_escalation_confirmed_is_set() {
+        let state = CaseConvState {
+            clarify_turns: 0,
+            awaiting_time_pref: false,
+            time_pref_false_count: 0,
+            preferred_contact_time: None,
+            time_pref_extraction_error_count: 0,
+            escalation_confirmed: true,
+        };
+        assert!(state.is_already_escalated());
+    }
+
     #[test]
     fn merge_conv_state_attributes_preserves_unrelated_existing_keys() {
         // read-merge-write: 会話状態と無関係な既存属性（question / last_decision 等）は消えない。
@@ -3106,6 +3399,7 @@ mod tests {
             time_pref_false_count: 0,
             preferred_contact_time: None,
             time_pref_extraction_error_count: 2,
+            escalation_confirmed: true,
         };
         let merged = merge_conv_state_attributes(&existing, &state);
         assert_eq!(merged.get("question").map(String::as_str), Some("元の質問"));
@@ -3132,6 +3426,10 @@ mod tests {
                 .map(String::as_str),
             Some("2")
         );
+        assert_eq!(
+            merged.get("escalation_confirmed").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -3151,6 +3449,7 @@ mod tests {
             time_pref_false_count: 0,
             preferred_contact_time: None,
             time_pref_extraction_error_count: 0,
+            escalation_confirmed: true,
         };
         let merged = merge_conv_state_attributes(&existing, &state);
         assert_eq!(merged.get("clarify_turns").map(String::as_str), Some("0"));
@@ -3176,6 +3475,7 @@ mod tests {
                 time_pref_false_count: 0,
                 preferred_contact_time: None,
                 time_pref_extraction_error_count: 0,
+                escalation_confirmed: false,
             },
             CaseConvState {
                 clarify_turns: 3,
@@ -3183,6 +3483,7 @@ mod tests {
                 time_pref_false_count: 2,
                 preferred_contact_time: Some("平日夕方（対応時間外の希望）".to_string()),
                 time_pref_extraction_error_count: 1,
+                escalation_confirmed: true,
             },
         ] {
             let merged = merge_conv_state_attributes(&std::collections::HashMap::new(), &state);

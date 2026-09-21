@@ -384,7 +384,11 @@ GMR が前提にする「同じ入力なら同じ答えでよい」は CS では
 
 ### 追記: 会話フロー v1.1（聞き返し・営業時間・希望時間帯、Issue #17）
 
-`/api/reply` 経路に限り、応答決定を「即答 / 聞き返し（最大3ターン）/ 文脈化エスカレーション」の3値へ拡張し、営業時間案内と希望時間帯の受付を追加した。本節が述べる「第1層・第2層は問答無用でルーティング、第3層のみグレー」という判定思想はそのまま前提とし、聞き返しは第3層グレー（`InsufficientDirectness` / `UnknownAddedSignal`）に限定して許可する。詳細（決定表・プロンプト制約・営業時間判定・case への状態追加）は `docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md` を正本とする。MCP tool（`evaluate_answerability`）の入出力・挙動は変更しない。
+`/api/reply` 経路に限り、応答決定を「即答 / 聞き返し（最大3ターン）/ 文脈化エスカレーション」の3値へ拡張し、営業時間案内と希望時間帯の受付を追加した。
+
+**Issue #54 改訂**: 上記の初版は「聞き返しは第3層グレーに限定して許可する」としていたが、これは第1層（明示エスカレーションルール）マッチ時に情報不足でも問答無用で確定してしまい、担当者取次（`human-handoff`、binding=mandatory）のような「聞き返しループからの脱出手段」自体が聞き返しに吸収される自己矛盾と、hazard signal で stakes が上がるほど threshold も上がり危険度の高い事象ほど聞き返しに倒れて確定が遅延するという反転を生んでいた（reviewer 一次レビュー Critical 1）。現行の契約は次のとおり: 第1層は `rule.binding` で分岐し、`binding = mandatory`（担当者取次・安全事故・物理破損・工事リスク等）は従来どおり問答無用で聞き返しを許可しない。`binding = advisory`（契約・保証関連等）は第3層グレーと同じ `evidence_sufficient` 判定を適用し、マニュアル一致度が閾値未満なら聞き返しを許可する。第2層（禁止ドメイン）は変更なく常に不許可。第3層グレー（`InsufficientDirectness` / `UnknownAddedSignal`）は従来どおり常に許可。契約の正本は `server/src/harness/decision.rs::decide()` と `server/src/harness/mod.rs::clarification_allowed()`。
+
+詳細（決定表・プロンプト制約・営業時間判定・case への状態追加）は `docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md` を正本とする。**MCP tool（`evaluate_answerability`）の入出力の形は変更しないが、`clarification_allowed` が返す値そのものは上記の契約変更の影響を受ける**（第1層 binding=advisory のケースで従来の false から true に変わりうる）。
 
 ### decision の構造（修正版）
 
@@ -827,7 +831,7 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
    - `evaluate_answerability` は `case_id` を受け取り（無ければ新規 `support_case` を作成）、当該 case の累積 signal 集合をサーバ側で維持する。判定は常に「累積 signal 集合 + known_resolution」に対して行う。
    - client から prior signals を受け取らない。累積集合を client 供給にすると hazard signal の欠落（改変）で誤マッチし得るため、I1 と同じ入力不信原則を会話層にも適用する。
    - 格納は `support_case -[HAS_SIGNAL]-> Signal` 辺（I2 準拠・グラフネイティブ）。
-   - 聞き返し（clarification）は会話層の第一級行為として、判定結果に `clarification_allowed`（第3層 insufficient_directness / unknown_added_signal のときのみ true、第1・2層では false）を決定論で付与し、文面生成は client に委ねる（message_policy 原則）。
+   - 聞き返し（clarification）は会話層の第一級行為として、判定結果に `clarification_allowed` を決定論で付与し、文面生成は client に委ねる（message_policy 原則）。**Issue #54 改訂**（詳細は上記§「追記: 会話フロー v1.1」参照）: 第3層 insufficient_directness / unknown_added_signal は常に true。第1層は `binding = advisory`（契約・保証関連等）かつ情報不足のときのみ true、`binding = mandatory`（担当者取次・安全事故等）は常に false。第2層（禁止ドメイン）は常に false。
 4. **grade（昇格・降格）は Step 1 から運用し、しきい値は config 駆動とする（2026-07-03 追加）。**
    - 昇格条件（approval_required → auto_answer_audited）: 承認回数 ≥ N ∧ 承認者多様性 ≥ M ∧ 却下率 ≤ r。降格条件: 却下数 ≥ K で approval_required へ戻す。判定は決定論の純関数 `regrade`。
    - N / M / r / K の具体値は S1-9 のとおり未決のため config（`[harness.grading]`）で注入し、初期値は N=3, M=2, r=0.2, K=2 の仮置きとする。**業務確認で確定させること。**
