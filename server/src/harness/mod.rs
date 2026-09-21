@@ -850,7 +850,11 @@ impl Harness {
                     schema = %ctx.schema,
                     decision = %decision,
                     "failed to append jev hearing audit event; the reply itself was not \
-                     affected, but this turn's jev_has_enough_info has NO audit record"
+                     affected, but this turn's jev_has_enough_info has NO audit record. If this \
+                     failure originated in the WORM audit write step (see error field), the \
+                     in-process WORM audit log is now poisoned and every subsequent audit append \
+                     (all decisions, not just jev hearing) will be refused until the process \
+                     restarts"
                 );
             }
             Err(err) => {
@@ -1808,7 +1812,10 @@ impl Harness {
                     "failed to record an audit trail for an out-of-scope product reply; the \
                      customer still received the correct out-of-scope message (that safety \
                      property does not depend on audit availability), but this conversation has \
-                     NO case/audit record — investigate vegapunk/knowledge connectivity"
+                     NO case/audit record — investigate vegapunk/knowledge connectivity. If this \
+                     failure originated in the WORM audit write step (see error field), the \
+                     in-process WORM audit log is now poisoned and every subsequent audit append \
+                     will be refused until the process restarts"
                 );
                 (fallback_id, String::new())
             }
@@ -1852,7 +1859,9 @@ impl Harness {
                      but the case record still shows the pre-demotion \
                      last_decision/last_kr_id/last_evidence_* (and this turn's signals were not \
                      excluded from future accumulation) — investigate vegapunk/knowledge \
-                     connectivity"
+                     connectivity. If this failure originated in the WORM audit write step (see \
+                     error field), the in-process WORM audit log is now poisoned and every \
+                     subsequent audit append will be refused until the process restarts"
                 );
                 (case_id.to_string(), String::new())
             }
