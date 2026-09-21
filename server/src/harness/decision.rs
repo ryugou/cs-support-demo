@@ -1,6 +1,6 @@
 use crate::harness::rules::{
-    match_known_resolution, match_layer1, match_layer2, EscalationRule, KnownResolution, KrMatch,
-    ProhibitedDomain,
+    match_known_resolution, match_layer1, match_layer2, Binding, EscalationRule, KnownResolution,
+    KrMatch, ProhibitedDomain,
 };
 use crate::harness::signal::SignalSet;
 use serde::Serialize;
@@ -151,19 +151,42 @@ pub struct DecisionInput<'a> {
 
 /// (B) 3 層判定の decision function。LLM 非介在・同じ入力なら必ず同じ判定（純関数）。
 /// 先に止まった層で確定し、後段は評価しない。第1・2層にメモ化を適用しない。
+///
+/// Issue #54: stakes/threshold の算出は副作用の無い純関数のため、第1層判定より前に計算しても
+/// 「先に止まった層で確定する」という上記の原則は壊れない。第1層（明示エスカレーションルール）
+/// マッチ時、**`rule.binding == Binding::Advisory` のときだけ** `evidence_sufficient` で情報
+/// 充足度を評価し、不足していれば `missing` を積む（`clarification_allowed` 側がこれを見て
+/// 聞き返し可否を決める）。`Binding::Mandatory` は「問答無用で確定ルーティングする」という
+/// 拘束度そのもの（specs/production-cs-mcp.md の第1層定義）であり、情報の有無に関わらず常に
+/// `missing: Vec::new()` にする（reviewer 一次レビュー Critical 1: mandatory まで聞き返しに
+/// 開放すると、担当者取次（human-handoff, mandatory）が聞き返しループへ吸収され脱出手段として
+/// 機能しなくなる自己矛盾が起きる。また hazard signal で stakes が上がるほど threshold も
+/// 上がり、危険度が高い mandatory 事象ほど evidence_sufficient が Insufficient になりやすいと
+/// いう反転も生む）。第2層（禁止ドメイン）は fail-closed の核であり、この分岐の対象外
+/// （常に `missing: Vec::new()` の即時エスカレーションのまま変更しない）。
 pub fn decide(input: &DecisionInput) -> AnswerDecision {
+    let stakes = classify_stakes(&input.stakes_input);
+    let threshold = answerability_threshold(input.thresholds, stakes);
+
     // 第1層: 明示エスカレーションルール
     if let Some(rule) = match_layer1(input.rules, input.question_signals) {
+        let missing = match rule.binding {
+            Binding::Mandatory => Vec::new(),
+            Binding::Advisory => match evidence_sufficient(threshold, input.best_manual_score) {
+                Sufficiency::Sufficient => Vec::new(),
+                Sufficiency::Insufficient { missing } => missing,
+            },
+        };
         return AnswerDecision::Escalate {
             reason: EscalateReason::RegulatedOrSafety,
             layer: 1,
             route_to: rule.route.clone(),
             disclosure_scope: DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
-            missing: Vec::new(),
+            missing,
         };
     }
-    // 第2層: 禁止領域
+    // 第2層: 禁止領域（変更しない。fail-closed の核。missing は常に空・情報の有無を問わない）
     if let Some(domain) = match_layer2(input.domains, input.question_signals, input.question_raw) {
         return AnswerDecision::Escalate {
             reason: EscalateReason::RegulatedOrSafety,
@@ -175,8 +198,6 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
         };
     }
     // 第3層: 回答可能性
-    let stakes = classify_stakes(&input.stakes_input);
-    let threshold = answerability_threshold(input.thresholds, stakes);
     let kr_match = match_known_resolution(input.resolutions, input.question_signals);
     if let KrMatch::Applicable(kr) = kr_match {
         return AnswerDecision::Allowed {
@@ -382,12 +403,144 @@ mod tests {
                 route_to,
                 reason,
                 audit_required,
+                missing,
                 ..
             } => {
                 assert_eq!(layer, 1);
                 assert_eq!(route_to, "safety_team");
                 assert_eq!(reason, EscalateReason::RegulatedOrSafety);
                 assert!(audit_required);
+                // Issue #54: マニュアル一致度が閾値(0.6)以上（=情報が十分）なら、従来どおり
+                // missing は空のまま（聞き返し対象外の即時エスカレーション）。
+                assert!(
+                    missing.is_empty(),
+                    "sufficient evidence must not carry a missing list"
+                );
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    // --- Issue #54 + reviewer Critical 1: 第1層 advisory エスカレーションでも情報不足なら
+    // 聞き返しを許可する ---
+    //
+    // 第1層（明示エスカレーションルール）は従来、binding に関わらず情報の有無を問わず無条件で
+    // 即時エスカレーションに倒れていた。製品未特定・症状要点不足のまま第1層ルールにマッチした
+    // 場合、聞き返しを一切せずに受付番号だけ発行するのは望ましくない。第3層グレーが既に
+    // 使っている `evidence_sufficient` をそのまま流用し、情報不足なら `missing` を積む
+    // （`clarification_allowed` 側の契約変更と対になる）。ただしこれは `Binding::Advisory` の
+    // ルールに限る（`Binding::Mandatory` は次の `layer1_mandatory_rule_never_carries_missing_
+    // regardless_of_evidence` が固定するとおり常に `missing: Vec::new()`）。第2層（禁止ドメイン）
+    // はこの変更の対象外（fail-closed の核、`layer2_blocks_before_layer3` 参照）。
+    #[test]
+    fn layer1_advisory_escalation_carries_missing_when_evidence_is_insufficient() {
+        let rules = vec![EscalationRule {
+            id: "r1".to_string(),
+            condition: signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: Binding::Advisory,
+        }];
+        let q = signals(&["post_ingestion_symptom"]);
+        // best_manual_score が閾値(low=0.6)を大きく下回る = 製品未特定・症状要点不足を模す。
+        let d = decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate {
+                layer,
+                reason,
+                route_to,
+                audit_required,
+                missing,
+                ..
+            } => {
+                assert_eq!(layer, 1);
+                assert_eq!(route_to, "safety_team");
+                // reason / audit_required は第1層の既定値のまま変更しない。
+                assert_eq!(reason, EscalateReason::RegulatedOrSafety);
+                assert!(audit_required);
+                assert_eq!(missing.len(), 1);
+                let EvidenceRequirement::DirectManualCoverage { required, best } = &missing[0];
+                assert_eq!(*required, thresholds().low);
+                assert_eq!(*best, 0.1);
+            }
+            other => panic!("expected layer1 escalate with missing, got {other:?}"),
+        }
+    }
+
+    // reviewer 一次レビュー Critical 1: binding=mandatory は evidence の充足度に関わらず
+    // 常に missing: Vec::new()（問答無用の即時エスカレーション）。ここを崩すと、担当者取次
+    // （human-handoff, mandatory）が聞き返しループの脱出手段として機能しなくなる。
+    #[test]
+    fn layer1_mandatory_rule_never_carries_missing_regardless_of_evidence() {
+        let rules = vec![EscalationRule {
+            id: "r1".to_string(),
+            condition: signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: Binding::Mandatory,
+        }];
+        let q = signals(&["post_ingestion_symptom"]);
+        // best_manual_score が閾値を大きく下回っても(製品未特定・症状要点不足を模しても)
+        // mandatory なら missing は積まれない。
+        let d = decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { layer, missing, .. } => {
+                assert_eq!(layer, 1);
+                assert!(
+                    missing.is_empty(),
+                    "binding=mandatory must never carry a missing list, even with \
+                     insufficient evidence"
+                );
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer1_advisory_rule_has_no_missing_when_evidence_is_sufficient() {
+        let rules = vec![EscalationRule {
+            id: "r1".to_string(),
+            condition: signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: Binding::Advisory,
+        }];
+        let q = signals(&["post_ingestion_symptom"]);
+        let d = decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(1.0),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { layer, missing, .. } => {
+                assert_eq!(layer, 1);
+                assert!(
+                    missing.is_empty(),
+                    "binding=advisory with sufficient evidence must not carry a missing list"
+                );
             }
             other => panic!("expected layer1 escalate, got {other:?}"),
         }
@@ -704,6 +857,159 @@ mod tests {
                 assert_eq!(route_to, "support_desk");
             }
             other => panic!("expected layer1 escalate for human_handoff_request, got {other:?}"),
+        }
+    }
+
+    // reviewer 一次レビュー Critical 1 失敗シナリオ A の実データ回帰。
+    //
+    // `human-handoff` は data/urtect/rules.json で binding=mandatory。担当者取次を依頼する発話は
+    // マニュアル本文と無関係なため best_manual_score は低い（ここでは None = 検索ヒット無しを
+    // 模す）。上のテストは best_manual_score=0.99（実運用では起きない高スコア）でしか検証して
+    // おらず、低スコア時（実運用の実態）に missing が積まれてしまう退行を検出できなかった。
+    // 「担当者につないでください」は聞き返しループからの脱出手段（specs/signal-vocabulary.md、
+    // conversation-flow-v11-design.md §3）であり、聞き返し対象になってはならない。
+    #[test]
+    fn bundled_human_handoff_rule_has_no_missing_with_low_manual_score() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["human_handoff_request"]);
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            None,
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate {
+                layer,
+                route_to,
+                missing,
+                ..
+            } => {
+                assert_eq!(layer, 1);
+                assert_eq!(route_to, "support_desk");
+                assert!(
+                    missing.is_empty(),
+                    "human_handoff_request (binding=mandatory) must never carry a missing \
+                     list; otherwise the explicit human-handoff request becomes subject to \
+                     clarification and the escape hatch from the clarify loop breaks"
+                );
+            }
+            other => panic!("expected layer1 escalate for human_handoff_request, got {other:?}"),
+        }
+    }
+
+    // reviewer 一次レビュー Critical 1 失敗シナリオ B の実データ回帰。
+    //
+    // `physical-damage`（`physical_damage_smell_heat`、binding=mandatory）は lexicon で
+    // `class: hazard` のため hazard_signal_count > 0 → Stakes::Mid → threshold が上がる
+    // （config.cloudrun.toml の mid=0.8）。stakes が上がるほど evidence_sufficient が
+    // Insufficient になりやすいという反転が、mandatory ルールでは missing に波及しないことを
+    // 固定する（危険度が高い事象ほど聞き返しに倒れて確定が遅延する、という反転の回帰防止）。
+    #[test]
+    fn bundled_physical_damage_rule_has_no_missing_under_hazard_mid_stakes() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["physical_damage_smell_heat"]);
+        let hazard_mid = StakesInput {
+            mandatory_domain_near: false,
+            ng_near_hit: false,
+            hazard_signal_count: 1,
+        };
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            hazard_mid,
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate {
+                layer,
+                route_to,
+                missing,
+                ..
+            } => {
+                assert_eq!(layer, 1);
+                assert_eq!(route_to, "support_desk");
+                assert!(
+                    missing.is_empty(),
+                    "physical_damage_smell_heat (binding=mandatory) must never carry a \
+                     missing list, even under the higher Stakes::Mid threshold"
+                );
+            }
+            other => {
+                panic!("expected layer1 escalate for physical_damage_smell_heat, got {other:?}")
+            }
+        }
+    }
+
+    // reviewer 第2ラウンド Suggestion 3。mandatory 側（human-handoff, physical-damage）は
+    // 既に実データで固定済みだが、Issue #54 で新設された挙動そのものである advisory 側
+    // （binding=advisory は evidence_sufficient を通す）の実データ回帰が欠けていた。
+    // `warranty-failure`（`warranty_hardware_failure`、binding=advisory）の binding を誤って
+    // mandatory に書き換えても、この2本を追加するまでは既存テストが全て緑のままだった。
+    #[test]
+    fn bundled_warranty_failure_rule_carries_missing_with_low_manual_score() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["warranty_hardware_failure"]);
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { layer, missing, .. } => {
+                assert_eq!(layer, 1);
+                assert_eq!(
+                    missing.len(),
+                    1,
+                    "warranty-failure (binding=advisory) with a low manual score must carry a \
+                     missing requirement so clarification stays possible"
+                );
+            }
+            other => {
+                panic!("expected layer1 escalate for warranty_hardware_failure, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_warranty_failure_rule_has_no_missing_with_high_manual_score() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["warranty_hardware_failure"]);
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            Some(1.0),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { layer, missing, .. } => {
+                assert_eq!(layer, 1);
+                assert!(
+                    missing.is_empty(),
+                    "warranty-failure (binding=advisory) with a sufficient manual score must \
+                     not carry a missing list"
+                );
+            }
+            other => {
+                panic!("expected layer1 escalate for warranty_hardware_failure, got {other:?}")
+            }
         }
     }
 

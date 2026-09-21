@@ -74,6 +74,11 @@ nodes:
       time_pref_false_count: { type: int }
       preferred_contact_time: { type: string }
       time_pref_extraction_error_count: { type: int }
+      # reviewer 一次レビュー Critical 2（Issue #54）: エスカレーション応答（受付番号付き）を
+      # 実際に顧客へ送ったかの正本フラグ（harness/mod.rs::CaseConvState::is_already_escalated）。
+      # 実体は bool だが既存 awaiting_time_pref と同じく "true"/"false" 文字列として書き込まれる
+      # ため type は string にする。
+      escalation_confirmed: { type: string }
       # Issue #28 二段目確定の降格で除外された signal の CSV（harness/mod.rs::exclude_recorded_signals）
       excluded_signals: { type: string }
       # Issue #31 design doc §2: 匿名化済みエンドユーザー識別子（任意、初回提供時に設定）

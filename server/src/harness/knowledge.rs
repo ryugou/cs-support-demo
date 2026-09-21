@@ -1960,6 +1960,9 @@ mod tests {
             "time_pref_false_count",
             "preferred_contact_time",
             "time_pref_extraction_error_count",
+            // reviewer 一次レビュー Critical 2（Issue #54）: harness/mod.rs::
+            // merge_conv_state_attributes が書く。3 schema ファイル全部に加算済み。
+            "escalation_confirmed",
             "excluded_signals",
             "turn_count",
             // homesec advisor 固有加算（design doc `2026-08-17-homesec-advisor-design.md` §4.4）。

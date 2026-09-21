@@ -286,19 +286,34 @@ fn note_time_pref_extraction_failure(conv: &mut crate::harness::CaseConvState) {
 /// インフラが継続的に失敗しているケースで「失敗 → EscalationReply → 0 に巻き戻る」を繰り返し、
 /// 3 回連続到達による自動解除が永久に到達不能になる（他の 3 箇所と揃えて書き忘れに見えても、
 /// 意図的に外している）。
+///
+/// reviewer 一次レビュー Critical 2: この関数はエスカレーション応答を実際に送るときにのみ
+/// 呼ばれるため、`escalation_confirmed = true` を立てる唯一の場所でもある。`awaiting_time_pref`
+/// はこの後の会話で自動解除されうるが（`time_pref.rs` の false 2 連続、`note_time_pref_
+/// extraction_failure` の 3 連続）、`escalation_confirmed` はそれらから独立して true のまま
+/// 残るため、`is_already_escalated()` が確定済み判定を取りこぼさない。
 fn arm_time_pref_solicitation(conv: &mut crate::harness::CaseConvState) {
     conv.awaiting_time_pref = true;
     conv.time_pref_false_count = 0;
     conv.clarify_turns = 0;
+    conv.escalation_confirmed = true;
 }
 
 /// `evaluate` の結果と会話状態から応答の種別を決める純関数（design doc §2 の決定表そのもの）。
 ///
 /// - `Allowed` かつ下書きあり かつ **非 truncated** → `Answer`
 /// - `Escalate` かつ `clarification_allowed` かつ `conv.clarify_turns < cfg.clarify_max_turns`
-///   → `Clarify`
+///   かつ **`!conv.is_already_escalated()`** → `Clarify`
 /// - それ以外すべて（`Escalate` の残り全部 / `Allowed` で下書き無しか truncated） →
 ///   `EscalationReply`
+///
+/// **`!conv.is_already_escalated()` の条件（Issue #54 要件3、reviewer 第2ラウンド Critical 5）**:
+/// 受付番号発行済みの確定済み case では聞き返しを再開しない。この条件が無いと、
+/// `arm_time_pref_solicitation` が新しいエスカレーション応答を送るたび `conv.clarify_turns` を
+/// 0 へリセットすることと相まって、「確定 → 次ターンは `clarify_turns(0) < max` を満たすため
+/// `Clarify` に戻る → 3 回聞き返し → 予算切れで `EscalationReply` → また 0 にリセット …」が
+/// 無限に繰り返される。確定済み case でも `Allowed` は抑止しない（回答可能な質問には従来どおり
+/// 答えてよい。抑止するのは聞き返しだけ）。
 ///
 /// truncated な下書きを `Answer` に使わない理由（`llm.rs` の `ReplyDraft` doc コメント参照）:
 /// 生成上限で途中切断された下書きは、**切れ目がたまたま「。」の直後に落ちると完成文に
@@ -347,13 +362,100 @@ pub fn decide_reply_action(
             _ => ReplyAction::EscalationReply,
         },
         AnswerDecision::Escalate { .. } => {
-            if outcome.clarification_allowed && conv.clarify_turns < cfg.clarify_max_turns {
+            // Issue #54 要件3（reviewer 第2ラウンド Critical 5）: エスカレーション確定済み
+            // （受付番号発行済み）case では聞き返しを再開しない。確定後は「受付済み」応対に
+            // 徹する。この条件が無いと、`arm_time_pref_solicitation` が `clarify_turns` を 0 へ
+            // リセットすることと相まって聞き返し予算が無限に再充填される。
+            if outcome.clarification_allowed
+                && conv.clarify_turns < cfg.clarify_max_turns
+                && !conv.is_already_escalated()
+            {
                 ReplyAction::Clarify
             } else {
                 ReplyAction::EscalationReply
             }
         }
     }
+}
+
+/// Issue #54 A-2 (b): `ReplyAction::EscalationReply` の応答文を組み立てる（`reply_handler` の
+/// 同分岐から抽出した部品）。
+///
+/// `conv.is_already_escalated()`（受付番号発行済みの後続ターン）なら、フルブロック（受け止め文の
+/// LLM 生成 + `build_deterministic_block` の再掲）を作らず、`escalation_reply::
+/// build_already_escalated_reply` の簡潔な応答に倒す。LLM を一切呼ばないため、A-2 (a) の
+/// 「質問しない」制約はそもそも LLM 生成物にしないことで構造的に満たす。この経路では `conv` を
+/// 一切変更しない（新たに希望時間帯を聞き直す必要が無いため `arm_time_pref_solicitation` を
+/// 呼ばない）。
+///
+/// 新規のエスカレーション確定（`is_already_escalated() == false`）では、従来どおり受け止め文を
+/// 生成し（`drafter` が `None` なら `fallback_ack`）、§3.5 応答側ゲート（`gate_generated_text`）を
+/// 通してから `build_deterministic_block` と連結する。`arm_time_pref_solicitation(conv)` を呼び、
+/// 次ターンの希望時間帯受付を有効化する。
+///
+/// 戻り値の第2要素 `conv_mutated` は、この呼び出しが `conv` を変更したか（＝新規エスカレー
+/// ションだったか）を表す。呼び出し元（`reply_handler`）はこれを見て `save_conv_state` の要否を
+/// 判断すること（この関数自体は保存を行わない）。
+///
+/// **Warning 1 是正（reviewer 第2ラウンド）**: 以前は呼び出し元が `conv.is_already_escalated()`
+/// を呼び出し前に先読みして「この分岐に来る前に conv を変更するコードが無い」という散文コメント
+/// だけを正しさの根拠にしていた。戻り値を `(String, bool)` にすることで、「保存するか」の根拠が
+/// この関数自身の戻り値になり、将来 `load_conv_state` とこの呼び出しの間に conv を変更する処理が
+/// 割り込んでも、先読みした古い判定に基づいて黙って書き込みを捨てる事故が起きない。
+#[allow(clippy::too_many_arguments)]
+async fn build_escalation_reply_text(
+    drafter: Option<&crate::llm::AnthropicClient>,
+    ng: &crate::harness::egress::NgDictionary,
+    max_tokens: u32,
+    question: &str,
+    is_continuation: bool,
+    allowlist: &product_gate::ProductAllowlist,
+    request_id: &str,
+    case_id: &str,
+    hours_label: &str,
+    out_of_hours_now: bool,
+    conv: &mut crate::harness::CaseConvState,
+) -> (String, bool) {
+    if conv.is_already_escalated() {
+        return (
+            escalation_reply::build_already_escalated_reply(
+                case_id,
+                hours_label,
+                conv.awaiting_time_pref,
+                out_of_hours_now,
+            ),
+            false,
+        );
+    }
+    let ack_text = match drafter {
+        Some(drafter) => {
+            escalation_reply::draft_ack_text(drafter, ng, max_tokens, question, is_continuation)
+                .await
+        }
+        None => escalation_reply::fallback_ack(is_continuation)
+            .0
+            .to_string(),
+    };
+    // Issue #28 §3.5: 応答側ゲート その 3/3。受け止め文。決定的ブロック（受付番号等）より前で
+    // チェックする。
+    let ack_text = gate_generated_text(
+        ack_text,
+        allowlist,
+        request_id,
+        case_id,
+        "escalation_ack",
+        "escalation ack text mentions an out-of-scope product model; falling back to the \
+         deterministic ack fallback",
+        || {
+            escalation_reply::fallback_ack(is_continuation)
+                .0
+                .to_string()
+        },
+    );
+    let block = escalation_reply::build_deterministic_block(case_id, hours_label, out_of_hours_now);
+    let reply_text = escalation_reply::assemble_escalation_reply(&ack_text, &block);
+    arm_time_pref_solicitation(conv);
+    (reply_text, true)
 }
 
 /// 「初回か継続か」をサーバがコードで判定する純関数（会話フロー v1.1 design doc §3）。
@@ -460,9 +562,21 @@ fn build_known_facts(
 
 /// 「聞き返し上限到達でエスカレーションへ落ちた」事象かどうかを判定する純関数（計測用）。
 ///
-/// `clarification_allowed = false`（第 1・2 層起因、そもそも聞き返し対象外）による
-/// `EscalationReply` とは区別する。あちらは `conv.clarify_turns` の値に関わらず「上限到達」
-/// ではない。
+/// `clarification_allowed = false`（第2層起因、または第1層で情報が十分な場合。Issue #54:
+/// 第1層は情報不足なら `clarification_allowed = true` になるため、無条件に「第 1・2 層起因」
+/// とは言えなくなった）による `EscalationReply` とは区別する。あちらは `conv.clarify_turns`
+/// の値に関わらず「上限到達」ではない。
+///
+/// **reviewer 第2ラウンド Critical 5 対応後の再発火チェック**: 確定済み（`escalation_confirmed`）
+/// case では `clarify_exhausted` の info ログが毎ターン再発火しないことを検討した。
+/// `conv.clarify_turns` を増やす場所は `ReplyAction::Clarify` 分岐（`reply_handler` 内の
+/// `conv.clarify_turns += 1`）だけで、その分岐は `decide_reply_action` が `Clarify` を返した
+/// ときにしか実行されない。Critical 5 の修正で `decide_reply_action` は
+/// `conv.is_already_escalated()` が true の間は絶対に `Clarify` を返さないため、確定後は
+/// `clarify_turns` を増やすコード経路が無くなり、確定した瞬間の値（`arm_time_pref_solicitation`
+/// が 0 にリセットした値）のまま固定される。したがって確定後に
+/// `conv.clarify_turns >= cfg.clarify_max_turns`（この関数の条件）が再び成立することは無く、
+/// 再発火しない。この分析で経路を構成できなかったため、ガードは追加していない。
 fn is_clarify_exhausted(
     outcome: &crate::harness::EvaluationOutcome,
     conv: &crate::harness::CaseConvState,
@@ -1282,57 +1396,41 @@ async fn reply_handler(
                     .await
                 }
                 ReplyAction::EscalationReply => {
-                    let ack_text = match state.harness.reply_drafter.as_ref() {
-                        Some(drafter) => {
-                            escalation_reply::draft_ack_text(
-                                drafter,
-                                &state.harness.ng,
-                                state.harness.reply_draft_max_tokens,
-                                &req.message,
-                                is_continuation,
-                            )
-                            .await
-                        }
-                        None => escalation_reply::fallback_ack(is_continuation)
-                            .0
-                            .to_string(),
-                    };
-                    // Issue #28 §3.5: 応答側ゲート その 3/3。受け止め文。決定的ブロック
-                    // （受付番号等、`build_deterministic_block`）より前でチェックする。判定本体
-                    // は `gate_generated_text` に抽出し、api.rs 単体テストで直接検証する。
-                    let ack_text = gate_generated_text(
-                        ack_text,
-                        &allowlist,
-                        &request_id,
-                        &outcome.case_id,
-                        "escalation_ack",
-                        "escalation ack text mentions an out-of-scope product model; falling \
-                         back to the deterministic ack fallback",
-                        || {
-                            escalation_reply::fallback_ack(is_continuation)
-                                .0
-                                .to_string()
-                        },
-                    );
+                    // Issue #54: 確定済み（受付番号発行済み）case の後続ターンかどうかで、
+                    // フルブロック生成（LLM + 決定的ブロック）と簡潔な確定済み応答を切り替える。
+                    // Warning 1 是正（reviewer 第2ラウンド）: 以前はここで `conv.is_already_
+                    // escalated()` を先読みし、「この分岐に来る前に conv を変更するコードが
+                    // 無い」という散文コメントだけを根拠に `save_conv_state` の要否を決めていた。
+                    // いまは `build_escalation_reply_text` 自身が返す `conv_mutated` を根拠にする
+                    // （先読みした古い判定に基づいて将来の変更を黙って捨てる事故を防ぐ）。
                     let out_of_hours_now = !hours::is_within_business_hours(
                         &state.config.api.business_hours,
                         chrono::Utc::now(),
                     );
                     let hours_label = hours::business_hours_label(&state.config.api.business_hours);
-                    let block = escalation_reply::build_deterministic_block(
+                    let (reply_text, conv_mutated) = build_escalation_reply_text(
+                        state.harness.reply_drafter.as_ref(),
+                        &state.harness.ng,
+                        state.harness.reply_draft_max_tokens,
+                        &req.message,
+                        is_continuation,
+                        &allowlist,
+                        &request_id,
                         &outcome.case_id,
                         &hours_label,
                         out_of_hours_now,
-                    );
-                    let reply_text = escalation_reply::assemble_escalation_reply(&ack_text, &block);
+                        &mut conv,
+                    )
+                    .await;
 
-                    arm_time_pref_solicitation(&mut conv);
-                    if let Err(err) = state
-                        .harness
-                        .save_conv_state(&ctx, &outcome.case_id, &conv)
-                        .await
-                    {
-                        return conv_state_save_failed(&err, &request_id, &outcome.case_id);
+                    if conv_mutated {
+                        if let Err(err) = state
+                            .harness
+                            .save_conv_state(&ctx, &outcome.case_id, &conv)
+                            .await
+                        {
+                            return conv_state_save_failed(&err, &request_id, &outcome.case_id);
+                        }
                     }
                     ok_reply_response(
                         &state,
@@ -1740,6 +1838,7 @@ mod tests {
             time_pref_false_count: 0,
             preferred_contact_time: None,
             time_pref_extraction_error_count: 0,
+            escalation_confirmed: false,
         }
     }
 
@@ -1807,6 +1906,11 @@ mod tests {
         );
         assert_eq!(conv.time_pref_false_count, 0);
         assert_eq!(conv.clarify_turns, 0);
+        assert!(
+            conv.escalation_confirmed,
+            "エスカレーション応答を送ったら escalation_confirmed を立てる \
+             (reviewer 一次レビュー Critical 2)"
+        );
     }
 
     /// design doc §5 はリセット対象を「分類成功時」と「3 回到達時」の 2 つに限定しており、
@@ -1875,7 +1979,10 @@ mod tests {
 
     #[test]
     fn decide_reply_action_escalates_when_clarification_is_not_allowed() {
-        // 第1・2層起因の escalate は clarification_allowed = false（決定論）。
+        // Issue #54 + reviewer 一次レビュー Critical 1: clarification_allowed = false になる
+        // escalate（第1層 binding=mandatory、または第2層。gray_escalate_decision 自体は第3層
+        // 相当の Escalate だが、ここでは `clarification_allowed` フラグを直接 false で渡して
+        // decide_reply_action が値だけを見て分岐することを検証している）。
         let outcome = base_outcome(gray_escalate_decision(), false);
         let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
         assert_eq!(action, ReplyAction::EscalationReply);
@@ -1884,8 +1991,11 @@ mod tests {
     /// `decide_reply_action` 自身は `layer` を見ない（`clarification_allowed` の値だけで
     /// 分岐する）。rule_match（第1層）相当の escalate で `clarification_allowed = false` が
     /// 渡ったとき、turns 消費とは無関係にエスカレーションへ倒れることを固定する。
-    /// 「第1層では `clarification_allowed` が常に false になる」こと自体は、この関数ではなく
-    /// 呼び出し元（`harness/mod.rs` の `clarification_allowed()` 契約テスト）が保証している。
+    /// 「第1層 binding=mandatory と第2層では `clarification_allowed` が常に false になる」
+    /// こと自体は、この関数ではなく呼び出し元（`decision::decide` の binding 分岐と、
+    /// `harness/mod.rs` の `clarification_allowed()` 契約テスト）が保証している。第1層
+    /// binding=advisory は情報不足時に true になりうる（`decision.rs::
+    /// layer1_advisory_escalation_carries_missing_when_evidence_is_insufficient` 等）。
     #[test]
     fn decide_reply_action_escalates_for_rule_match_even_with_turns_remaining() {
         let outcome = base_outcome(rule_match_escalate_decision(), false);
@@ -1917,6 +2027,322 @@ mod tests {
         conv.clarify_turns = 2; // < clarify_max_turns(3): 通常なら Clarify になる
         let action = decide_reply_action(&outcome, &conv, &default_api_config());
         assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    // ---- decide_reply_action: Issue #54 要件3（reviewer 第2ラウンド Critical 5） ----
+    //
+    // 確定済み（受付番号発行済み）case では、`clarification_allowed = true` かつ予算内でも
+    // `Clarify` を返してはならない。失敗シナリオ: `arm_time_pref_solicitation` が新しい
+    // エスカレーション応答のたび `clarify_turns` を 0 にリセットするため、この条件が無いと
+    // 確定直後の次ターンは必ず `clarify_turns(0) < clarify_max_turns` を満たし、聞き返しが
+    // 無限に再開してしまう。
+
+    #[test]
+    fn decide_reply_action_never_clarifies_once_escalation_is_confirmed() {
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 0; // 予算は十分残っている
+        conv.escalation_confirmed = true;
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(
+            action,
+            ReplyAction::EscalationReply,
+            "escalation_confirmed の case は聞き返し予算が残っていても再開してはならない"
+        );
+    }
+
+    /// `escalation_confirmed` 追加前の既存 case への後方互換経路（`is_already_escalated` の
+    /// 契約）。`awaiting_time_pref = true` だけでも同様に抑止されること。
+    #[test]
+    fn decide_reply_action_never_clarifies_when_awaiting_time_pref_alone_marks_it_confirmed() {
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 0;
+        conv.awaiting_time_pref = true;
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    /// 同上。`preferred_contact_time` だけでも同様に抑止されること。
+    #[test]
+    fn decide_reply_action_never_clarifies_when_a_recorded_contact_time_alone_marks_it_confirmed() {
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 0;
+        conv.preferred_contact_time = Some("平日午後".to_string());
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    /// 回帰防止: `!conv.is_already_escalated()` の条件は `Escalate` 分岐にのみ足す。`Allowed`
+    /// 分岐まで巻き込んで抑止すると、確定済み case で二度と回答できなくなる（回答可能な質問には
+    /// 従来どおり答えてよい。抑止するのは聞き返しだけ）。
+    #[test]
+    fn decide_reply_action_still_answers_when_allowed_even_after_escalation_is_confirmed() {
+        let mut outcome = base_outcome(allowed_decision(), false);
+        outcome.customer_reply_draft = Some("下書き本文".to_string());
+        outcome.customer_reply_draft_truncated = false;
+        let mut conv = default_conv_state();
+        conv.escalation_confirmed = true;
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::Answer("下書き本文".to_string()));
+    }
+
+    /// 主フローの回帰防止: 未確定 case（3 フィールドすべて既定値）は従来どおり `Clarify` を返す。
+    #[test]
+    fn decide_reply_action_still_clarifies_when_not_yet_escalated() {
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 0;
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::Clarify);
+    }
+
+    // ---- build_escalation_reply_text（Issue #54 A-2 (b)） ----
+    //
+    // `reply_handler` の `ReplyAction::EscalationReply` 分岐から抽出した部品。実 vegapunk・
+    // 実 HTTP router 無しで、`conv.is_already_escalated()` の分岐（フルブロック生成 vs 簡潔な
+    // 確定済み応答）を直接検証する。LLM は `crate::llm::test_support::spawn_messages_stub` の
+    // stub を使い、「LLM が呼ばれていないこと」は stub への到達リクエスト数 0 で確認する
+    // （`escalation_reply.rs::draft_ack_text_via_stub` と同じパターン）。
+
+    /// `crate::llm::AnthropicClient` を stub エンドポイントへ向けて組み立てる
+    /// （`escalation_reply.rs::draft_ack_text_via_stub` と同じ構成）。
+    async fn stub_drafter(
+        draft_text: &str,
+    ) -> (
+        crate::llm::AnthropicClient,
+        crate::llm::test_support::RequestLog,
+    ) {
+        let body = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": draft_text}],
+        })
+        .to_string();
+        let (endpoint, log) = crate::llm::test_support::spawn_messages_stub(body).await;
+
+        let dir =
+            std::env::temp_dir().join(format!("api-escalation-reply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let key_path = dir.join("llm-api-key");
+        std::fs::write(&key_path, "test-key\n").expect("write api key file");
+        let drafter = crate::llm::AnthropicClient::from_config(&crate::config::LlmConfig {
+            enabled: true,
+            endpoint,
+            api_key_file: Some(key_path.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .expect("llm client must build from the stub config")
+        .expect("enabled = true with a readable key file must yield a client");
+        (drafter, log)
+    }
+
+    fn test_ng() -> crate::harness::egress::NgDictionary {
+        crate::harness::egress::NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn build_escalation_reply_text_uses_the_full_block_for_a_new_escalation() {
+        let (drafter, log) = stub_drafter("ご質問の件、担当者が確認のうえご連絡いたします。").await;
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state(); // awaiting_time_pref = false, preferred_contact_time = None
+
+        let (reply_text, conv_mutated) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "エラーが出て困っています",
+            false,
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::assemble_escalation_reply(
+                "ご質問の件、担当者が確認のうえご連絡いたします。",
+                &escalation_reply::build_deterministic_block(
+                    "case-12345678-abcd",
+                    "平日 10:00〜18:00",
+                    false
+                )
+            )
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "a new escalation must draft the ack text via the LLM"
+        );
+        assert!(
+            conv.awaiting_time_pref,
+            "a new escalation must arm the time-preference solicitation"
+        );
+        assert!(
+            conv_mutated,
+            "Warning 1: a new escalation must report conv_mutated = true so the caller saves it"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_escalation_reply_text_skips_the_llm_and_full_block_when_already_escalated() {
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true; // 受付番号発行済みの後続ターンを模す
+
+        let (reply_text, conv_mutated) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "追加の補足です",
+            true,
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::build_already_escalated_reply(
+                "case-12345678-abcd",
+                "平日 10:00〜18:00",
+                true,
+                false
+            )
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "an already-escalated case must not call draft_ack_text (A-2 (a): no LLM, so no \
+             question can leak through)"
+        );
+        let full_block = escalation_reply::assemble_escalation_reply(
+            "この下書きは絶対に使われてはならない",
+            &escalation_reply::build_deterministic_block(
+                "case-12345678-abcd",
+                "平日 10:00〜18:00",
+                false,
+            ),
+        );
+        assert_ne!(reply_text, full_block);
+        assert!(!reply_text.contains("この下書きは絶対に使われてはならない"));
+        assert!(
+            conv.awaiting_time_pref,
+            "an already-escalated case must not be re-armed or otherwise mutated"
+        );
+        assert!(
+            !conv_mutated,
+            "Warning 1: an already-escalated case must report conv_mutated = false so the \
+             caller skips the redundant save_conv_state call"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_escalation_reply_text_treats_a_recorded_contact_time_as_already_escalated() {
+        // awaiting_time_pref が既に false に戻っていても、preferred_contact_time が残っていれば
+        // 確定済みと判定する（`CaseConvState::is_already_escalated` の契約）。
+        let (drafter, log) = stub_drafter("この下書きも使われてはならない").await;
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state();
+        conv.preferred_contact_time = Some("平日午後".to_string());
+
+        let (reply_text, conv_mutated) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "追加の補足です",
+            true,
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::build_already_escalated_reply(
+                "case-12345678-abcd",
+                "平日 10:00〜18:00",
+                false,
+                false
+            ),
+            "awaiting_time_pref = false のままなので時間帯依頼の行は付かない"
+        );
+        assert_eq!(log.lock().unwrap().len(), 0);
+        assert_eq!(
+            conv.preferred_contact_time.as_deref(),
+            Some("平日午後"),
+            "確定済み経路は conv を一切変更しない"
+        );
+        assert!(
+            !conv_mutated,
+            "Warning 1: an already-escalated case must report conv_mutated = false"
+        );
+    }
+
+    // reviewer 一次レビュー Critical 2 の回帰テスト。`awaiting_time_pref` が false 分類 2 連続 /
+    // 抽出インフラ失敗 3 連続のいずれかで自動解除された直後（まだ `preferred_contact_time` は
+    // 未確定）を模す。旧 `is_already_escalated()`（`awaiting_time_pref ||
+    // preferred_contact_time.is_some()`）はこの状態を「未確定」と誤判定し、2 ターンごとに
+    // フルブロック（LLM 受け止め文 + 決定的ブロック）を再掲していた。`escalation_confirmed`
+    // フラグが正本になったことで、この状態でも確定済みと判定できることを固定する。
+    #[tokio::test]
+    async fn build_escalation_reply_text_treats_escalation_confirmed_alone_as_already_escalated() {
+        let (drafter, log) = stub_drafter("この下書きも使われてはならない").await;
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state();
+        conv.escalation_confirmed = true;
+        // awaiting_time_pref / preferred_contact_time はどちらも未設定のまま
+        // (自動解除された直後・時間帯はまだ確定していない状態)。
+
+        let (reply_text, conv_mutated) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "追加の補足です",
+            true,
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::build_already_escalated_reply(
+                "case-12345678-abcd",
+                "平日 10:00〜18:00",
+                false,
+                false
+            ),
+            "awaiting_time_pref = false のままなので時間帯依頼の行は付かない"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "escalation_confirmed だけが立っている状態でも LLM を一切呼んではならない"
+        );
+        assert!(!reply_text.contains("この下書きも使われてはならない"));
+        assert!(
+            !conv_mutated,
+            "Warning 1: an already-escalated case must report conv_mutated = false"
+        );
     }
 
     // ---- is_continuation（会話フロー v1.1 design doc §3: 初回/継続の決定論判定） ----

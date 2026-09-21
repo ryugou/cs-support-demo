@@ -77,7 +77,12 @@ pub struct EvaluateAnswerabilityResponse {
     /// 次ターンで渡す会話キー
     pub case_id: String,
     /// true のとき、不足条件（decision.missing）について利用者へ聞き返してよい。
-    /// 文面は client（LLM）が生成する。第1・2層エスカレーションでは常に false。
+    /// 文面は client（LLM）が生成する。Issue #54 で契約を更新: 第1層のうち
+    /// `binding = mandatory` のルール（担当者取次・安全事故・物理破損・工事リスク等、
+    /// 問答無用の即時エスカレーション）と第2層（禁止ドメイン）は常に false。第1層のうち
+    /// `binding = advisory` のルール（例: 契約・保証関連）は、マニュアル一致度が閾値未満
+    /// （製品未特定・症状要点不足）なら true になりうる。第3層グレー
+    /// （`InsufficientDirectness` / `UnknownAddedSignal`）は従来どおり常に true。
     pub clarification_allowed: bool,
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
