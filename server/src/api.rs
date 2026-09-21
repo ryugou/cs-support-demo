@@ -427,15 +427,16 @@ fn decide_jev_hearing_action(
     }
 }
 
-/// Issue #58: Jev へ `has_enough_info` を問い合わせる。HTTP 呼び出し失敗・タイムアウト・
+/// Issue #58: Jev へ `has_enough_info` を問い合わせる。`state` は [`build_jev_state`] で組み立てた
+/// 「過去の顧客発話 + 今ターンの発話」（呼び出し元は `resolve_jev_has_enough_info`）。HTTP 呼び出し失敗・タイムアウト・
 /// 応答に `has_enough_info` の `noul` 回答が無いのいずれも `None`（呼び出し側は
 /// `decide_reply_action` へフォールバックすること。fail-closed にせず fail-back する）。
 async fn query_jev_has_enough_info(
     jev: &crate::jev::JevClient,
-    message: &str,
+    state: &str,
     request_id: &str,
 ) -> Option<f64> {
-    match jev.evaluate(message).await {
+    match jev.evaluate(state).await {
         Ok(outcome) => match outcome.answers.get("has_enough_info") {
             Some(crate::jev::JevAnswer::Noul { noul }) => Some(*noul),
             other => {
@@ -466,10 +467,27 @@ async fn query_jev_has_enough_info(
 /// 戻り値が `Some` のときだけ、呼び出し側は `decide_jev_hearing_action` を使い、かつ
 /// `Harness::record_jev_hearing_decision` で専用の監査行を書くこと（`None` のターンは
 /// 通常どおり `decide_reply_action` に委譲し、この監査行を書かない）。
+///
+/// Jev へ送る `state` は、完成済みの文字列ではなく `history` と `message`（今ターンの発話）を
+/// 受け取り、対象ターンと判定した**後**にこの関数の中で [`build_jev_state`] を呼んで組み立てる。
+/// 理由は 2 つ。(1) 呼び出し側（`reply_handler`）が将来 `message` だけを渡す形へ退行しても、
+/// wiremock が受信した `state` を検証するテストで検出できる（完成済みの `state` を受ける
+/// シグネチャだと、この結線が退行しても既存テストが全て通ってしまう）。(2) `[jev] enabled = false`
+/// や対象外のターン（大半のリクエスト）で、使わない `state` の組み立て（履歴の走査・文字数集計）
+/// を毎回払わない。
+///
+/// **テスト方針（`reply_handler` 全体を駆動する統合テストを置かない理由）**: `Harness.knowledge`
+/// は具象型 `KnowledgeStore`（vegapunk gRPC クライアントを内包）で差し替えられず、
+/// `/api/reply` の 200 経路は実 vegapunk が無いと通せない（`reply_handler` の 401/400/404/500
+/// のみ `oneshot` で検証する、という既存の裁定。`mod tests` 内「/api/reply ルーティング」節の
+/// コメント参照）。このためこの関数と `decide_jev_hearing_action` を部品として単体で検証している。
+/// Clarify 応答・clarify 予算の永続化・後続のエスカレーション到達の通し検証は、`KnowledgeStore`
+/// をトレイト化する変更が要り Issue #58 のスコープ外。
 async fn resolve_jev_has_enough_info(
     harness: &Harness,
     outcome: &crate::harness::EvaluationOutcome,
     conv: &crate::harness::CaseConvState,
+    history: &[ReplyHistoryTurn],
     message: &str,
     request_id: &str,
 ) -> Option<f64> {
@@ -477,7 +495,134 @@ async fn resolve_jev_has_enough_info(
         return None;
     }
     let jev = harness.jev_client.as_ref()?;
-    query_jev_has_enough_info(jev, message, request_id).await
+    let state = build_jev_state(history, message, request_id);
+    query_jev_has_enough_info(jev, &state, request_id).await
+}
+
+/// Issue #58: Jev の `state` に渡す文字列を組み立てる純関数。過去の顧客発話（時系列昇順）を
+/// 前置し、最後に今ターンの `message` を足して `\n` で連結する。履歴に顧客発話が 1 件も無い
+/// ときは `message` のみを返す（余計な改行を付けない）。
+///
+/// **なぜ履歴を含めるか**: `has_enough_info` の判定基準は「対象の製品と具体的な症状の両方が
+/// 分かる」（`server/data/urtect/jev-questions.json`）。今ターンの発話だけを渡すと、顧客が
+/// 1 ターン目に症状、2 ターン目に型番を答えた多ターンのヒアリングで、どのターン単体でも
+/// 「両方分かる」にならず `has_enough_info` が上がらない。結果 `clarify_max_turns` に達する
+/// まで聞き返しを繰り返してからエスカレーションする。累積 signal や `build_known_facts` の
+/// 把握済み事項は既に履歴を見ているため、Jev だけが履歴を見ない不整合の是正でもある。
+///
+/// **なぜ assistant 発話を含めないか**: `has_enough_info` は「顧客が伝えた情報の十分性」を測る
+/// 指標であり、聞き返し文など自社発話が判定を押し上げてはならない。
+///
+/// **なぜ [`select_customer_history_for_known_facts`] を使わないか（表示用の要約予算を判定入力へ
+/// 流用しない）**: あちらは把握済み事項リストへ載せる**表示用**に 1 発話を 100 字 + `…` へ切り詰める。
+/// これを Jev の**判定入力**へ流用すると、発話が途中で切られて意味が反転する経路が生まれる。
+/// 決定的情報（型番）が 101 字目以降なら Jev から見えず `has_enough_info` が不当に下がる。より
+/// 重いのは、訂正・否定（「ADC-V523 ではなく実際の型番は不明です」等）が 101 字目以降で切り落とされ、
+/// 誤った型番だけが残って `has_enough_info` が不当に上がる場合で、症状のみの今ターンが「誤った型番
+/// + 症状」に見えて、聞き返すべきところが即エスカレーションになる。しかも切り詰めは warn に
+/// 出ないため痕跡が残らない。そのため発話は**途中で切らず**、予算超過は古い側の発話を**丸ごと**
+/// 落とす（[`select_customer_history_for_jev`]）。
+///
+/// **発話単位の削除にも「安全側にしか振れない」保証は無い**（是正: 当初この doc コメントは
+/// 「丸ごと落ちるなら意味反転は構造的に起きない」と断言していたが、これは誤りだった）。
+/// 発話内の切り詰めより厳密に安全ではある（訂正・否定が発話の一部だけ生き残って文意が変わる
+/// 経路は無い）が、古いターンが後続ターンの言及を**限定・否定**しているケースでは、その古い
+/// ターンを丸ごと落とすことで逆に `has_enough_info` が不当に**上がる**方向へ振れうる。例:
+/// 古い発話「後で例に出す ADC-V523 は他人の製品です。私の型番は不明です」が丸ごと落ち、
+/// 「ADC-V523 の症状」に触れる新しい発話だけが残ると、型番が確定して見えてしまう。そのため
+/// 除外（件数窓・予算超過のいずれも）は必ず warn に記録し（[`select_customer_history_for_jev`]）、
+/// 事後に会話を突き合わせて再構成できるようにしている。
+///
+/// 今ターンの `message` は切り詰めない（入力上限は `validate` の `MAX_MESSAGE_CHARS` が既に持つ）。
+/// ただし過去発話と同じ改行潰しの正規化（[`crate::harness::prompt_input::collapse_to_single_line`]）
+/// は掛ける。「1 顧客発話 = 必ず 1 行」という不変条件が、state の末尾行（今ターン）だけ崩れて
+/// いたため。正規化後に空になる場合（制御文字だけの発話。`validate` は通過しうる）は、state の
+/// 末尾に空行を残さないよう行ごと省く。
+///
+/// `request_id` は予算超過の warn を該当リクエストと突き合わせるためだけに使う。
+fn build_jev_state(history: &[ReplyHistoryTurn], message: &str, request_id: &str) -> String {
+    let mut lines = select_customer_history_for_jev(history, request_id);
+    let current_turn = crate::harness::prompt_input::collapse_to_single_line(message);
+    if !current_turn.is_empty() {
+        lines.push(current_turn);
+    }
+    lines.join("\n")
+}
+
+/// Jev の判定入力に載せる過去の顧客発話の合計文字数（`chars().count()` の総和。正規化後の値で、
+/// 今ターンの `message` と行区切りの `\n` は含まない）の上限。
+///
+/// `/api/reply` の `history[].text` 上限（[`MAX_HISTORY_TEXT_CHARS`]）と同値。したがって
+/// `validate` を通った入力では 1 発話だけで予算を超えることはなく、超過は複数発話の合計でのみ
+/// 起きる。1 発話で超える分岐（丸ごと落として過去発話 0 件になる）は、`validate` を経由しない
+/// 呼び出しや将来の上限変更に対する防御であり、切り詰めで代替しない。
+///
+/// state が今ターンだけの場合から最大でこの字数ぶん増えるため、Jev の入力トークン・
+/// レイテンシは有効化前に実測し直すこと（`docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
+const MAX_JEV_HISTORY_CHARS: usize = 2_000;
+
+/// Jev の**判定入力**専用の過去の顧客発話の選択。時系列昇順で返す。**発話を途中で切らない**。
+///
+/// 1. `role == Customer` に絞り、各発話へ改行潰しの正規化**のみ**を掛ける（切り詰めを伴う
+///    [`normalize_customer_turn_to_single_line`] は使わない）。正規化後に空になるもの
+///    （制御文字だけの発話等）は除外する。先に除外するのは、`validate` は `trim()` 後の非空しか
+///    見ないため、空になる発話が枠を消費して有効な発話を押し出す事故を防ぐ
+///    （[`select_customer_history_for_known_facts`] と同じ理由）。
+/// 2. 新しい側から最大 [`crate::harness::reply::MAX_HISTORY_TURNS`] 件を採る（把握済み事項の窓と
+///    件数を揃える）。この件数窓による除外も、下記の予算超過と同じく warn に出す
+///    （`window_dropped_turns` フィールド）。件数窓は固定長で除外理由も機械的だが、除外自体は
+///    観測できないと事後に会話を再構成できないため、対象外にしない。
+/// 3. 合計文字数が [`MAX_JEV_HISTORY_CHARS`] を超える間、古い側の発話を 1 件ずつ**丸ごと**落とす。
+///    1 件だけで超える発話も切り詰めず丸ごと落とす（過去発話 0 件になりうる）。
+///
+/// **表示用の要約予算（1 発話 100 字 + `…`）を判定入力へ流用しない**こと。理由（訂正・否定が
+/// 切り落とされて `has_enough_info` が不当に上がる意味反転）は [`build_jev_state`] の doc コメント
+/// を参照。同コメントが記す既知の限界（発話単位の削除も安全側にしか振れない保証は無いこと）も
+/// 参照。
+///
+/// 手順 2（件数窓）または手順 3（予算超過）のいずれかで 1 件以上落としたときは `tracing::warn!`
+/// を 1 回出す。件数窓で落ちた件数は `window_dropped_turns`、予算超過で落ちた件数は
+/// `dropped_turns`（既存フィールド名を維持）に分けて出す。**発話本文は絶対に出さない**
+/// （個人情報を含みうる）。`request_id` は該当リクエストと突き合わせるための相関 ID で、本文ではない。
+fn select_customer_history_for_jev(history: &[ReplyHistoryTurn], request_id: &str) -> Vec<String> {
+    let mut turns: Vec<String> = history
+        .iter()
+        .filter(|turn| turn.role == ReplyHistoryRole::Customer)
+        .map(|turn| crate::harness::prompt_input::collapse_to_single_line(&turn.text))
+        .filter(|text| !text.is_empty())
+        .collect();
+    let window_skip = turns
+        .len()
+        .saturating_sub(crate::harness::reply::MAX_HISTORY_TURNS);
+    turns.drain(..window_skip);
+
+    // 古い側から順に、合計が予算に収まるまで丸ごと落とす。`total_chars` は `turns` の総和なので、
+    // 全件落とせば 0 になりループは必ず終わる（`turns` が空でも panic しない）。
+    let mut total_chars: usize = turns.iter().map(|turn| turn.chars().count()).sum();
+    let mut dropped_turns = 0;
+    for turn in &turns {
+        if total_chars <= MAX_JEV_HISTORY_CHARS {
+            break;
+        }
+        total_chars -= turn.chars().count();
+        dropped_turns += 1;
+    }
+    turns.drain(..dropped_turns);
+
+    if window_skip > 0 || dropped_turns > 0 {
+        tracing::warn!(
+            request_id = %request_id,
+            window_dropped_turns = window_skip,
+            dropped_turns,
+            kept_turns = turns.len(),
+            reason = "jev_history_budget",
+            "past customer turns were dropped whole from jev's judgment input (via the history \
+             window and/or the character budget; turns are never truncated). if a dropped turn \
+             limited or negated something mentioned in a later turn, has_enough_info can come out \
+             either higher or lower than the whole conversation warrants"
+        );
+    }
+    turns
 }
 
 /// Issue #54 A-2 (b): `ReplyAction::EscalationReply` の応答文を組み立てる（`reply_handler` の
@@ -587,6 +732,10 @@ fn normalize_customer_turn_to_single_line(text: &str) -> String {
 
 /// 「把握済み事項リスト」専用の customer 発話選択（Warning 1 修正、2 巡目の Warning で
 /// 選択と正規化の順序を修正）。
+///
+/// **これは表示用（LLM プロンプトへ載せる要約）。判定入力には使わないこと。** 1 発話を 100 字 +
+/// `…` へ切り詰めるため、判定に使うと訂正・否定が切り落とされて意味が反転する。Jev の判定入力は
+/// 発話を切らない [`select_customer_history_for_jev`] を使う。
 ///
 /// **なぜ `reply::select_history` をそのまま使わないか**: あちらは「新しい側から最大
 /// [`crate::harness::reply::MAX_HISTORY_TURNS`] ターン・合計 4000 字」を**全 role・原文長**で
@@ -1431,10 +1580,14 @@ async fn reply_handler(
             // 対象外のターン・Jev 無効・HTTPエラー・タイムアウト・応答欠落のいずれでも
             // `None` になり、その場合は従来どおり `decide_reply_action`（missing ベース）に
             // 委譲する（fail-back。詳細は `resolve_jev_has_enough_info` の doc コメント）。
+            // Jev には今ターンの発話だけでなく過去の顧客発話も渡す（`build_jev_state` の
+            // doc コメント参照）。state の組み立ては対象ターンと判定した後に
+            // `resolve_jev_has_enough_info` の中で行う（ここで先に作らない）。
             let jev_has_enough_info = resolve_jev_has_enough_info(
                 &state.harness,
                 &outcome,
                 &conv,
+                &history,
                 &req.message,
                 &request_id,
             )
@@ -2330,7 +2483,7 @@ mod tests {
 
     // ---- Issue #58: 第1層 advisory の聞き返し判定に Jev の has_enough_info を使う ----
 
-    // --- decide_jev_hearing_action（純関数。実測値は背景 seciton・design doc §7 参照） ---
+    // --- decide_jev_hearing_action（純関数。実測値は背景 section・design doc §7 参照） ---
 
     #[test]
     fn decide_jev_hearing_action_clarifies_when_below_threshold_and_turns_remain() {
@@ -2519,9 +2672,15 @@ mod tests {
         let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
         let conv = default_conv_state();
 
-        let result =
-            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
-                .await;
+        let result = resolve_jev_has_enough_info(
+            &harness,
+            &outcome,
+            &conv,
+            &[],
+            "電源が入らなくなった",
+            "req-1",
+        )
+        .await;
 
         assert_eq!(
             result, None,
@@ -2546,12 +2705,40 @@ mod tests {
         harness.jev_client = Some(jev);
         let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
         let conv = default_conv_state();
+        let history = vec![
+            customer_turn("録画が再生できません"),
+            assistant_turn("型番を教えていただけますか？"),
+            customer_turn("先週から映らなくなりました"),
+        ];
 
-        let result =
-            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
-                .await;
+        let result = resolve_jev_has_enough_info(
+            &harness,
+            &outcome,
+            &conv,
+            &history,
+            "型番は ADC-V523 です",
+            "req-1",
+        )
+        .await;
 
         assert_eq!(result, Some(0.14));
+        // 結線の固定: `resolve_jev_has_enough_info` が `history` と `message` から state を
+        // 組み立て、それが HTTP で実際に送信されること。将来ここが `message` のみの送信へ
+        // 退行すると、多ターンのヒアリングで `has_enough_info` が上がらなくなる（Issue #58）。
+        let received = server.received_requests().await.expect("recording enabled");
+        assert_eq!(received.len(), 1, "jev must be called exactly once");
+        let sent: serde_json::Value = received[0].body_json().expect("request body is json");
+        assert_eq!(
+            sent["state"], "録画が再生できません\n先週から映らなくなりました\n型番は ADC-V523 です",
+            "state must be past customer turns (chronological) + the current message"
+        );
+        assert!(
+            !sent["state"]
+                .as_str()
+                .expect("state is a string")
+                .contains("教えていただけますか"),
+            "assistant turns must never reach jev: {sent}"
+        );
     }
 
     #[tokio::test]
@@ -2573,6 +2760,7 @@ mod tests {
             &harness,
             &outcome,
             &conv,
+            &[],
             "電源が入らなくなった",
             "req-1",
         ))
@@ -2604,9 +2792,15 @@ mod tests {
         let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
         let conv = default_conv_state();
 
-        let result =
-            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
-                .await;
+        let result = resolve_jev_has_enough_info(
+            &harness,
+            &outcome,
+            &conv,
+            &[],
+            "電源が入らなくなった",
+            "req-1",
+        )
+        .await;
 
         assert_eq!(result, None);
     }
@@ -2629,9 +2823,15 @@ mod tests {
         let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
         let conv = default_conv_state();
 
-        let result =
-            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
-                .await;
+        let result = resolve_jev_has_enough_info(
+            &harness,
+            &outcome,
+            &conv,
+            &[],
+            "電源が入らなくなった",
+            "req-1",
+        )
+        .await;
 
         assert_eq!(result, None);
     }
@@ -2657,9 +2857,15 @@ mod tests {
         let outcome = base_outcome(layer1_mandatory_escalate_decision(), false);
         let conv = default_conv_state();
 
-        let result =
-            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
-                .await;
+        let result = resolve_jev_has_enough_info(
+            &harness,
+            &outcome,
+            &conv,
+            &[],
+            "電源が入らなくなった",
+            "req-1",
+        )
+        .await;
 
         assert_eq!(result, None);
         let received = server.received_requests().await.expect("recording enabled");
@@ -3234,6 +3440,529 @@ mod tests {
             !text.lines().any(|line| line == "- 顧客発話: "),
             "正規化後に空になる発話は行として出力してはならない"
         );
+    }
+
+    // ---- build_jev_state（Issue #58: Jev へ渡す state。過去の顧客発話 + 今ターンの発話） ----
+
+    fn customer_turn(text: &str) -> ReplyHistoryTurn {
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: text.to_string(),
+        }
+    }
+
+    fn assistant_turn(text: &str) -> ReplyHistoryTurn {
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Assistant,
+            text: text.to_string(),
+        }
+    }
+
+    /// `build_jev_state` の戻り値と、その実行中に出た WARN / ERROR ログ（無ければ空文字）を返す。
+    fn build_jev_state_capturing_warnings(
+        history: &[ReplyHistoryTurn],
+        message: &str,
+    ) -> (String, String) {
+        let (state, logs) =
+            crate::test_support::capture_logs(|| build_jev_state(history, message, "req-1"));
+        (
+            state,
+            crate::test_support::filter_warn_and_error_lines(&logs),
+        )
+    }
+
+    /// 履歴が空（初回ターン）なら今ターンの発話だけを返し、先頭・末尾に余計な改行を付けない。
+    #[test]
+    fn build_jev_state_returns_only_the_message_when_history_is_empty() {
+        let state = build_jev_state(&[], "電源が入らなくなった", "req-1");
+        assert_eq!(state, "電源が入らなくなった");
+    }
+
+    /// 履歴に assistant 発話しか無い（過去の顧客発話が 0 件）ときも、今ターンの発話だけを返す。
+    #[test]
+    fn build_jev_state_returns_only_the_message_when_history_has_only_assistant_turns() {
+        let history = vec![
+            assistant_turn("型番を教えていただけますか？"),
+            assistant_turn("いつ頃から発生していますか？"),
+        ];
+        let state = build_jev_state(&history, "電源が入らなくなった", "req-1");
+        assert_eq!(state, "電源が入らなくなった");
+    }
+
+    /// 顧客が症状（1 ターン目）→ 型番（2 ターン目）と別ターンで答えた場合の再現ケース。
+    /// 過去の顧客発話が時系列昇順で並び、最後に今ターンの発話が来て `\n` で連結されること。
+    #[test]
+    fn build_jev_state_joins_past_customer_turns_then_the_message_in_chronological_order() {
+        let history = vec![
+            customer_turn("録画が再生できません"),
+            customer_turn("先週から映らなくなりました"),
+        ];
+        let state = build_jev_state(&history, "型番は ADC-V523 です", "req-1");
+        assert_eq!(
+            state,
+            "録画が再生できません\n先週から映らなくなりました\n型番は ADC-V523 です"
+        );
+    }
+
+    /// assistant 発話は state に含めない（顧客が伝えた情報の十分性を測る指標のため、
+    /// 聞き返し文などの自社発話が「情報が揃った」判定を押し上げてはならない）。
+    #[test]
+    fn build_jev_state_excludes_assistant_turns() {
+        let history = vec![
+            customer_turn("録画が再生できません"),
+            assistant_turn("型番を教えていただけますか？"),
+        ];
+        let state = build_jev_state(&history, "型番は ADC-V523 です", "req-1");
+        assert_eq!(state, "録画が再生できません\n型番は ADC-V523 です");
+        assert!(
+            !state.contains("教えていただけますか"),
+            "assistant 発話が state に混入している: {state}"
+        );
+    }
+
+    /// customer 発話が `MAX_HISTORY_TURNS`(6) 件を超えるとき、新しい側 6 件だけが採られ、
+    /// 今ターンの発話がその後ろに付くこと（古い 2 件は落ちる）。
+    #[test]
+    fn build_jev_state_keeps_only_the_newest_max_history_turns_of_customer_turns() {
+        let history: Vec<ReplyHistoryTurn> = (0..crate::harness::reply::MAX_HISTORY_TURNS + 2)
+            .map(|i| customer_turn(&format!("過去発話{i}")))
+            .collect();
+        let state = build_jev_state(&history, "今ターンの発話", "req-1");
+
+        let lines: Vec<&str> = state.lines().collect();
+        assert_eq!(
+            lines.len(),
+            crate::harness::reply::MAX_HISTORY_TURNS + 1,
+            "新しい側 MAX_HISTORY_TURNS 件 + 今ターンの発話の行数になること: {state}"
+        );
+        assert!(
+            !state.contains("過去発話0") && !state.contains("過去発話1"),
+            "枠に収まらない古い 2 件は落ちること: {state}"
+        );
+        assert_eq!(lines.first().copied(), Some("過去発話2"));
+        assert_eq!(lines.last().copied(), Some("今ターンの発話"));
+    }
+
+    /// `/api/reply` の入力検証は `trim()` 後の非空しか見ないため、制御文字（BEL）だけの発話は
+    /// 検証を通過する。正規化後に空になる発話が `MAX_HISTORY_TURNS` の枠を消費して有効な発話を
+    /// 押し出してはならず、空行も state に出してはならない。
+    #[test]
+    fn build_jev_state_does_not_let_control_character_only_turns_consume_the_window() {
+        let mut history = vec![customer_turn("型番は URT-2 です")];
+        history.extend(
+            (0..crate::harness::reply::MAX_HISTORY_TURNS)
+                .map(|_| customer_turn("\u{0007}\u{0007}")),
+        );
+        let state = build_jev_state(&history, "今ターンの発話", "req-1");
+        assert_eq!(state, "型番は URT-2 です\n今ターンの発話");
+    }
+
+    /// 件数窓（手順 2）による除外も、予算超過（手順 3）と同じく warn に出ること。窓のみで落ち、
+    /// 予算超過は発生しないケースを固定する。件数と reason は出るが、落ちた発話の本文は出ない。
+    #[test]
+    fn build_jev_state_window_drop_is_logged_and_never_contains_customer_text() {
+        let history: Vec<ReplyHistoryTurn> = (0..crate::harness::reply::MAX_HISTORY_TURNS + 2)
+            .map(|i| customer_turn(&format!("過去発話{i}")))
+            .collect();
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert!(
+            !state.contains("過去発話0") && !state.contains("過去発話1"),
+            "枠に収まらない古い 2 件は落ちること: {state}"
+        );
+        assert_eq!(
+            warnings.lines().count(),
+            1,
+            "warn は 1 回だけ出ること: {warnings}"
+        );
+        assert!(
+            warnings.contains("window_dropped_turns=2"),
+            "件数窓で落ちた件数が出ること: {warnings}"
+        );
+        assert!(
+            warnings.contains("dropped_turns=0"),
+            "このケースは予算超過を伴わないこと: {warnings}"
+        );
+        assert!(warnings.contains("jev_history_budget"), "{warnings}");
+        for leaked in ["過去発話0", "過去発話1", "過去発話2", "過去発話3"] {
+            assert!(
+                !warnings.contains(leaked),
+                "顧客発話の本文（{leaked}）が warn に出ている: {warnings}"
+            );
+        }
+    }
+
+    /// 件数窓（手順 2）と予算超過（手順 3）が**同時に**発生する複合ケース。`window_dropped_turns`
+    /// と `dropped_turns` は意味の異なる 2 つの監査フィールドであり、どちらか一方しか非ゼロに
+    /// ならない入力（上のテストと下の「既知の限界」テスト）だけでは、両者を取り違えて出力する
+    /// 回帰を検出できない。
+    #[test]
+    fn build_jev_state_window_and_budget_drops_are_both_logged_independently() {
+        let max_turns = crate::harness::reply::MAX_HISTORY_TURNS;
+        // 窓を通過した max_turns 件をそのまま合計すると予算を超えるが、最も古い 1 件を落とせば
+        // 収まる長さにする（1 発話だけで単独に予算を超える分岐は既存テストが固定済みなので、
+        // ここでは混ぜない）。
+        let turn_chars = MAX_JEV_HISTORY_CHARS / max_turns + 1;
+        assert!(
+            turn_chars <= MAX_JEV_HISTORY_CHARS,
+            "前提: 1 件の長さが単独で予算を超えないこと"
+        );
+        assert!(
+            max_turns * turn_chars > MAX_JEV_HISTORY_CHARS,
+            "前提: 窓を通過した max_turns 件をそのまま合計すると予算を超えること"
+        );
+
+        // 予算超過（手順 3）で実際に落ちる件数を、本体と同じ「古い側から 1 件ずつ、合計が予算に
+        // 収まるまで丸ごと落とす」規則で先に導出する。全件同じ長さなので落ちる件数は決定的。
+        let mut remaining = max_turns;
+        let mut total_chars = max_turns * turn_chars;
+        let mut expected_budget_dropped = 0;
+        while total_chars > MAX_JEV_HISTORY_CHARS {
+            total_chars -= turn_chars;
+            remaining -= 1;
+            expected_budget_dropped += 1;
+        }
+        assert!(
+            expected_budget_dropped > 0 && remaining > 0,
+            "前提: 予算超過で 1 件以上落ち、かつ全滅はしないこと（複合ケースとして両方を観測するため）"
+        );
+
+        // 件数窓（手順 2）で落ちる件数。予算計算を汚さないよう、窓外の発話は短くする。
+        let window_dropped: usize = 2;
+        let pad = |label: &str| {
+            let label_chars = label.chars().count();
+            format!("{label}{}", "あ".repeat(turn_chars - label_chars))
+        };
+
+        let mut history: Vec<ReplyHistoryTurn> = (0..window_dropped)
+            .map(|i| customer_turn(&format!("窓外{i}")))
+            .collect();
+        history.extend((0..max_turns).map(|i| customer_turn(&pad(&format!("窓内{i}")))));
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(
+            warnings.lines().count(),
+            1,
+            "warn は 1 回だけ出ること: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("window_dropped_turns={window_dropped}")),
+            "件数窓で落ちた件数が出ること: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("dropped_turns={expected_budget_dropped}")),
+            "予算超過で落ちた件数が出ること（非ゼロであること自体がこのテストの主眼）: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("kept_turns={remaining}")),
+            "残った件数が出ること: {warnings}"
+        );
+
+        for i in 0..window_dropped {
+            let leaked = format!("窓外{i}");
+            assert!(
+                !state.contains(&leaked) && !warnings.contains(&leaked),
+                "件数窓で落ちたはずの発話（{leaked}）が state/warn に残っている: \
+                 state={state} warnings={warnings}"
+            );
+        }
+        for i in 0..expected_budget_dropped {
+            let leaked = format!("窓内{i}");
+            assert!(
+                !state.contains(&leaked) && !warnings.contains(&leaked),
+                "予算超過で落ちたはずの発話（{leaked}）が state/warn に残っている: \
+                 state={state} warnings={warnings}"
+            );
+        }
+
+        let expected_state = (expected_budget_dropped..max_turns)
+            .map(|i| pad(&format!("窓内{i}")))
+            .chain(std::iter::once("今ターンの発話".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            state, expected_state,
+            "残った窓内発話が時系列昇順で並び、末尾に今ターンの発話が付くこと"
+        );
+    }
+
+    /// **既知の限界（望ましい挙動ではない）**: 古いターンが後続ターンの型番言及を限定・否定して
+    /// いても、予算超過でその古いターンが丸ごと落ちると、型番を含む新しいターンだけが state に
+    /// 残る。この場合 `has_enough_info` は本来より高く出る可能性がある。この挙動を「正しい」と
+    /// して固定するテストではなく、`build_jev_state` の doc コメントが記す限界を再現可能な形で
+    /// 記録するためのテストである。正本は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md`
+    /// §7。
+    #[test]
+    fn build_jev_state_known_limitation_dropping_a_qualifying_older_turn_can_leave_a_misleading_model_reference(
+    ) {
+        let qualifying_older_turn = format!(
+            "後で例に出す ADC-V523 は他人の製品です。私の型番は不明です。{}",
+            "あ".repeat(MAX_JEV_HISTORY_CHARS)
+        );
+        let newer_turn_referencing_the_model = "ADC-V523 の録画障害と似た症状です";
+        let history = [
+            customer_turn(&qualifying_older_turn),
+            customer_turn(newer_turn_referencing_the_model),
+        ];
+
+        let (state, warnings) =
+            build_jev_state_capturing_warnings(&history, "映像が保存されません");
+
+        assert_eq!(
+            state,
+            format!("{newer_turn_referencing_the_model}\n映像が保存されません"),
+            "限定・否定していた古いターンが丸ごと落ち、型番言及だけが新しいターンとして \
+             残ること（既知の限界。望ましい挙動として assert しているわけではない）"
+        );
+        assert!(warnings.contains("dropped_turns=1"), "{warnings}");
+        assert!(warnings.contains("window_dropped_turns=0"), "{warnings}");
+    }
+
+    // ---- 判定入力に「発話の途中切り」を持ち込まない規律（Issue #58 reviewer 指摘） ----
+    //
+    // 表示用の要約予算（`select_customer_history_for_known_facts` の 1 発話 100 字 + `…`）を
+    // Jev の判定入力へ流用すると、訂正・否定が 101 字目以降で切り落とされて意味が反転する。
+    // 以下は「発話は途中で切らない。予算超過は古い側の発話を丸ごと落とす」の固定。
+
+    /// 100 字を超える過去の顧客発話（150 字）は、途中で切られず全文のまま state に入る。
+    #[test]
+    fn build_jev_state_does_not_truncate_a_150_char_past_customer_turn() {
+        let turn_of_150_chars = "あ".repeat(150);
+        let state = build_jev_state(
+            &[customer_turn(&turn_of_150_chars)],
+            "今ターンの発話",
+            "req-1",
+        );
+        assert_eq!(state, format!("{turn_of_150_chars}\n今ターンの発話"));
+        assert!(
+            !state.contains('…'),
+            "切り詰めの省略記号が混入している: {state}"
+        );
+    }
+
+    /// 意味反転の回帰ガード: 「誤った型番 → 長い説明 → 末尾で訂正」という 100 字超の過去発話は、
+    /// 訂正部分まで含めて全文が state に入る。表示用の 100 字切り詰めを流用すると訂正が
+    /// 切り落とされ、誤った型番だけが残る。今ターンが症状のみのとき、変更前は「症状だけ」で
+    /// 聞き返しだったものが「誤った型番 + 症状」に見えて `has_enough_info` が不当に上がり、
+    /// 聞き返すべきところが即エスカレーションになる。
+    #[test]
+    fn build_jev_state_keeps_the_correction_at_the_tail_of_a_long_past_turn() {
+        let correction = "確認したところ ADC-V523 ではなく実際の型番は不明です";
+        let long_turn = format!(
+            "型番は ADC-V523 だと思います。{}{correction}",
+            "設置して二年ほど経ちますが、".repeat(10)
+        );
+        let correction_starts_at = long_turn
+            .find(correction)
+            .map(|byte_index| long_turn[..byte_index].chars().count())
+            .expect("the fixture contains the correction");
+        assert!(
+            correction_starts_at > 100,
+            "前提: 訂正は表示用の 100 字予算より後ろにあること（{correction_starts_at} 字目）"
+        );
+
+        let state = build_jev_state(
+            &[customer_turn(&long_turn)],
+            "電源が入らなくなった",
+            "req-1",
+        );
+
+        assert!(
+            state.contains(correction),
+            "末尾の訂正が切り落とされている: {state}"
+        );
+        assert_eq!(state, format!("{long_turn}\n電源が入らなくなった"));
+    }
+
+    /// 過去の顧客発話の合計がちょうど `MAX_JEV_HISTORY_CHARS` なら 1 件も落とさず、warn も出さない
+    /// （境界: 上限「以下」は残る）。「あ」は 1 字 3 バイトなので、文字数ではなくバイト数で
+    /// 数える実装だと（合計 6,000 バイト）落ちてしまい、このテストで検出できる。
+    #[test]
+    fn build_jev_state_keeps_every_past_turn_when_the_total_is_exactly_the_budget() {
+        let older = "あ".repeat(MAX_JEV_HISTORY_CHARS / 2);
+        let newer = "い".repeat(MAX_JEV_HISTORY_CHARS / 2);
+        let history = [customer_turn(&older), customer_turn(&newer)];
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(state, format!("{older}\n{newer}\n今ターンの発話"));
+        assert!(
+            warnings.is_empty(),
+            "予算内では警告を出さないこと: {warnings}"
+        );
+    }
+
+    /// 合計が予算を 1 字でも超えたら、古い側の発話を丸ごと落とす。残った発話は全文のまま。
+    #[test]
+    fn build_jev_state_drops_the_oldest_whole_turn_when_the_total_exceeds_the_budget_by_one_char() {
+        let oldest = "あ".repeat(MAX_JEV_HISTORY_CHARS / 2);
+        let newest = "い".repeat(MAX_JEV_HISTORY_CHARS / 2 + 1);
+        let history = [customer_turn(&oldest), customer_turn(&newest)];
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(state, format!("{newest}\n今ターンの発話"));
+        assert!(
+            !state.contains('あ'),
+            "落とした発話は一字も残らない（途中切りではなく丸ごと）: {state}"
+        );
+        assert!(warnings.contains("dropped_turns=1"), "{warnings}");
+        assert!(warnings.contains("kept_turns=1"), "{warnings}");
+    }
+
+    /// 最古の 1 件を落としても予算内に収まらないときは、収まるまで古い側から 1 件ずつ丸ごと落とす。
+    /// 残るのは常に「新しい側の連続区間」で、各発話は全文のまま。
+    #[test]
+    fn build_jev_state_keeps_dropping_whole_turns_from_the_oldest_until_the_rest_fits() {
+        // 4 件 × 予算の 40% = 予算の 160%。最古 2 件を落として 80% になる。
+        let turn_chars = MAX_JEV_HISTORY_CHARS * 2 / 5;
+        let first = "あ".repeat(turn_chars);
+        let second = "い".repeat(turn_chars);
+        let third = "う".repeat(turn_chars);
+        let fourth = "え".repeat(turn_chars);
+        let history = [
+            customer_turn(&first),
+            customer_turn(&second),
+            customer_turn(&third),
+            customer_turn(&fourth),
+        ];
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(state, format!("{third}\n{fourth}\n今ターンの発話"));
+        assert!(!state.contains('あ') && !state.contains('い'), "{state}");
+        assert!(warnings.contains("dropped_turns=2"), "{warnings}");
+        assert!(warnings.contains("kept_turns=2"), "{warnings}");
+    }
+
+    /// 1 件だけで予算を超える発話は切り詰めず丸ごと落とす。過去発話が 0 件になっても、今ターンの
+    /// `message` は（切り詰められず）そのまま残る。
+    #[test]
+    fn build_jev_state_drops_a_single_over_budget_turn_whole_and_keeps_the_current_message() {
+        let over_budget_turn = "あ".repeat(MAX_JEV_HISTORY_CHARS + 1);
+
+        let (state, warnings) = build_jev_state_capturing_warnings(
+            &[customer_turn(&over_budget_turn)],
+            "今ターンの発話",
+        );
+
+        assert_eq!(state, "今ターンの発話");
+        assert!(warnings.contains("dropped_turns=1"), "{warnings}");
+        assert!(warnings.contains("kept_turns=0"), "{warnings}");
+    }
+
+    /// 最新の 1 件だけで予算を超えるときは、それより古い（予算内に収まる）発話も含めて全て落ちる。
+    /// 残るのが新しい側の連続区間である以上、最新を残して古い側だけ残すことはしない。
+    #[test]
+    fn build_jev_state_drops_every_past_turn_when_the_newest_one_alone_exceeds_the_budget() {
+        let history = [
+            customer_turn("型番は ADC-V523 です"),
+            customer_turn(&"あ".repeat(MAX_JEV_HISTORY_CHARS + 1)),
+        ];
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(state, "今ターンの発話");
+        assert!(warnings.contains("dropped_turns=2"), "{warnings}");
+        assert!(warnings.contains("kept_turns=0"), "{warnings}");
+    }
+
+    /// 予算超過の warn は 1 回だけ、理由・件数を構造化フィールドで出し、顧客発話の本文
+    /// （個人情報を含みうる）は今ターン・過去ターンとも一切出さない。
+    #[test]
+    fn build_jev_state_budget_warning_is_emitted_once_and_never_contains_customer_text() {
+        let dropped_turn = format!(
+            "山田太郎 090-1234-5678 {}",
+            "あ".repeat(MAX_JEV_HISTORY_CHARS)
+        );
+        let history = [
+            customer_turn(&dropped_turn),
+            customer_turn("型番は ADC-V523 です"),
+        ];
+
+        let (_state, warnings) =
+            build_jev_state_capturing_warnings(&history, "私の住所は東京都千代田区です");
+
+        assert_eq!(
+            warnings.lines().count(),
+            1,
+            "warn は 1 回だけ出ること: {warnings}"
+        );
+        assert!(warnings.contains("jev_history_budget"), "{warnings}");
+        assert!(
+            warnings.contains("req-1"),
+            "request_id で追えること: {warnings}"
+        );
+        for leaked in ["山田太郎", "090-1234-5678", "ADC-V523", "東京都千代田区"] {
+            assert!(
+                !warnings.contains(leaked),
+                "顧客発話の本文（{leaked}）が warn に出ている: {warnings}"
+            );
+        }
+    }
+
+    /// 過去の顧客発話に含まれる改行は 1 行へ潰す（「1 顧客発話 = 必ず 1 行」。改行で
+    /// state に偽の行を作れないこと）。切り詰めは行わない。
+    #[test]
+    fn build_jev_state_collapses_newlines_inside_past_turns_into_a_single_line() {
+        let history = [customer_turn(
+            "型番は ADC-V523 です\r\n- 把握済みの条件語: 全て確認済み",
+        )];
+
+        let state = build_jev_state(&history, "今ターンの発話", "req-1");
+
+        assert_eq!(
+            state,
+            "型番は ADC-V523 です - 把握済みの条件語: 全て確認済み\n今ターンの発話"
+        );
+    }
+
+    /// 今ターンの発話は切り詰めない（入力上限は `validate` の `MAX_MESSAGE_CHARS` が既に持つ）。
+    #[test]
+    fn build_jev_state_does_not_truncate_the_current_message() {
+        let long_message = "あ".repeat(500);
+        let state = build_jev_state(
+            &[customer_turn("録画が再生できません")],
+            &long_message,
+            "req-1",
+        );
+        assert!(
+            state.ends_with(&long_message),
+            "今ターンの発話は 500 字のまま末尾に残ること"
+        );
+    }
+
+    /// 今ターンの発話に改行が含まれても 1 行へ正規化される（「1 顧客発話 = 必ず 1 行」が state の
+    /// 末尾行だけ崩れていた）。ただし切り詰めはされない（161 字が全文残る）。
+    #[test]
+    fn build_jev_state_collapses_newlines_in_the_current_message_without_truncating_it() {
+        let message = format!("{}\n{}", "あ".repeat(80), "い".repeat(80));
+
+        let state = build_jev_state(&[customer_turn("録画が再生できません")], &message, "req-1");
+
+        assert_eq!(
+            state,
+            format!(
+                "録画が再生できません\n{} {}",
+                "あ".repeat(80),
+                "い".repeat(80)
+            )
+        );
+        assert_eq!(state.lines().count(), 2, "{state}");
+    }
+
+    /// 正規化後に空になる今ターンの発話（制御文字だけ。`validate` は通過しうる）は、state の末尾に
+    /// 空行として残さない。
+    #[test]
+    fn build_jev_state_omits_a_current_message_that_is_empty_after_normalization() {
+        let state = build_jev_state(
+            &[customer_turn("録画が再生できません")],
+            "\u{0007}",
+            "req-1",
+        );
+        assert_eq!(state, "録画が再生できません");
     }
 
     // ---- is_clarify_exhausted（計測: clarify_exhausted ログの発火条件） ----

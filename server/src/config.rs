@@ -526,7 +526,8 @@ schema = "s"
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert!(
             !cfg.jev.enabled,
-            "jev must default to disabled (shadow-only, unwired)"
+            "jev must default to disabled: unless enabled, the layer-1 advisory hearing \
+             decision path (Issue #58) is never exercised"
         );
         assert_eq!(cfg.jev.endpoint, "https://api.typesafe.ai/v1/systemone");
         assert_eq!(cfg.jev.model, "jev-latest");

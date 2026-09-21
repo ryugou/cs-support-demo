@@ -13,10 +13,11 @@
 
 ## 1. 採用する設計
 
-Jev は「解釈」だけを担い、判定はコードに残す(既存の原則どおり)。本タスクでは判定に一切使わず、**並行実行して記録するだけ**とする。
+Jev は「解釈」だけを担い、判定はコードに残す(既存の原則どおり)。本タスクでは判定に一切使わず、**並行実行して記録するだけ**とする(ただし Issue #58 により §7 の経路だけが例外。第1層 advisory の聞き返し判定にのみ `has_enough_info` を使う。詳細は §7)。
 
 - 呼び出し: `POST https://api.typesafe.ai/v1/systemone`、`Authorization: Bearer <TYPESAFE_API_KEY>`
 - リクエスト: `{ "state": <顧客発話>, "model": "jev-latest", "questions": <質問定義> }`
+  - §7 の経路(第1層 advisory の聞き返し判定)では、`state` は今ターンの発話 1 件ではなく「過去の顧客発話 + 今ターンの発話」に組み立て直される(§7「Jev へ渡す state」)
 - レスポンス: `{ "model", "answers": { <id>: { "type": "noul"|"choice"|"score", ... } }, "usage": { "input_tokens", "output_tokens" } }`
   - noul: `noul`(0〜1)
   - choice: `choice` / `confidence` / `probabilities`
@@ -121,6 +122,55 @@ info`)を判定に使い(2 と矛盾)、対象ターンの応答時間は Jev �
 並び順を変えてもこの契約は壊れない(Issue #58 の codex レビューで、advisory が後続
 mandatory を覆い隠す経路が Critical として指摘され是正した)。
 
+### Jev へ渡す state
+
+Jev の `state` には、今ターンの発話だけでなく**過去の顧客発話**も含める。`has_enough_info` の
+判定基準は「対象の製品と具体的な症状の両方が分かる」であり、今ターンの発話だけを渡すと、
+多ターンのヒアリングで顧客が 1 ターン目に症状、2 ターン目に型番を答えたとき、どのターン単体
+でも「両方分かる」にならず `has_enough_info` が上がらない。その結果 `clarify_max_turns`(既定
+3)に達するまで聞き返しを繰り返してからエスカレーションすることになる。パイプラインの他の部分
+(累積 signal、`build_known_facts` の把握済み事項)は履歴を見ているため、Jev だけが履歴を見ない
+不整合の是正でもある。
+
+- 組み立て: 過去の顧客発話を**時系列昇順**で前置し、最後に今ターンの発話を足して `\n` で連結する
+  (実装: `server/src/api.rs::build_jev_state`。対象ターンと判定した後に
+  `resolve_jev_has_enough_info` の中で組み立てる。Jev 無効・対象外のターンでは組み立てない)。
+  履歴に顧客発話が無い(初回ターン)ときは今ターンの発話のみを渡す。今ターン・過去とも改行は 1 行へ
+  潰す(「1 顧客発話 = 必ず 1 行」)が、**どちらも途中で切り詰めない**(今ターンの入力上限は
+  `validate` の `MAX_MESSAGE_CHARS` が既に持つ)
+- 過去の顧客発話の選択(`select_customer_history_for_jev`): customer 発話のみ → 改行潰しのみの
+  正規化 → 正規化後に空になるものを除外 → 新しい側から最大 6 件(`MAX_HISTORY_TURNS`。把握済み
+  事項の窓と件数を揃える) → **合計 2,000 字(`MAX_JEV_HISTORY_CHARS`)を超える間、古い側の発話を
+  1 件ずつ丸ごと落とす**。1 件だけで超える発話も切り詰めず丸ごと落とす(過去発話 0 件になりうる。
+  今ターンの発話は残る)。件数窓・予算超過のいずれかで 1 件でも落としたら `tracing::warn!` を
+  1 回出す(`request_id` / `window_dropped_turns`(件数窓で落ちた件数) / `dropped_turns`(予算超過
+  で落ちた件数) / `kept_turns` / `reason = "jev_history_budget"`。**発話本文は出さない**)。
+  6 件の件数窓による除外も、予算超過と同じく warn に出す(固定長の窓だからといって対象外にしない。
+  下記「既知の限界」参照)
+- **表示用の要約予算を判定入力へ流用しない。** 把握済み事項用の
+  `select_customer_history_for_known_facts` は 1 発話を 100 字 + `…` へ切り詰める(表示用)。これを
+  Jev の判定入力に流用すると発話が途中で切れて意味が反転する。型番が 101 字目以降なら Jev から
+  見えず `has_enough_info` が不当に**下がる**。より重いのは、訂正・否定(「ADC-V523 ではなく実際の
+  型番は不明です」等)が 101 字目以降で切り落とされ、誤った型番だけが残って `has_enough_info` が
+  不当に**上がる**場合で、症状のみの今ターンが「誤った型番 + 症状」に見えて、聞き返すべきところが
+  即エスカレーションになる(しかも切り詰めは warn に出ず痕跡が残らない)。発話単位で丸ごと落とす
+  方式はこの経路より厳密に安全(発話の一部だけ生き残って文意が変わることは無い)だが、**「安全側
+  (has_enough_info が下がる側)にしか振れない」という保証は無い**。古いターンが後続ターンの言及を
+  限定・否定しているケースでは、その古いターンが丸ごと落ちることで逆に `has_enough_info` が不当に
+  **上がる**方向へ振れうる。例: 古い発話「後で例に出す ADC-V523 は他人の製品です。私の型番は不明
+  です」が予算超過で丸ごと落ち、「ADC-V523 の症状」に触れる新しい発話だけが残ると、型番が確定して
+  見えてしまう
+- **既知の限界**: 上記の理由により、除外(件数窓・予算超過のいずれも)が起きたターンでは
+  `has_enough_info` が会話全体から見て本来より高くも低くも出うる。これを検出・補正する仕組みは
+  無い。そのため除外は必ず `tracing::warn!` に記録し、事後に該当リクエストの会話を突き合わせて
+  再構成できるようにしている(是正済みの反例テストは `server/src/api.rs` の
+  `build_jev_state_known_limitation_dropping_a_qualifying_older_turn_can_leave_a_misleading_model_reference`)
+- **assistant 発話は含めない。** `has_enough_info` は顧客が伝えた情報の十分性を測る指標であり、
+  聞き返し文など自社発話が判定を押し上げてはならない
+- 送信範囲: `[jev] enabled = true` のとき TypeSafe へ送られる顧客発話は、今ターンの発話に加えて
+  過去の顧客発話(最大 6 件・合計 2,000 字まで。発話は切り詰めず、超過分は古い側から丸ごと
+  落とす)に広がる。送信が発生するのは対象ターン(上記トリガー条件)に限る点は変わらない
+
 ### 閾値と判定
 
 config `[jev] enough_info_threshold`(既定 0.5)。`has_enough_info < enough_info_threshold`
@@ -173,3 +223,22 @@ Jev を呼ばなかった/使わなかったターンではこの新規監査行
 - `/{project_id}/api/reply` 以外の経路(MCP `evaluate_answerability` 等)。`decision::decide`
   自体は共有ロジックだが、`rule_binding` を見て Jev を呼ぶかどうかを決めるのは `api.rs::
   reply_handler` だけであり、MCP 経路は従来どおり `missing` ベースのまま
+
+### 有効化前の確認項目(`[jev] enabled = true` にする前に)
+
+- **Jev の入力トークン・レイテンシの再実測。** §1 の実測値(5 問で入力 945 トークン等)は今ターン
+  1 発話だけを `state` に送った時点の測定。この経路では過去の顧客発話が加わり `state` が最大
+  約 2,000 字(`MAX_JEV_HISTORY_CHARS`)増えるため、有効化前に多ターンの `state` で測り直す。
+  TypeSafe へ送る `state` 本文は最大で約 7,000 字になりうる(内訳: 過去発話
+  `MAX_JEV_HISTORY_CHARS` = 2,000 字 + 今ターン `MAX_MESSAGE_CHARS` = 5,000 字。
+  `server/src/api.rs` の該当定数を参照)
+- **E2E: 同一利用者が別製品の相談へ切り替えるケース。** `/api/reply` の `history` は同一 case・
+  同一相談対象に限る契約(`2026-08-11-answer-api-line-adapter-design.md` §2)だが、現状の LINE
+  アダプタは 60 分 TTL での失効のみで、相談対象の切り替えを検知してリセットする機構を持たない。
+  切り替え後も古い製品名が `history` に残ると、古い製品名 + 今ターンの症状で `has_enough_info`
+  が不当に上がり、誤った製品文脈で即時エスカレーションしうる。実会話で挙動を確認してから有効化する
+- **履歴の除外が起きたターンの挙動確認。** 件数窓(`MAX_HISTORY_TURNS`)・予算超過
+  (`MAX_JEV_HISTORY_CHARS`)のいずれかで過去発話が丸ごと落ちた実会話を使い、`has_enough_info` が
+  不当に上振れ(誤って `EscalationReply` 側に倒れる)していないかを、warn ログの
+  `window_dropped_turns` / `dropped_turns` と実際の会話内容を突き合わせて確認する(「Jev へ渡す
+  state」の既知の限界を参照)
