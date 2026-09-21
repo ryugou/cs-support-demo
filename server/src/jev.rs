@@ -1,10 +1,16 @@
-//! Jev（TypeSafe System One）shadow 判定クライアント。
+//! Jev（TypeSafe System One）判定クライアント。
 //!
-//! **shadow 専用で、どの呼び出し経路にも配線されていない。** Issue #56 の範囲はこの
-//! クライアントと config のみで、`evaluate` を呼ぶ側（`POST /{project_id}/api/reply` からの
-//! fire-and-forget 起動、結果の記録）は Issue #57 で別途実装する。このファイルの型・関数は
-//! 現時点でどこからも参照されない（`main.rs` / `api.rs` / `mcp.rs` / `harness/` 配下のどこにも
-//! 配線しないこと）。判定・分岐・応答生成に一切使わない設計（design doc §1〜§3 の不変条件）。
+//! **配線先は `server/src/api.rs::reply_handler` の 1 箇所のみ。** Issue #58 で、第1層
+//! advisory のエスカレーションルール（`rule_binding == Some(Binding::Advisory)`）にマッチした
+//! ターンに限り、`api.rs::resolve_jev_has_enough_info` がこのクライアントの `evaluate` を呼び、
+//! 応答の `has_enough_info`（`noul` 値）だけを聞き返し（Clarify）vs 即エスカレーション
+//! （EscalationReply）の判定に使う（`api.rs::decide_jev_hearing_action`）。他の質問への回答は
+//! 判定に使わない。この経路以外（第1層 mandatory・第2層・第3層・MCP `evaluate_answerability`・
+//! `advisor/` 配下）へは配線しないこと（design doc §7「対象外」）。
+//!
+//! Issue #56 設計にあった「fire-and-forget の shadow ログ記録（全質問の結果を
+//! `tracing::info!` で 1 行残す、`main.rs` / `mcp.rs` 等からの並行呼び出し）」は依然として
+//! 未実装のまま。詳細と不変条件は design doc §1〜§3・§7 を参照。
 //!
 //! API キーは env `TYPESAFE_API_KEY` のみから解決する。`llm.rs` の `AnthropicClient` と違い
 //! ファイルフォールバック（`*_key_file` 設定）は無い（design doc に記載が無いため追加していない）。
@@ -65,7 +71,9 @@ pub struct JevUsage {
     pub output_tokens: u64,
 }
 
-/// `evaluate` の戻り値。**現時点でどの呼び出し側も存在しない**（Issue #57 で配線される）。
+/// `evaluate` の戻り値。呼び出し側は `server/src/api.rs::query_jev_has_enough_info`
+/// （`resolve_jev_has_enough_info` 経由、Issue #58）で、`answers` のうち `has_enough_info` の
+/// `noul` 回答だけを読む。
 #[derive(Debug, Clone, PartialEq)]
 pub struct JevOutcome {
     pub answers: HashMap<String, JevAnswer>,
@@ -134,8 +142,13 @@ impl JevClient {
     /// `TYPESAFE_API_KEY` はプロセス全体の環境変数であり、`cargo test` は同一プロセス内で
     /// テストを並列実行するため、素朴に `env::set_var` すると他のテスト（鍵未設定を確認する
     /// テスト）の判定と競合し flaky になる。鍵を引数で受けることでこの経路を丸ごと避ける。
-    fn build(api_key: String, cfg: &JevConfig, config_dir: &Path) -> Result<Self> {
+    ///
+    /// `pub(crate)`（Issue #58）: `api.rs` の聞き返し判定（`resolve_jev_has_enough_info` 等）を
+    /// wiremock 相手の統合テストで検証するために、このモジュール外からも同じ「env を汚染しない」
+    /// 構築経路が要る。crate 外へは公開しない。
+    pub(crate) fn build(api_key: String, cfg: &JevConfig, config_dir: &Path) -> Result<Self> {
         validate_endpoint_scheme(&cfg.endpoint)?;
+        validate_enough_info_threshold(cfg.enough_info_threshold)?;
         let questions_path = resolve_relative_to(config_dir, &cfg.questions_path);
         let raw = fs::read_to_string(&questions_path)
             .with_context(|| format!("read jev.questions_path {}", questions_path.display()))?;
@@ -183,10 +196,22 @@ impl JevClient {
 
     /// 顧客発話（`state`）を Jev へ送り、質問定義に対する回答を得る。
     ///
-    /// **呼び出し側の責務（design doc §2・§3、Issue #57 で実装）**: `tokio::spawn` で
-    /// fire-and-forget にし、失敗・タイムアウトを応答内容・応答時間に一切波及させないこと。
-    /// このメソッド自体は同期的に `Result` を返すだけで、リトライ・タイムアウト後の劣化判断は
-    /// 呼び出し側の責務。
+    /// **呼び出し側の責務はユースケースにより異なる。呼び出し元ごとに design doc の該当節を
+    /// 確認すること:**
+    ///
+    /// - **Issue #58 の第1層 advisory 聞き返し判定（design doc §7、実装済み）**:
+    ///   `api.rs::resolve_jev_has_enough_info` が**同期 `.await`** で呼び出す。結果
+    ///   （`has_enough_info`）をそのターンの `Clarify` / `EscalationReply` 判定にそのまま使い、
+    ///   対象ターンの応答時間は Jev の応答時間ぶん実際に延びる。失敗・タイムアウトは
+    ///   `None` にフォールバックし（`query_jev_has_enough_info`）、`missing` ベースの既存判定
+    ///   （`decide_reply_action`）へ委ねる。fire-and-forget ではない。
+    /// - **design doc §1〜§3 の shadow-only 用途（未実装）**: `tokio::spawn` で
+    ///   fire-and-forget にし、失敗・タイムアウトを応答内容・応答時間に一切波及させないことが
+    ///   前提だった（§3 不変条件 1・2）。この経路は Issue #57 時点では未配線のままで、Issue #58
+    ///   でも配線していない（モジュール doc 冒頭「配線先は…の1箇所のみ」参照）。
+    ///
+    /// このメソッド自体はどちらの用途でも同期的に `Result` を返すだけで、fire-and-forget化・
+    /// リトライ・タイムアウト後の劣化判断はすべて呼び出し側の責務。
     pub async fn evaluate(&self, state: &str) -> Result<JevOutcome> {
         let payload = serde_json::json!({
             "state": state,
@@ -308,6 +333,45 @@ fn validate_endpoint_scheme(endpoint: &str) -> Result<()> {
             "jev.endpoint {endpoint} must use https:// (http:// is allowed only for \
              http://127.0.0.1 or http://localhost, used by local stub servers in tests); \
              refusing to send the API key and customer utterances in plaintext"
+        );
+    }
+    Ok(())
+}
+
+/// `[jev] enough_info_threshold` の範囲検証（reviewer 指摘、Issue #58 第2ラウンド）。
+///
+/// `api.rs::decide_jev_hearing_action` / `is_reply_clarify_exhausted` の判定式
+/// `has_enough_info < enough_info_threshold` のうち、`has_enough_info` 側は `is_valid_noul`
+/// により `[0.0, 1.0]` の有限値であることが保証されているが、`threshold` 側は config から
+/// 読んだ値をそのまま比較に使っており、これまで無検証だった。無検証のままだと次の誤設定が
+/// **警告も出さずに**通ってしまう:
+///
+/// - `[0.0, 1.0]` の範囲外（負値・`1.0` 超。例: `0.5` の打ち間違いで `5` と書いた場合。TOML の
+///   整数は f64 へそのまま入る）
+/// - `NaN`（TOML では `nan` リテラルを持つ）・無限大: あらゆる比較が false になり判定式の
+///   意味が失われる
+///
+/// この2種類はこのリポジトリの既存の流儀（`CS_SUPPORT_OAUTH_SIGNING_KEY` の長さ検査、
+/// `[llm] enabled = true` 時の鍵解決失敗での起動失敗、`validate_endpoint_scheme` 自身）に
+/// 揃え、起動時に fail closed で拒否する。
+///
+/// 一方、境界値ちょうどの `0.0` / `1.0` は `has_enough_info` 側の `is_valid_noul` が inclusive
+/// に扱っているのと揃えて**受理する**（確率の有効な境界値であり拒否しない）。ただし運用上は
+/// どちらも極端な設定になることを踏まえて使うこと:
+///
+/// - `0.0`: `has_enough_info < 0.0` がどの有効な noul でも成立しないため、常に
+///   `EscalationReply`（＝聞き返しゼロで即エスカレーション。Issue #58 が直したはずの不具合を
+///   無言で再発させる誤設定になりうる）
+/// - `1.0`: `has_enough_info < 1.0` が `has_enough_info == 1.0` 以外すべてで成立するため、
+///   ほぼ常に `Clarify`（聞き返し予算を必ず使い切ってからエスカレーションする）
+///
+/// `enabled = false` の構成では呼び出されない（`build` は `enabled = true` のときにしか
+/// 呼ばれないため。無効な機能の設定値で起動を妨げない規律は `from_config` の doc を参照）。
+fn validate_enough_info_threshold(value: f64) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        bail!(
+            "jev.enough_info_threshold must be a finite value in the range 0.0..=1.0, \
+             but the configured value was {value} ([jev] enough_info_threshold を確認してください)"
         );
     }
     Ok(())
@@ -638,6 +702,112 @@ mod tests {
              used in tests, got: {:?}",
             client.err()
         );
+    }
+
+    // ---- enough_info_threshold validation (reviewer 指摘、Issue #58 第2ラウンド) ----
+
+    #[test]
+    fn validate_enough_info_threshold_accepts_in_range_values_including_boundaries() {
+        for value in [0.0, 0.5, 1.0] {
+            assert!(
+                validate_enough_info_threshold(value).is_ok(),
+                "{value} is within [0.0, 1.0] and must be accepted \
+                 (boundaries are inclusive, matching is_valid_noul)"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_enough_info_threshold_rejects_out_of_range_nan_and_infinite() {
+        for value in [-0.1, 1.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = validate_enough_info_threshold(value)
+                .expect_err(&format!("{value} must be rejected"));
+            let message = err.to_string();
+            assert!(
+                message.contains(&value.to_string()),
+                "error message must include the configured value so operators can see what \
+                 was actually set, got: {message}"
+            );
+            assert!(
+                message.contains("enough_info_threshold"),
+                "error message must name the offending config key, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_with_boundary_enough_info_threshold_succeeds() {
+        // 境界値 `0.0` / `1.0` は `has_enough_info` 側の `is_valid_noul` が inclusive に扱うのと
+        // 揃えて許容する。判定式は `has_enough_info < enough_info_threshold` なので、
+        // `0.0` は「常に EscalationReply」（`x < 0.0` はどの有効な noul でも成立しない＝
+        // 聞き返しゼロ）、`1.0` は「ほぼ常に Clarify」（`x < 1.0` は `x == 1.0` 以外すべてで
+        // 成立）という極端な運用設定になる。値そのものは有効な確率境界であるため拒否しない。
+        for threshold in [0.0, 1.0] {
+            let cfg = JevConfig {
+                enabled: true,
+                questions_path: valid_questions_path(),
+                enough_info_threshold: threshold,
+                ..Default::default()
+            };
+            let client = JevClient::build("test-key".to_string(), &cfg, &unused_config_dir());
+            assert!(
+                client.is_ok(),
+                "enough_info_threshold = {threshold} is an inclusive boundary and must be \
+                 accepted, got: {:?}",
+                client.err()
+            );
+        }
+    }
+
+    #[test]
+    fn build_with_negative_enough_info_threshold_errs() {
+        // 負値は `has_enough_info < threshold` を常に false にし、Issue #58 が直したはずの
+        // 「聞かずに即エスカレーション」へ無言で退行させる。起動時に fail closed する。
+        let cfg = JevConfig {
+            enabled: true,
+            questions_path: valid_questions_path(),
+            enough_info_threshold: -0.1,
+            ..Default::default()
+        };
+        let err = JevClient::build("test-key".to_string(), &cfg, &unused_config_dir())
+            .expect_err("enough_info_threshold = -0.1 must fail closed at startup");
+        assert!(
+            err.to_string().contains("enough_info_threshold"),
+            "error must identify which setting failed validation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_with_out_of_range_enough_info_threshold_errs() {
+        // `1.0` 超（TOML の整数打ち間違い、例: `0.5` のつもりで `5` と書いた場合）も
+        // 同じ理由で fail closed する。
+        let cfg = JevConfig {
+            enabled: true,
+            questions_path: valid_questions_path(),
+            enough_info_threshold: 5.0,
+            ..Default::default()
+        };
+        let err = JevClient::build("test-key".to_string(), &cfg, &unused_config_dir())
+            .expect_err("enough_info_threshold = 5.0 must fail closed at startup");
+        assert!(
+            err.to_string().contains("enough_info_threshold"),
+            "error must identify which setting failed validation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_disabled_ignores_out_of_range_enough_info_threshold() {
+        // `enabled = false` の構成は、無効な機能の設定値で起動を妨げない既存規律
+        // （`from_config_disabled_returns_none_without_reading_questions_file` と同じ）を
+        // enough_info_threshold にも適用する。
+        let cfg = JevConfig {
+            enabled: false,
+            enough_info_threshold: f64::NAN,
+            ..Default::default()
+        };
+        let client = JevClient::from_config(&cfg, &unused_config_dir())
+            .expect("enabled=false must not validate enough_info_threshold");
+        assert!(client.is_none());
     }
 
     #[test]

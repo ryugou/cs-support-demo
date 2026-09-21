@@ -569,6 +569,7 @@ mod tests {
             disclosure_scope: scope,
             audit_required: true,
             missing: Vec::new(),
+            rule_binding: None,
         }
     }
 

@@ -78,6 +78,10 @@ pub struct Harness {
     /// テストの `harness_for_test()` では構築できない）で `Option` にしてある。本番は
     /// `Harness::build` が常に `Some` を設定する。
     pub product_gate: Option<product_gate::ProductGate>,
+    /// Jev（TypeSafe System One）shadow 判定クライアント（Issue #56）。`config.jev.enabled =
+    /// false`（既定）なら `None`。Issue #58 時点では `api.rs::reply_handler` が第1層 advisory
+    /// の聞き返し判定にのみ使う（他の呼び出し経路からは一切参照されない、shadow-only のまま）。
+    pub jev_client: Option<crate::jev::JevClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -623,6 +627,11 @@ impl Harness {
         // 材料 corpus ローダは 1 インスタンスを ManualStore と evaluate で共有し、
         // manual_corpus の TTL キャッシュを read 経路・評価経路の双方で使い回す。
         let corpus = Arc::new(crate::corpus::CorpusLoader::new(client.clone()));
+        // Jev（Issue #56 shadow クライアント、Issue #58 で第1層 advisory の聞き返し判定にのみ
+        // 接続）。`enabled = false` なら `from_config` が `Ok(None)` を返す。`enabled = true` で
+        // 鍵が解決できない場合は起動時 fail closed する（`anthropic_client` と同じ規律）。
+        let jev_client = crate::jev::JevClient::from_config(&config.jev, config_dir)
+            .context("configure jev client")?;
         Ok(Self {
             authenticator: authn::Authenticator::new(
                 config.projects.iter().map(|p| p.schema.clone()).collect(),
@@ -651,6 +660,7 @@ impl Harness {
             reply_drafter,
             reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
             product_gate: Some(product_gate::ProductGate::new(client)),
+            jev_client,
         })
     }
 
@@ -788,11 +798,69 @@ impl Harness {
             route,
             governing_norm_ids,
             extraction_mode: extraction::audit_extraction_mode(extraction_mode),
+            jev_has_enough_info: None,
         };
         let worm = self.worm.clone();
         tokio::task::spawn_blocking(move || worm.append(draft))
             .await
             .context("join audit write task")?
+    }
+
+    /// Issue #58: 第1層 advisory の聞き返し判定に Jev の `has_enough_info` を使ったターンのみ、
+    /// `evaluate()` が既に書いた通常の監査行（`allowed:*` / `escalate:*`）に加えて、この判定
+    /// 固有の監査行を追記する。`audit_with_nodes`（多数の呼び出し元を持つ共通メソッド）の
+    /// シグネチャは変更しない方針のため、専用の薄いメソッドとして分離する。
+    ///
+    /// `decision` は `"jev_hearing:clarify"` / `"jev_hearing:escalate"` のような grep しやすい
+    /// ラベルを渡すこと（呼び出し元 `api.rs::reply_handler` 参照）。
+    ///
+    /// この監査書き込みの失敗は reply_handler 全体を失敗させない（`record_out_of_scope_case` と
+    /// 同じ「応答継続を優先する」設計判断）。ただし失敗を握りつぶさず `tracing::warn!` に残す
+    /// （運用者が「この聞き返し判定に監査記録が無い」ことを事後に追えるようにするため）。
+    pub async fn record_jev_hearing_decision(
+        &self,
+        ctx: &RequestContext,
+        decision: impl Into<String>,
+        jev_has_enough_info: f64,
+    ) {
+        let decision = decision.into();
+        let draft = audit::AuditDraft {
+            request_id: ctx.request_id.clone(),
+            schema: ctx.schema.clone(),
+            actor: ctx.actor.sub.clone(),
+            actor_email: ctx.actor.email.clone(),
+            used_scope: ctx.scope.clone(),
+            retrieved_node_ids: Vec::new(),
+            decision: decision.clone(),
+            route: None,
+            governing_norm_ids: Vec::new(),
+            extraction_mode: extraction::audit_extraction_mode(None),
+            jev_has_enough_info: Some(jev_has_enough_info),
+        };
+        let worm = self.worm.clone();
+        match tokio::task::spawn_blocking(move || worm.append(draft)).await {
+            Ok(Ok(_event_id)) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = ?err,
+                    request_id = %ctx.request_id,
+                    schema = %ctx.schema,
+                    decision = %decision,
+                    "failed to append jev hearing audit event; the reply itself was not \
+                     affected, but this turn's jev_has_enough_info has NO audit record"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    request_id = %ctx.request_id,
+                    schema = %ctx.schema,
+                    decision = %decision,
+                    "jev hearing audit write task panicked or was cancelled; the reply itself \
+                     was not affected, but this turn's jev_has_enough_info has NO audit record"
+                );
+            }
+        }
     }
 
     /// record_answer_outcome の本体（遵守事項 3）。attempt の存在検証 → outcome の
@@ -2059,6 +2127,9 @@ mod tests {
             // VegapunkClient の実接続を要求するため、`manual` / `corpus` と同じ理由で
             // 同期テストヘルパでは構築しない（`product_gate.rs` の非同期テストが別途カバーする）。
             product_gate: None,
+            // Jev はデモ用で既定 off。判定そのものを見るテストは常に無効（Issue #58 の
+            // wiremock 統合テストは `api.rs` 側で専用の Harness を組み立てる）。
+            jev_client: None,
         }
     }
 
@@ -2085,6 +2156,37 @@ mod tests {
         assert_eq!(ctx.actor.sub, "google-sub:101572111487015263315");
         assert_eq!(ctx.actor.email, "op@sivira.co");
         assert!(!ctx.request_id.is_empty());
+    }
+
+    /// Issue #58: `record_jev_hearing_decision` は通常の `audit`/`audit_with_nodes` とは別に、
+    /// `jev_has_enough_info` を伴う専用の監査行を書く。ラベルと値が両方 WORM ログへそのまま
+    /// 残ることを固定する。
+    #[tokio::test]
+    async fn record_jev_hearing_decision_appends_jev_has_enough_info_to_worm_log() {
+        let dir = std::env::temp_dir().join(format!("harness-jev-audit-{}", uuid::Uuid::new_v4()));
+        let worm = Arc::new(audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap());
+        let harness = Harness {
+            worm: worm.clone(),
+            ..harness_for_test()
+        };
+        let ctx = harness
+            .begin(
+                &test_identity(),
+                "sivira-cs-demo",
+                crate::config::ManualSchemaKind::LegacySection,
+            )
+            .expect("begin");
+
+        harness
+            .record_jev_hearing_decision(&ctx, "jev_hearing:clarify", 0.14)
+            .await;
+
+        let body = std::fs::read_to_string(dir.join("audit.jsonl")).expect("read worm log");
+        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(line["decision"], "jev_hearing:clarify");
+        assert_eq!(line["jev_has_enough_info"], serde_json::json!(0.14));
+        assert_eq!(line["request_id"], ctx.request_id);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// W1 回帰: 起票者（attempt.actor_email）と承認者（outcome_actor_email）が別人のとき、
@@ -2556,6 +2658,7 @@ mod tests {
             disclosure_scope: decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing,
+            rule_binding: None,
         }
     }
 

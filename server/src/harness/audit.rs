@@ -26,6 +26,11 @@ pub struct AuditDraft {
     /// not_applicable）。加算フィールド。既存ログ行にはこのキーが無いが、
     /// `verify_chain` は行ごとに実在するキーだけを再ハッシュするため後方互換。
     pub extraction_mode: String,
+    /// Issue #58: 第1層 advisory の聞き返し判定に Jev の `has_enough_info` を使ったターンのみ
+    /// `Some`。使わなかったターンは常に `None`（`extraction_mode` 追加時と同じ加算フィールド。
+    /// 既存ログ行にこのキーは無いが、`verify_chain` は行ごとに実在するキーだけを再ハッシュする
+    /// ため後方互換）。
+    pub jev_has_enough_info: Option<f64>,
 }
 
 /// WORM に書かれる 1 行（I5: provenance キー付き構造化レコード）。
@@ -51,6 +56,8 @@ struct AuditEvent<'a> {
     graph_provenance_linked: bool,
     /// S1-11 改訂: 今ターンの signal 抽出モード（加算フィールド）。
     extraction_mode: &'a str,
+    /// Issue #58: 第1層 advisory の聞き返し判定に使った Jev の `has_enough_info`（加算フィールド）。
+    jev_has_enough_info: Option<f64>,
     prev_hash: &'a str,
     hash: &'a str,
 }
@@ -115,6 +122,7 @@ impl WormAuditLog {
             "governing_norm_ids": draft.governing_norm_ids,
             "graph_provenance_linked": false,
             "extraction_mode": draft.extraction_mode,
+            "jev_has_enough_info": draft.jev_has_enough_info,
         });
         let payload_text = serde_json::to_string(&payload)?;
         let mut hasher = Sha256::new();
@@ -136,6 +144,7 @@ impl WormAuditLog {
             governing_norm_ids: &draft.governing_norm_ids,
             graph_provenance_linked: false,
             extraction_mode: &draft.extraction_mode,
+            jev_has_enough_info: draft.jev_has_enough_info,
             prev_hash,
             hash: &hash,
         };
@@ -229,6 +238,7 @@ mod tests {
             route: None,
             governing_norm_ids: Vec::new(),
             extraction_mode: "not_applicable".to_string(),
+            jev_has_enough_info: None,
         }
     }
 
@@ -262,6 +272,7 @@ mod tests {
                 "graph_provenance_linked",
                 "extraction_mode",
                 "actor_email",
+                "jev_has_enough_info",
                 "prev_hash",
                 "hash",
             ] {
@@ -270,6 +281,42 @@ mod tests {
         }
         // hash chain: 2 行目の prev_hash は 1 行目の hash
         assert_eq!(lines[1]["prev_hash"], lines[0]["hash"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #58: `jev_has_enough_info` は Jev 起点の聞き返し判定を使ったターンだけ `Some`
+    /// として記録され、JSON では数値としてそのまま読める（`null` ではない）。
+    #[test]
+    fn append_records_jev_has_enough_info_when_present() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let log = WormAuditLog::open(&path).expect("open worm log");
+        let mut d = draft("req-jev", "jev_hearing:clarify");
+        d.jev_has_enough_info = Some(0.14);
+        log.append(d).expect("append");
+
+        let body = std::fs::read_to_string(&path).expect("read log");
+        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(line["jev_has_enough_info"], serde_json::json!(0.14));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 未使用ターン（`jev_has_enough_info: None`）は JSON 上 `null` として記録され、
+    /// かつ hash chain の検証を妨げない（既存の `draft()` ヘルパーが使う既定値の回帰防止）。
+    #[test]
+    fn append_records_null_for_jev_has_enough_info_when_absent() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let log = WormAuditLog::open(&path).expect("open worm log");
+        log.append(draft("req-1", "allowed")).expect("append");
+
+        let body = std::fs::read_to_string(&path).expect("read log");
+        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert!(line["jev_has_enough_info"].is_null());
+        // 再オープンでも整合性検証を通る(このフィールドを追加しても既存の hash chain 検証は
+        // 壊れないことの確認)。
+        drop(log);
+        WormAuditLog::open(&path).expect("log with null jev_has_enough_info must reopen");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -378,6 +378,108 @@ pub fn decide_reply_action(
     }
 }
 
+/// Issue #58: 第1層 advisory の聞き返し判定に Jev の `has_enough_info` を使うべきターンか。
+///
+/// - layer=1 かつ `rule_binding == Some(Binding::Advisory)` の `Escalate` であること
+///   （mandatory ルール・第2層・第3層は対象外。`decision::decide` が第1層マッチ時に積む
+///   `rule_binding` そのものを判別に使い、`missing` の中身には依存しない。背景の不具合:
+///   「電源が入らなくなった」は advisory ルールにマッチしたが `missing`（マニュアル材料の
+///   カバレッジ不足で決まる）がたまたま空になり、聞き返しに入らず即エスカレーションして
+///   いた。`missing` に依存しないことがこの是正の核）
+/// - 今ターンの signal 抽出が `LexiconFallback` に落ちていないこと（抽出 LLM 不調時は
+///   `decide_reply_action` 自身が fail-closed で `EscalationReply` に倒すため、Jev を呼んでも
+///   結果を使わない）
+/// - `conv.is_already_escalated()` でないこと（確定済み case は `decide_reply_action` 自身が
+///   `!conv.is_already_escalated()` ガードで `EscalationReply` に倒すため、Jev を呼んでも結果を
+///   使わず無駄な待ちとコストが発生するだけ。二重実装を避け、既存の契約に委ねる）
+fn is_layer1_advisory_escalate(
+    outcome: &crate::harness::EvaluationOutcome,
+    conv: &crate::harness::CaseConvState,
+) -> bool {
+    outcome.extraction_mode != crate::harness::extraction::ExtractionMode::LexiconFallback
+        && matches!(
+            &outcome.decision,
+            AnswerDecision::Escalate {
+                layer: 1,
+                rule_binding: Some(crate::harness::rules::Binding::Advisory),
+                ..
+            }
+        )
+        && !conv.is_already_escalated()
+}
+
+/// Issue #58: 第1層 advisory の聞き返し判定そのもの（純関数）。`decide_reply_action` の
+/// decision table とは独立に存在し、`decide_reply_action` 自体は変更しない。
+///
+/// `has_enough_info` が閾値未満、かつ聞き返し予算内なら聞き返し（`Clarify`）、そうでなければ
+/// エスカレーション確定（`EscalationReply`）。実測値・閾値の根拠は
+/// `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7 を参照。
+fn decide_jev_hearing_action(
+    has_enough_info: f64,
+    clarify_turns: u32,
+    clarify_max_turns: u32,
+    enough_info_threshold: f64,
+) -> ReplyAction {
+    if has_enough_info < enough_info_threshold && clarify_turns < clarify_max_turns {
+        ReplyAction::Clarify
+    } else {
+        ReplyAction::EscalationReply
+    }
+}
+
+/// Issue #58: Jev へ `has_enough_info` を問い合わせる。HTTP 呼び出し失敗・タイムアウト・
+/// 応答に `has_enough_info` の `noul` 回答が無いのいずれも `None`（呼び出し側は
+/// `decide_reply_action` へフォールバックすること。fail-closed にせず fail-back する）。
+async fn query_jev_has_enough_info(
+    jev: &crate::jev::JevClient,
+    message: &str,
+    request_id: &str,
+) -> Option<f64> {
+    match jev.evaluate(message).await {
+        Ok(outcome) => match outcome.answers.get("has_enough_info") {
+            Some(crate::jev::JevAnswer::Noul { noul }) => Some(*noul),
+            other => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    answer = ?other,
+                    "jev hearing evaluate response is missing a has_enough_info noul answer; \
+                     falling back to the missing-based clarify decision"
+                );
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                request_id = %request_id,
+                "jev hearing evaluate failed; falling back to the missing-based clarify decision"
+            );
+            None
+        }
+    }
+}
+
+/// Issue #58: `is_layer1_advisory_escalate` が true で、かつ Jev が有効
+/// （`harness.jev_client.is_some()`）なときだけ Jev を呼ぶ。対象外のターン・Jev 無効
+/// （`[jev] enabled = false`）のいずれも Jev を呼ばずに `None` を返す。
+///
+/// 戻り値が `Some` のときだけ、呼び出し側は `decide_jev_hearing_action` を使い、かつ
+/// `Harness::record_jev_hearing_decision` で専用の監査行を書くこと（`None` のターンは
+/// 通常どおり `decide_reply_action` に委譲し、この監査行を書かない）。
+async fn resolve_jev_has_enough_info(
+    harness: &Harness,
+    outcome: &crate::harness::EvaluationOutcome,
+    conv: &crate::harness::CaseConvState,
+    message: &str,
+    request_id: &str,
+) -> Option<f64> {
+    if !is_layer1_advisory_escalate(outcome, conv) {
+        return None;
+    }
+    let jev = harness.jev_client.as_ref()?;
+    query_jev_has_enough_info(jev, message, request_id).await
+}
+
 /// Issue #54 A-2 (b): `ReplyAction::EscalationReply` の応答文を組み立てる（`reply_handler` の
 /// 同分岐から抽出した部品）。
 ///
@@ -587,15 +689,50 @@ fn is_clarify_exhausted(
         && conv.clarify_turns >= cfg.clarify_max_turns
 }
 
+/// Issue #58 Warning 2: 「聞き返し上限到達でエスカレーションへ落ちた」を計測する
+/// `clarify_exhausted` ログを出すべきかどうかを、Jev 経由の聞き返し判定にも対応させて判定する。
+/// `reply_handler` はこの関数 1 つだけを呼び、Jev / 非 Jev の分岐をインライン展開しない。
+///
+/// - `jev_has_enough_info == None`（非 Jev 経路）: 従来の `is_clarify_exhausted` の判定結果を
+///   そのまま返す。発火条件は本関数の追加前後で一切変えていない（既存の `is_clarify_exhausted_*`
+///   テストがそのまま通ることで担保する）。
+/// - `jev_has_enough_info == Some(has_enough_info)`（Jev 経路）: `decide_jev_hearing_action` が
+///   聞き返し予算切れ（`has_enough_info < enough_info_threshold` かつ
+///   `clarify_turns >= clarify_max_turns`）を理由に `EscalationReply` を返したときだけ true。
+///   `has_enough_info >= enough_info_threshold`（Jev が情報十分と判定した即エスカレーション）は
+///   予算切れではないため false のまま返す。この 2 つを取り違えると、即エスカレーションの
+///   たびに「聞き返し上限到達」という誤ったログが出て計測が無意味になる。
+///
+/// `outcome` / `cfg` は非 Jev 経路にのみ使う。Jev 経路では `outcome.clarification_allowed` が
+/// 契約上 false になる（Jev トリガー条件が第1層 advisory の `Escalate` に限られるため、
+/// `harness::mod::clarification_allowed()` の契約上ほぼ常に false）ため参照しない。
+fn is_reply_clarify_exhausted(
+    jev_has_enough_info: Option<f64>,
+    enough_info_threshold: f64,
+    outcome: &crate::harness::EvaluationOutcome,
+    conv: &crate::harness::CaseConvState,
+    cfg: &crate::config::ApiConfig,
+) -> bool {
+    match jev_has_enough_info {
+        Some(has_enough_info) => {
+            has_enough_info < enough_info_threshold && conv.clarify_turns >= cfg.clarify_max_turns
+        }
+        None => is_clarify_exhausted(outcome, conv, cfg),
+    }
+}
+
 /// 「今回の聞き返しが最終ターンか」を判定する純関数（B4: 会話フロー v1.2 design doc §3
 /// 「残り確認回数の可視化」）。`Warning 2` 対応: 以前は `reply_handler` 内に
 /// `conv.clarify_turns + 1 >= max` としてインライン化されていてテストが無く、
 /// オフバイワンが仕込まれてもコメントでしか守られていなかった。`is_clarify_exhausted` と
 /// 同じ理由で純関数へ切り出す。
 ///
-/// **前提**: この関数は `decide_reply_action` が `ReplyAction::Clarify` を返した後にのみ
-/// 呼ぶこと。その分岐に入る時点で `conv.clarify_turns < cfg.clarify_max_turns` が保証されて
-/// いる（`decide_reply_action` の decision table）。加算オーバーフローを避けるため
+/// **前提**: この関数は `decide_reply_action` または `decide_jev_hearing_action`（Issue #58）が
+/// `ReplyAction::Clarify` を返した後にのみ呼ぶこと。どちらの分岐に入る時点でも
+/// `conv.clarify_turns < cfg.clarify_max_turns` が保証されている（`decide_reply_action` の
+/// decision table、および `decide_jev_hearing_action` が `Clarify` を返す条件そのもの
+/// `has_enough_info < enough_info_threshold && clarify_turns < clarify_max_turns`）。加算
+/// オーバーフローを避けるため
 /// `clarify_turns + 1 >= max` ではなく `clarify_turns >= max - 1`（`saturating_sub`）の形で書く。
 /// `cfg.clarify_max_turns == 0` の場合 `saturating_sub(1)` は 0 を返すため単体では常に `true`
 /// になるが、上記の前提（`clarify_turns < max`）が保証する呼び出し経路では `max == 0` は
@@ -627,6 +764,13 @@ fn missing_to_text(missing: &[decision::EvidenceRequirement]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Issue #58: Jev 起点の聞き返し（`resolve_jev_has_enough_info` が `Some` を返したターンの
+/// `Clarify`）で使う固定文言。マニュアルカバレッジ由来の `missing_to_text` とは無関係
+/// （Jev は「顧客が話した情報の十分性」を見ており、マニュアル材料の一致度とは異なる指標のため、
+/// 同じ文言を使い回さない）。
+const JEV_HEARING_MISSING_TEXT: &str =
+    "対象の製品の型番と、具体的な症状（いつから・どんな状態か）が確認できていません。";
 
 /// `Harness::evaluate` が返す `anyhow::Error` を HTTP ステータスへ分類する純関数
 /// （design doc §2 のエラー表: 503 `upstream_unavailable` / 500 `internal`）。
@@ -1283,13 +1427,54 @@ async fn reply_handler(
                 &outcome.case_id,
             );
 
-            let action = decide_reply_action(&outcome, &conv, &state.config.api);
+            // Issue #58: 第1層 advisory の聞き返し判定にのみ Jev の has_enough_info を使う。
+            // 対象外のターン・Jev 無効・HTTPエラー・タイムアウト・応答欠落のいずれでも
+            // `None` になり、その場合は従来どおり `decide_reply_action`（missing ベース）に
+            // 委譲する（fail-back。詳細は `resolve_jev_has_enough_info` の doc コメント）。
+            let jev_has_enough_info = resolve_jev_has_enough_info(
+                &state.harness,
+                &outcome,
+                &conv,
+                &req.message,
+                &request_id,
+            )
+            .await;
+
+            let action = match jev_has_enough_info {
+                Some(has_enough_info) => decide_jev_hearing_action(
+                    has_enough_info,
+                    conv.clarify_turns,
+                    state.config.api.clarify_max_turns,
+                    state.config.jev.enough_info_threshold,
+                ),
+                None => decide_reply_action(&outcome, &conv, &state.config.api),
+            };
+
+            // Jev を実際に使って判定したターンのみ、専用の監査行を追記する
+            // （`Harness::record_jev_hearing_decision` の doc コメント参照）。
+            if let Some(has_enough_info) = jev_has_enough_info {
+                let jev_hearing_label = if action == ReplyAction::Clarify {
+                    "jev_hearing:clarify"
+                } else {
+                    "jev_hearing:escalate"
+                };
+                state
+                    .harness
+                    .record_jev_hearing_decision(&ctx, jev_hearing_label, has_enough_info)
+                    .await;
+            }
 
             // 計測: 「聞き返し上限到達でエスカレーションへ落ちた」事象を運用者が追える info ログ。
             // `arm_time_pref_solicitation` が `conv.clarify_turns` を 0 にリセットする**前**に
             // 判定する（リセット後だと `is_clarify_exhausted` が常に false になる）。
             if action == ReplyAction::EscalationReply
-                && is_clarify_exhausted(&outcome, &conv, &state.config.api)
+                && is_reply_clarify_exhausted(
+                    jev_has_enough_info,
+                    state.config.jev.enough_info_threshold,
+                    &outcome,
+                    &conv,
+                    &state.config.api,
+                )
             {
                 tracing::info!(
                     case_id = %outcome.case_id,
@@ -1313,21 +1498,33 @@ async fn reply_handler(
                     .await
                 }
                 ReplyAction::Clarify => {
-                    let missing: &[decision::EvidenceRequirement] = match &outcome.decision {
-                        AnswerDecision::Escalate { missing, .. } => missing,
-                        other => {
-                            tracing::error!(
-                                request_id = %request_id,
-                                decision = ?other,
-                                "decide_reply_action returned Clarify for a non-Escalate decision; \
-                                 this is a bug in decide_reply_action's decision-table logic. \
-                                 Falling back to an empty missing list so the clarify prompt still \
-                                 degrades gracefully instead of panicking"
-                            );
-                            &[]
-                        }
+                    // Issue #58: Jev 起点の聞き返しは、マニュアルカバレッジ由来の
+                    // `missing_to_text` ではなく固定文言を使う（Jev は「顧客が話した情報の
+                    // 十分性」を見ており、`outcome.decision` の `missing`（マニュアル材料との
+                    // 一致度）とは無関係な指標のため）。`jev_has_enough_info.is_some()` は、
+                    // このターンの `action` が `decide_jev_hearing_action` 経由で決まった
+                    // ことを意味する（`resolve_jev_has_enough_info` が `None` を返した場合は
+                    // 必ず従来どおり `decide_reply_action` に委譲されている）。
+                    let missing_text = if jev_has_enough_info.is_some() {
+                        JEV_HEARING_MISSING_TEXT.to_string()
+                    } else {
+                        let missing: &[decision::EvidenceRequirement] = match &outcome.decision {
+                            AnswerDecision::Escalate { missing, .. } => missing,
+                            other => {
+                                tracing::error!(
+                                    request_id = %request_id,
+                                    decision = ?other,
+                                    "decide_reply_action returned Clarify for a non-Escalate \
+                                     decision; this is a bug in decide_reply_action's \
+                                     decision-table logic. Falling back to an empty missing \
+                                     list so the clarify prompt still degrades gracefully \
+                                     instead of panicking"
+                                );
+                                &[]
+                            }
+                        };
+                        missing_to_text(missing)
                     };
-                    let missing_text = missing_to_text(missing);
                     // B1: 把握済み事項リスト（design doc §3 v1.2 追記）。聞き返しのたびに
                     // 既知の情報を再質問してしまう退行を防ぐ。
                     let known_facts = build_known_facts(
@@ -1795,10 +1992,16 @@ mod tests {
                 required: 0.8,
                 best: 0.5,
             }],
+            rule_binding: None,
         }
     }
 
-    /// 第1層（明示エスカレーションルール、rule_match）相当の escalate。
+    /// 第1層（明示エスカレーションルール、rule_match）相当の escalate。`rule_binding` を
+    /// `None` にしているのは既存呼び出し元（このテストファイルの他の多数のテスト）が
+    /// 「第1層 advisory」判定に該当しないことを前提にしているため（Issue #58: Jev 起点の
+    /// 聞き返し判定は `rule_binding == Some(Binding::Advisory)` のときだけ発火する。既存
+    /// テストの意図を変えないよう、rule_binding を明示するテストは別ヘルパー
+    /// `layer1_advisory_escalate_decision` / `layer1_mandatory_escalate_decision` を新設する）。
     fn rule_match_escalate_decision() -> AnswerDecision {
         AnswerDecision::Escalate {
             reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
@@ -1807,6 +2010,33 @@ mod tests {
             disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: vec![],
+            rule_binding: None,
+        }
+    }
+
+    /// Issue #58: 第1層 advisory 相当の escalate（Jev 起点の聞き返し判定の対象）。
+    fn layer1_advisory_escalate_decision() -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: vec![],
+            rule_binding: Some(crate::harness::rules::Binding::Advisory),
+        }
+    }
+
+    /// Issue #58: 第1層 mandatory 相当の escalate（Jev 起点の聞き返し判定の対象外）。
+    fn layer1_mandatory_escalate_decision() -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: vec![],
+            rule_binding: Some(crate::harness::rules::Binding::Mandatory),
         }
     }
 
@@ -2096,6 +2326,348 @@ mod tests {
         conv.clarify_turns = 0;
         let action = decide_reply_action(&outcome, &conv, &default_api_config());
         assert_eq!(action, ReplyAction::Clarify);
+    }
+
+    // ---- Issue #58: 第1層 advisory の聞き返し判定に Jev の has_enough_info を使う ----
+
+    // --- decide_jev_hearing_action（純関数。実測値は背景 seciton・design doc §7 参照） ---
+
+    #[test]
+    fn decide_jev_hearing_action_clarifies_when_below_threshold_and_turns_remain() {
+        // 実測: 「電源が入らなくなった」has_enough_info = 0.14（閾値 0.5 未満）。
+        let action = decide_jev_hearing_action(0.14, 0, 3, 0.5);
+        assert_eq!(action, ReplyAction::Clarify);
+    }
+
+    #[test]
+    fn decide_jev_hearing_action_escalates_when_at_or_above_threshold() {
+        // 実測: 「ADC-V523 の録画がうまく再生できない」has_enough_info = 0.69（閾値以上）。
+        let action = decide_jev_hearing_action(0.69, 0, 3, 0.5);
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    #[test]
+    fn decide_jev_hearing_action_escalates_when_below_threshold_but_turns_exhausted() {
+        let action = decide_jev_hearing_action(0.14, 3, 3, 0.5);
+        assert_eq!(
+            action,
+            ReplyAction::EscalationReply,
+            "insufficient info must not clarify forever; the clarify budget still applies"
+        );
+    }
+
+    #[test]
+    fn decide_jev_hearing_action_treats_the_threshold_value_itself_as_sufficient() {
+        // 境界値: `has_enough_info == threshold` は「閾値未満」ではないため Clarify にならない。
+        let action = decide_jev_hearing_action(0.5, 0, 3, 0.5);
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    // --- is_layer1_advisory_escalate（純関数。対象/対象外の切り分け） ---
+
+    #[test]
+    fn is_layer1_advisory_escalate_true_for_a_fresh_layer1_advisory_escalation() {
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let conv = default_conv_state();
+        assert!(is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_layer1_advisory_escalate_false_for_layer1_mandatory() {
+        // Issue #58 必須テスト4: mandatory ルールは has_enough_info の値に関わらず対象外
+        // （Jev をそもそも呼ばない）。
+        let outcome = base_outcome(layer1_mandatory_escalate_decision(), false);
+        let conv = default_conv_state();
+        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    // reviewer Stage 2 codex レビュー Critical 1 の回帰防止（名指し）。
+    //
+    // `rules::match_layer1` を binding 優先に直す前は、advisory ルールと mandatory ルールが
+    // 同一ターンで同時マッチすると、配列順によっては advisory が先に確定し
+    // `decide` が `rule_binding: Some(Binding::Advisory)` を返してしまい得た。その結果
+    // `is_layer1_advisory_escalate` が true になり、本来問答無用で即エスカレーションすべき
+    // mandatory 事象（例: 「人に代わってください」による human-handoff）が Jev 起点の
+    // 聞き返しループへ吸収される。`match_layer1` 修正後は同時マッチ時に必ず
+    // `rule_binding: Some(Binding::Mandatory)` が選ばれるため、この形の decision に対して
+    // `is_layer1_advisory_escalate` が false であり続けることをここで名指しに固定する
+    // （`decision.rs::bundled_warranty_failure_and_human_handoff_conflict_resolves_to_mandatory`
+    // と対になる、api.rs 側の回帰ガード）。
+    #[test]
+    fn is_layer1_advisory_escalate_false_for_the_mandatory_winner_of_an_advisory_mandatory_conflict(
+    ) {
+        let outcome = base_outcome(layer1_mandatory_escalate_decision(), false);
+        let conv = default_conv_state();
+        assert!(
+            !is_layer1_advisory_escalate(&outcome, &conv),
+            "a layer1 decision whose rule_binding resolved to Mandatory (because match_layer1 \
+             prioritized it over a conflicting advisory rule) must never be treated as the \
+             layer1-advisory Jev-hearing target"
+        );
+    }
+
+    #[test]
+    fn is_layer1_advisory_escalate_false_for_layer2_prohibited_domain() {
+        let decision = AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 2,
+            route_to: "derm_liaison".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            rule_binding: None,
+        };
+        let outcome = base_outcome(decision, false);
+        let conv = default_conv_state();
+        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_layer1_advisory_escalate_false_for_layer3_gray_insufficient_directness() {
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let conv = default_conv_state();
+        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_layer1_advisory_escalate_false_for_layer3_gray_unknown_added_signal() {
+        let decision = AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::UnknownAddedSignal,
+            layer: 3,
+            route_to: "triage".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::NoInternalDetails,
+            audit_required: true,
+            missing: vec![decision::EvidenceRequirement::DirectManualCoverage {
+                required: 0.8,
+                best: 0.5,
+            }],
+            rule_binding: None,
+        };
+        let outcome = base_outcome(decision, true);
+        let conv = default_conv_state();
+        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_layer1_advisory_escalate_false_when_extraction_fell_back_to_lexicon() {
+        let mut outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        outcome.extraction_mode = crate::harness::extraction::ExtractionMode::LexiconFallback;
+        let conv = default_conv_state();
+        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_layer1_advisory_escalate_false_when_already_escalated_via_confirmed_flag() {
+        // Issue #58 必須テスト7: 確定済み case では Jev を呼ばない
+        // （`decide_reply_action` 自身のガードに委ねる。二重実装を避ける）。
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.escalation_confirmed = true;
+        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_layer1_advisory_escalate_false_when_already_escalated_via_awaiting_time_pref() {
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true;
+        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_layer1_advisory_escalate_false_when_already_escalated_via_preferred_contact_time() {
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.preferred_contact_time = Some("平日午後".to_string());
+        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+    }
+
+    // --- resolve_jev_has_enough_info（Jev 呼び出しの最小限の統合テスト、wiremock） ---
+
+    /// `JevClient::build`（Issue #58 で `pub(crate)` に拡張）を wiremock 相手に組み立てる。
+    /// `jev.rs::tests::test_client` と同じ「env を汚染しない」構築経路（api.rs は同一 crate 内
+    /// だが別モジュールのため、`jev.rs` のテスト専用 `test_client` は private で使えない）。
+    fn jev_questions_file() -> String {
+        let dir = std::env::temp_dir().join(format!("api-jev-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("questions.json");
+        std::fs::write(&path, r#"{"has_enough_info": {"type": "noul"}}"#)
+            .expect("write questions file");
+        path.to_string_lossy().to_string()
+    }
+
+    fn build_test_jev_client(endpoint: String, timeout_secs: u64) -> crate::jev::JevClient {
+        let cfg = crate::config::JevConfig {
+            enabled: true,
+            endpoint,
+            model: "jev-test".to_string(),
+            questions_path: jev_questions_file(),
+            timeout_secs,
+            enough_info_threshold: 0.5,
+        };
+        crate::jev::JevClient::build(
+            "test-key".to_string(),
+            &cfg,
+            std::path::Path::new("/unused-because-questions-path-is-absolute"),
+        )
+        .expect("build jev client for a loopback http endpoint")
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_none_when_jev_disabled() {
+        let harness = test_harness(); // jev_client: None（`[jev] enabled = false` 相当）
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let conv = default_conv_state();
+
+        let result =
+            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
+                .await;
+
+        assert_eq!(
+            result, None,
+            "jev disabled must fall back to the missing-based decision, not fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_the_noul_value_on_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "answers": {"has_enough_info": {"type": "noul", "noul": 0.14}},
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let jev = build_test_jev_client(server.uri(), 5);
+        let mut harness = test_harness();
+        harness.jev_client = Some(jev);
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let conv = default_conv_state();
+
+        let result =
+            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
+                .await;
+
+        assert_eq!(result, Some(0.14));
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_none_on_http_error() {
+        // Issue #58 必須テスト5: HTTP エラー時は missing ベースの挙動へフォールバックする
+        // （fail-closed にしない）。
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let jev = build_test_jev_client(server.uri(), 5);
+        let mut harness = test_harness();
+        harness.jev_client = Some(jev);
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let conv = default_conv_state();
+
+        let (result, logs) = crate::test_support::capture_logs_async(resolve_jev_has_enough_info(
+            &harness,
+            &outcome,
+            &conv,
+            "電源が入らなくなった",
+            "req-1",
+        ))
+        .await;
+
+        assert_eq!(result, None);
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("jev hearing evaluate failed"),
+            "an operator-facing warning must name the failure, got: {warnings}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_none_on_timeout() {
+        // Issue #58 必須テスト5: タイムアウト時も missing ベースの挙動へフォールバックする。
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)),
+            )
+            .mount(&server)
+            .await;
+        // timeout_secs は config 経由では整数秒単位が最小のため、確実にタイムアウトさせるため
+        // モック側の遅延(2秒)より短い 1 秒に設定する。
+        let jev = build_test_jev_client(server.uri(), 1);
+        let mut harness = test_harness();
+        harness.jev_client = Some(jev);
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let conv = default_conv_state();
+
+        let result =
+            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
+                .await;
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_none_when_response_is_missing_the_answer() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "answers": {},
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let jev = build_test_jev_client(server.uri(), 5);
+        let mut harness = test_harness();
+        harness.jev_client = Some(jev);
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let conv = default_conv_state();
+
+        let result =
+            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
+                .await;
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_never_calls_jev_for_a_mandatory_escalation() {
+        // Issue #58 必須テスト4の補強: Jev が正常に動作していても、mandatory ルールでは
+        // そもそもリクエストが飛ばないことを実測する（値に関わらず対象外、ではなく本当に
+        // 呼んでいないことの証拠）。
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "answers": {"has_enough_info": {"type": "noul", "noul": 0.14}},
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                })),
+            )
+            .mount(&server)
+            .await;
+        let jev = build_test_jev_client(server.uri(), 5);
+        let mut harness = test_harness();
+        harness.jev_client = Some(jev);
+        let outcome = base_outcome(layer1_mandatory_escalate_decision(), false);
+        let conv = default_conv_state();
+
+        let result =
+            resolve_jev_has_enough_info(&harness, &outcome, &conv, "電源が入らなくなった", "req-1")
+                .await;
+
+        assert_eq!(result, None);
+        let received = server.received_requests().await.expect("recording enabled");
+        assert!(
+            received.is_empty(),
+            "a mandatory layer-1 escalation must never call jev, got {} request(s)",
+            received.len()
+        );
     }
 
     // ---- build_escalation_reply_text（Issue #54 A-2 (b)） ----
@@ -2712,6 +3284,76 @@ mod tests {
         ));
     }
 
+    // ---- is_reply_clarify_exhausted（Issue #58 Warning 2: clarify_exhausted ログを Jev 経路にも対応） ----
+
+    #[test]
+    fn is_reply_clarify_exhausted_true_for_jev_path_when_below_threshold_and_turns_exhausted() {
+        // ケース1: Jev 経路・閾値未満・予算切れ → decide_jev_hearing_action は予算切れを理由に
+        // EscalationReply を返す。これは「聞き返し上限到達」そのものなので true。
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), false);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3; // == clarify_max_turns(3)
+        assert!(is_reply_clarify_exhausted(
+            Some(0.14),
+            0.5,
+            &outcome,
+            &conv,
+            &default_api_config(),
+        ));
+    }
+
+    #[test]
+    fn is_reply_clarify_exhausted_false_for_jev_path_when_info_is_sufficient() {
+        // ケース2: Jev 経路・閾値以上（情報十分と判定した即エスカレーション）・予算切れの
+        // 状態であっても、EscalationReply の理由は「情報十分」であって「予算切れ」ではない
+        // ため false（取り違えると即エスカレーションのたびに誤った計測ログが出る）。
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), false);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3;
+        assert!(!is_reply_clarify_exhausted(
+            Some(0.69),
+            0.5,
+            &outcome,
+            &conv,
+            &default_api_config(),
+        ));
+    }
+
+    #[test]
+    fn is_reply_clarify_exhausted_false_for_jev_path_when_turns_remain() {
+        // ケース3: Jev 経路・閾値未満・予算内 → decide_jev_hearing_action は Clarify を返す
+        // （そもそも EscalationReply に落ちないケース）ため false。
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), false);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 0;
+        assert!(!is_reply_clarify_exhausted(
+            Some(0.14),
+            0.5,
+            &outcome,
+            &conv,
+            &default_api_config(),
+        ));
+    }
+
+    #[test]
+    fn is_reply_clarify_exhausted_matches_is_clarify_exhausted_for_non_jev_path() {
+        // ケース4: 非 Jev 経路（jev_has_enough_info == None）では、既存の is_clarify_exhausted
+        // と完全に同じ結果を返すこと（発火条件を一切変えていないことの直接証拠）。
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3; // == clarify_max_turns(3)
+        let cfg = default_api_config();
+        assert_eq!(
+            is_reply_clarify_exhausted(None, 0.5, &outcome, &conv, &cfg),
+            is_clarify_exhausted(&outcome, &conv, &cfg),
+        );
+        assert!(
+            is_reply_clarify_exhausted(None, 0.5, &outcome, &conv, &cfg),
+            "sanity: this scenario must actually be an exhausted case, otherwise the equality \
+             assertion above would trivially pass even if both sides were always false"
+        );
+    }
+
     // ---- is_final_clarify_turn（Warning 2: B4「残り確認回数の可視化」の最終ターン判定） ----
     //
     // `default_api_config()` は `clarify_max_turns = 3`。`decide_reply_action` が Clarify を
@@ -3013,6 +3655,7 @@ mod tests {
                     "ADC-V724".to_string()
                 ]),
             )),
+            jev_client: None,
         }
     }
 

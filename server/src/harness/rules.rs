@@ -2,7 +2,7 @@ use crate::harness::signal::SignalSet;
 use crate::resolve::normalize_key;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Binding {
     Mandatory,
@@ -108,13 +108,31 @@ impl KnownResolution {
 }
 
 /// 第1層照合: rule.condition ⊆ question のとき確定ルーティング。空条件はマッチしない。
+///
+/// マッチする候補が複数あるとき、**配列順ではなく binding を優先**して選ぶ
+/// （`Binding::Mandatory` が `Binding::Advisory` より必ず優先される）。同一 binding 内では
+/// 従来どおり配列の先頭を優先する。
+///
+/// なぜ配列順で決めてはいけないか: `decide`（`decision.rs`）の doc コメントが定める
+/// 「第1層 mandatory は情報の有無を問わず問答無用で即エスカレーションし、Jev の聞き返し
+/// 判定に一切左右されない」という不変条件が、素朴な `find`（先頭一致）実装のもとでは
+/// `rules.json` の**配列順**という脆い前提の上に成り立ってしまう。累積 signal 集合が
+/// advisory ルールと mandatory ルールの両方にマッチしたとき、advisory がたまたま配列で
+/// 先にあるだけで mandatory が隠れ、本来即時確定すべきターン（例: 「人に代わってください」
+/// による `human-handoff` mandatory）が advisory 扱いになって Jev 起点の聞き返しループへ
+/// 吸収されてしまう（reviewer Stage 2 codex レビュー Critical 1）。この関数が binding を
+/// 見て選ぶことで、`rules.json` の並び替えではこの契約が壊れないようにする。
 pub fn match_layer1<'a>(
     rules: &'a [EscalationRule],
     question: &SignalSet,
 ) -> Option<&'a EscalationRule> {
+    fn matches(rule: &EscalationRule, question: &SignalSet) -> bool {
+        !rule.condition.is_empty() && rule.condition.is_subset(question)
+    }
     rules
         .iter()
-        .find(|rule| !rule.condition.is_empty() && rule.condition.is_subset(question))
+        .find(|rule| matches(rule, question) && rule.binding == Binding::Mandatory)
+        .or_else(|| rules.iter().find(|rule| matches(rule, question)))
 }
 
 /// 第2層照合: signal 一致 or raw text パターン一致で必ず止める（面で塞ぐ）。
@@ -225,6 +243,83 @@ mod tests {
         )
         .is_some());
         assert!(match_layer1(&rules, &signals(&["discoloration"])).is_none());
+    }
+
+    // reviewer Stage 2 codex レビュー Critical 1 の回帰防止: 配列上 advisory が mandatory
+    // より前にあり、両方の condition が同一 signal 集合にマッチするとき、match_layer1 は
+    // 配列順ではなく binding で mandatory を優先して返さなければならない。
+    #[test]
+    fn match_layer1_prefers_mandatory_over_earlier_advisory_when_both_match() {
+        let rules = vec![
+            EscalationRule {
+                id: "advisory-first".to_string(),
+                condition: signals(&["warranty_hardware_failure"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Advisory,
+            },
+            EscalationRule {
+                id: "mandatory-second".to_string(),
+                condition: signals(&["human_handoff_request"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Mandatory,
+            },
+        ];
+        // 累積 signal 集合が両方の condition を包含する（1ターン目で warranty_hardware_failure、
+        // 2ターン目で human_handoff_request が累積したケースを模す）。
+        let question = signals(&["warranty_hardware_failure", "human_handoff_request"]);
+        let matched = match_layer1(&rules, &question).expect("expected a match");
+        assert_eq!(matched.id, "mandatory-second");
+    }
+
+    // mandatory が1件もマッチしないときは、従来どおり最初にマッチした advisory を返す
+    // （binding 優先ロジックが advisory オンリーのケースを壊していないことの確認）。
+    #[test]
+    fn match_layer1_returns_first_advisory_when_no_mandatory_matches() {
+        let rules = vec![
+            EscalationRule {
+                id: "advisory-a".to_string(),
+                condition: signals(&["warranty_hardware_failure"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Advisory,
+            },
+            EscalationRule {
+                id: "advisory-b".to_string(),
+                condition: signals(&["contract_billing_question"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Advisory,
+            },
+        ];
+        let question = signals(&["warranty_hardware_failure", "contract_billing_question"]);
+        let matched = match_layer1(&rules, &question).expect("expected a match");
+        assert_eq!(matched.id, "advisory-a");
+    }
+
+    // mandatory が複数マッチするときは、同一 binding 内の順序（配列の先頭優先）が保たれる。
+    #[test]
+    fn match_layer1_returns_first_mandatory_when_multiple_mandatory_match() {
+        let rules = vec![
+            EscalationRule {
+                id: "mandatory-a".to_string(),
+                condition: signals(&["security_incident"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Mandatory,
+            },
+            EscalationRule {
+                id: "mandatory-b".to_string(),
+                condition: signals(&["physical_damage_smell_heat"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Mandatory,
+            },
+        ];
+        let question = signals(&["security_incident", "physical_damage_smell_heat"]);
+        let matched = match_layer1(&rules, &question).expect("expected a match");
+        assert_eq!(matched.id, "mandatory-a");
     }
 
     #[test]

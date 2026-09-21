@@ -1577,6 +1577,7 @@ mod tests {
             reply_drafter: None,
             reply_draft_max_tokens: 700,
             product_gate: None,
+            jev_client: None,
         };
         AdminState {
             schema: "urtect".to_string(),

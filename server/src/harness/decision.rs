@@ -132,6 +132,14 @@ pub enum AnswerDecision {
         disclosure_scope: DisclosureScope,
         audit_required: bool,
         missing: Vec<EvidenceRequirement>,
+        /// Issue #58: 第1層（明示エスカレーションルール）マッチ時に、そのルールが
+        /// `Binding::Mandatory` か `Binding::Advisory` かを保持する。第2・3層は `None`。
+        ///
+        /// `route_to` は mandatory/advisory のどちらでも `"support_desk"` になりうるため
+        /// route では拘束度を判別できない。呼び出し側（`api.rs`）はこのフィールドで
+        /// 「第1層 advisory」を判別し、Jev の `has_enough_info` に基づく聞き返し判定
+        /// （`missing` の中身に依存しない別経路）を発火させる。
+        rule_binding: Option<Binding>,
     },
 }
 
@@ -151,6 +159,13 @@ pub struct DecisionInput<'a> {
 
 /// (B) 3 層判定の decision function。LLM 非介在・同じ入力なら必ず同じ判定（純関数）。
 /// 先に止まった層で確定し、後段は評価しない。第1・2層にメモ化を適用しない。
+///
+/// 第1層のルール選択（`match_layer1` 呼び出し）は `rules.json` の配列順ではなく binding を
+/// 優先する（`Binding::Mandatory` が `Binding::Advisory` より必ず優先される。詳細は
+/// `rules::match_layer1` の doc コメント）。累積 signal が advisory ルールと mandatory ルールの
+/// 両方にマッチしたターンでも mandatory が選ばれ、下記の「mandatory は常に `missing:
+/// Vec::new()`」という契約がルールの並び順に依存せず成り立つ（reviewer Stage 2 codex レビュー
+/// Critical 1）。
 ///
 /// Issue #54: stakes/threshold の算出は副作用の無い純関数のため、第1層判定より前に計算しても
 /// 「先に止まった層で確定する」という上記の原則は壊れない。第1層（明示エスカレーションルール）
@@ -184,6 +199,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             disclosure_scope: DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing,
+            rule_binding: Some(rule.binding),
         };
     }
     // 第2層: 禁止領域（変更しない。fail-closed の核。missing は常に空・情報の有無を問わない）
@@ -195,6 +211,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             disclosure_scope: DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: Vec::new(),
+            rule_binding: None,
         };
     }
     // 第3層: 回答可能性
@@ -229,6 +246,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
                 disclosure_scope: DisclosureScope::ConfirmingWithTeam,
                 audit_required: true,
                 missing,
+                rule_binding: None,
             }
         }
     }
@@ -543,6 +561,124 @@ mod tests {
                 );
             }
             other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    // --- Issue #58: rule_binding は第1層マッチ時のみ Some、第2・3層は常に None ---
+    //
+    // `route_to` は mandatory/advisory のどちらでも "support_desk" になりうるため、呼び出し側
+    // （`api.rs`）が「第1層 advisory」を判別するにはこのフィールドが要る。
+
+    #[test]
+    fn layer1_mandatory_rule_carries_rule_binding_mandatory() {
+        let rules = vec![EscalationRule {
+            id: "r1".to_string(),
+            condition: signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: Binding::Mandatory,
+        }];
+        let q = signals(&["post_ingestion_symptom"]);
+        let d = decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(1.0),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { rule_binding, .. } => {
+                assert_eq!(rule_binding, Some(Binding::Mandatory));
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer1_advisory_rule_carries_rule_binding_advisory() {
+        let rules = vec![EscalationRule {
+            id: "r1".to_string(),
+            condition: signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding: Binding::Advisory,
+        }];
+        let q = signals(&["post_ingestion_symptom"]);
+        let d = decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { rule_binding, .. } => {
+                assert_eq!(rule_binding, Some(Binding::Advisory));
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer2_escalation_has_no_rule_binding() {
+        let domains = vec![ProhibitedDomain {
+            id: "d1".to_string(),
+            domain_signals: signals(&["skin_irritation"]),
+            text_patterns: Vec::new(),
+            route: "derm_liaison".to_string(),
+            binding: Binding::Mandatory,
+        }];
+        let q = signals(&["skin_irritation"]);
+        let d = decide(&input(
+            &q,
+            &[],
+            &domains,
+            &[],
+            Some(1.0),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { rule_binding, .. } => {
+                assert_eq!(
+                    rule_binding, None,
+                    "layer 2 (prohibited domain) must never carry a rule_binding, even though \
+                     the domain itself has a binding field"
+                );
+            }
+            other => panic!("expected layer2 escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer3_gray_escalation_has_no_rule_binding() {
+        let resolutions = vec![kr("kr1", &["discoloration"])];
+        let q = signals(&["discoloration", "mold"]);
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &resolutions,
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { rule_binding, .. } => {
+                assert_eq!(
+                    rule_binding, None,
+                    "layer 3 must never carry a rule_binding"
+                );
+            }
+            other => panic!("expected layer3 escalate, got {other:?}"),
         }
     }
 
@@ -1010,6 +1146,96 @@ mod tests {
             other => {
                 panic!("expected layer1 escalate for warranty_hardware_failure, got {other:?}")
             }
+        }
+    }
+
+    // reviewer Stage 2 codex レビュー Critical 1 の実データ回帰。
+    //
+    // data/urtect/rules.json の配列順は
+    // [security-incident(mandatory), physical-damage(mandatory), warranty-failure(advisory),
+    //  contract-billing(advisory), construction-risk(mandatory), human-handoff(mandatory)]。
+    // warranty-failure（advisory）は human-handoff（mandatory）より配列で先にある。
+    // 素朴な配列順 find だと、累積 signal に両方の condition が含まれるターンで
+    // warranty-failure が先に確定してしまい、「人に代わってください」という明示的な脱出要求
+    // （human_handoff_request）が Jev 起点の聞き返しループへ誤って吸収される
+    // （specs/production-cs-mcp.md・decision.rs decide の doc コメントが定める不変条件違反）。
+    // ここでは binding 優先ロジックにより mandatory（human-handoff）が選ばれ、missing が
+    // 常に空になることを実データで固定する。
+    #[test]
+    fn bundled_warranty_failure_and_human_handoff_conflict_resolves_to_mandatory() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["warranty_hardware_failure", "human_handoff_request"]);
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate {
+                layer,
+                rule_binding,
+                missing,
+                ..
+            } => {
+                assert_eq!(layer, 1);
+                assert_eq!(
+                    rule_binding,
+                    Some(Binding::Mandatory),
+                    "human-handoff (mandatory) must win over warranty-failure (advisory) even \
+                     though warranty-failure appears earlier in rules.json"
+                );
+                assert!(
+                    missing.is_empty(),
+                    "the winning mandatory rule must never carry a missing list"
+                );
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    // reviewer Stage 2 codex レビュー Critical 1 の実データ回帰（2件目）。
+    //
+    // contract-billing（advisory）は construction-risk（mandatory、高所作業・電気工事の
+    // hazard）より配列で先にある。同様の組み合わせでも mandatory が優先されることを固定する。
+    #[test]
+    fn bundled_contract_billing_and_construction_risk_conflict_resolves_to_mandatory() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["contract_billing_question", "physical_construction_risk"]);
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate {
+                layer,
+                rule_binding,
+                missing,
+                ..
+            } => {
+                assert_eq!(layer, 1);
+                assert_eq!(
+                    rule_binding,
+                    Some(Binding::Mandatory),
+                    "construction-risk (mandatory) must win over contract-billing (advisory) \
+                     even though contract-billing appears earlier in rules.json"
+                );
+                assert!(
+                    missing.is_empty(),
+                    "the winning mandatory rule must never carry a missing list"
+                );
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
         }
     }
 
