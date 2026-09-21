@@ -61,6 +61,7 @@ tower = { version = "0.5", features = ["util"] }
 # テストのみで使う機能なので `[dependencies]` 側の tokio には足さない
 # （本番バイナリへ test-util を持ち込まない）。
 tokio = { version = "1", features = ["test-util"] }
+wiremock = "0.6.5"
 
 [[bin]]
 name = "cs-support-mcp"

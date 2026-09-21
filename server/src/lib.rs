@@ -6,6 +6,7 @@ pub mod corpus;
 pub mod harness;
 pub mod health;
 pub mod ingest;
+pub mod jev;
 pub mod llm;
 pub mod manual;
 pub mod mcp;

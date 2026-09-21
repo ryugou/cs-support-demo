@@ -42,6 +42,10 @@ pub struct AppConfig {
     /// 応答生成 API（`POST /{project_id}/api/reply`）の設定。既定は無効。
     #[serde(default)]
     pub api: ApiConfig,
+    /// Jev（TypeSafe System One）shadow 判定クライアントの設定。既定は無効。
+    /// Issue #56 時点では判定には一切未接続（クライアントと config のみ）。
+    #[serde(default)]
+    pub jev: JevConfig,
     /// 管理 SPA（`/admin` 配下）の静的ビルド成果物ディレクトリ（`index.html` を含む）。
     /// design doc（`2026-08-16-admin-dashboard-design.md` §5）: 同一 axum サーバの
     /// `/admin` から静的配信する。config ファイルからの相対パス（`config_dir` 基準）または
@@ -196,6 +200,31 @@ impl Default for LlmConfig {
             // 変更しない。`extract_product_references` も同じ上限を使うため 600 の余裕は
             // 引き続き必要）。
             max_tokens: 600,
+        }
+    }
+}
+
+/// Jev（TypeSafe System One）shadow 判定クライアントの設定。
+/// API キーは env `TYPESAFE_API_KEY` からのみ注入する（config への平文記載は禁止。
+/// `LlmConfig` と異なりファイルフォールバックは持たない）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct JevConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub model: String,
+    pub questions_path: String,
+    pub timeout_secs: u64,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "https://api.typesafe.ai/v1/systemone".to_string(),
+            model: "jev-latest".to_string(),
+            questions_path: "data/urtect/jev-questions.json".to_string(),
+            timeout_secs: 3,
         }
     }
 }
@@ -473,6 +502,72 @@ manual_scoring_v2_enabled = true
         assert_eq!(cfg.llm.api_key_file.as_deref(), Some("/tmp/key"));
         assert!(cfg.harness.vector_route_enabled);
         assert!(cfg.harness.manual_scoring_v2_enabled);
+    }
+
+    #[test]
+    fn jev_config_defaults_disabled() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(
+            !cfg.jev.enabled,
+            "jev must default to disabled (shadow-only, unwired)"
+        );
+        assert_eq!(cfg.jev.endpoint, "https://api.typesafe.ai/v1/systemone");
+        assert_eq!(cfg.jev.model, "jev-latest");
+        assert_eq!(cfg.jev.questions_path, "data/urtect/jev-questions.json");
+        assert_eq!(cfg.jev.timeout_secs, 3);
+    }
+
+    #[test]
+    fn jev_config_parses_section() {
+        let toml = r#"
+bind_addr = "127.0.0.1:3443"
+vegapunk_endpoint = "http://x:6840"
+[[projects]]
+project_id = "p"
+schema = "s"
+[jev]
+enabled = true
+endpoint = "https://jev.test/v1/systemone"
+model = "jev-test"
+questions_path = "data/test/jev-questions.json"
+timeout_secs = 7
+"#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.jev.enabled);
+        assert_eq!(cfg.jev.endpoint, "https://jev.test/v1/systemone");
+        assert_eq!(cfg.jev.model, "jev-test");
+        assert_eq!(cfg.jev.questions_path, "data/test/jev-questions.json");
+        assert_eq!(cfg.jev.timeout_secs, 7);
+    }
+
+    /// 既存の全 config ファイルが無改訂でロードでき、いずれも `[jev]` を明示していないため
+    /// 既定（無効）のまま読めることを固定する（受け入れ基準: Issue #56 は既存 config を
+    /// 一切変更しない）。
+    #[test]
+    fn all_existing_config_files_load_with_jev_disabled() {
+        let paths = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.cloudrun.toml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.gce.toml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.homesec.toml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.local-https.toml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.urtect.toml"),
+        ];
+        for path in paths {
+            let cfg = AppConfig::load(std::path::Path::new(path))
+                .unwrap_or_else(|err| panic!("{path} must load: {err}"));
+            assert!(
+                !cfg.jev.enabled,
+                "{path} does not declare [jev] and must default to disabled"
+            );
+        }
     }
 
     #[test]
