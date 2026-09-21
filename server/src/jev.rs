@@ -377,7 +377,9 @@ fn resolve_relative_to(config_dir: &Path, raw: &str) -> PathBuf {
     }
 }
 
-/// Jev endpoint の起動時検証（fail closed）。scheme と userinfo を見る。
+/// Jev endpoint の起動時検証（fail closed）。scheme・userinfo・クエリ文字列・フラグメントを見る。
+///
+/// 検査順序は parse → userinfo 拒否 → クエリ拒否 → フラグメント拒否 → scheme 拒否。
 ///
 /// - **scheme**: API キーと顧客発話(state)を平文で送信しないため、既定では https のみを
 ///   許可する。テスト用スタブサーバ(wiremock の MockServer は 127.0.0.1 の動的ポートで起動する)
@@ -386,15 +388,29 @@ fn resolve_relative_to(config_dir: &Path, raw: &str) -> PathBuf {
 ///   原因チェーンを出し、reqwest のエラー文言は `for url ({url})` と endpoint をそのまま含むため、
 ///   userinfo があると資格情報がアプリケーションログへ載る。認証は `Authorization` ヘッダ
 ///   （env `TYPESAFE_API_KEY`）で行うので、URL に資格情報を入れる理由は無い。
-/// - **クエリ文字列(`?key=value`)**: 拒否しない。正当なクエリパラメータ(マルチテナント識別用の
-///   `?tenant=...` 等)を壊さないための判断で、userinfo とは扱いを分けている
-///   (`build_accepts_https_endpoints_without_userinfo` が `?tenant=a@b` を明示的に許可する形で
-///   固定している)。ただし userinfo と同じ経路(reqwest のエラー文言 `for url ({url})`)でログへ
-///   載るため、`[jev] endpoint` のクエリへ資格情報(API キー・トークン)を置かないこと。
+/// - **クエリ文字列(`?key=value`)**: 拒否する。userinfo と同じ経路(reqwest のエラー文言
+///   `for url ({url})`)でログへ載るため、`?api_key=...` のような値を置けること自体が漏洩経路に
+///   なる。かつては正当な用途(マルチテナント識別用の `?tenant=...` 等)を壊さないよう doc の警告
+///   だけに留めていたが、現時点でそのような用途は存在せず、「資格情報をログに載せない」という
+///   この検証の目的を doc に委ねるのは弱いので fail closed に倒した(本番の endpoint
+///   `https://api.typesafe.ai/v1/systemone` はクエリを持たないため影響しない)。
+///   空クエリ(`?` のみ)も、`url::Url::query()` が `Some("")` を返すため拒否する。資格情報は
+///   運べないが、「クエリを一切持たない」という単純な規則にして運用者への説明を一文で済ませる
+///   ためで、末尾の `?` は設定の打ち間違いとしても検出する価値がある。
+/// - **フラグメント(`#token=...`)**: 拒否する。クエリと同じ漏洩経路で、空フラグメント(`#` のみ)も
+///   `url::Url::fragment()` が `Some("")` を返すため、クエリと同じ理由(「一切持たない」という
+///   単純な規則)で拒否する。**reqwest がフラグメントをエラー文言へ実際に露出するかは実測して
+///   いないが、露出するかどうかに関係なく拒否する**: `url::Url::as_str()` が fragment を保持する
+///   以上、URL を出すログ経路が将来 1 つ増えるだけで漏れるため。ここで拒否するのは userinfo・
+///   クエリ・フラグメントの 3 つだけで、**パスは検証対象外**（正当な endpoint のパスと資格情報を
+///   機械的に区別できないため）。パスに資格情報を置くと reqwest のエラー文言 `for url ({url})` と
+///   下記の scheme 拒否メッセージの両方にそのまま載るので、パスへ資格情報を置かないことは
+///   引き続き運用側の約束（このコードでは強制できない）として残る。
 ///
-/// **エラーメッセージに endpoint の値を出してよいのは、userinfo が無いと確認できた後だけ**。
-/// 値を出すと、塞ごうとしている漏洩を起動時エラーで再現してしまう。parse に失敗した値は
-/// userinfo の有無を判定できないので、parse 失敗と userinfo 拒否のメッセージは値を含めない。
+/// **エラーメッセージに endpoint の値を出してよいのは、userinfo・クエリ・フラグメントのいずれも
+/// 無いと確認できた後だけ**（＝現状 scheme 拒否のメッセージだけ）。値を出すと、塞ごうとしている
+/// 漏洩を起動時エラーで再現してしまう。parse に失敗した値はそれらの有無を判定できないので、
+/// parse 失敗・userinfo 拒否・クエリ拒否・フラグメント拒否のメッセージは値を含めない。
 fn validate_endpoint(endpoint: &str) -> Result<()> {
     let url = url::Url::parse(endpoint).context(
         "parse jev.endpoint as a URL (the value is omitted from this message because it may \
@@ -408,7 +424,26 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
              ([jev] endpoint を確認してください)"
         );
     }
-    // ここから先は userinfo が無いと確認済みなので、endpoint の値をメッセージに出してよい。
+    if url.query().is_some() {
+        bail!(
+            "jev.endpoint must not contain a query string (?key=value): failure logs include the \
+             endpoint URL, so a credential placed in the query would leak into the logs. \
+             The API key is sent via env {API_KEY_ENV}, never in the URL \
+             ([jev] endpoint を確認してください。値はクエリに資格情報が含まれうるため \
+             このメッセージには出しません)"
+        );
+    }
+    if url.fragment().is_some() {
+        bail!(
+            "jev.endpoint must not contain a fragment (#...): failure logs include the endpoint \
+             URL, so a credential placed in the fragment would leak into the logs. \
+             The API key is sent via env {API_KEY_ENV}, never in the URL \
+             ([jev] endpoint を確認してください。値はフラグメントに資格情報が含まれうるため \
+             このメッセージには出しません)"
+        );
+    }
+    // ここから先は userinfo・クエリ・フラグメントのいずれも無いと確認済みなので、endpoint の値を
+    // メッセージに出してよい。
     let is_loopback_http =
         url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"));
     if url.scheme() != "https" && !is_loopback_http {
@@ -973,19 +1008,170 @@ mod tests {
         }
     }
 
+    // ---- endpoint のクエリ文字列拒否（Copilot レビュー High、Issue #58） ----
+    //
+    // 失敗時の warn（`api.rs::query_jev_has_enough_info`）は原因チェーンを出し、reqwest の
+    // エラー文言は `for url ({url})` と endpoint をそのまま含む。クエリに資格情報
+    // （`?api_key=...` 等）を置けると userinfo と同じ経路でログへ載るため、起動時に拒否する。
+
+    const QUERY_SENTINEL: &str = "QUERY-SENTINEL";
+
     #[test]
-    fn build_accepts_https_endpoints_without_userinfo() {
-        // 本番の endpoint と同じ形。`@` がパス・クエリに現れても userinfo ではないので通る
+    fn build_rejects_an_endpoint_with_a_query_string_without_echoing_it() {
+        let endpoints = [
+            format!("https://api.typesafe.ai/v1/systemone?api_key={QUERY_SENTINEL}"),
+            // キー無しのクエリ（値だけを置く形）
+            format!("https://api.typesafe.ai/v1/systemone?{QUERY_SENTINEL}"),
+            // 旧仕様が「正当なクエリ」として許可していた形（`@` を含むクエリ）も拒否する
+            format!("https://api.typesafe.ai:8443/v1/systemone?tenant=a@{QUERY_SENTINEL}"),
+            // percent-encoded な値もそのまま拒否する（decode の有無に依存しない）
+            format!("https://api.typesafe.ai/v1/systemone?token=%41{QUERY_SENTINEL}"),
+            // https 以外でも、scheme 拒否のメッセージ（endpoint を出す）より先にクエリを拒否し、
+            // 値を出さないこと。検査順序（クエリ拒否 → scheme 拒否）を固定する。
+            format!("http://example.com/v1/systemone?api_key={QUERY_SENTINEL}"),
+            // テスト用スタブ向けの loopback http 例外の対象でも、クエリは拒否する。
+            format!("http://127.0.0.1:8080/v1/systemone?api_key={QUERY_SENTINEL}"),
+        ];
+        for endpoint in endpoints {
+            let err = build_with_endpoint(&endpoint)
+                .expect_err("an endpoint with a query string must fail closed at startup");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("query string"),
+                "the error must tell operators what to fix, got: {message}"
+            );
+            assert!(
+                message.contains(API_KEY_ENV),
+                "the error must point operators at where the credential belongs, got: {message}"
+            );
+            assert!(
+                !message.contains(QUERY_SENTINEL),
+                "the error message must not echo the query ({QUERY_SENTINEL}), got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_rejects_an_empty_query_marker_as_well() {
+        // `url::Url` は空クエリ `?` を `Some("")` として保持し、`as_str()` にも `?` が残る
+        // （実測。下の前提アサーションで固定する）。空クエリは資格情報を運べないが、
+        // 「クエリを一切持たない」という単純な規則にして運用者への説明を一文で済ませるため、
+        // 存在するクエリはすべて拒否する。末尾の `?` は設定の打ち間違いとしても妥当な検出対象。
+        let endpoint = "https://api.typesafe.ai/v1/systemone?";
+        let parsed = url::Url::parse(endpoint).expect("endpoint is a valid URL");
+        assert_eq!(
+            parsed.query(),
+            Some(""),
+            "premise: the url crate keeps an empty query as Some(\"\")"
+        );
+        assert_eq!(
+            parsed.as_str(),
+            "https://api.typesafe.ai/v1/systemone?",
+            "premise: url::Url::as_str() keeps the trailing '?', so any log path that prints \
+             the URL would leak it"
+        );
+        let err = build_with_endpoint(endpoint)
+            .expect_err("an empty query marker must fail closed like any other query");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("query string"),
+            "the error must tell operators what to fix, got: {message}"
+        );
+    }
+
+    // ---- endpoint のフラグメント拒否（Issue #58） ----
+    //
+    // フラグメント（`#token=...`）はクエリと同じ漏洩経路。`url::Url::as_str()` が fragment を
+    // 保持する（各テストの前提アサーションで固定）ため、その URL をエラー文言へ出す経路が 1 つでも
+    // あれば資格情報がログへ載る。reqwest が実際に fragment をエラー文言へ露出するかは実測して
+    // いないが、露出するかどうかに関係なく拒否する（将来ログ経路が 1 つ増えるだけで漏れるため）。
+
+    const FRAGMENT_SENTINEL: &str = "FRAGMENT-SENTINEL";
+
+    #[test]
+    fn build_rejects_an_endpoint_with_a_fragment_without_echoing_it() {
+        let endpoints = [
+            format!("https://api.typesafe.ai/v1/systemone#token={FRAGMENT_SENTINEL}"),
+            // キー無しのフラグメント（値だけを置く形）
+            format!("https://api.typesafe.ai/v1/systemone#{FRAGMENT_SENTINEL}"),
+            // percent-encoded な値もそのまま拒否する（decode の有無に依存しない）
+            format!("https://api.typesafe.ai/v1/systemone#tok=%41{FRAGMENT_SENTINEL}"),
+            // https 以外でも、scheme 拒否のメッセージ（endpoint を出す）より先にフラグメントを
+            // 拒否し、値を出さないこと。検査順序（フラグメント拒否 → scheme 拒否）を固定する。
+            format!("http://example.com/v1/systemone#token={FRAGMENT_SENTINEL}"),
+            // テスト用スタブ向けの loopback http 例外の対象でも、フラグメントは拒否する。
+            format!("http://127.0.0.1:8080/v1/systemone#token={FRAGMENT_SENTINEL}"),
+        ];
+        for endpoint in endpoints {
+            let parsed = url::Url::parse(&endpoint).expect("endpoint is a valid URL");
+            assert!(
+                parsed.as_str().contains(FRAGMENT_SENTINEL),
+                "premise: url::Url::as_str() keeps the fragment, so any log path that prints \
+                 the URL would leak it, got: {}",
+                parsed.as_str()
+            );
+            let err = build_with_endpoint(&endpoint)
+                .expect_err("an endpoint with a fragment must fail closed at startup");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("fragment"),
+                "the error must tell operators what to fix, got: {message}"
+            );
+            assert!(
+                message.contains(API_KEY_ENV),
+                "the error must point operators at where the credential belongs, got: {message}"
+            );
+            assert!(
+                !message.contains(FRAGMENT_SENTINEL),
+                "the error message must not echo the fragment ({FRAGMENT_SENTINEL}), got: \
+                 {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_rejects_an_empty_fragment_marker_as_well() {
+        // `url::Url` は空フラグメント `#` を `Some("")` として保持し、`as_str()` にも `#` が残る
+        // （実測。下の前提アサーションで固定する）。空フラグメントは資格情報を運べないが、クエリと
+        // 同じ理由（「フラグメントを一切持たない」という単純な規則にして運用者への説明を一文で
+        // 済ませる）で、存在するフラグメントはすべて拒否する。
+        let endpoint = "https://api.typesafe.ai/v1/systemone#";
+        let parsed = url::Url::parse(endpoint).expect("endpoint is a valid URL");
+        assert_eq!(
+            parsed.fragment(),
+            Some(""),
+            "premise: the url crate keeps an empty fragment as Some(\"\")"
+        );
+        assert_eq!(
+            parsed.as_str(),
+            "https://api.typesafe.ai/v1/systemone#",
+            "premise: url::Url::as_str() keeps the trailing '#', so any log path that prints \
+             the URL would leak it"
+        );
+        let err = build_with_endpoint(endpoint)
+            .expect_err("an empty fragment marker must fail closed like any other fragment");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("fragment"),
+            "the error must tell operators what to fix, got: {message}"
+        );
+    }
+
+    #[test]
+    fn build_accepts_https_endpoints_without_userinfo_query_or_fragment() {
+        // 本番の endpoint と同じ形。`@` がパスに現れても userinfo ではないので通る
         // （拒否の判定は文字列中の `@` ではなく、パース結果の username / password で行う）。
+        // クエリ・フラグメントを持つ形は上の `build_rejects_an_endpoint_with_a_query_string_...` /
+        // `build_rejects_an_endpoint_with_a_fragment_...` が拒否を固定する。
         for endpoint in [
             "https://api.typesafe.ai/v1/systemone",
-            "https://api.typesafe.ai:8443/v1/systemone?tenant=a@b",
+            "https://api.typesafe.ai:8443/v1/systemone",
             "https://api.typesafe.ai/v1/user@systemone",
         ] {
             let client = build_with_endpoint(endpoint);
             assert!(
                 client.is_ok(),
-                "{endpoint} has no userinfo and must be accepted, got: {:?}",
+                "{endpoint} has no userinfo, query or fragment and must be accepted, got: {:?}",
                 client.err()
             );
         }

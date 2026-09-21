@@ -454,8 +454,9 @@ fn decide_jev_hearing_action(
 /// response body` の下に原因チェーンが続く**（`jev.rs::describe_send_error` の doc 参照）。
 /// **チェーンには endpoint の URL が含まれうる**
 /// （config 由来の公開値。API キーは `Authorization` ヘッダで送るため URL には載らない。endpoint の
-/// userinfo は起動時検証 `jev.rs::validate_endpoint` が拒否する。ただし**クエリ文字列は拒否されない**
-/// ため、`[jev] endpoint` のクエリに資格情報を置くとログへ載る（クエリに資格情報を置かないこと））。
+/// userinfo・クエリ文字列・フラグメントは起動時検証 `jev.rs::validate_endpoint` が拒否する。
+/// **パスは検証対象外**（正当な endpoint のパスと資格情報を機械的に区別できないため）なので、
+/// パスに資格情報を置くとこのログへ載る）。
 /// **API キーと顧客発話（`state`）は含まれない**（reqwest のエラーはリクエスト本文もヘッダも
 /// 持たない。`assert_jev_failure_logged_once_without_leaking` が固定）。
 async fn query_jev_has_enough_info(

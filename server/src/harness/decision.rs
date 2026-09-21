@@ -139,6 +139,13 @@ pub enum AnswerDecision {
         /// route では拘束度を判別できない。呼び出し側（`api.rs`）はこのフィールドで
         /// 「第1層 advisory」を判別し、Jev の `has_enough_info` に基づく聞き返し判定
         /// （`missing` の中身に依存しない別経路）を発火させる。
+        ///
+        /// このフィールドは `api.rs` の内部判定専用であり、MCP の出力契約には載せない
+        /// （`#[serde(skip)]`）。`AnswerDecision` は `evaluate_answerability` の応答へそのまま
+        /// シリアライズされ生成スキーマにも出るため、skip しないと社内の拘束度分類が MCP
+        /// クライアントへ露出し、「MCP tool の入出力の形は変更しない」不変条件に反する。
+        /// `Deserialize` は derive していないので、skip による round-trip の破壊は起きない。
+        #[serde(skip)]
         rule_binding: Option<Binding>,
     },
 }
@@ -680,6 +687,73 @@ mod tests {
             }
             other => panic!("expected layer3 escalate, got {other:?}"),
         }
+    }
+
+    // --- Issue #58: rule_binding は MCP の出力契約（payload とスキーマ）に載せない ---
+    //
+    // `AnswerDecision` は `EvaluateAnswerabilityResponse.decision` として MCP tool
+    // `evaluate_answerability` の応答へそのままシリアライズされ、生成スキーマにも出る。
+    // `rule_binding` は mandatory / advisory という社内の拘束度分類で、`api.rs` の内部判定専用。
+    // specs/production-cs-mcp.md の「MCP tool（`evaluate_answerability`）の入出力の形は変更しない」
+    // に従い、外へ出してはならない。
+
+    fn escalate_with_binding(rule_binding: Option<Binding>) -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            rule_binding,
+        }
+    }
+
+    #[test]
+    fn escalate_payload_keeps_its_pre_issue_58_shape_and_hides_rule_binding() {
+        // Issue #58 以前の Escalate のキー集合（tag の `decision` を含む）。`rule_binding` の値に
+        // 関わらず（Some(Mandatory) / Some(Advisory) / None）この集合と完全一致すること。
+        // 「rule_binding が無い」だけでなく「他のキーが増減していない」ことまで固定する。
+        const PRE_ISSUE_58_ESCALATE_KEYS: [&str; 7] = [
+            "audit_required",
+            "decision",
+            "disclosure_scope",
+            "layer",
+            "missing",
+            "reason",
+            "route_to",
+        ];
+        for rule_binding in [Some(Binding::Mandatory), Some(Binding::Advisory), None] {
+            let value = serde_json::to_value(escalate_with_binding(rule_binding))
+                .expect("AnswerDecision must serialize");
+            let object = value
+                .as_object()
+                .expect("AnswerDecision must serialize to a JSON object");
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys, PRE_ISSUE_58_ESCALATE_KEYS,
+                "the MCP payload for rule_binding={rule_binding:?} must not gain or lose keys \
+                 (rule_binding is an internal classification), got: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_decision_json_schema_hides_rule_binding() {
+        let schema = schemars::schema_for!(AnswerDecision);
+        let rendered = serde_json::to_string(&schema).expect("schema must serialize");
+        // 空振り防止: 同じ variant の他フィールドがスキーマに出ていること（スキーマ生成自体が
+        // 成功して内容を持っていること）を先に確かめる。
+        assert!(
+            rendered.contains("route_to"),
+            "the generated schema must describe the Escalate fields, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("rule_binding"),
+            "rule_binding must not appear in the generated schema advertised to MCP clients, \
+             got: {rendered}"
+        );
     }
 
     #[test]

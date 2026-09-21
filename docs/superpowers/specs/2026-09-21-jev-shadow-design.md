@@ -116,6 +116,13 @@ info`)を判定に使い(2 と矛盾)、対象ターンの応答時間は Jev �
 ため、route では拘束度を判別できない)。実装は `server/src/api.rs` の
 `is_layer1_advisory_escalate` / `resolve_jev_has_enough_info`。
 
+`rule_binding` は `api.rs` の内部判定専用で、**MCP の出力契約(`evaluate_answerability` の
+応答 payload と生成スキーマ)には載せない**。`AnswerDecision` は
+`EvaluateAnswerabilityResponse.decision` としてそのままシリアライズされるため、
+`#[serde(skip)]` で外している(`specs/production-cs-mcp.md` の「MCP tool の入出力の形は
+変更しない」不変条件。`decision.rs` と `rmcp_server.rs` のテストが payload・スキーマ・
+`tools/list` の `outputSchema` の 3 か所で固定している)。
+
 `layer == 1` の選択自体(`rules::match_layer1`)は、マッチした全ルールのうち
 `Binding::Mandatory` を `Binding::Advisory` より必ず優先する(同一 binding 内は配列の
 先頭優先)。したがって advisory と mandatory の条件が同時に成立するターン(累積 signal
@@ -189,7 +196,7 @@ config `[jev] enough_info_threshold`(既定 0.5)。`has_enough_info < enough_inf
 - Jev のタイムアウト(`[jev] timeout_secs`)
 - Jev の応答に `has_enough_info` の `noul` 回答が無い(欠落・型不一致)
 
-失敗時の warn(`jev hearing evaluate failed`)は `error` に原因チェーン(`{err:#}`)を出すため、endpoint の URL が含まれうる(config 由来の公開値。endpoint に userinfo(`user:pass@`)が含まれる構成は、資格情報がログに載るため、起動時検証 `JevClient::build` が fail closed で拒否する。拒否・parse 失敗のエラーメッセージにも endpoint の値は出さない)。API キー・顧客発話(`state`)・モデル生成文字列は含まれない(§3 の 3・5。API キーは `Authorization` ヘッダで送るため。ただし `[jev] endpoint` のクエリ文字列へ資格情報を置いた場合は endpoint URL の一部としてログに載る。クエリへ資格情報を置かないこと)。タイムアウトのうち `send()` 中(接続・リクエスト送出・応答ヘッダ受信まで)のタイムアウトは `jev evaluate api timed out after <timeout_secs>s` という固有の文言で判別でき(`jev.rs` が所有する安定した文字列で、reqwest / hyper の文言には依存しない)、接続拒否・DNS 失敗・TLS 失敗などそれ以外の送出エラーは `call jev evaluate api` の下に原因チェーンが続く。応答ヘッダ受信後の本文読み込み中(`response.chunk()`)のタイムアウトはこの固有文言が付かず、`read jev evaluate api response body` の下に原因チェーンが続く。
+失敗時の warn(`jev hearing evaluate failed`)は `error` に原因チェーン(`{err:#}`)を出すため、endpoint の URL が含まれうる(config 由来の公開値。endpoint に userinfo(`user:pass@`)・クエリ文字列(`?key=value`。空の `?` を含む)・フラグメント(`#token=...`。空の `#` を含む)のいずれかが含まれる構成は、資格情報がログに載るため、起動時検証 `JevClient::build` が fail closed で拒否する。フラグメントは reqwest がエラー文言へ実際に露出するかを実測していないが、`url::Url::as_str()` が保持する以上ログ経路が 1 つ増えるだけで漏れるため、露出の有無に関係なく拒否する。エラーメッセージに endpoint の値を出してよいのは、userinfo・クエリ・フラグメントのいずれも無いと確認できた後だけ(現状は scheme 拒否のメッセージのみ)で、parse 失敗・userinfo 拒否・クエリ拒否・フラグメント拒否のメッセージには endpoint の値を出さない。**パスは検証対象外**(正当な endpoint のパスと資格情報を機械的に区別できないため)なので、パスに資格情報を置くと reqwest のエラー文言にも scheme 拒否のメッセージにもそのまま載る。認証は env `TYPESAFE_API_KEY` で行い、URL には資格情報を置かない。本番の endpoint `https://api.typesafe.ai/v1/systemone` はクエリもフラグメントも持たないため影響しない)。API キー・顧客発話(`state`)・モデル生成文字列は含まれない(§3 の 3・5。API キーは `Authorization` ヘッダで送るため)。タイムアウトのうち `send()` 中(接続・リクエスト送出・応答ヘッダ受信まで)のタイムアウトは `jev evaluate api timed out after <timeout_secs>s` という固有の文言で判別でき(`jev.rs` が所有する安定した文字列で、reqwest / hyper の文言には依存しない)、接続拒否・DNS 失敗・TLS 失敗などそれ以外の送出エラーは `call jev evaluate api` の下に原因チェーンが続く。応答ヘッダ受信後の本文読み込み中(`response.chunk()`)のタイムアウトはこの固有文言が付かず、`read jev evaluate api response body` の下に原因チェーンが続く。
 
 **応答時間は従来と同一にはならない。** `resolve_jev_has_enough_info` は `evaluate` を `await`
 する同期呼び出しであり、トリガー条件(上記 3 条件)を満たした対象ターンに限り、Jev の 1 往復分
