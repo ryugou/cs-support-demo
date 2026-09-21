@@ -378,21 +378,38 @@ pub fn decide_reply_action(
     }
 }
 
-/// Issue #58: 第1層 advisory の聞き返し判定に Jev の `has_enough_info` を使うべきターンか。
+/// Issue #58: Jev の `has_enough_info` による聞き返し判定へ流すべきターンか（マッチした第1層
+/// ルールが `product_and_symptom` のヒアリング契約を宣言しているターンか）。
 ///
-/// - layer=1 かつ `rule_binding == Some(Binding::Advisory)` の `Escalate` であること
-///   （mandatory ルール・第2層・第3層は対象外。`decision::decide` が第1層マッチ時に積む
-///   `rule_binding` そのものを判別に使い、`missing` の中身には依存しない。背景の不具合:
-///   「電源が入らなくなった」は advisory ルールにマッチしたが `missing`（マニュアル材料の
-///   カバレッジ不足で決まる）がたまたま空になり、聞き返しに入らず即エスカレーションして
-///   いた。`missing` に依存しないことがこの是正の核）
+/// - layer=1 かつ、マッチしたルールが `HearingContract::ProductAndSymptom` を宣言している
+///   `Escalate` であること（`decision::decide` が第1層マッチ時に `hearing` へ積む。mandatory
+///   ルール・宣言の無いルール・第2層・第3層はすべて `None` で対象外）。`missing` の中身には
+///   依存しない。背景の不具合: 「電源が入らなくなった」は advisory ルールにマッチしたが
+///   `missing`（マニュアル材料のカバレッジ不足で決まる）がたまたま空になり、聞き返しに入らず
+///   即エスカレーションしていた。`missing` に依存しないことがこの是正の核
 /// - 今ターンの signal 抽出が `LexiconFallback` に落ちていないこと（抽出 LLM 不調時は
 ///   `decide_reply_action` 自身が fail-closed で `EscalationReply` に倒すため、Jev を呼んでも
 ///   結果を使わない）
 /// - `conv.is_already_escalated()` でないこと（確定済み case は `decide_reply_action` 自身が
 ///   `!conv.is_already_escalated()` ガードで `EscalationReply` に倒すため、Jev を呼んでも結果を
 ///   使わず無駄な待ちとコストが発生するだけ。二重実装を避け、既存の契約に委ねる）
-fn is_layer1_advisory_escalate(
+///
+/// **なぜ binding（advisory か否か）ではなくヒアリング契約で判別するのか**: `rules.json` の
+/// advisory は 2 件あり、情報の契約が違う。`warranty-failure`（製品の故障）は型番と症状が揃って
+/// 初めて話が進むが、`contract-billing`（契約・請求）は型番も症状も関係ない。一方
+/// `has_enough_info` の判定基準は「対象の製品と具体的な症状の両方が分かる」
+/// （`server/data/urtect/jev-questions.json`）で、聞き返し文言も型番と症状を尋ねる固定文
+/// （`JEV_HEARING_MISSING_TEXT`）。したがって binding だけで判別すると、十分に具体的な契約・請求の
+/// 問い合わせが型番と症状を尋ねる無関係なヒアリングへ流れ、Issue #58 が直そうとした「質問ばかりで
+/// 話が進まない」不具合が別の入口で再現する（PR #60 Copilot 指摘）。加えて、契約・請求の顧客発話を
+/// 不要に第三者（TypeSafe）へ送ることにもなる。宣言の無いルール（`contract-billing`）は Jev を
+/// 呼ばず、従来の `decide_reply_action`（`missing` ベース）に委ねる。rule_id では分岐しない
+/// （ルールを足しても、宣言を付けるだけで対象にできる）。
+///
+/// 判別は `matches!` で `ProductAndSymptom` を名指ししている（`is_some()` ではない）。将来別の
+/// 契約が増えても、その契約は別の質問が要るので、この経路（`has_enough_info` 専用）へ自動では
+/// 流れない。
+fn is_product_and_symptom_hearing_turn(
     outcome: &crate::harness::EvaluationOutcome,
     conv: &crate::harness::CaseConvState,
 ) -> bool {
@@ -401,14 +418,15 @@ fn is_layer1_advisory_escalate(
             &outcome.decision,
             AnswerDecision::Escalate {
                 layer: 1,
-                rule_binding: Some(crate::harness::rules::Binding::Advisory),
+                hearing: Some(crate::harness::rules::HearingContract::ProductAndSymptom),
                 ..
             }
         )
         && !conv.is_already_escalated()
 }
 
-/// Issue #58: 第1層 advisory の聞き返し判定そのもの（純関数）。`decide_reply_action` の
+/// Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルールの聞き返し判定
+/// そのもの（純関数）。`decide_reply_action` の
 /// decision table とは独立に存在し、`decide_reply_action` 自体は変更しない。
 ///
 /// `has_enough_info` が閾値未満、かつ聞き返し予算内なら聞き返し（`Clarify`）、そうでなければ
@@ -489,9 +507,11 @@ async fn query_jev_has_enough_info(
     }
 }
 
-/// Issue #58: `is_layer1_advisory_escalate` が true で、かつ Jev が有効
-/// （`harness.jev_client.is_some()`）なときだけ Jev を呼ぶ。対象外のターン・Jev 無効
-/// （`[jev] enabled = false`）のいずれも Jev を呼ばずに `None` を返す。
+/// Issue #58: `is_product_and_symptom_hearing_turn` が true（マッチした第1層ルールが
+/// `product_and_symptom` のヒアリング契約を宣言している）で、かつ Jev が有効
+/// （`harness.jev_client.is_some()`）なときだけ Jev を呼ぶ。対象外のターン（宣言の無い
+/// advisory ルール `contract-billing` を含む）・Jev 無効（`[jev] enabled = false`）のいずれも
+/// Jev を呼ばずに `None` を返す。
 ///
 /// 戻り値が `Some` のときだけ、呼び出し側は `decide_jev_hearing_action` を使い、かつ
 /// `Harness::record_jev_hearing_decision` で専用の監査行を書くこと（`None` のターンは
@@ -520,7 +540,7 @@ async fn resolve_jev_has_enough_info(
     message: &str,
     request_id: &str,
 ) -> Option<f64> {
-    if !is_layer1_advisory_escalate(outcome, conv) {
+    if !is_product_and_symptom_hearing_turn(outcome, conv) {
         return None;
     }
     let jev = harness.jev_client.as_ref()?;
@@ -882,7 +902,8 @@ fn is_clarify_exhausted(
 ///   たびに「聞き返し上限到達」という誤ったログが出て計測が無意味になる。
 ///
 /// `outcome` / `cfg` は非 Jev 経路にのみ使う。Jev 経路では `outcome.clarification_allowed` が
-/// 契約上 false になる（Jev トリガー条件が第1層 advisory の `Escalate` に限られるため、
+/// 契約上 false になる（Jev トリガー条件がヒアリング契約を宣言した第1層 `Escalate`
+/// （`is_product_and_symptom_hearing_turn`）に限られるため、
 /// `harness::mod::clarification_allowed()` の契約上ほぼ常に false）ため参照しない。
 fn is_reply_clarify_exhausted(
     jev_has_enough_info: Option<f64>,
@@ -1605,7 +1626,8 @@ async fn reply_handler(
                 &outcome.case_id,
             );
 
-            // Issue #58: 第1層 advisory の聞き返し判定にのみ Jev の has_enough_info を使う。
+            // Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルール
+            // （`warranty-failure`）にマッチしたターンにのみ Jev の has_enough_info を使う。
             // 対象外のターン・Jev 無効・HTTPエラー・タイムアウト・応答欠落のいずれでも
             // `None` になり、その場合は従来どおり `decide_reply_action`（missing ベース）に
             // 委譲する（fail-back。詳細は `resolve_jev_has_enough_info` の doc コメント）。
@@ -2174,16 +2196,16 @@ mod tests {
                 required: 0.8,
                 best: 0.5,
             }],
-            rule_binding: None,
+            hearing: None,
         }
     }
 
-    /// 第1層（明示エスカレーションルール、rule_match）相当の escalate。`rule_binding` を
-    /// `None` にしているのは既存呼び出し元（このテストファイルの他の多数のテスト）が
-    /// 「第1層 advisory」判定に該当しないことを前提にしているため（Issue #58: Jev 起点の
-    /// 聞き返し判定は `rule_binding == Some(Binding::Advisory)` のときだけ発火する。既存
-    /// テストの意図を変えないよう、rule_binding を明示するテストは別ヘルパー
-    /// `layer1_advisory_escalate_decision` / `layer1_mandatory_escalate_decision` を新設する）。
+    /// 第1層（明示エスカレーションルール、rule_match）相当の escalate。`hearing` を `None` に
+    /// しているのは既存呼び出し元（このテストファイルの他の多数のテスト）が「ヒアリング契約を
+    /// 宣言した第1層ルール」判定に該当しないことを前提にしているため（Issue #58: Jev 起点の
+    /// 聞き返し判定は `hearing == Some(HearingContract::ProductAndSymptom)` のときだけ発火する。
+    /// 既存テストの意図を変えないよう、宣言を明示するテストは別ヘルパー
+    /// `layer1_hearing_escalate_decision` / `layer1_escalate_without_hearing_decision` を使う）。
     fn rule_match_escalate_decision() -> AnswerDecision {
         AnswerDecision::Escalate {
             reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
@@ -2192,12 +2214,13 @@ mod tests {
             disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: vec![],
-            rule_binding: None,
+            hearing: None,
         }
     }
 
-    /// Issue #58: 第1層 advisory 相当の escalate（Jev 起点の聞き返し判定の対象）。
-    fn layer1_advisory_escalate_decision() -> AnswerDecision {
+    /// Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（実データでは
+    /// `warranty-failure`）にマッチした escalate。Jev 起点の聞き返し判定の対象。
+    fn layer1_hearing_escalate_decision() -> AnswerDecision {
         AnswerDecision::Escalate {
             reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
             layer: 1,
@@ -2205,12 +2228,15 @@ mod tests {
             disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: vec![],
-            rule_binding: Some(crate::harness::rules::Binding::Advisory),
+            hearing: Some(crate::harness::rules::HearingContract::ProductAndSymptom),
         }
     }
 
-    /// Issue #58: 第1層 mandatory 相当の escalate（Jev 起点の聞き返し判定の対象外）。
-    fn layer1_mandatory_escalate_decision() -> AnswerDecision {
+    /// Issue #58: ヒアリング契約を宣言していない第1層ルールにマッチした escalate（Jev 起点の
+    /// 聞き返し判定の対象外）。mandatory ルール、および宣言の無い advisory ルール（実データでは
+    /// `contract-billing`）がこの形になる。この 2 つは decision の上では区別されない
+    /// （区別しないことが設計。判別は宣言だけで行う）。
+    fn layer1_escalate_without_hearing_decision() -> AnswerDecision {
         AnswerDecision::Escalate {
             reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
             layer: 1,
@@ -2218,8 +2244,46 @@ mod tests {
             disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: vec![],
-            rule_binding: Some(crate::harness::rules::Binding::Mandatory),
+            hearing: None,
         }
+    }
+
+    /// 実際に配布される `data/urtect/rules.json` で `decide()` を回した decision。手組みの
+    /// decision ではなく**実データの宣言**を通して、Jev を呼ぶか否かを固定するためのヘルパ。
+    /// `best_manual_score` は閾値（low=0.6）未満の 0.1 にして、`missing` が積まれる
+    /// （＝従来なら advisory が聞き返しに入りうる）状況で判別が宣言だけで決まることも見る。
+    fn bundled_layer1_decision(signal_values: &[&str]) -> AnswerDecision {
+        let rules = crate::test_support::load_bundled_escalation_rules();
+        let question: crate::harness::signal::SignalSet = signal_values
+            .iter()
+            .map(|v| crate::harness::signal::Signal::new(*v))
+            .collect();
+        let thresholds = decision::Thresholds {
+            low: 0.6,
+            mid: 0.8,
+            high: 0.95,
+        };
+        let decision = decision::decide(&decision::DecisionInput {
+            question_signals: &question,
+            question_raw: "質問",
+            rules: &rules,
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: decision::StakesInput {
+                mandatory_domain_near: false,
+                ng_near_hit: false,
+                hazard_signal_count: 0,
+            },
+            thresholds: &thresholds,
+            default_route: "triage",
+        });
+        assert!(
+            matches!(decision, AnswerDecision::Escalate { layer: 1, .. }),
+            "the bundled rules must escalate {signal_values:?} at layer 1, got {decision:?}"
+        );
+        decision
     }
 
     fn base_outcome(
@@ -2510,7 +2574,7 @@ mod tests {
         assert_eq!(action, ReplyAction::Clarify);
     }
 
-    // ---- Issue #58: 第1層 advisory の聞き返し判定に Jev の has_enough_info を使う ----
+    // ---- Issue #58: ヒアリング契約を宣言した第1層ルールの聞き返し判定に Jev の has_enough_info を使う ----
 
     // --- decide_jev_hearing_action（純関数。実測値は背景 section・design doc §7 参照） ---
 
@@ -2545,51 +2609,79 @@ mod tests {
         assert_eq!(action, ReplyAction::EscalationReply);
     }
 
-    // --- is_layer1_advisory_escalate（純関数。対象/対象外の切り分け） ---
+    // --- is_product_and_symptom_hearing_turn（純関数。対象/対象外の切り分け） ---
 
     #[test]
-    fn is_layer1_advisory_escalate_true_for_a_fresh_layer1_advisory_escalation() {
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+    fn is_product_and_symptom_hearing_turn_true_for_a_fresh_layer1_escalation_declaring_the_hearing(
+    ) {
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
         let conv = default_conv_state();
-        assert!(is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     #[test]
-    fn is_layer1_advisory_escalate_false_for_layer1_mandatory() {
-        // Issue #58 必須テスト4: mandatory ルールは has_enough_info の値に関わらず対象外
-        // （Jev をそもそも呼ばない）。
-        let outcome = base_outcome(layer1_mandatory_escalate_decision(), false);
+    fn is_product_and_symptom_hearing_turn_false_for_a_layer1_escalation_without_a_declaration() {
+        // Issue #58 必須テスト4: 宣言の無いルール（mandatory 全件と、契約・請求のような
+        // advisory）は has_enough_info の値に関わらず対象外（Jev をそもそも呼ばない）。
+        let outcome = base_outcome(layer1_escalate_without_hearing_decision(), false);
         let conv = default_conv_state();
-        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     // reviewer Stage 2 codex レビュー Critical 1 の回帰防止（名指し）。
     //
     // `rules::match_layer1` を binding 優先に直す前は、advisory ルールと mandatory ルールが
-    // 同一ターンで同時マッチすると、配列順によっては advisory が先に確定し
-    // `decide` が `rule_binding: Some(Binding::Advisory)` を返してしまい得た。その結果
-    // `is_layer1_advisory_escalate` が true になり、本来問答無用で即エスカレーションすべき
-    // mandatory 事象（例: 「人に代わってください」による human-handoff）が Jev 起点の
-    // 聞き返しループへ吸収される。`match_layer1` 修正後は同時マッチ時に必ず
-    // `rule_binding: Some(Binding::Mandatory)` が選ばれるため、この形の decision に対して
-    // `is_layer1_advisory_escalate` が false であり続けることをここで名指しに固定する
-    // （`decision.rs::bundled_warranty_failure_and_human_handoff_conflict_resolves_to_mandatory`
-    // と対になる、api.rs 側の回帰ガード）。
+    // 同一ターンで同時マッチすると、配列順によっては advisory（warranty-failure）が先に確定し、
+    // その宣言が decision に載ってしまい得た。その結果 `is_product_and_symptom_hearing_turn` が
+    // true になり、本来問答無用で即エスカレーションすべき mandatory 事象（例:「人に代わって
+    // ください」による human-handoff）が Jev 起点の聞き返しループへ吸収される。`match_layer1`
+    // 修正後は同時マッチ時に必ず mandatory が選ばれ、宣言は載らない。実データで `decide` を回し、
+    // その decision に対して `is_product_and_symptom_hearing_turn` が false であり続けることを
+    // 名指しに固定する（`decision.rs::bundled_warranty_failure_and_human_handoff_conflict_
+    // resolves_to_mandatory` と対になる、api.rs 側の回帰ガード）。
     #[test]
-    fn is_layer1_advisory_escalate_false_for_the_mandatory_winner_of_an_advisory_mandatory_conflict(
+    fn is_product_and_symptom_hearing_turn_false_for_the_mandatory_winner_of_a_warranty_failure_conflict(
     ) {
-        let outcome = base_outcome(layer1_mandatory_escalate_decision(), false);
+        let decision =
+            bundled_layer1_decision(&["warranty_hardware_failure", "human_handoff_request"]);
+        let outcome = base_outcome(decision, false);
         let conv = default_conv_state();
         assert!(
-            !is_layer1_advisory_escalate(&outcome, &conv),
-            "a layer1 decision whose rule_binding resolved to Mandatory (because match_layer1 \
-             prioritized it over a conflicting advisory rule) must never be treated as the \
-             layer1-advisory Jev-hearing target"
+            !is_product_and_symptom_hearing_turn(&outcome, &conv),
+            "human-handoff (mandatory) must never be treated as the Jev-hearing target, even \
+             when warranty-failure (which declares the hearing) matches in the same turn"
+        );
+    }
+
+    // PR #60 Copilot 指摘の回帰防止（実データ）。契約・請求は advisory だが型番も症状も関係ない。
+    // 「advisory だから聞き返す」結合に戻ると、十分に具体的な契約・請求の問い合わせが型番と
+    // 症状を尋ねるヒアリングへ流れる。
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_for_the_bundled_contract_billing_rule() {
+        let outcome = base_outcome(
+            bundled_layer1_decision(&["contract_billing_question"]),
+            true,
+        );
+        let conv = default_conv_state();
+        assert!(
+            !is_product_and_symptom_hearing_turn(&outcome, &conv),
+            "contract-billing needs neither a model number nor a symptom, so it must not be \
+             a target of the product-and-symptom hearing"
         );
     }
 
     #[test]
-    fn is_layer1_advisory_escalate_false_for_layer2_prohibited_domain() {
+    fn is_product_and_symptom_hearing_turn_true_for_the_bundled_warranty_failure_rule() {
+        let outcome = base_outcome(
+            bundled_layer1_decision(&["warranty_hardware_failure"]),
+            true,
+        );
+        let conv = default_conv_state();
+        assert!(is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_for_layer2_prohibited_domain() {
         let decision = AnswerDecision::Escalate {
             reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
             layer: 2,
@@ -2597,22 +2689,22 @@ mod tests {
             disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: Vec::new(),
-            rule_binding: None,
+            hearing: None,
         };
         let outcome = base_outcome(decision, false);
         let conv = default_conv_state();
-        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     #[test]
-    fn is_layer1_advisory_escalate_false_for_layer3_gray_insufficient_directness() {
+    fn is_product_and_symptom_hearing_turn_false_for_layer3_gray_insufficient_directness() {
         let outcome = base_outcome(gray_escalate_decision(), true);
         let conv = default_conv_state();
-        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     #[test]
-    fn is_layer1_advisory_escalate_false_for_layer3_gray_unknown_added_signal() {
+    fn is_product_and_symptom_hearing_turn_false_for_layer3_gray_unknown_added_signal() {
         let decision = AnswerDecision::Escalate {
             reason: crate::harness::decision::EscalateReason::UnknownAddedSignal,
             layer: 3,
@@ -2623,45 +2715,46 @@ mod tests {
                 required: 0.8,
                 best: 0.5,
             }],
-            rule_binding: None,
+            hearing: None,
         };
         let outcome = base_outcome(decision, true);
         let conv = default_conv_state();
-        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     #[test]
-    fn is_layer1_advisory_escalate_false_when_extraction_fell_back_to_lexicon() {
-        let mut outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+    fn is_product_and_symptom_hearing_turn_false_when_extraction_fell_back_to_lexicon() {
+        let mut outcome = base_outcome(layer1_hearing_escalate_decision(), true);
         outcome.extraction_mode = crate::harness::extraction::ExtractionMode::LexiconFallback;
         let conv = default_conv_state();
-        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     #[test]
-    fn is_layer1_advisory_escalate_false_when_already_escalated_via_confirmed_flag() {
+    fn is_product_and_symptom_hearing_turn_false_when_already_escalated_via_confirmed_flag() {
         // Issue #58 必須テスト7: 確定済み case では Jev を呼ばない
         // （`decide_reply_action` 自身のガードに委ねる。二重実装を避ける）。
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
         let mut conv = default_conv_state();
         conv.escalation_confirmed = true;
-        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     #[test]
-    fn is_layer1_advisory_escalate_false_when_already_escalated_via_awaiting_time_pref() {
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+    fn is_product_and_symptom_hearing_turn_false_when_already_escalated_via_awaiting_time_pref() {
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
         let mut conv = default_conv_state();
         conv.awaiting_time_pref = true;
-        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     #[test]
-    fn is_layer1_advisory_escalate_false_when_already_escalated_via_preferred_contact_time() {
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+    fn is_product_and_symptom_hearing_turn_false_when_already_escalated_via_preferred_contact_time()
+    {
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
         let mut conv = default_conv_state();
         conv.preferred_contact_time = Some("平日午後".to_string());
-        assert!(!is_layer1_advisory_escalate(&outcome, &conv));
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
     }
 
     // --- resolve_jev_has_enough_info（Jev 呼び出しの最小限の統合テスト、wiremock） ---
@@ -2723,16 +2816,17 @@ mod tests {
         }))
     }
 
-    /// 聞き返し判定の対象ターン（第1層 advisory・未確定 case）で `resolve_jev_has_enough_info` を
+    /// 聞き返し判定の対象ターン（ヒアリング契約を宣言した第1層ルール・未確定 case）で
+    /// `resolve_jev_has_enough_info` を
     /// 1 回実行し、`(戻り値, 捕捉した生ログ)` を返す。生ログは INFO 以上を全て含む（WARN だけに
     /// 絞ると、別レベルへの漏洩を見逃すため、漏洩の否定 assert には生ログを使う）。
-    async fn resolve_on_advisory_turn(
+    async fn resolve_on_hearing_turn(
         harness: &Harness,
         history: &[ReplyHistoryTurn],
         message: &str,
         request_id: &str,
     ) -> (Option<f64>, String) {
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
         let conv = default_conv_state();
         crate::test_support::capture_logs_async(resolve_jev_has_enough_info(
             harness, &outcome, &conv, history, message, request_id,
@@ -2747,7 +2841,7 @@ mod tests {
         request_id: &str,
     ) -> (Option<f64>, String) {
         let (_server, harness) = jev_stub_harness(jev_answers_response(answers_json), 5).await;
-        resolve_on_advisory_turn(&harness, &[], "電源が入らなくなった", request_id).await
+        resolve_on_hearing_turn(&harness, &[], "電源が入らなくなった", request_id).await
     }
 
     /// Jev 呼び出しの失敗（HTTP エラー・タイムアウト）で fail-back したときのログ契約を検証する。
@@ -2793,7 +2887,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_jev_has_enough_info_returns_none_when_jev_disabled() {
         let harness = test_harness(); // jev_client: None（`[jev] enabled = false` 相当）
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
         let conv = default_conv_state();
 
         let result = resolve_jev_has_enough_info(
@@ -2828,7 +2922,7 @@ mod tests {
         ];
 
         let (result, logs) =
-            resolve_on_advisory_turn(&harness, &history, "型番は ADC-V523 です", "req-1").await;
+            resolve_on_hearing_turn(&harness, &history, "型番は ADC-V523 です", "req-1").await;
 
         assert_eq!(result, Some(0.14));
         // 正常系では WARN / ERROR を一切出さない。`noul` が正常に返ったターンで無駄な warn が
@@ -2864,7 +2958,7 @@ mod tests {
         let (_server, harness) = jev_stub_harness(wiremock::ResponseTemplate::new(500), 5).await;
         let utterance = "電源が入らなくなった";
 
-        let (result, logs) = resolve_on_advisory_turn(&harness, &[], utterance, "req-1").await;
+        let (result, logs) = resolve_on_hearing_turn(&harness, &[], utterance, "req-1").await;
 
         assert_eq!(result, None);
         assert_jev_failure_logged_once_without_leaking(&logs, "req-1", utterance);
@@ -2882,7 +2976,7 @@ mod tests {
         .await;
         let utterance = "電源が入らなくなった";
 
-        let (result, logs) = resolve_on_advisory_turn(&harness, &[], utterance, "req-1").await;
+        let (result, logs) = resolve_on_hearing_turn(&harness, &[], utterance, "req-1").await;
 
         assert_eq!(result, None);
         // タイムアウトは `[jev] enabled = true` 後に実際に起こる fail-back 経路で、運用者が
@@ -3045,7 +3139,7 @@ mod tests {
             5,
         )
         .await;
-        let outcome = base_outcome(layer1_mandatory_escalate_decision(), false);
+        let outcome = base_outcome(layer1_escalate_without_hearing_decision(), false);
         let conv = default_conv_state();
 
         let result = resolve_jev_has_enough_info(
@@ -3064,6 +3158,84 @@ mod tests {
             received.is_empty(),
             "a mandatory layer-1 escalation must never call jev, got {} request(s)",
             received.len()
+        );
+    }
+
+    /// 実データ（`data/urtect/rules.json`）で `decide()` した第1層 decision を対象に、Jev が
+    /// 正常に動作している状況（`has_enough_info = 0.14`）で `resolve_jev_has_enough_info` を
+    /// 1 回実行し、`(戻り値, Jev スタブへ届いたリクエスト数)` を返す。
+    async fn resolve_bundled_layer1_turn(
+        signal_values: &[&str],
+        message: &str,
+    ) -> (Option<f64>, usize) {
+        let (server, harness) = jev_stub_harness(
+            jev_answers_response(serde_json::json!({
+                "has_enough_info": {"type": "noul", "noul": 0.14}
+            })),
+            5,
+        )
+        .await;
+        let outcome = base_outcome(bundled_layer1_decision(signal_values), true);
+        let conv = default_conv_state();
+
+        let result =
+            resolve_jev_has_enough_info(&harness, &outcome, &conv, &[], message, "req-1").await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recording enabled")
+            .len();
+        (result, requests)
+    }
+
+    // PR #60 Copilot 指摘。契約・請求（contract-billing）は advisory だが、型番も症状も関係ない
+    // 問い合わせ。`has_enough_info` は「対象の製品と具体的な症状の両方が分かる」ことを測り、聞き返し
+    // 文言も型番と症状を尋ねる固定文なので、十分に具体的な契約・請求の問い合わせがそこへ流れると
+    // 無関係なヒアリングになる（Issue #58 が直そうとした「質問ばかりで話が進まない」の再現）。
+    // Jev には**リクエストすら飛ばない**こと（顧客発話を第三者へ送らないこと）まで固定する。
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_never_calls_jev_for_the_bundled_contract_billing_rule() {
+        let (result, requests) = resolve_bundled_layer1_turn(
+            &["contract_billing_question"],
+            "先月の請求額が契約プランの料金と違っています",
+        )
+        .await;
+
+        assert_eq!(
+            result, None,
+            "contract-billing must fall back to the missing-based decision, not the hearing"
+        );
+        assert_eq!(
+            requests, 0,
+            "a contract/billing turn must never send the customer's utterance to jev"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_calls_jev_for_the_bundled_warranty_failure_rule() {
+        let (result, requests) =
+            resolve_bundled_layer1_turn(&["warranty_hardware_failure"], "電源が入らなくなった")
+                .await;
+
+        assert_eq!(result, Some(0.14));
+        assert_eq!(requests, 1, "warranty-failure must call jev exactly once");
+    }
+
+    // Critical 1（mandatory の脱出手段が聞き返しに吸収される）の、Jev 呼び出しまで含めた実データ回帰。
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_never_calls_jev_when_human_handoff_beats_warranty_failure()
+    {
+        let (result, requests) = resolve_bundled_layer1_turn(
+            &["warranty_hardware_failure", "human_handoff_request"],
+            "人に代わってください",
+        )
+        .await;
+
+        assert_eq!(result, None);
+        assert_eq!(
+            requests, 0,
+            "the mandatory human-handoff escape hatch must never be routed to the hearing"
         );
     }
 
@@ -4210,7 +4382,7 @@ mod tests {
     fn is_reply_clarify_exhausted_true_for_jev_path_when_below_threshold_and_turns_exhausted() {
         // ケース1: Jev 経路・閾値未満・予算切れ → decide_jev_hearing_action は予算切れを理由に
         // EscalationReply を返す。これは「聞き返し上限到達」そのものなので true。
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), false);
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), false);
         let mut conv = default_conv_state();
         conv.clarify_turns = 3; // == clarify_max_turns(3)
         assert!(is_reply_clarify_exhausted(
@@ -4227,7 +4399,7 @@ mod tests {
         // ケース2: Jev 経路・閾値以上（情報十分と判定した即エスカレーション）・予算切れの
         // 状態であっても、EscalationReply の理由は「情報十分」であって「予算切れ」ではない
         // ため false（取り違えると即エスカレーションのたびに誤った計測ログが出る）。
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), false);
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), false);
         let mut conv = default_conv_state();
         conv.clarify_turns = 3;
         assert!(!is_reply_clarify_exhausted(
@@ -4243,7 +4415,7 @@ mod tests {
     fn is_reply_clarify_exhausted_false_for_jev_path_when_turns_remain() {
         // ケース3: Jev 経路・閾値未満・予算内 → decide_jev_hearing_action は Clarify を返す
         // （そもそも EscalationReply に落ちないケース）ため false。
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), false);
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), false);
         let mut conv = default_conv_state();
         conv.clarify_turns = 0;
         assert!(!is_reply_clarify_exhausted(

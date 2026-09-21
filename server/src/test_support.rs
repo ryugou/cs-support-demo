@@ -24,8 +24,73 @@
 //! `#[tokio::test]` は既定で current-thread ランタイムなので、`.await` をまたいでも同一
 //! スレッド上で実行される限り成立する。
 
+use crate::harness::rules::{Binding, EscalationRule, HearingContract};
+use crate::harness::signal::Signal;
 use std::cell::RefCell;
 use std::sync::Once;
+
+/// `ingest_rules.rs` の `RuleInput` と同形のテスト専用パース struct。CLI 側の構造体は bin
+/// 内にあり lib のテストから import できないため複製している（CLI が書く属性と、実行時の
+/// ローダ `escalation_rule_from_attributes` が読む属性の一致は、`ingest_rules.rs` 側の
+/// テストが CLI の出力を実行時ローダへ通して固定している）。
+#[derive(Debug, serde::Deserialize)]
+struct BundledRuleInput {
+    rule_id: String,
+    condition: Vec<String>,
+    owner: Option<String>,
+    route: String,
+    binding: String,
+    hearing: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BundledRulesFile {
+    escalation_rules: Vec<BundledRuleInput>,
+}
+
+/// 実際に配布される `data/urtect/rules.json` の第1層ルールを実行時の型で返す。
+/// 決定ロジック（`decision::decide`）と Jev 呼び出し可否（`api.rs`）の両方のテストが、
+/// 手組みのルールではなく**実データ**を通して契約を固定するための共有ヘルパ。
+pub(crate) fn load_bundled_escalation_rules() -> Vec<EscalationRule> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/urtect/rules.json");
+    let body = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read bundled urtect rules.json {path:?}: {e}"));
+    let parsed: BundledRulesFile = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("parse bundled urtect rules.json {path:?}: {e}"));
+    parsed
+        .escalation_rules
+        .into_iter()
+        .map(|r| {
+            // `r.rule_id` is moved into `id` below; bind it first so the panic messages for
+            // `hearing` and `binding` can still refer to it.
+            let rule_id = r.rule_id;
+            EscalationRule {
+                hearing: r.hearing.as_deref().map(|value| {
+                    HearingContract::parse(value).unwrap_or_else(|| {
+                        panic!(
+                            "unknown hearing contract {value:?} on rule {} in bundled urtect \
+                             rules.json",
+                            rule_id
+                        )
+                    })
+                }),
+                // 正本パーサ `Binding::parse`（`harness::rules`、完全一致のみ受理）を使う。
+                // `hearing` と同じく、実データを本番と同じ解釈で通すため文字列対応表を
+                // ここで複製しない（Binding に variant が増えたときの乖離点を無くす）。
+                binding: Binding::parse(&r.binding).unwrap_or_else(|| {
+                    panic!(
+                        "unknown binding {:?} on rule {rule_id} in bundled urtect rules.json",
+                        r.binding
+                    )
+                }),
+                id: rule_id,
+                condition: r.condition.into_iter().map(Signal::new).collect(),
+                route: r.route,
+                owner: r.owner,
+            }
+        })
+        .collect()
+}
 
 thread_local! {
     /// このスレッド上で `install_global_subscriber` インストール後に出た INFO 以上のログ。

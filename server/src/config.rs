@@ -43,7 +43,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub api: ApiConfig,
     /// Jev（TypeSafe System One）shadow 判定クライアントの設定。既定は無効。
-    /// Issue #56 時点では判定には一切未接続だったが、Issue #58 で第1層 advisory の
+    /// Issue #56 時点では判定には一切未接続だったが、Issue #58 で「ヒアリング契約
+    /// `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）にマッチしたターン」の
     /// 聞き返し判定にのみ接続した（`api.rs::reply_handler`）。他の経路は引き続き
     /// shadow-only（詳細: `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
     #[serde(default)]
@@ -217,7 +218,8 @@ pub struct JevConfig {
     pub model: String,
     pub questions_path: String,
     pub timeout_secs: u64,
-    /// Issue #58: 第1層 advisory の聞き返し判定に使う `has_enough_info` の閾値。
+    /// Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルールの聞き返し判定に
+    /// 使う `has_enough_info` の閾値。
     /// `has_enough_info < enough_info_threshold` かつ聞き返し予算内なら聞き返し(Clarify)、
     /// それ以外はエスカレーション確定(EscalationReply)。実測値（2026-09-21、
     /// `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）: 「電源が入らなくなった」
@@ -526,8 +528,8 @@ schema = "s"
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert!(
             !cfg.jev.enabled,
-            "jev must default to disabled: unless enabled, the layer-1 advisory hearing \
-             decision path (Issue #58) is never exercised"
+            "jev must default to disabled: unless enabled, the layer-1 product-and-symptom \
+             hearing decision path (Issue #58) is never exercised"
         );
         assert_eq!(cfg.jev.endpoint, "https://api.typesafe.ai/v1/systemone");
         assert_eq!(cfg.jev.model, "jev-latest");

@@ -26,7 +26,8 @@ pub struct AuditDraft {
     /// not_applicable）。加算フィールド。既存ログ行にはこのキーが無いが、
     /// `verify_chain` は行ごとに実在するキーだけを再ハッシュするため後方互換。
     pub extraction_mode: String,
-    /// Issue #58: 第1層 advisory の聞き返し判定に Jev の `has_enough_info` を使ったターンのみ
+    /// Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルール
+    /// （`warranty-failure`）の聞き返し判定に Jev の `has_enough_info` を使ったターンのみ
     /// `Some`。使わなかったターンは常に `None`（`extraction_mode` 追加時と同じ加算フィールド。
     /// 既存ログ行にこのキーは無いが、`verify_chain` は行ごとに実在するキーだけを再ハッシュする
     /// ため後方互換）。
@@ -56,7 +57,8 @@ struct AuditEvent<'a> {
     graph_provenance_linked: bool,
     /// S1-11 改訂: 今ターンの signal 抽出モード（加算フィールド）。
     extraction_mode: &'a str,
-    /// Issue #58: 第1層 advisory の聞き返し判定に使った Jev の `has_enough_info`（加算フィールド）。
+    /// Issue #58: ヒアリング契約を宣言した第1層ルールの聞き返し判定に使った Jev の
+    /// `has_enough_info`（加算フィールド）。
     jev_has_enough_info: Option<f64>,
     prev_hash: &'a str,
     hash: &'a str,

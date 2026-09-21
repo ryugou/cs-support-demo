@@ -59,7 +59,8 @@ const MAX_EXCERPTS: usize = 3;
 
 /// 生成プロンプトに注入する会話履歴の最大ターン数（design doc §5）。
 /// 原則、生成にのみ使う。evaluate 本体の判定（signal 抽出・第1〜3層の escalation 判定・
-/// signal 累積）には使わない。**例外**: Issue #58 の第1層 advisory の聞き返し判定
+/// signal 累積）には使わない。**例外**: Issue #58 の、ヒアリング契約 `product_and_symptom` を
+/// 宣言した第1層ルール（`warranty-failure`）の聞き返し判定
 /// （Jev の `has_enough_info`）に限り、顧客発話の履歴が判定入力になる
 /// （`[jev] enabled = true` のときのみ動く。正本は
 /// `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
@@ -84,8 +85,9 @@ pub enum ReplyHistoryRole {
 /// 応答生成プロンプトへ注入する会話履歴 1 ターン。
 ///
 /// 原則、生成の材料としてのみ扱う。signal 抽出・escalation 判定のターン間文脈は既存の
-/// case 機構（`case_id` による signal 累積）が担う（design doc §5）。**例外**: Issue #58 の
-/// 第1層 advisory の聞き返し判定に限り、この型が `api::build_jev_state` /
+/// case 機構（`case_id` による signal 累積）が担う（design doc §5）。**例外**: Issue #58 の、
+/// ヒアリング契約 `product_and_symptom` を宣言した第1層ルールの聞き返し判定に限り、この型が
+/// `api::build_jev_state` /
 /// `api::select_customer_history_for_jev` を経由して Jev（TypeSafe System One）の判定入力
 /// になる。その経路の切り詰め規律・予算は `api.rs` 側の doc コメントを参照
 /// （正本は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
@@ -578,7 +580,7 @@ mod tests {
             disclosure_scope: scope,
             audit_required: true,
             missing: Vec::new(),
-            rule_binding: None,
+            hearing: None,
         }
     }
 

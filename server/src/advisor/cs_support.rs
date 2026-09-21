@@ -1043,7 +1043,7 @@ mod tests {
                 required: 0.8,
                 best: 0.5,
             }],
-            rule_binding: None,
+            hearing: None,
         }
     }
 

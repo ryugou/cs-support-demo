@@ -1,12 +1,17 @@
 //! Jev（TypeSafe System One）判定クライアント。
 //!
-//! **配線先は `server/src/api.rs::reply_handler` の 1 箇所のみ。** Issue #58 で、第1層
-//! advisory のエスカレーションルール（`rule_binding == Some(Binding::Advisory)`）にマッチした
-//! ターンに限り、`api.rs::resolve_jev_has_enough_info` がこのクライアントの `evaluate` を呼び、
-//! 応答の `has_enough_info`（`noul` 値）だけを聞き返し（Clarify）vs 即エスカレーション
-//! （EscalationReply）の判定に使う（`api.rs::decide_jev_hearing_action`）。他の質問への回答は
-//! 判定に使わない。この経路以外（第1層 mandatory・第2層・第3層・MCP `evaluate_answerability`・
-//! `advisor/` 配下）へは配線しないこと（design doc §7「対象外」）。
+//! **配線先は `server/src/api.rs::reply_handler` の 1 箇所のみ。** Issue #58 で、第1層の
+//! エスカレーションルールのうち、ヒアリング契約 `product_and_symptom`
+//! （`harness::rules::HearingContract::ProductAndSymptom`。実データでは `warranty-failure` だけが
+//! 宣言）を宣言したルールにマッチしたターンに限り、`api.rs::resolve_jev_has_enough_info` が
+//! このクライアントの `evaluate` を呼び、応答の `has_enough_info`（`noul` 値）だけを聞き返し
+//! （Clarify）vs 即エスカレーション（EscalationReply）の判定に使う
+//! （`api.rs::decide_jev_hearing_action`）。他の質問への回答は判定に使わない。この経路以外
+//! （宣言の無い第1層ルール（`contract-billing` を含む）・第1層 mandatory・第2層・第3層・MCP
+//! `evaluate_answerability`・`advisor/` 配下）へは配線しないこと（design doc §7「対象外」）。
+//! 判別を binding（advisory か）ではなく宣言で行う理由は `api.rs::is_product_and_symptom_hearing_turn`
+//! の doc を参照（`has_enough_info` は製品と症状の両方が分かるかを測るので、型番も症状も
+//! 関係ない契約・請求の問い合わせには当てはまらない）。
 //!
 //! Issue #56 設計にあった「fire-and-forget の shadow ログ記録（全質問の結果を
 //! `tracing::info!` で 1 行残す、`main.rs` / `mcp.rs` 等からの並行呼び出し）」は依然として
@@ -221,7 +226,8 @@ impl JevClient {
     /// **呼び出し側の責務はユースケースにより異なる。呼び出し元ごとに design doc の該当節を
     /// 確認すること:**
     ///
-    /// - **Issue #58 の第1層 advisory 聞き返し判定（design doc §7、実装済み）**:
+    /// - **Issue #58 の、ヒアリング契約 `product_and_symptom` を宣言した第1層ルール
+    ///   （`warranty-failure`）の聞き返し判定（design doc §7、実装済み）**:
     ///   `api.rs::resolve_jev_has_enough_info` が**同期 `.await`** で呼び出す。結果
     ///   （`has_enough_info`）をそのターンの `Clarify` / `EscalationReply` 判定にそのまま使い、
     ///   対象ターンの応答時間は Jev の応答時間ぶん実際に延びる。失敗・タイムアウトは

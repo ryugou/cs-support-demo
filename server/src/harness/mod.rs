@@ -79,8 +79,9 @@ pub struct Harness {
     /// `Harness::build` が常に `Some` を設定する。
     pub product_gate: Option<product_gate::ProductGate>,
     /// Jev（TypeSafe System One）shadow 判定クライアント（Issue #56）。`config.jev.enabled =
-    /// false`（既定）なら `None`。Issue #58 時点では `api.rs::reply_handler` が第1層 advisory
-    /// の聞き返し判定にのみ使う（他の呼び出し経路からは一切参照されない、shadow-only のまま）。
+    /// false`（既定）なら `None`。Issue #58 時点では `api.rs::reply_handler` が、ヒアリング契約
+    /// `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）の聞き返し判定にのみ使う
+    /// （他の呼び出し経路からは一切参照されない、shadow-only のまま）。
     pub jev_client: Option<crate::jev::JevClient>,
 }
 
@@ -627,8 +628,9 @@ impl Harness {
         // 材料 corpus ローダは 1 インスタンスを ManualStore と evaluate で共有し、
         // manual_corpus の TTL キャッシュを read 経路・評価経路の双方で使い回す。
         let corpus = Arc::new(crate::corpus::CorpusLoader::new(client.clone()));
-        // Jev（Issue #56 shadow クライアント、Issue #58 で第1層 advisory の聞き返し判定にのみ
-        // 接続）。`enabled = false` なら `from_config` が `Ok(None)` を返す。`enabled = true` で
+        // Jev（Issue #56 shadow クライアント、Issue #58 で、ヒアリング契約
+        // `product_and_symptom` を宣言した第1層ルールの聞き返し判定にのみ接続）。
+        // `enabled = false` なら `from_config` が `Ok(None)` を返す。`enabled = true` で
         // 鍵が解決できない場合は起動時 fail closed する（`anthropic_client` と同じ規律）。
         let jev_client = crate::jev::JevClient::from_config(&config.jev, config_dir)
             .context("configure jev client")?;
@@ -806,7 +808,8 @@ impl Harness {
             .context("join audit write task")?
     }
 
-    /// Issue #58: 第1層 advisory の聞き返し判定に Jev の `has_enough_info` を使ったターンのみ、
+    /// Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルールの聞き返し判定に
+    /// Jev の `has_enough_info` を使ったターンのみ、
     /// `evaluate()` が既に書いた通常の監査行（`allowed:*` / `escalate:*`）に加えて、この判定
     /// 固有の監査行を追記する。`audit_with_nodes`（多数の呼び出し元を持つ共通メソッド）の
     /// シグネチャは変更しない方針のため、専用の薄いメソッドとして分離する。
@@ -2658,7 +2661,7 @@ mod tests {
             disclosure_scope: decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing,
-            rule_binding: None,
+            hearing: None,
         }
     }
 
@@ -2802,6 +2805,7 @@ mod tests {
             route: "safety_team".to_string(),
             owner: None,
             binding: rules::Binding::Mandatory,
+            hearing: None,
         }];
         let resolutions = vec![contract_test_kr("kr1", &["post_ingestion_symptom"])];
         let q = contract_test_signals(&["post_ingestion_symptom"]);
@@ -2839,6 +2843,7 @@ mod tests {
             route: "safety_team".to_string(),
             owner: None,
             binding: rules::Binding::Advisory,
+            hearing: None,
         }];
         let q = contract_test_signals(&["post_ingestion_symptom"]);
         let d = decision::decide(&decision::DecisionInput {
@@ -2879,6 +2884,7 @@ mod tests {
             route: "safety_team".to_string(),
             owner: None,
             binding: rules::Binding::Mandatory,
+            hearing: None,
         }];
         let q = contract_test_signals(&["post_ingestion_symptom"]);
         let d = decision::decide(&decision::DecisionInput {

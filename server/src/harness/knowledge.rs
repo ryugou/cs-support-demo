@@ -1,5 +1,6 @@
 use crate::harness::rules::{
-    Binding, EscalationRule, Grade, KnownResolution, ProhibitedDomain, RootCause, SourceAuthority,
+    Binding, EscalationRule, Grade, HearingContract, KnownResolution, ProhibitedDomain, RootCause,
+    SourceAuthority,
 };
 use crate::harness::signal::{Signal, SignalSet};
 use crate::ingest::schema_generation_prefix;
@@ -227,11 +228,57 @@ pub fn search_cases_from_snapshot(
     hits
 }
 
-fn parse_binding(value: Option<&String>) -> Binding {
-    match value.map(String::as_str) {
-        Some("mandatory") => Binding::Mandatory,
-        _ => Binding::Advisory,
+/// `binding` 属性（拘束度）の復元。属性なしは従来どおり advisory（旧ノード互換。書き込み側の
+/// `ingest_rules` は `binding` を必須として検証し、常に値を書く）。**未知の値（綴りミス・
+/// 大文字違い・空文字）は advisory に倒し、warn を出す。**
+///
+/// 未知の値を `Err` にしない理由（fail-back）: `load_escalation_rules` /
+/// `load_prohibited_domains` は 1 件でも `Err` を返すと全件の読み込みが失敗し、第1層・第2層が
+/// まとめて止まる。一方、黙って倒すのは危険: mandatory の綴りミス（`"manadatory"` 等）が
+/// advisory 扱いになると、即時エスカレーションの保証（`match_layer1` の mandatory 優先・
+/// `decide` の `missing` 抑止・`hearing_contract` の無効化）が失われる。そのため warn に
+/// 種別・ID・値を残す。書き込み側（`ingest_rules`）が未知の値を投入前に拒否するので、通常ここへは
+/// 来ない（旧データ・手書きノードへの二重の備え）。
+///
+/// `kind` はログ用のノード種別（`escalation_rule` / `prohibited_domain` / `known_resolution`）。
+fn parse_binding(kind: &str, id: &str, value: Option<&String>) -> Binding {
+    let Some(value) = value else {
+        return Binding::Advisory;
+    };
+    Binding::parse(value).unwrap_or_else(|| {
+        tracing::warn!(
+            kind = %kind,
+            id = %id,
+            binding = %value,
+            "node has an unknown binding; treating it as advisory. If it was meant to be \
+             mandatory, its unconditional escalation is NOT in effect: fix `binding` in \
+             rules.json and re-run ingest-rules"
+        );
+        Binding::Advisory
+    })
+}
+
+/// `hearing` 属性（ルールが宣言するヒアリング契約）の復元。欠落・空文字は「宣言なし」。
+///
+/// 未知の値は `Err` にせず「宣言なし」へ落として warn する。他の必須属性（`condition` 等）と扱いを
+/// 変えている理由: この宣言は「Jev に聞き返しを判定させるか」の任意の付加情報で、未宣言に倒れても
+/// 従来の `missing` ベース判定へ戻るだけで安全側に寄る。一方 `load_escalation_rules` は 1 件でも
+/// `Err` を返すと第1層の全ルールの読み込みが失敗するため、未知の値（デプロイ順序のずれで、新しい
+/// 契約名を書き込んだ `ingest-rules` の結果を旧リビジョンが読む場合など）を `Err` にすると第1層
+/// 全体が止まる。書き込み側（`ingest_rules`）が未知の値を拒否するので、通常ここへは来ない。
+fn parse_hearing(rule_id: &str, value: Option<&String>) -> Option<HearingContract> {
+    let value = value.map(String::as_str).filter(|v| !v.is_empty())?;
+    let parsed = HearingContract::parse(value);
+    if parsed.is_none() {
+        tracing::warn!(
+            rule_id = %rule_id,
+            hearing = %value,
+            "escalation_rule declares an unknown hearing contract; treating it as undeclared \
+             (no jev hearing for this rule). Check the running image is not older than the \
+             ingested rules.json"
+        );
     }
+    parsed
 }
 
 pub fn escalation_rule_from_attributes(attrs: &HashMap<String, String>) -> Result<EscalationRule> {
@@ -255,7 +302,8 @@ pub fn escalation_rule_from_attributes(attrs: &HashMap<String, String>) -> Resul
             .cloned()
             .ok_or_else(|| anyhow!("escalation_rule {id} missing route"))?,
         owner: attrs.get("owner").cloned().filter(|v| !v.is_empty()),
-        binding: parse_binding(attrs.get("binding")),
+        binding: parse_binding("escalation_rule", &id, attrs.get("binding")),
+        hearing: parse_hearing(&id, attrs.get("hearing")),
         id,
         condition,
     })
@@ -291,7 +339,7 @@ pub fn prohibited_domain_from_attributes(
             .get("route")
             .cloned()
             .ok_or_else(|| anyhow!("prohibited_domain {id} missing route"))?,
-        binding: parse_binding(attrs.get("binding")),
+        binding: parse_binding("prohibited_domain", &id, attrs.get("binding")),
         id,
         domain_signals,
         text_patterns,
@@ -620,7 +668,11 @@ fn known_resolutions_from_nodes(
                 rejection_count: get("rejection_count").parse().unwrap_or(0),
                 approver_set: csv_list(&get("approver_set")),
                 origin: get("origin"),
-                binding: parse_binding(attrs.get("binding")),
+                binding: parse_binding(
+                    "known_resolution",
+                    attrs.get("kr_id").map_or("", String::as_str),
+                    attrs.get("binding"),
+                ),
                 registration_trigger: get("registration_trigger"),
                 knowledge_class: get("knowledge_class"),
                 outcome_ref: csv_list(&get("outcome_ref")),
@@ -1241,6 +1293,162 @@ mod tests {
             ("condition", "mold")
         ]))
         .is_err());
+    }
+
+    // ---- EscalationRule.hearing（Issue #58: ルール自身が宣言するヒアリング契約） ----
+
+    fn advisory_rule_attrs<'a>(hearing: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
+        let mut pairs = vec![
+            ("rule_id", "warranty-failure"),
+            ("condition", "warranty_hardware_failure"),
+            ("route", "support_desk"),
+            ("binding", "advisory"),
+        ];
+        if let Some(value) = hearing {
+            pairs.push(("hearing", value));
+        }
+        pairs
+    }
+
+    #[test]
+    fn escalation_rule_from_attributes_reads_the_hearing_declaration() {
+        let rule = escalation_rule_from_attributes(&attrs(&advisory_rule_attrs(Some(
+            "product_and_symptom",
+        ))))
+        .expect("parses");
+        assert_eq!(rule.hearing, Some(HearingContract::ProductAndSymptom));
+    }
+
+    #[test]
+    fn escalation_rule_from_attributes_treats_absent_or_empty_hearing_as_undeclared() {
+        // 欠落（旧ノード・宣言なしのルール）と空文字（`ingest_rules` が「宣言なし」を明示的に
+        // 書き込む表現。宣言を消す再投入が部分マージでも確実に効くようにするため）を区別しない。
+        for hearing in [None, Some("")] {
+            let rule = escalation_rule_from_attributes(&attrs(&advisory_rule_attrs(hearing)))
+                .expect("parses");
+            assert_eq!(rule.hearing, None, "hearing attribute = {hearing:?}");
+        }
+    }
+
+    #[test]
+    fn escalation_rule_from_attributes_keeps_loading_when_the_hearing_value_is_unknown() {
+        // `load_escalation_rules` は 1 件でも Err を返すと第1層の全ルールの読み込みが失敗する。
+        // この宣言は任意の付加情報（未宣言なら従来の `missing` ベース判定へ戻るだけで安全側）
+        // なので、未知の値（デプロイ順序のずれで新しい契約名を旧リビジョンが読む場合など）で
+        // 第1層全体を止めない。ただし黙って落とさず、ルール ID と値を warn に残す。
+        let (rule, logs) = crate::test_support::capture_logs(|| {
+            escalation_rule_from_attributes(&attrs(&advisory_rule_attrs(Some("future_contract"))))
+        });
+        let rule = rule.expect("an unknown hearing value must not fail the rule load");
+        assert_eq!(rule.hearing, None);
+        assert_eq!(rule.id, "warranty-failure");
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("warranty-failure") && warnings.contains("future_contract"),
+            "the warn must name the rule and the unknown value so an operator can act, \
+             got: {warnings:?}"
+        );
+    }
+
+    // ---- binding の値（Issue #58 reviewer Warning 1）----
+    //
+    // ローダは fail-back（未知値は advisory に倒す。fail closed にすると 1 件のエラーで第1層の
+    // 全ルールが読めなくなるため）。ただし「黙って」倒さない: mandatory の綴りミスは、即時
+    // エスカレーションの保証が失われることを意味する。書き込み側（`ingest_rules`）が未知値を
+    // 投入前に拒否するので、通常ここへは来ない（旧データ・手書きノードへの二重の備え）。
+
+    fn escalation_attrs_with_binding(binding: Option<&str>) -> HashMap<String, String> {
+        let mut pairs = vec![
+            ("rule_id", "human-handoff"),
+            ("condition", "human_handoff_request"),
+            ("route", "support_desk"),
+        ];
+        if let Some(value) = binding {
+            pairs.push(("binding", value));
+        }
+        attrs(&pairs)
+    }
+
+    fn domain_attrs_with_binding(binding: Option<&str>) -> HashMap<String, String> {
+        let mut pairs = vec![
+            ("domain_id", "legal-privacy"),
+            ("domain_signals", "legal_privacy_question"),
+            ("pattern", "x"),
+            ("route", "support_desk"),
+        ];
+        if let Some(value) = binding {
+            pairs.push(("binding", value));
+        }
+        attrs(&pairs)
+    }
+
+    #[test]
+    fn escalation_rule_from_attributes_falls_back_to_advisory_and_warns_on_an_unknown_binding() {
+        for unknown in ["manadatory", "Mandatory", ""] {
+            let (rule, logs) = crate::test_support::capture_logs(|| {
+                escalation_rule_from_attributes(&escalation_attrs_with_binding(Some(unknown)))
+            });
+            let rule = rule.expect("an unknown binding must not fail the rule load");
+            assert_eq!(
+                rule.binding,
+                Binding::Advisory,
+                "binding attribute = {unknown:?} keeps the loader's fail-back semantics"
+            );
+            let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+            assert!(
+                warnings.contains("human-handoff")
+                    && warnings.contains("unknown binding")
+                    && warnings.contains(&format!("binding={unknown}")),
+                "the warn must name the rule and the value so an operator can act \
+                 (binding attribute = {unknown:?}), got: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_rule_from_attributes_does_not_warn_for_a_known_or_absent_binding() {
+        for (binding, expected) in [
+            (Some("mandatory"), Binding::Mandatory),
+            (Some("advisory"), Binding::Advisory),
+            // 属性なしは従来どおり advisory（旧ノード互換）。書き込み側は常に値を書く。
+            (None, Binding::Advisory),
+        ] {
+            let (rule, logs) = crate::test_support::capture_logs(|| {
+                escalation_rule_from_attributes(&escalation_attrs_with_binding(binding))
+            });
+            assert_eq!(rule.expect("parses").binding, expected, "{binding:?}");
+            let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+            assert!(
+                warnings.is_empty(),
+                "a known or absent binding ({binding:?}) must not warn, got: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prohibited_domain_from_attributes_falls_back_to_advisory_and_warns_on_an_unknown_binding() {
+        let (domain, logs) = crate::test_support::capture_logs(|| {
+            prohibited_domain_from_attributes(&domain_attrs_with_binding(Some("manadatory")))
+        });
+        let domain = domain.expect("an unknown binding must not fail the domain load");
+        assert_eq!(domain.binding, Binding::Advisory);
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("legal-privacy")
+                && warnings.contains("unknown binding")
+                && warnings.contains("binding=manadatory"),
+            "the warn must name the domain and the value, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn prohibited_domain_from_attributes_keeps_a_known_mandatory_binding_without_warning() {
+        let (domain, logs) = crate::test_support::capture_logs(|| {
+            prohibited_domain_from_attributes(&domain_attrs_with_binding(Some("mandatory")))
+        });
+        assert_eq!(domain.expect("parses").binding, Binding::Mandatory);
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
     }
 
     #[test]

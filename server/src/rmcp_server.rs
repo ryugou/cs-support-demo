@@ -1249,9 +1249,10 @@ mod tests {
     // ---- evaluate_answerability の公開 output schema（Issue #58） ----
 
     #[test]
-    fn evaluate_answerability_advertised_output_schema_hides_rule_binding() {
-        // `rule_binding` は `api.rs` の内部判定専用の拘束度分類で、MCP の出力契約へ載せない
-        // （specs/production-cs-mcp.md「MCP tool の入出力の形は変更しない」）。
+    fn evaluate_answerability_advertised_output_schema_hides_internal_decision_fields() {
+        // `hearing`（ルールが宣言するヒアリング契約）は `api.rs` の内部判定専用で、MCP の出力
+        // 契約へ載せない（specs/production-cs-mcp.md「MCP tool の入出力の形は変更しない」）。
+        // 先行して同じ扱いだった `rule_binding`（廃止済み）の再導入も合わせて検知する。
         // `harness::decision` 側のスキーマ単体テストに加え、MCP クライアントが `tools/list` で
         // 実際に受け取る `outputSchema` そのものを検査する（rmcp が `Json<T>` から生成する経路）。
         let router = CsSupportRmcpServer::tool_router();
@@ -1271,10 +1272,13 @@ mod tests {
             "the advertised output schema must describe the decision's Escalate fields, \
              got: {rendered}"
         );
-        assert!(
-            !rendered.contains("rule_binding"),
-            "rule_binding must not appear in the outputSchema advertised to MCP clients, \
-             got: {rendered}"
-        );
+        // プロパティ名としての出現を見る（引用符付き）。
+        for internal_field in ["\"hearing\"", "\"rule_binding\""] {
+            assert!(
+                !rendered.contains(internal_field),
+                "{internal_field} must not appear in the outputSchema advertised to MCP \
+                 clients, got: {rendered}"
+            );
+        }
     }
 }

@@ -7,17 +7,19 @@
 | 正本の範囲 | Jev クライアントの契約、質問定義の置き場、起動点と fail-soft 規律、記録の形、config と secret |
 | 関連文書 | `2026-08-11-answer-api-line-adapter-design.md`(/api/reply 契約)、GitHub Issue #56 |
 
-**2026-09-21 追記**: Issue #58 により、第1層 advisory の聞き返し判定にのみ Jev の
-`has_enough_info` を使うよう変更した(詳細 §7)。他の経路は引き続き §1〜§6 の shadow-only の
-まま。
+**2026-09-21 追記**: Issue #58 により、第1層のうちヒアリング契約 `product_and_symptom` を
+宣言したルール(実データでは `warranty-failure` のみ)にマッチしたターンの聞き返し判定にのみ、
+Jev の `has_enough_info` を使うよう変更した(詳細 §7)。他の経路は引き続き §1〜§6 の
+shadow-only のまま。`contract-billing`(契約・請求)は advisory だが宣言を持たないため対象外
+(型番も症状も関係ない問い合わせを、型番と症状を尋ねるヒアリングへ流さないため。§7)。
 
 ## 1. 採用する設計
 
-Jev は「解釈」だけを担い、判定はコードに残す(既存の原則どおり)。本タスクでは判定に一切使わず、**並行実行して記録するだけ**とする(ただし Issue #58 により §7 の経路だけが例外。第1層 advisory の聞き返し判定にのみ `has_enough_info` を使う。詳細は §7)。
+Jev は「解釈」だけを担い、判定はコードに残す(既存の原則どおり)。本タスクでは判定に一切使わず、**並行実行して記録するだけ**とする(ただし Issue #58 により §7 の経路だけが例外。ヒアリング契約 `product_and_symptom` を宣言した第1層ルール(`warranty-failure`)の聞き返し判定にのみ `has_enough_info` を使う。詳細は §7)。
 
 - 呼び出し: `POST https://api.typesafe.ai/v1/systemone`、`Authorization: Bearer <TYPESAFE_API_KEY>`
 - リクエスト: `{ "state": <顧客発話>, "model": "jev-latest", "questions": <質問定義> }`
-  - §7 の経路(第1層 advisory の聞き返し判定)では、`state` は今ターンの発話 1 件ではなく「過去の顧客発話 + 今ターンの発話」に組み立て直される(§7「Jev へ渡す state」)
+  - §7 の経路(ヒアリング契約 `product_and_symptom` を宣言した第1層ルールの聞き返し判定)では、`state` は今ターンの発話 1 件ではなく「過去の顧客発話 + 今ターンの発話」に組み立て直される(§7「Jev へ渡す state」)
 - レスポンス: `{ "model", "answers": { <id>: { "type": "noul"|"choice"|"score", ... } }, "usage": { "input_tokens", "output_tokens" } }`
   - noul: `noul`(0〜1)
   - choice: `choice` / `confidence` / `probabilities`
@@ -53,10 +55,11 @@ Jev は「解釈」だけを担い、判定はコードに残す(既存の原則
 4. `[jev] enabled = false` の構成では Jev へ一切アクセスしない
 5. Jev の answer のうちモデル生成文字列(`choice` の選択値・`probabilities` のキー・`legend`)をログに書かない(顧客由来のデータを含みうる。書いてよいのは種別 `JevAnswer::kind()` と数値のみ)
 
-**§7 の経路はこの限りではない**: 第1層 advisory の聞き返し判定に限り、Jev の結果(`has_enough_
-info`)を判定に使い(2 と矛盾)、対象ターンの応答時間は Jev の 1 往復分だけ増える(1 と矛盾)。
+**§7 の経路はこの限りではない**: ヒアリング契約 `product_and_symptom` を宣言した第1層ルール
+(`warranty-failure`)の聞き返し判定に限り、Jev の結果(`has_enough_info`)を判定に使い(2 と矛盾)、
+対象ターンの応答時間は Jev の 1 往復分だけ増える(1 と矛盾)。
 これは Issue #58 で意図的に導入した例外であり、詳細と許容根拠は §7 を参照。1 と 2 は §7 の
-経路(第1層 advisory のエスカレーションターン)では成立しない。3・4・5 は §7 の経路においても
+経路(`warranty-failure` にマッチしたターン)では成立しない。3・4・5 は §7 の経路においても
 真のまま(顧客発話の本文と Jev の answer のモデル生成文字列はログに書かず、
 `[jev] enabled = false` の構成では Jev へ一切アクセスしない)。
 
@@ -74,8 +77,8 @@ info`)を判定に使い(2 と矛盾)、対象ターンの応答時間は Jev �
 
 ## 6. 次段階(本タスクの範囲外)
 
-第一層 advisory の聞き返し判定は §7 で先行実施済み。本節の残り(緊急・製品・担当者要望への
-拡張)は引き続き未着手。
+第1層 `warranty-failure`(ヒアリング契約 `product_and_symptom` を宣言したルール)の聞き返し
+判定は §7 で先行実施済み。本節の残り(緊急・製品・担当者要望への拡張)は引き続き未着手。
 
 実会話 1〜2 週間の記録で較正を確認したのち、判定の置き換えへ進む。初期の閾値案(すべてコード側):
 
@@ -86,47 +89,109 @@ info`)を判定に使い(2 と矛盾)、対象ターンの応答時間は Jev �
 
 複数の型番に言及されたケースは Choice では 1 つしか返らないため(実測: V724 0.84 / V523 0.05)、置き換え時は**型番ごとの Noul** に変更する。型番の音写(「びーけーごーにーさん」)は解決できない(実測: 製品なし 0.93)。
 
-## 7. 段階A: 第一層 advisory の聞き返し判定への適用(Issue #58、実装済み)
+## 7. 段階A: ヒアリング契約を宣言した第1層ルールの聞き返し判定への適用(Issue #58、実装済み)
 
 ### 背景
 
 本番実測(2026-09-21)で、「電源が入らなくなった」という問い合わせが第1層の明示エスカレー
-ションルール(advisory binding)にマッチしたが、そのルールの `missing`(マニュアル材料の
-カバレッジ不足で決まる)がたまたま空になり、聞き返し(Clarify)に入らず即エスカレーション
-していた。`missing` は「マニュアル側の根拠十分性」であって「顧客が話した情報の十分性」では
-ないため、この経路に限り、後者を直接測る Jev の `has_enough_info`(質問定義
+ションルール(`warranty-failure`、advisory binding)にマッチしたが、そのルールの `missing`
+(マニュアル材料のカバレッジ不足で決まる)がたまたま空になり、聞き返し(Clarify)に入らず
+即エスカレーションしていた。`missing` は「マニュアル側の根拠十分性」であって「顧客が話した
+情報の十分性」ではないため、この経路に限り、後者を直接測る Jev の `has_enough_info`(質問定義
 `server/data/urtect/jev-questions.json`、`criteria.true`: 「対象の製品と具体的な症状の両方が
 分かる」)に置き換えた。
+
+### ヒアリング契約: なぜ binding(advisory か)ではなくルール自身の宣言で判別するか
+
+`server/data/urtect/rules.json` の advisory ルールは 2 件あり、**情報の契約が違う**。
+
+| rule_id | 問い合わせ | 話が進むのに要る情報 |
+| --- | --- | --- |
+| `warranty-failure` | 製品の故障 | 型番と症状が揃って初めて話が進む |
+| `contract-billing` | 契約・請求 | 型番も症状も関係ない |
+
+`has_enough_info` の判定基準は「対象の製品と具体的な症状の両方が分かる」で、聞き返し文言
+(`JEV_HEARING_MISSING_TEXT`)も固定で型番と症状を尋ねる。したがって「advisory だから聞き返す」
+という binding での判別だと、**十分に具体的な契約・請求の問い合わせが、型番と症状を尋ねる無関係
+なヒアリングに流れる**。これは Issue #58 が直そうとした「質問ばかりで話が進まない」不具合を
+別の入口で再現する(PR #60 の Copilot レビューで指摘)。加えて、契約・請求の顧客発話を不要に
+第三者(TypeSafe)へ送ることにもなる。
+
+そこで、**ルール自身が「どの情報契約でヒアリングするか」を宣言する**形にした。rule_id では
+分岐しない(ルールを足しても、宣言を付けるだけで対象にできる)。
+
+- `rules.json` の `escalation_rules[]` に任意フィールド `hearing` を持てる。現在定義済みの値は
+  `product_and_symptom`(対象の製品の型番と具体的な症状の両方が分かって初めて話が進む問い合わせ。
+  質問 `has_enough_info` がこれに対応する)のみ。**`warranty-failure` にだけ付ける**。
+  `contract-billing` と mandatory 4 件(`security-incident` / `physical-damage` /
+  `construction-risk` / `human-handoff`)には付けない
+- 実行時の型は `harness::rules::HearingContract`(`EscalationRule.hearing: Option<HearingContract>`)。
+  **`Binding::Mandatory` のルールは宣言があっても常に「宣言なし」として扱う**
+  (`EscalationRule::hearing_contract()`)。mandatory は情報の有無を問わず即エスカレーションする
+  拘束度そのもので、設定ミスで宣言が付いても聞き返しへ開放しない
+- 永続化: vegapunk の `EscalationRule` ノードの `hearing` 属性(`schema/cs-schema.yml` と
+  `schema/cs-support.yml` の両方に宣言)。書き込みは `ingest_rules` CLI、読み込みは
+  `harness::knowledge::escalation_rule_from_attributes`。宣言なしは**空文字を明示的に書く**
+  (属性を省略すると、`UpsertNodes` が部分マージの場合に、宣言を消した再投入が旧い宣言を
+  残しうるため)。読み込み側は欠落・空文字を同じく「宣言なし」とする
+- 検証(vegapunk へ接続する前): `ingest_rules` は次をエラーにして、vegapunk へ接続する前
+  (＝何も書く前)に落ちる(CI の `ingest-rules` job が赤くなる)。
+  - **rules ファイルの未知フィールド名**(綴りミス。`RulesFile` / `RuleInput` / `DomainInput`
+    すべて `deny_unknown_fields`。例: `hearing` → `hearng`)。serde の既定だと綴りミスは黙って
+    捨てられ、「宣言なし」として通って本番で Jev が永久に呼ばれなくなるため。エラーは間違えた
+    フィールド名と有効なフィールド名の一覧を名指しする
+  - **`binding` の省略、および未知の `binding` 値**(`"manadatory"` / `"Mandatory"` / 空文字等。
+    **`binding` は必須で、既定値は無い。値は完全一致のみ受理**。`escalation_rules` と
+    `prohibited_domains` の両方。キーなし・`null` は `missing binding`、未知値は `unknown binding`
+    で、どちらもエラーは rule_id / domain_id と有効な値の一覧 `mandatory, advisory` を名指しする)。
+    実行時のローダは未知の binding・属性なしを advisory に倒す(下記)ため、ここで落とさないと
+    mandatory の綴りミスや `binding` の書き忘れが黙って advisory になり、`match_layer1` の
+    mandatory 優先・`decide` の `missing` 抑止・`hearing` の mandatory ガード(この CLI の検証と
+    実行時の `hearing_contract`)が**同時に**破れる。`human-handoff`(聞き返しループからの
+    脱出手段)のような mandatory が Jev のヒアリングに吸収されうる。入力形式を狭めるのは意図した
+    fail-closed(現行の `rules.json` / `rules.sample.json` は全件明示している)。旧仕様は省略を許し、
+    第1層は advisory・第2層は mandatory を既定にしていたが、必須化で省略経路ごと消えた
+  - **未知の `hearing` 値**、および **`binding = mandatory` への `hearing` 宣言**
+
+  実行時のローダは、未知の `hearing` 値を **Err にせず「宣言なし」に倒して warn**、未知の
+  `binding` 値を **Err にせず advisory に倒して warn** する(`load_escalation_rules` /
+  `load_prohibited_domains` は 1 件でも Err を返すと第1層・第2層の全ルールが読めなくなるため。
+  デプロイ順序のずれで、新しい契約名を旧リビジョンが読む場合に第1層全体が止まらないようにする)。
+  「宣言なし」は従来の `missing` ベース判定へ戻るだけで安全側。advisory への倒しは mandatory の
+  綴りミスなら保証が失われる方向なので、warn(種別・ID・値)を必ず残す。CLI が fail-closed、
+  ローダが fail-back という非対称は意図した設計
+- `hearing` は `api.rs` の内部判定専用で、**MCP の出力契約(`evaluate_answerability` の
+  応答 payload と生成スキーマ)には載せない**。`AnswerDecision` は
+  `EvaluateAnswerabilityResponse.decision` としてそのままシリアライズされるため、
+  `#[serde(skip)]` で外している(`specs/production-cs-mcp.md` の「MCP tool の入出力の形は
+  変更しない」不変条件。`decision.rs` と `rmcp_server.rs` のテストが payload・スキーマ・
+  `tools/list` の `outputSchema` の 3 か所で固定している)。先行して同じ扱いだった
+  `rule_binding`(拘束度の内部分類)は、`api.rs` での唯一の用途がこの判別だったため、
+  `hearing` に置き換えて廃止した
 
 ### トリガー条件
 
 次の 3 条件をすべて満たすターンでだけ、Jev を `await` して使う(毎ターンではない)。
 
-1. `layer == 1` かつ `rule_binding == Some(Binding::Advisory)` の `Escalate` であること
-   (mandatory ルール・第2層・第3層は対象外。`missing` の中身には依存しない — これが本是正の
-   核)
+1. `layer == 1` かつ、マッチしたルールが `HearingContract::ProductAndSymptom` を宣言している
+   `Escalate` であること(宣言の無いルール(`contract-billing` を含む)・mandatory ルール・
+   第2層・第3層は対象外。`missing` の中身には依存しない — これが本是正の核)
 2. 今ターンの signal 抽出が `ExtractionMode::LexiconFallback` に落ちていないこと(抽出 LLM
    不調時は `decide_reply_action` 自身が fail-closed で `EscalationReply` に倒すため)
 3. `conv.is_already_escalated()` でないこと(確定済み case は `decide_reply_action` 自身が
    `!conv.is_already_escalated()` ガードで `EscalationReply` に倒すため、Jev を呼んでも結果を
    使わず無駄な待ちとコストが発生するだけ)
 
-判別は `AnswerDecision::Escalate` に新設した `rule_binding: Option<harness::rules::Binding>`
-フィールドで行う(`route_to` は mandatory/advisory のどちらでも `"support_desk"` になりうる
-ため、route では拘束度を判別できない)。実装は `server/src/api.rs` の
-`is_layer1_advisory_escalate` / `resolve_jev_has_enough_info`。
-
-`rule_binding` は `api.rs` の内部判定専用で、**MCP の出力契約(`evaluate_answerability` の
-応答 payload と生成スキーマ)には載せない**。`AnswerDecision` は
-`EvaluateAnswerabilityResponse.decision` としてそのままシリアライズされるため、
-`#[serde(skip)]` で外している(`specs/production-cs-mcp.md` の「MCP tool の入出力の形は
-変更しない」不変条件。`decision.rs` と `rmcp_server.rs` のテストが payload・スキーマ・
-`tools/list` の `outputSchema` の 3 か所で固定している)。
+判別は `AnswerDecision::Escalate` の `hearing: Option<HearingContract>` フィールドで行う
+(`decision::decide` が第1層マッチ時に、マッチしたルールの `hearing_contract()` を積む)。
+実装は `server/src/api.rs` の `is_product_and_symptom_hearing_turn` /
+`resolve_jev_has_enough_info`。
 
 `layer == 1` の選択自体(`rules::match_layer1`)は、マッチした全ルールのうち
 `Binding::Mandatory` を `Binding::Advisory` より必ず優先する(同一 binding 内は配列の
 先頭優先)。したがって advisory と mandatory の条件が同時に成立するターン(累積 signal
-により実際に起こりうる)でも `rule_binding` は `Mandatory` になり、Jev は呼ばれない。
+により実際に起こりうる)でも選ばれるのは mandatory で、その decision の `hearing` は
+`None` になり、Jev は呼ばれない。
 この優先順位が mandatory の即時エスカレーション契約を担保しており、`rules.json` の
 並び順を変えてもこの契約は壊れない(Issue #58 の codex レビューで、advisory が後続
 mandatory を覆い隠す経路が Critical として指摘され是正した)。
@@ -228,15 +293,28 @@ Jev を呼ばなかった/使わなかったターンではこの新規監査行
 
 ### 対象外(従来どおり `decide_reply_action` のまま)
 
-- mandatory ルール(`rule_binding == Some(Binding::Mandatory)`)
+- ヒアリング契約を宣言していない第1層ルール。**advisory でも対象外**(`contract-billing`:
+  型番も症状も関係ない問い合わせのため。§7「ヒアリング契約」)。判定は従来どおり `missing`
+  ベース(`decide_reply_action`)で、Jev は呼ばず顧客発話も TypeSafe へ送らない
+- mandatory ルール(`security-incident` / `physical-damage` / `construction-risk` /
+  `human-handoff`。宣言が付いていても `hearing_contract()` が無効化する)
 - 第2層(禁止ドメイン)
 - 第3層(`InsufficientDirectness` / `UnknownAddedSignal` を含む)
 - `/{project_id}/api/reply` 以外の経路(MCP `evaluate_answerability` 等)。`decision::decide`
-  自体は共有ロジックだが、`rule_binding` を見て Jev を呼ぶかどうかを決めるのは `api.rs::
+  自体は共有ロジックだが、`hearing` を見て Jev を呼ぶかどうかを決めるのは `api.rs::
   reply_handler` だけであり、MCP 経路は従来どおり `missing` ベースのまま
 
 ### 有効化前の確認項目(`[jev] enabled = true` にする前に)
 
+- **本番 vegapunk の `EscalationRule` ノードに `hearing` 属性が入っていること。** ヒアリング契約は
+  vegapunk 上のルールノードから実行時に読むため、`rules.json` を変えただけでは反映されない。
+  `server/data/**` / `schema/**` の変更をマージすると CI の `auto-ingest` が `ingest-rules` を
+  自動実行し、schema 登録(`hearing` 属性の加算)→ ノード再投入の順で反映する(`ingest_rules` は
+  schema 登録を先に行う)。未反映・失敗の間は `warranty-failure` も「宣言なし」として読まれ、
+  Jev を呼ばず従来の `missing` ベース判定へ fail-back する(安全側だが、この機能は効かない)。
+  `ingest-rules` job の成功を確認してから有効化する。`ingest_rules` は未知の `hearing` 値・
+  `binding` の省略・未知の `binding` 値・mandatory への `hearing` 宣言・未知のフィールド名を
+  投入前に拒否するため、綴りミス・書き忘れは job の失敗として見える
 - **Jev の入力トークン・レイテンシの再実測。** §1 の実測値(5 問で入力 945 トークン等)は今ターン
   1 発話だけを `state` に送った時点の測定。この経路では過去の顧客発話が加わり `state` が最大
   約 2,000 字(`MAX_JEV_HISTORY_CHARS`)増えるため、有効化前に多ターンの `state` で測り直す。
