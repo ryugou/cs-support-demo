@@ -64,6 +64,23 @@ pub enum JevAnswer {
     },
 }
 
+impl JevAnswer {
+    /// 回答の種別名。語彙は Jev の応答 JSON の `type` フィールドと同一（`noul` / `choice` /
+    /// `score`。`parse_one_answer` と揃えてあり、テストで固定している）。
+    ///
+    /// **値を一切含まない**ことが目的。`choice` の選択値・`confidence`・`probabilities`・
+    /// `legend`・`score` はモデル生成値で、顧客由来のデータを含みうる。ログには種別名だけを
+    /// 出したい呼び出し側（`api.rs::query_jev_has_enough_info`）が使う。`Debug` 出力
+    /// （`{:?}`）は実値を全部含むため、ログ用途では使わないこと。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            JevAnswer::Noul { .. } => "noul",
+            JevAnswer::Choice { .. } => "choice",
+            JevAnswer::Score { .. } => "score",
+        }
+    }
+}
+
 /// Anthropic 同様の入出力トークン数（課金・較正の実測用。design doc §1 の実測値参照）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct JevUsage {
@@ -87,6 +104,9 @@ pub struct JevClient {
     endpoint: String,
     model: String,
     api_key: String,
+    /// `[jev] timeout_secs` の実値（`http` に設定したものと同一）。`evaluate` がタイムアウトを
+    /// 報告する文言へ埋め込み、運用者が「設定値を上げるべきか」を warn 1 行で判断できるようにする。
+    timeout: Duration,
     /// 構築時に 1 度だけ読み込み、以後は `evaluate` のリクエストへそのまま埋め込む
     /// （毎呼び出しでファイルを再読み込みしない）。
     questions: serde_json::Value,
@@ -147,7 +167,7 @@ impl JevClient {
     /// wiremock 相手の統合テストで検証するために、このモジュール外からも同じ「env を汚染しない」
     /// 構築経路が要る。crate 外へは公開しない。
     pub(crate) fn build(api_key: String, cfg: &JevConfig, config_dir: &Path) -> Result<Self> {
-        validate_endpoint_scheme(&cfg.endpoint)?;
+        validate_endpoint(&cfg.endpoint)?;
         validate_enough_info_threshold(cfg.enough_info_threshold)?;
         let questions_path = resolve_relative_to(config_dir, &cfg.questions_path);
         let raw = fs::read_to_string(&questions_path)
@@ -170,9 +190,10 @@ impl JevClient {
                 json_shape_label(&questions)
             );
         }
+        let timeout = Duration::from_secs(cfg.timeout_secs);
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(cfg.timeout_secs))
-            // リダイレクトを一切追わない。`validate_endpoint_scheme` は構築時に設定された
+            .timeout(timeout)
+            // リダイレクトを一切追わない。`validate_endpoint` は構築時に設定された
             // endpoint の URL だけを検証しており、リダイレクト先の scheme までは見ない。
             // 307/308 は元の POST 本文(顧客発話 `state` を含む)をそのまま再送する仕様なので、
             // 追従を許すと平文 http:// へ本文が送られうる。さらに reqwest の
@@ -190,6 +211,7 @@ impl JevClient {
             endpoint: cfg.endpoint.clone(),
             model: cfg.model.clone(),
             api_key,
+            timeout,
             questions,
         })
     }
@@ -212,7 +234,18 @@ impl JevClient {
     ///
     /// このメソッド自体はどちらの用途でも同期的に `Result` を返すだけで、fire-and-forget化・
     /// リトライ・タイムアウト後の劣化判断はすべて呼び出し側の責務。
-    pub async fn evaluate(&self, state: &str) -> Result<JevOutcome> {
+    ///
+    /// `request_id` は**ログの突合専用**。応答の要素をパースできず捨てるときの warn
+    /// （`parse_answers`）へ載せるためだけに使い、Jev へ送るリクエスト本文には含めない
+    /// （社内の相関 ID を外部サービスへ渡さない。`evaluate_sends_state_model_and_questions_in_request_body`
+    /// が固定）。呼び出し側（`api.rs::query_jev_has_enough_info`）の warn も同じ値を持つため、
+    /// Cloud Run で `/api/reply` が並行処理されていても、2 つの warn を `request_id` で結べる。
+    ///
+    /// `send()` の失敗は、タイムアウトなら `jev evaluate api timed out after <timeout_secs>s`
+    /// （こちらが所有する安定した文言。`describe_send_error` 参照）、それ以外は
+    /// `call jev evaluate api` を context に持つ。原因は context の下のチェーンにあるので、
+    /// ログへ出す側は `{err:#}` を使うこと（`{err}` だと最外層しか出ない）。
+    pub async fn evaluate(&self, state: &str, request_id: &str) -> Result<JevOutcome> {
         let payload = serde_json::json!({
             "state": state,
             "model": self.model,
@@ -228,7 +261,7 @@ impl JevClient {
             .body(body)
             .send()
             .await
-            .context("call jev evaluate api")?;
+            .map_err(|err| describe_send_error(err, self.timeout))?;
 
         // status は本文を読む前に確認する。サイズ上限チェックを先にすると、Jev が非成功
         // status とともに大きなエラーページを返した場合、本来の診断情報である HTTP status が
@@ -278,12 +311,37 @@ impl JevClient {
         let parsed: RawJevResponse =
             serde_json::from_str(text).context("parse jev evaluate api response as json")?;
         Ok(JevOutcome {
-            answers: parse_answers(parsed.answers),
+            answers: parse_answers(parsed.answers, request_id),
             usage: JevUsage {
                 input_tokens: parsed.usage.input_tokens,
                 output_tokens: parsed.usage.output_tokens,
             },
         })
+    }
+}
+
+/// `send()` が返した `reqwest::Error` に、運用者が原因を判別できる context を付ける。
+///
+/// - タイムアウト（`is_timeout()`）: `jev evaluate api timed out after <timeout>s`。
+///   `<timeout>` は `[jev] timeout_secs` の実値（`3` → `3s`、サブ秒なら `0.05s`）。
+/// - それ以外（接続拒否・DNS 失敗・TLS 失敗など）: 従来どおり `call jev evaluate api`。
+///   具体的な原因は、context の下に残る reqwest のエラーチェーンが持つ。
+///
+/// **タイムアウトの文言は、こちらが所有する安定した文字列**であり、判別にもテストにも
+/// これを使う。reqwest / hyper の文言（`operation timed out` 等）は依存更新で変わりうるため、
+/// 依存しない。anyhow の `Display` は最外層の context しか出さないので、呼び出し側は原因まで
+/// 出すために `{err:#}` を使うこと（`api.rs::query_jev_has_enough_info`）。
+///
+/// `send()` の失敗だけが対象。応答本文の読み込み（`response.chunk()`）中のタイムアウトは、
+/// 従来どおり `read jev evaluate api response body` の context に原因チェーンが付く。
+fn describe_send_error(err: reqwest::Error, timeout: Duration) -> anyhow::Error {
+    if err.is_timeout() {
+        anyhow::Error::new(err).context(format!(
+            "jev evaluate api timed out after {}s",
+            timeout.as_secs_f64()
+        ))
+    } else {
+        anyhow::Error::new(err).context("call jev evaluate api")
     }
 }
 
@@ -319,13 +377,38 @@ fn resolve_relative_to(config_dir: &Path, raw: &str) -> PathBuf {
     }
 }
 
-/// Jev endpoint に対して要求するスキーム。API キーと顧客発話(state)を平文で
-/// 送信しないため、既定では https のみを許可する。テスト用スタブサーバ
-/// (wiremock の MockServer は 127.0.0.1 の動的ポートで起動する)だけ、
-/// ローカルループバックへの http を例外として許可する。
-fn validate_endpoint_scheme(endpoint: &str) -> Result<()> {
-    let url = url::Url::parse(endpoint)
-        .with_context(|| format!("parse jev.endpoint {endpoint} as a URL"))?;
+/// Jev endpoint の起動時検証（fail closed）。scheme と userinfo を見る。
+///
+/// - **scheme**: API キーと顧客発話(state)を平文で送信しないため、既定では https のみを
+///   許可する。テスト用スタブサーバ(wiremock の MockServer は 127.0.0.1 の動的ポートで起動する)
+///   だけ、ローカルループバックへの http を例外として許可する。
+/// - **userinfo（`user:pass@`）**: 拒否する。失敗時の warn（`api.rs::query_jev_has_enough_info`）は
+///   原因チェーンを出し、reqwest のエラー文言は `for url ({url})` と endpoint をそのまま含むため、
+///   userinfo があると資格情報がアプリケーションログへ載る。認証は `Authorization` ヘッダ
+///   （env `TYPESAFE_API_KEY`）で行うので、URL に資格情報を入れる理由は無い。
+/// - **クエリ文字列(`?key=value`)**: 拒否しない。正当なクエリパラメータ(マルチテナント識別用の
+///   `?tenant=...` 等)を壊さないための判断で、userinfo とは扱いを分けている
+///   (`build_accepts_https_endpoints_without_userinfo` が `?tenant=a@b` を明示的に許可する形で
+///   固定している)。ただし userinfo と同じ経路(reqwest のエラー文言 `for url ({url})`)でログへ
+///   載るため、`[jev] endpoint` のクエリへ資格情報(API キー・トークン)を置かないこと。
+///
+/// **エラーメッセージに endpoint の値を出してよいのは、userinfo が無いと確認できた後だけ**。
+/// 値を出すと、塞ごうとしている漏洩を起動時エラーで再現してしまう。parse に失敗した値は
+/// userinfo の有無を判定できないので、parse 失敗と userinfo 拒否のメッセージは値を含めない。
+fn validate_endpoint(endpoint: &str) -> Result<()> {
+    let url = url::Url::parse(endpoint).context(
+        "parse jev.endpoint as a URL (the value is omitted from this message because it may \
+         contain credentials; [jev] endpoint を確認してください)",
+    )?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!(
+            "jev.endpoint must not contain userinfo (a username or password before the host): \
+             failure logs include the endpoint URL, so credentials in it would leak into the logs. \
+             The API key is sent via env {API_KEY_ENV}, never in the URL \
+             ([jev] endpoint を確認してください)"
+        );
+    }
+    // ここから先は userinfo が無いと確認済みなので、endpoint の値をメッセージに出してよい。
     let is_loopback_http =
         url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"));
     if url.scheme() != "https" && !is_loopback_http {
@@ -352,7 +435,7 @@ fn validate_endpoint_scheme(endpoint: &str) -> Result<()> {
 ///   意味が失われる
 ///
 /// この2種類はこのリポジトリの既存の流儀（`CS_SUPPORT_OAUTH_SIGNING_KEY` の長さ検査、
-/// `[llm] enabled = true` 時の鍵解決失敗での起動失敗、`validate_endpoint_scheme` 自身）に
+/// `[llm] enabled = true` 時の鍵解決失敗での起動失敗、`validate_endpoint` 自身）に
 /// 揃え、起動時に fail closed で拒否する。
 ///
 /// 一方、境界値ちょうどの `0.0` / `1.0` は `has_enough_info` 側の `is_valid_noul` が inclusive
@@ -410,7 +493,13 @@ struct RawJevUsage {
 /// 素朴な `#[serde(tag = "type")]` enum は未知の `type` 値が 1 件でもあると `answers`
 /// 全体が `Err` になる。Jev の質問セットは運用中に増減するため、未知の質問 ID・未知の
 /// `type` を 1 件の欠落として扱い、他の回答は失わない設計にする。
-fn parse_answers(raw: HashMap<String, serde_json::Value>) -> HashMap<String, JevAnswer> {
+///
+/// `request_id` は、捨てた要素の warn を呼び出し側（`api.rs::query_jev_has_enough_info`）の
+/// warn と結ぶためだけに使う（`evaluate` の doc 参照）。
+fn parse_answers(
+    raw: HashMap<String, serde_json::Value>,
+    request_id: &str,
+) -> HashMap<String, JevAnswer> {
     raw.into_iter()
         .filter_map(|(id, value)| {
             let type_field = value
@@ -422,8 +511,11 @@ fn parse_answers(raw: HashMap<String, serde_json::Value>) -> HashMap<String, Jev
                 Ok(answer) => Some((id, answer)),
                 Err(reason) => {
                     // 顧客発話の本文はこのレイヤーに無いが、ログ衛生の規律は他箇所と揃え、
-                    // id / type / 理由のみを出す（value そのものは出さない）。
+                    // id / type / 理由のみを出す（value そのものは出さない）。例外は `reason` に
+                    // 載る数値 `noul` の範囲エラーの実値だけで、診断のため意図的に出している
+                    // （f64 は顧客由来のテキストを運べない）。
                     tracing::warn!(
+                        request_id = %request_id,
                         answer_id = %id,
                         answer_type = %type_field,
                         reason = %reason,
@@ -457,6 +549,9 @@ fn parse_one_answer(value: &serde_json::Value) -> std::result::Result<JevAnswer,
                 .and_then(|v| v.as_f64())
                 .ok_or_else(|| "missing or non-numeric 'noul' field".to_string())?;
             if !is_valid_noul(noul) {
+                // 実値を理由へ含めるのは診断のための意図的な例外（f64 は顧客由来のテキストを
+                // 運べないためログ衛生上の問題にならない。`evaluate_discards_out_of_range_noul_...`
+                // が「実値が WARN に出ること」を固定している）。
                 return Err(format!(
                     "noul value {noul} is out of the valid [0.0, 1.0] range or not finite"
                 ));
@@ -530,6 +625,10 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// `evaluate` の `request_id` 引数用。ログ突合専用の値で、応答パースの挙動には影響しない
+    /// テスト（大半）はこれを渡す。値そのものを assert するテストは専用の値を使う。
+    const TEST_REQUEST_ID: &str = "req-test";
+
     fn temp_dir() -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("cs-support-jev-test-{}", uuid::Uuid::new_v4()));
@@ -546,6 +645,72 @@ mod tests {
 
     fn valid_questions_path() -> String {
         write_questions_file(r#"{"is_emergency": {"type": "noul"}}"#)
+    }
+
+    // ---- JevAnswer::kind（ログ用の値を含まない種別名） ----
+
+    #[test]
+    fn kind_names_each_variant_without_carrying_any_value() {
+        assert_eq!(JevAnswer::Noul { noul: 0.42 }.kind(), "noul");
+        assert_eq!(
+            JevAnswer::Choice {
+                choice: "SENTINEL-CHOICE".to_string(),
+                confidence: 0.9,
+                probabilities: HashMap::new(),
+            }
+            .kind(),
+            "choice"
+        );
+        assert_eq!(
+            JevAnswer::Score {
+                score: 3.0,
+                confidence: 0.9,
+                probabilities: HashMap::new(),
+                legend: HashMap::new(),
+            }
+            .kind(),
+            "score"
+        );
+    }
+
+    #[test]
+    fn kind_uses_the_same_vocabulary_as_the_wire_type_field() {
+        // 固定するのは「Jev の応答 JSON の `type` 文字列 = パース後の variant = `kind()` が返す
+        // 語彙」の 3 者の一致。ずれると、運用者が warn の `answer_kind` と Jev の応答 JSON を
+        // 突き合わせられなくなる。`kind()` 自体は網羅 match のため、variant を足せば本体側が
+        // コンパイルエラーで止まる（それはこのテストの役割ではない）。
+        let wire_answers = [
+            serde_json::json!({"type": "noul", "noul": 0.5}),
+            serde_json::json!({
+                "type": "choice", "choice": "a", "confidence": 0.9, "probabilities": {"a": 0.9}
+            }),
+            serde_json::json!({
+                "type": "score", "score": 1.0, "confidence": 0.7,
+                "probabilities": {"1": 0.7}, "legend": {"1": "中"}
+            }),
+        ];
+        for wire in wire_answers {
+            let parsed = parse_one_answer(&wire).expect("well-formed answer must parse");
+            // `_ =>` を置かない網羅 match。JevAnswer に variant を足すとテスト側もここで
+            // コンパイルエラーになり、`wire_answers` へ新 variant の wire 例を足す判断を促す
+            // （配列は variant を列挙できないため、足し忘れの検出はこの網羅性に頼る）。
+            let expected_wire_type = match &parsed {
+                JevAnswer::Noul { .. } => "noul",
+                JevAnswer::Choice { .. } => "choice",
+                JevAnswer::Score { .. } => "score",
+            };
+            assert_eq!(
+                wire["type"].as_str(),
+                Some(expected_wire_type),
+                "wire example {wire} must parse into the variant whose wire type is \
+                 {expected_wire_type}"
+            );
+            assert_eq!(
+                parsed.kind(),
+                expected_wire_type,
+                "kind() must equal the wire `type` for {wire}"
+            );
+        }
     }
 
     /// `from_config` / `build` の `config_dir` 引数用。このテストファイルの `questions_path`
@@ -572,6 +737,7 @@ mod tests {
             endpoint,
             model: "jev-test".to_string(),
             api_key: "test-key".to_string(),
+            timeout,
             questions: serde_json::json!({"is_emergency": {"type": "noul"}}),
         }
     }
@@ -702,6 +868,159 @@ mod tests {
              used in tests, got: {:?}",
             client.err()
         );
+    }
+
+    // ---- endpoint の userinfo 拒否（失敗時の warn が endpoint URL を出すため） ----
+    //
+    // `from_config` は鍵解決（env）の後に `build` を呼ぶだけなので、env を書き換えずに済む
+    // `build` で検証する（`build` の doc 参照）。センチネル値は、エラーメッセージ自身の文言
+    // （"password" 等）と偶然一致しないよう、固有の文字列にしている。
+
+    const USERNAME_SENTINEL: &str = "USERNAME-SENTINEL";
+    const PASSWORD_SENTINEL: &str = "PASSWORD-SENTINEL";
+
+    fn build_with_endpoint(endpoint: &str) -> Result<JevClient> {
+        let cfg = JevConfig {
+            enabled: true,
+            endpoint: endpoint.to_string(),
+            questions_path: valid_questions_path(),
+            ..Default::default()
+        };
+        JevClient::build("test-key".to_string(), &cfg, &unused_config_dir())
+    }
+
+    #[test]
+    fn build_rejects_an_endpoint_with_userinfo_without_echoing_the_credentials() {
+        // 失敗時の warn は reqwest のエラー（`for url ({url})`）を通じて endpoint をそのまま出す。
+        // userinfo があると資格情報がログに載るため、起動時に fail closed で拒否する。
+        // 拒否メッセージにも値を出さない（出すと塞ぎたい漏洩を起動時エラーで再現してしまう）。
+        let endpoints = [
+            format!("https://{USERNAME_SENTINEL}:{PASSWORD_SENTINEL}@api.typesafe.ai/v1/systemone"),
+            format!("https://{USERNAME_SENTINEL}@api.typesafe.ai/v1/systemone"),
+            format!("https://:{PASSWORD_SENTINEL}@api.typesafe.ai/v1/systemone"),
+            // https 以外でも、scheme 拒否のメッセージ（endpoint を出す）より先に userinfo を
+            // 拒否し、値を出さないこと。
+            format!("http://{USERNAME_SENTINEL}:{PASSWORD_SENTINEL}@example.com/v1/systemone"),
+        ];
+        for endpoint in endpoints {
+            let err = build_with_endpoint(&endpoint)
+                .expect_err("an endpoint with userinfo must fail closed at startup");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("userinfo"),
+                "the error must tell operators what to fix, got: {message}"
+            );
+            for secret in [USERNAME_SENTINEL, PASSWORD_SENTINEL] {
+                assert!(
+                    !message.contains(secret),
+                    "the error message must not echo the credentials ({secret}), got: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_rejects_an_endpoint_with_percent_encoded_userinfo_without_echoing_the_credentials() {
+        // codex 指摘(Issue #58 レビュー、reviewer 実測): `url::Url` の `username()` / `password()`
+        // は percent-decode しない(実測: `https://%55SER:%50ASS@host/` → username() ==
+        // "%55SER"、password() == Some("%50ASS"))。単純な `is_empty()` / `is_some()` 判定は
+        // decode の有無に依存しないため percent-encoded な userinfo も素通りしない。さらに、
+        // `url::Url` は percent-encoded な userinfo を**シリアライズ結果にもそのまま保持する**
+        // (空 userinfo のような正規化落ちが起きない)ため、拒否しなければ reqwest が
+        // `for url ({url})` で出すエラーに percent-encoded な資格情報がそのまま載る。
+        const PERCENT_ENCODED_USERNAME_SENTINEL: &str = "%55SER-PCT-SENTINEL";
+        const PERCENT_ENCODED_PASSWORD_SENTINEL: &str = "%50ASS-PCT-SENTINEL";
+        let endpoint = format!(
+            "https://{PERCENT_ENCODED_USERNAME_SENTINEL}:{PERCENT_ENCODED_PASSWORD_SENTINEL}\
+             @api.typesafe.ai/v1/systemone"
+        );
+        let err = build_with_endpoint(&endpoint).expect_err(
+            "percent-encoded userinfo must fail closed at startup, the same as plain userinfo",
+        );
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("userinfo"),
+            "the error must tell operators what to fix, got: {message}"
+        );
+        for secret in [
+            PERCENT_ENCODED_USERNAME_SENTINEL,
+            PERCENT_ENCODED_PASSWORD_SENTINEL,
+        ] {
+            assert!(
+                !message.contains(secret),
+                "the error message must not echo the percent-encoded credentials ({secret}), \
+                 got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_with_an_unparseable_endpoint_errs_without_echoing_it() {
+        // parse に失敗した値は userinfo の有無を判定できないため、値を出さない。
+        let endpoint = format!("https://{USERNAME_SENTINEL}:{PASSWORD_SENTINEL}@exa mple.com/");
+        let err = build_with_endpoint(&endpoint)
+            .expect_err("an unparseable endpoint must fail closed at startup");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("jev.endpoint"),
+            "the error must identify which setting failed to parse, got: {message}"
+        );
+        for secret in [USERNAME_SENTINEL, PASSWORD_SENTINEL] {
+            assert!(
+                !message.contains(secret),
+                "the error message must not echo the endpoint ({secret}), got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_accepts_https_endpoints_without_userinfo() {
+        // 本番の endpoint と同じ形。`@` がパス・クエリに現れても userinfo ではないので通る
+        // （拒否の判定は文字列中の `@` ではなく、パース結果の username / password で行う）。
+        for endpoint in [
+            "https://api.typesafe.ai/v1/systemone",
+            "https://api.typesafe.ai:8443/v1/systemone?tenant=a@b",
+            "https://api.typesafe.ai/v1/user@systemone",
+        ] {
+            let client = build_with_endpoint(endpoint);
+            assert!(
+                client.is_ok(),
+                "{endpoint} has no userinfo and must be accepted, got: {:?}",
+                client.err()
+            );
+        }
+    }
+
+    #[test]
+    fn build_accepts_empty_userinfo_because_url_normalization_drops_it_before_serialization() {
+        // codex 指摘(Issue #58 レビュー、reviewer 実測): 空の userinfo(`https://@host/` /
+        // `https://:@host/`)は username() が ""、password() が None になり build() は受理する。
+        // 「`@` が文字列にあるから危険」ではなく「パース結果の username / password で判定する」
+        // という validate_endpoint の設計が正しいことを示すため、受理してよい理由まで固定する:
+        // url::Url はこれらの空 userinfo を正規化の過程で `@` ごと落とすため、reqwest が失敗時
+        // ログへ出す `for url ({url})` の URL には資格情報どころか `@` 自体が一切残らない
+        // (percent-encoded な userinfo が正規化されずそのまま残るのと対照的。上の
+        // build_rejects_an_endpoint_with_percent_encoded_userinfo_... 参照)。
+        for endpoint in [
+            "https://@api.typesafe.ai/v1/systemone",
+            "https://:@api.typesafe.ai/v1/systemone",
+        ] {
+            let client = build_with_endpoint(endpoint);
+            assert!(
+                client.is_ok(),
+                "{endpoint} has an empty userinfo that url normalization drops entirely and \
+                 must be accepted, got: {:?}",
+                client.err()
+            );
+
+            let parsed = url::Url::parse(endpoint).expect("endpoint is a valid URL");
+            assert!(
+                !parsed.as_str().contains('@'),
+                "url normalization must drop the empty userinfo (including the '@') so that no \
+                 credential marker survives into the URL reqwest would log on failure, got: {}",
+                parsed.as_str()
+            );
+        }
     }
 
     // ---- enough_info_threshold validation (reviewer 指摘、Issue #58 第2ラウンド) ----
@@ -863,7 +1182,7 @@ mod tests {
             Duration::from_secs(5),
         );
         let outcome = client
-            .evaluate("電源が入りません")
+            .evaluate("電源が入りません", TEST_REQUEST_ID)
             .await
             .expect("well-formed response must parse");
 
@@ -921,7 +1240,7 @@ mod tests {
             Duration::from_secs(5),
         );
         client
-            .evaluate("STATE-MARKER")
+            .evaluate("STATE-MARKER", TEST_REQUEST_ID)
             .await
             .expect("stub response must parse");
 
@@ -931,6 +1250,78 @@ mod tests {
         assert_eq!(sent["state"], "STATE-MARKER");
         assert_eq!(sent["model"], "jev-test");
         assert_eq!(sent["questions"]["is_emergency"]["type"], "noul");
+        // 本文のトップレベルキーは design doc §1 のリクエスト契約と完全一致させる。
+        // 個別キーの値だけを見ていると、キーが 1 つ増えても（社内 ID や追加のメタデータが
+        // 外部サービスへ流れ始めても）気付けない。
+        let sent_keys: std::collections::BTreeSet<&str> = sent
+            .as_object()
+            .expect("request body is a json object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            sent_keys,
+            std::collections::BTreeSet::from(["model", "questions", "state"]),
+            "the request body must contain exactly the documented top-level keys, got: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_never_sends_the_request_id_to_jev_in_body_headers_or_url() {
+        // `request_id` はログ突合専用。社内の相関 ID を外部サービスへ渡さない。送信面は本文・
+        // HTTP ヘッダ・URL（クエリ）の 3 つあり、design doc §2 の「Jev へは送信しない」は
+        // そのどれにも当てはまる。どの面へ足されても落ちるよう、それぞれで「キー名（ヘッダ名）
+        // にも値にも現れない」ことを固定する。
+        const SENTINEL: &str = "req-must-not-be-sent-to-jev";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "answers": {},
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(
+            format!("{}/v1/systemone", server.uri()),
+            Duration::from_secs(5),
+        );
+
+        client
+            .evaluate("state", SENTINEL)
+            .await
+            .expect("stub response must parse");
+
+        let requests = server.received_requests().await.expect("recording enabled");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+
+        // 本文: 入れ子を含む全体にキー名も値も現れない。
+        let body_text = String::from_utf8_lossy(&request.body);
+        assert!(
+            !body_text.contains("request_id") && !body_text.contains(SENTINEL),
+            "request_id must not appear in the request body, got: {body_text}"
+        );
+        // ヘッダ: 名前は小文字化済みで、`_` と `-` の表記ゆれ（`request_id` / `x-request-id` /
+        // `request-id`）を `-` へ寄せて判定する。
+        for (name, value) in &request.headers {
+            let normalized_name = name.as_str().replace('_', "-");
+            let value_text = String::from_utf8_lossy(value.as_bytes());
+            assert!(
+                !normalized_name.contains("request-id"),
+                "request_id must not be sent as an HTTP header, got header name: {name}"
+            );
+            assert!(
+                !value_text.contains(SENTINEL),
+                "request_id must not be sent as an HTTP header value, got: {name}: {value_text}"
+            );
+        }
+        // URL（クエリを含む）。
+        let url = request.url.as_str();
+        assert!(
+            !url.contains("request_id") && !url.contains(SENTINEL),
+            "request_id must not be sent in the request URL, got: {url}"
+        );
     }
 
     #[tokio::test]
@@ -948,7 +1339,7 @@ mod tests {
             .await;
 
         let client = test_client(server.uri(), Duration::from_secs(5));
-        let (result, logs) = capture_logs_async(client.evaluate("state")).await;
+        let (result, logs) = capture_logs_async(client.evaluate("state", TEST_REQUEST_ID)).await;
         let outcome = result.expect("unknown answer type must not fail the whole response");
 
         assert_eq!(
@@ -987,7 +1378,7 @@ mod tests {
             .await;
 
         let client = test_client(server.uri(), Duration::from_secs(5));
-        let (result, logs) = capture_logs_async(client.evaluate("state")).await;
+        let (result, logs) = capture_logs_async(client.evaluate("state", TEST_REQUEST_ID)).await;
         let outcome = result.expect("a malformed answer entry must not fail the whole response");
 
         assert_eq!(outcome.answers.len(), 1);
@@ -996,6 +1387,41 @@ mod tests {
         assert!(
             warnings.contains("product") && warnings.contains("choice"),
             "got: {warnings}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_parse_failure_warn_carries_the_request_id() {
+        // `/api/reply` は並行処理される。捨てた回答の理由（この warn）と、呼び出し側
+        // （`api.rs`）の `answer_kind=missing` warn を結ぶ相関 ID がここに無いと、運用者は
+        // 時刻近傍で当て推量するしかなく、他リクエストのパース失敗を取り違える。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "answers": {
+                    "is_emergency": {"type": "noul", "noul": 0.9},
+                    "future_field": {"type": "vector", "vector": [1, 2, 3]}
+                },
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(server.uri(), Duration::from_secs(5));
+        let (result, logs) = capture_logs_async(client.evaluate("state", "req-jev-unit-7")).await;
+        result.expect("an unparseable answer entry must not fail the whole response");
+
+        let warnings = filter_warn_and_error_lines(&logs);
+        let discard_line = warnings
+            .lines()
+            .find(|line| line.contains("answer_id=future_field"))
+            .unwrap_or_else(|| {
+                panic!("the discarded entry must be reported by a WARN line, got: {warnings}")
+            });
+        assert!(
+            discard_line.contains("request_id=req-jev-unit-7"),
+            "the parse-failure WARN must carry the request_id so it can be joined with the \
+             caller's warn, got: {discard_line}"
         );
     }
 
@@ -1029,7 +1455,7 @@ mod tests {
             .await;
 
         let client = test_client(server.uri(), Duration::from_secs(5));
-        let (result, logs) = capture_logs_async(client.evaluate("state")).await;
+        let (result, logs) = capture_logs_async(client.evaluate("state", TEST_REQUEST_ID)).await;
         let outcome = result.expect("an out-of-range noul must not fail the whole response");
 
         assert_eq!(
@@ -1064,7 +1490,7 @@ mod tests {
 
         let client = test_client(server.uri(), Duration::from_secs(5));
         let err = client
-            .evaluate("state")
+            .evaluate("state", TEST_REQUEST_ID)
             .await
             .expect_err("malformed top-level JSON must be an error, not a panic");
         assert!(err.to_string().contains("parse"));
@@ -1087,7 +1513,7 @@ mod tests {
 
         let client = test_client(server.uri(), Duration::from_secs(5));
         let err = client
-            .evaluate("state")
+            .evaluate("state", TEST_REQUEST_ID)
             .await
             .expect_err("a response body over the size cap must be rejected, not parsed");
         let message = err.to_string();
@@ -1163,7 +1589,7 @@ mod tests {
     async fn evaluate_errs_on_oversized_chunked_response_without_content_length() {
         let endpoint = spawn_oversized_chunked_stub().await;
         let client = test_client(endpoint, Duration::from_secs(5));
-        let err = client.evaluate("state").await.expect_err(
+        let err = client.evaluate("state", TEST_REQUEST_ID).await.expect_err(
             "a chunked response with no content-length header must still be capped by the \
              incremental reader, not buffered in full before checking",
         );
@@ -1231,7 +1657,7 @@ mod tests {
         // 引き続き受理されること（1バイトでも境界がずれていないこと）を検証する。
         let endpoint = spawn_exact_cap_chunked_stub().await;
         let client = test_client(endpoint, Duration::from_secs(5));
-        let err = client.evaluate("state").await.expect_err(
+        let err = client.evaluate("state", TEST_REQUEST_ID).await.expect_err(
             "the stub body is not valid JSON, so evaluate must still fail overall — but the \
              failure must come from JSON parsing, not the size cap, which is what proves a \
              body of exactly MAX_RESPONSE_BYTES is not rejected by the pre-append size check",
@@ -1270,8 +1696,8 @@ mod tests {
             .await;
 
         let client = test_client(redirector.uri(), Duration::from_secs(5));
-        let err = client.evaluate("state").await.expect_err(
-            "a 307 redirect must not be followed transparently: validate_endpoint_scheme only \
+        let err = client.evaluate("state", TEST_REQUEST_ID).await.expect_err(
+            "a 307 redirect must not be followed transparently: validate_endpoint only \
              checks the configured endpoint, not the redirect target, and 307 resends the POST \
              body (customer utterances) to wherever Location points",
         );
@@ -1300,7 +1726,7 @@ mod tests {
     /// `build()` を実際に通して生成した `JevClient` でリダイレクト非追従を検証することで、
     /// その退行を検出できるようにする。
     ///
-    /// `validate_endpoint_scheme` は `http://127.0.0.1` を許可するため、wiremock の
+    /// `validate_endpoint` は `http://127.0.0.1` を許可するため、wiremock の
     /// `server.uri()`（`http://127.0.0.1:<port>`）をそのまま `JevConfig.endpoint` に渡して
     /// `build()` を通せる。
     #[tokio::test]
@@ -1332,7 +1758,7 @@ mod tests {
         let client = JevClient::build("test-key".to_string(), &cfg, &unused_config_dir())
             .expect("build() must succeed for a loopback http endpoint");
 
-        let err = client.evaluate("state").await.expect_err(
+        let err = client.evaluate("state", TEST_REQUEST_ID).await.expect_err(
             "a 307 redirect must not be followed transparently by a client built through the \
              production build() path",
         );
@@ -1363,7 +1789,7 @@ mod tests {
 
         let client = test_client(server.uri(), Duration::from_secs(5));
         let err = client
-            .evaluate("state")
+            .evaluate("state", TEST_REQUEST_ID)
             .await
             .expect_err("HTTP 401 must be an error");
         assert!(err.to_string().contains("401"));
@@ -1379,7 +1805,7 @@ mod tests {
 
         let client = test_client(server.uri(), Duration::from_secs(5));
         let err = client
-            .evaluate("state")
+            .evaluate("state", TEST_REQUEST_ID)
             .await
             .expect_err("HTTP 429 must be an error");
         assert!(err.to_string().contains("429"));
@@ -1395,7 +1821,7 @@ mod tests {
 
         let client = test_client(server.uri(), Duration::from_secs(5));
         let err = client
-            .evaluate("state")
+            .evaluate("state", TEST_REQUEST_ID)
             .await
             .expect_err("HTTP 529 must be an error");
         assert!(err.to_string().contains("529"));
@@ -1412,9 +1838,43 @@ mod tests {
         // per-request timeout をサーバの遅延より短くして、確実にタイムアウト経路を通す。
         let client = test_client(server.uri(), Duration::from_millis(50));
         let err = client
-            .evaluate("state")
+            .evaluate("state", TEST_REQUEST_ID)
             .await
             .expect_err("a response slower than the client timeout must be an error");
-        assert!(err.to_string().contains("call jev evaluate api"));
+        // タイムアウトは、こちらが所有する安定した文言（設定値入り）で判別できること。
+        // reqwest / hyper の文言（`operation timed out` 等）には依存しない。
+        assert_eq!(
+            err.to_string(),
+            "jev evaluate api timed out after 0.05s",
+            "a timeout must be labelled with the stable phrase and the configured timeout"
+        );
+        // 原因（reqwest のエラー）は context の下にチェーンとして残る。呼び出し側が
+        // `{err:#}` で出せるよう、握りつぶさないことを固定する（文言には立ち入らない）。
+        assert!(
+            format!("{err:#}").starts_with("jev evaluate api timed out after 0.05s: "),
+            "the underlying cause must remain in the error chain, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_keeps_the_generic_context_for_a_send_error_that_is_not_a_timeout() {
+        // タイムアウト以外の送出エラー（ここでは接続拒否）は従来の context のままで、
+        // 「タイムアウトした」と誤って名乗らない（運用者が原因を取り違えないため）。
+        // 空きポートを確保してすぐ閉じることで、接続拒否を決定論的に再現する。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("read the bound address");
+        drop(listener);
+
+        let client = test_client(format!("http://{addr}"), Duration::from_secs(5));
+        let err = client
+            .evaluate("state", TEST_REQUEST_ID)
+            .await
+            .expect_err("connecting to a closed port must be an error");
+
+        assert_eq!(err.to_string(), "call jev evaluate api");
+        assert!(
+            !format!("{err:#}").contains("timed out after"),
+            "a non-timeout failure must not be labelled as a timeout, got: {err:#}"
+        );
     }
 }

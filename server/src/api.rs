@@ -431,19 +431,47 @@ fn decide_jev_hearing_action(
 /// 「過去の顧客発話 + 今ターンの発話」（呼び出し元は `resolve_jev_has_enough_info`）。HTTP 呼び出し失敗・タイムアウト・
 /// 応答に `has_enough_info` の `noul` 回答が無いのいずれも `None`（呼び出し側は
 /// `decide_reply_action` へフォールバックすること。fail-closed にせず fail-back する）。
+///
+/// `noul` 以外が返ったときの warn は、回答の**種別名だけ**を `answer_kind` に出し、値
+/// （`choice` の選択値・`confidence`・`probabilities`・`legend`・`score`）は出さない。これらは
+/// モデル生成値で顧客由来のデータを含みうるため、`{:?}` で丸ごと出すとアプリケーションログへ
+/// 顧客データが載る。`jev.rs::parse_answers` の warn（id / type / 理由のみ）とログ衛生の規律を
+/// 揃えている。`answer_kind=missing` は「エントリが無い、またはパースに失敗して捨てられた」場合
+/// （後者の理由は同リクエストの `jev.rs` 側 warn に出る）で、型の取り違えとは切り分けられる。
+/// `jev.rs` 側の warn も `request_id` を持つ（`JevClient::evaluate` の引数で伝播）ため、
+/// `answer_kind=missing` を観測したら同じ `request_id` の warn で破棄理由を引ける。
+///
+/// 数値 `noul` の範囲エラー（`jev.rs` の `noul value {noul} is out of ...`）だけは、診断のため
+/// 実値を `reason` に出す例外とする。f64 は顧客由来のテキストを運べないため許容している。
+///
+/// 失敗時の warn（`Err` 分岐）は `error` に**原因チェーンまで**出す（`{err:#}`）。anyhow の
+/// `Display` は最外層の context しか出さず、`{err}` だと接続拒否・DNS 失敗・TLS 失敗・
+/// タイムアウトがすべて同じ 1 行になり、運用者が原因を区別できない。タイムアウトのうち
+/// **`send()` 中（接続・リクエスト送出・応答ヘッダ受信まで）のタイムアウト**は
+/// `jev evaluate api timed out after <timeout_secs>s` という、`jev.rs` が所有する安定した
+/// 文言で判別できる（reqwest の文言には依存しない）。**応答ヘッダ受信後の本文読み込み中
+/// （`response.chunk()`）のタイムアウトはこの固有文言が付かず、`read jev evaluate api
+/// response body` の下に原因チェーンが続く**（`jev.rs::describe_send_error` の doc 参照）。
+/// **チェーンには endpoint の URL が含まれうる**
+/// （config 由来の公開値。API キーは `Authorization` ヘッダで送るため URL には載らない。endpoint の
+/// userinfo は起動時検証 `jev.rs::validate_endpoint` が拒否する。ただし**クエリ文字列は拒否されない**
+/// ため、`[jev] endpoint` のクエリに資格情報を置くとログへ載る（クエリに資格情報を置かないこと））。
+/// **API キーと顧客発話（`state`）は含まれない**（reqwest のエラーはリクエスト本文もヘッダも
+/// 持たない。`assert_jev_failure_logged_once_without_leaking` が固定）。
 async fn query_jev_has_enough_info(
     jev: &crate::jev::JevClient,
     state: &str,
     request_id: &str,
 ) -> Option<f64> {
-    match jev.evaluate(state).await {
+    match jev.evaluate(state, request_id).await {
         Ok(outcome) => match outcome.answers.get("has_enough_info") {
             Some(crate::jev::JevAnswer::Noul { noul }) => Some(*noul),
             other => {
+                let answer_kind = other.map_or("missing", crate::jev::JevAnswer::kind);
                 tracing::warn!(
                     request_id = %request_id,
-                    answer = ?other,
-                    "jev hearing evaluate response is missing a has_enough_info noul answer; \
+                    answer_kind = %answer_kind,
+                    "jev hearing evaluate response has no usable has_enough_info noul answer; \
                      falling back to the missing-based clarify decision"
                 );
                 None
@@ -451,7 +479,7 @@ async fn query_jev_has_enough_info(
         },
         Err(err) => {
             tracing::warn!(
-                error = %err,
+                error = %format_args!("{err:#}"),
                 request_id = %request_id,
                 "jev hearing evaluate failed; falling back to the missing-based clarify decision"
             );
@@ -2649,6 +2677,9 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
+    /// テスト用 Jev クライアントの API キー。ログへ漏れないことを検証するテストが参照する。
+    const JEV_TEST_API_KEY: &str = "test-key";
+
     fn build_test_jev_client(endpoint: String, timeout_secs: u64) -> crate::jev::JevClient {
         let cfg = crate::config::JevConfig {
             enabled: true,
@@ -2659,11 +2690,103 @@ mod tests {
             enough_info_threshold: 0.5,
         };
         crate::jev::JevClient::build(
-            "test-key".to_string(),
+            JEV_TEST_API_KEY.to_string(),
             &cfg,
             std::path::Path::new("/unused-because-questions-path-is-absolute"),
         )
         .expect("build jev client for a loopback http endpoint")
+    }
+
+    /// `template` を返す Jev スタブ（wiremock）と、そのスタブを向いた Jev 有効の `Harness` を
+    /// 組み立てる。`MockServer` は戻り値を保持している間だけ生きる（落とすとスタブが止まる）ため、
+    /// 受信リクエストを検証しないテストも `_server` として束縛し続けること。
+    async fn jev_stub_harness(
+        template: wiremock::ResponseTemplate,
+        timeout_secs: u64,
+    ) -> (wiremock::MockServer, Harness) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let mut harness = test_harness();
+        harness.jev_client = Some(build_test_jev_client(server.uri(), timeout_secs));
+        (server, harness)
+    }
+
+    /// HTTP 200 で `{"answers": <answers_json>, "usage": ...}` を返すテンプレート。
+    fn jev_answers_response(answers_json: serde_json::Value) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "answers": answers_json,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+    }
+
+    /// 聞き返し判定の対象ターン（第1層 advisory・未確定 case）で `resolve_jev_has_enough_info` を
+    /// 1 回実行し、`(戻り値, 捕捉した生ログ)` を返す。生ログは INFO 以上を全て含む（WARN だけに
+    /// 絞ると、別レベルへの漏洩を見逃すため、漏洩の否定 assert には生ログを使う）。
+    async fn resolve_on_advisory_turn(
+        harness: &Harness,
+        history: &[ReplyHistoryTurn],
+        message: &str,
+        request_id: &str,
+    ) -> (Option<f64>, String) {
+        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
+        let conv = default_conv_state();
+        crate::test_support::capture_logs_async(resolve_jev_has_enough_info(
+            harness, &outcome, &conv, history, message, request_id,
+        ))
+        .await
+    }
+
+    /// Jev が `answers` として `answers_json` を返す状況で、対象ターンの
+    /// `resolve_jev_has_enough_info` を 1 回実行する（履歴なし・固定の発話）。
+    async fn resolve_with_jev_answers(
+        answers_json: serde_json::Value,
+        request_id: &str,
+    ) -> (Option<f64>, String) {
+        let (_server, harness) = jev_stub_harness(jev_answers_response(answers_json), 5).await;
+        resolve_on_advisory_turn(&harness, &[], "電源が入らなくなった", request_id).await
+    }
+
+    /// Jev 呼び出しの失敗（HTTP エラー・タイムアウト）で fail-back したときのログ契約を検証する。
+    ///
+    /// - WARN / ERROR がちょうど 1 件で、fail-back を名指しし、`error=` と `request_id` を持つ。
+    ///   `[jev] enabled = true` 後に実際に起こる経路で、運用者に残る手掛かりはこの warn だけ
+    ///   なので、欠落だけでなく重複（同じ失敗の二重報告）も固定する
+    /// - 顧客発話（Jev へ送る `state`）と API キーが、全レベルのログのどこにも載っていない
+    fn assert_jev_failure_logged_once_without_leaking(
+        logs: &str,
+        request_id: &str,
+        customer_utterance: &str,
+    ) {
+        let warnings = crate::test_support::filter_warn_and_error_lines(logs);
+        assert_eq!(
+            warnings.lines().count(),
+            1,
+            "a jev failure must emit exactly one WARN/ERROR line, got: {warnings:?}"
+        );
+        assert!(
+            warnings.contains("jev hearing evaluate failed"),
+            "an operator-facing warning must name the failure, got: {warnings}"
+        );
+        assert!(
+            warnings.contains("error="),
+            "the warning must carry the underlying error, got: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("request_id={request_id}")),
+            "the warning must carry the request_id, got: {warnings}"
+        );
+        for (what, secret) in [
+            ("customer utterance", customer_utterance),
+            ("api key", JEV_TEST_API_KEY),
+        ] {
+            assert!(
+                !logs.contains(secret),
+                "the {what} must never reach the logs ({secret}), got: {logs}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2690,38 +2813,30 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_jev_has_enough_info_returns_the_noul_value_on_success() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "answers": {"has_enough_info": {"type": "noul", "noul": 0.14}},
-                    "usage": {"input_tokens": 10, "output_tokens": 5}
-                })),
-            )
-            .mount(&server)
-            .await;
-        let jev = build_test_jev_client(server.uri(), 5);
-        let mut harness = test_harness();
-        harness.jev_client = Some(jev);
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
-        let conv = default_conv_state();
+        let (server, harness) = jev_stub_harness(
+            jev_answers_response(serde_json::json!({
+                "has_enough_info": {"type": "noul", "noul": 0.14}
+            })),
+            5,
+        )
+        .await;
         let history = vec![
             customer_turn("録画が再生できません"),
             assistant_turn("型番を教えていただけますか？"),
             customer_turn("先週から映らなくなりました"),
         ];
 
-        let result = resolve_jev_has_enough_info(
-            &harness,
-            &outcome,
-            &conv,
-            &history,
-            "型番は ADC-V523 です",
-            "req-1",
-        )
-        .await;
+        let (result, logs) =
+            resolve_on_advisory_turn(&harness, &history, "型番は ADC-V523 です", "req-1").await;
 
         assert_eq!(result, Some(0.14));
+        // 正常系では WARN / ERROR を一切出さない。`noul` が正常に返ったターンで無駄な warn が
+        // 出る退行は、Cloud Run のログノイズになり、運用者に誤った障害調査をさせる。
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.is_empty(),
+            "a successful jev call must not emit any WARN/ERROR line, got: {warnings}"
+        );
         // 結線の固定: `resolve_jev_has_enough_info` が `history` と `message` から state を
         // 組み立て、それが HTTP で実際に送信されること。将来ここが `message` のみの送信へ
         // 退行すると、多ターンのヒアリングで `has_enough_info` が上がらなくなる（Issue #58）。
@@ -2745,95 +2860,176 @@ mod tests {
     async fn resolve_jev_has_enough_info_returns_none_on_http_error() {
         // Issue #58 必須テスト5: HTTP エラー時は missing ベースの挙動へフォールバックする
         // （fail-closed にしない）。
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let jev = build_test_jev_client(server.uri(), 5);
-        let mut harness = test_harness();
-        harness.jev_client = Some(jev);
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
-        let conv = default_conv_state();
+        let (_server, harness) = jev_stub_harness(wiremock::ResponseTemplate::new(500), 5).await;
+        let utterance = "電源が入らなくなった";
 
-        let (result, logs) = crate::test_support::capture_logs_async(resolve_jev_has_enough_info(
-            &harness,
-            &outcome,
-            &conv,
-            &[],
-            "電源が入らなくなった",
-            "req-1",
-        ))
-        .await;
+        let (result, logs) = resolve_on_advisory_turn(&harness, &[], utterance, "req-1").await;
 
         assert_eq!(result, None);
-        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
-        assert!(
-            warnings.contains("jev hearing evaluate failed"),
-            "an operator-facing warning must name the failure, got: {warnings}"
-        );
+        assert_jev_failure_logged_once_without_leaking(&logs, "req-1", utterance);
     }
 
     #[tokio::test]
     async fn resolve_jev_has_enough_info_returns_none_on_timeout() {
         // Issue #58 必須テスト5: タイムアウト時も missing ベースの挙動へフォールバックする。
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)),
-            )
-            .mount(&server)
-            .await;
         // timeout_secs は config 経由では整数秒単位が最小のため、確実にタイムアウトさせるため
         // モック側の遅延(2秒)より短い 1 秒に設定する。
-        let jev = build_test_jev_client(server.uri(), 1);
-        let mut harness = test_harness();
-        harness.jev_client = Some(jev);
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
-        let conv = default_conv_state();
-
-        let result = resolve_jev_has_enough_info(
-            &harness,
-            &outcome,
-            &conv,
-            &[],
-            "電源が入らなくなった",
-            "req-1",
+        let (_server, harness) = jev_stub_harness(
+            wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)),
+            1,
         )
         .await;
+        let utterance = "電源が入らなくなった";
+
+        let (result, logs) = resolve_on_advisory_turn(&harness, &[], utterance, "req-1").await;
 
         assert_eq!(result, None);
+        // タイムアウトは `[jev] enabled = true` 後に実際に起こる fail-back 経路で、運用者が
+        // 「Jev が倒れた」と気付く手掛かりは warn だけ。HTTP エラーと同じ水準で固定する。
+        assert_jev_failure_logged_once_without_leaking(&logs, "req-1", utterance);
+
+        // タイムアウトは、こちらが所有する安定した文言（`[jev] timeout_secs` の実値入り。この
+        // テストは 1 秒）で判別できること。reqwest / hyper の文言には依存しない。
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("jev evaluate api timed out after 1s"),
+            "the warn must say it was a timeout and the configured value, got: {warnings}"
+        );
+        // 最外層だけでなく原因チェーンまで出していること（`{err:#}`）。安定文言の直後に
+        // anyhow のチェーン区切り `: ` で原因が続く。文言そのものには立ち入らない。
+        assert!(
+            warnings.contains("jev evaluate api timed out after 1s: "),
+            "the warn must print the whole error chain, not only the outermost context, \
+             got: {warnings}"
+        );
     }
 
     #[tokio::test]
-    async fn resolve_jev_has_enough_info_returns_none_when_response_is_missing_the_answer() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "answers": {},
-                    "usage": {"input_tokens": 1, "output_tokens": 1}
-                })),
-            )
-            .mount(&server)
-            .await;
-        let jev = build_test_jev_client(server.uri(), 5);
-        let mut harness = test_harness();
-        harness.jev_client = Some(jev);
-        let outcome = base_outcome(layer1_advisory_escalate_decision(), true);
-        let conv = default_conv_state();
+    async fn resolve_jev_has_enough_info_falls_back_and_logs_kind_missing_when_the_answer_entry_is_absent(
+    ) {
+        // 応答に has_enough_info のエントリが無いとき、fail-closed にせず missing ベースの判定へ
+        // 委ねること（`None`）と、運用者が「Jev が答えを返さなかった」ケースを「型が違った」
+        // ケース（choice / score）と切り分けられること（`answer_kind=missing`）を固定する。
+        let (result, logs) = resolve_with_jev_answers(serde_json::json!({}), "req-1").await;
 
-        let result = resolve_jev_has_enough_info(
-            &harness,
-            &outcome,
-            &conv,
-            &[],
-            "電源が入らなくなった",
+        assert_eq!(
+            result, None,
+            "an absent has_enough_info entry must fall back to the missing-based decision"
+        );
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("answer_kind=missing"),
+            "an absent has_enough_info entry must be reported as kind=missing, got: {warnings}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_falls_back_and_logs_only_the_kind_when_answer_is_a_choice()
+    {
+        // 値（choice / confidence / probabilities）はモデル生成で、顧客由来のデータを含みうる。
+        // 8 桁以上の数値は、タイムスタンプ（小数部は最大 6 桁）と偶然一致しないための選択。
+        let (result, logs) = resolve_with_jev_answers(
+            serde_json::json!({
+                "has_enough_info": {
+                    "type": "choice",
+                    "choice": "SENTINEL-CHOICE-VALUE",
+                    "confidence": 0.87313131,
+                    "probabilities": {
+                        "SENTINEL-CHOICE-VALUE": 0.87313131, "SENTINEL-OTHER": 0.12686869
+                    }
+                }
+            }),
             "req-1",
         )
         .await;
 
+        assert_eq!(
+            result, None,
+            "a non-noul has_enough_info must fall back to the missing-based decision"
+        );
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("answer_kind=choice"),
+            "the returned kind must be logged so operators can tell the type mismatch, got: {warnings}"
+        );
+        for leaked in ["SENTINEL", "87313131", "12686869"] {
+            assert!(
+                !logs.contains(leaked),
+                "model-generated answer values must never reach the logs ({leaked}), got: {logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_falls_back_and_logs_only_the_kind_when_answer_is_a_score()
+    {
+        let (result, logs) = resolve_with_jev_answers(
+            serde_json::json!({
+                "has_enough_info": {
+                    "type": "score",
+                    "score": 3.14159265,
+                    "confidence": 0.87313131,
+                    "probabilities": {"3": 0.87313131},
+                    "legend": {"3": "SENTINEL-LEGEND-TEXT"}
+                }
+            }),
+            "req-1",
+        )
+        .await;
+
+        assert_eq!(
+            result, None,
+            "a non-noul has_enough_info must fall back to the missing-based decision"
+        );
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("answer_kind=score"),
+            "the returned kind must be logged so operators can tell the type mismatch, got: {warnings}"
+        );
+        for leaked in ["SENTINEL", "14159265", "87313131"] {
+            assert!(
+                !logs.contains(leaked),
+                "model-generated answer values must never reach the logs ({leaked}), got: {logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_joins_the_parse_failure_warn_and_the_missing_warn_by_request_id(
+    ) {
+        // Jev が has_enough_info を未知の `type` で返すと、jev.rs が破棄理由を warn し、api.rs は
+        // 続けて `answer_kind=missing` を warn する。`/api/reply` が並行処理される本番で運用者が
+        // 他リクエストの warn と取り違えずにこの 2 行を結べるよう、両方が同じ request_id を持つこと。
+        let (result, logs) = resolve_with_jev_answers(
+            serde_json::json!({"has_enough_info": {"type": "vector", "vector": [1, 2, 3]}}),
+            "req-correlate-42",
+        )
+        .await;
+
         assert_eq!(result, None);
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        let find_line = |needle: &str| -> String {
+            warnings
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no WARN line contains {needle:?}, got: {warnings}"))
+                .to_string()
+        };
+        for (which, line) in [
+            (
+                "jev.rs parse-failure warn",
+                find_line("answer_id=has_enough_info"),
+            ),
+            (
+                "api.rs answer_kind=missing warn",
+                find_line("answer_kind=missing"),
+            ),
+        ] {
+            assert!(
+                line.contains("request_id=req-correlate-42"),
+                "the {which} must carry the request_id so the two warns can be joined, got: {line}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2841,19 +3037,13 @@ mod tests {
         // Issue #58 必須テスト4の補強: Jev が正常に動作していても、mandatory ルールでは
         // そもそもリクエストが飛ばないことを実測する（値に関わらず対象外、ではなく本当に
         // 呼んでいないことの証拠）。
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "answers": {"has_enough_info": {"type": "noul", "noul": 0.14}},
-                    "usage": {"input_tokens": 10, "output_tokens": 5}
-                })),
-            )
-            .mount(&server)
-            .await;
-        let jev = build_test_jev_client(server.uri(), 5);
-        let mut harness = test_harness();
-        harness.jev_client = Some(jev);
+        let (server, harness) = jev_stub_harness(
+            jev_answers_response(serde_json::json!({
+                "has_enough_info": {"type": "noul", "noul": 0.14}
+            })),
+            5,
+        )
+        .await;
         let outcome = base_outcome(layer1_mandatory_escalate_decision(), false);
         let conv = default_conv_state();
 

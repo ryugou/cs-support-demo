@@ -28,11 +28,12 @@ Jev は「解釈」だけを担い、判定はコードに残す(既存の原則
 
 - `server/src/jev.rs`(新規)
   - `JevClient::from_config(&JevConfig) -> Result<Option<Self>>`: `enabled = false` なら `None`、`enabled = true` で鍵が解決できなければ起動時 `Err`(`AnthropicClient::from_config` と同じ流儀)
-  - `async fn evaluate(&self, state: &str) -> Result<JevOutcome>`: 質問定義は構築時に読み込んで保持する
+  - `async fn evaluate(&self, state: &str, request_id: &str) -> Result<JevOutcome>`: 質問定義は構築時に読み込んで保持する
+    - `request_id` は**ログの突合専用**で、Jev へは送信しない(リクエスト本文は §1 の `state` / `model` / `questions` のみ)。応答の要素をパースできず捨てるときの warn に載せ、呼び出し側(`api.rs::query_jev_has_enough_info`)の warn と同じ値で結ぶ
   - タイムアウトは config(既定 3 秒)。エラーは型で返し、呼び出し側が握りつぶす
 - 質問定義: `server/data/urtect/jev-questions.json`(イメージ同梱)。パスは config の `[jev] questions_path`
 - 起動点: `/{project_id}/api/reply` の入力検証を通った直後。**`tokio::spawn` で fire-and-forget**(応答を待たない。ターン永続化と同じ規律)
-- 記録: `tracing::info!` の構造化ログ 1 行。`request_id` / `case_id`(無ければ空)/ 各 answer の値・信頼度・上位確率 / 所要ミリ秒 / 入出力トークン。**顧客発話の本文はログに出さない**(request_id で監査ログと突合する)
+- 記録: `tracing::info!` の構造化ログ 1 行。`request_id` / `case_id`(無ければ空)/ 各 answer の**種別**(`JevAnswer::kind()`)と数値(`noul` / `score` / `confidence`)/ 所要ミリ秒 / 入出力トークン。**顧客発話の本文はログに出さない**(request_id で監査ログと突合する)。**`choice` の選択値・`probabilities` のキー・`legend` は出さない**(モデル生成文字列で、顧客由来のデータを含みうる。`api.rs::query_jev_has_enough_info` と同じ規律。`{:?}` での丸ごと出力も不可)
 - config:
   ```toml
   [jev]
@@ -50,20 +51,21 @@ Jev は「解釈」だけを担い、判定はコードに残す(既存の原則
 2. Jev の結果を判定・分岐・生成プロンプトに一切渡さない(本タスクの範囲)
 3. 顧客発話の本文をログに書かない
 4. `[jev] enabled = false` の構成では Jev へ一切アクセスしない
+5. Jev の answer のうちモデル生成文字列(`choice` の選択値・`probabilities` のキー・`legend`)をログに書かない(顧客由来のデータを含みうる。書いてよいのは種別 `JevAnswer::kind()` と数値のみ)
 
 **§7 の経路はこの限りではない**: 第1層 advisory の聞き返し判定に限り、Jev の結果(`has_enough_
 info`)を判定に使い(2 と矛盾)、対象ターンの応答時間は Jev の 1 往復分だけ増える(1 と矛盾)。
 これは Issue #58 で意図的に導入した例外であり、詳細と許容根拠は §7 を参照。1 と 2 は §7 の
-経路(第1層 advisory のエスカレーションターン)では成立しない。3・4 は §7 の経路においても
-真のまま(顧客発話の本文はログに書かず、`[jev] enabled = false` の構成では Jev へ一切
-アクセスしない)。
+経路(第1層 advisory のエスカレーションターン)では成立しない。3・4・5 は §7 の経路においても
+真のまま(顧客発話の本文と Jev の answer のモデル生成文字列はログに書かず、
+`[jev] enabled = false` の構成では Jev へ一切アクセスしない)。
 
 ## 4. テスト
 
 - 無効時: クライアントが構築されず、呼び出しも発生しない
 - 有効時: スタブで成功・HTTP エラー・タイムアウトを与え、いずれも応答本文と `reply_kind` が不変であること
 - パース: noul / choice / score の 3 型、未知フィールド、壊れた JSON(失敗として扱い応答に影響しない)
-- ログ: 顧客発話の本文が出力に含まれないことを固定
+- ログ: 顧客発話の本文と、Jev の answer のモデル生成文字列(`choice` の選択値・`probabilities` のキー・`legend`)が出力に含まれないことを固定(後者は `api.rs` の `..._logs_only_the_kind_when_answer_is_a_choice` / `..._score` がセンチネル値で固定)
 
 ## 5. 運用
 
@@ -186,6 +188,8 @@ config `[jev] enough_info_threshold`(既定 0.5)。`has_enough_info < enough_inf
 - Jev の HTTP エラー(4xx/5xx)
 - Jev のタイムアウト(`[jev] timeout_secs`)
 - Jev の応答に `has_enough_info` の `noul` 回答が無い(欠落・型不一致)
+
+失敗時の warn(`jev hearing evaluate failed`)は `error` に原因チェーン(`{err:#}`)を出すため、endpoint の URL が含まれうる(config 由来の公開値。endpoint に userinfo(`user:pass@`)が含まれる構成は、資格情報がログに載るため、起動時検証 `JevClient::build` が fail closed で拒否する。拒否・parse 失敗のエラーメッセージにも endpoint の値は出さない)。API キー・顧客発話(`state`)・モデル生成文字列は含まれない(§3 の 3・5。API キーは `Authorization` ヘッダで送るため。ただし `[jev] endpoint` のクエリ文字列へ資格情報を置いた場合は endpoint URL の一部としてログに載る。クエリへ資格情報を置かないこと)。タイムアウトのうち `send()` 中(接続・リクエスト送出・応答ヘッダ受信まで)のタイムアウトは `jev evaluate api timed out after <timeout_secs>s` という固有の文言で判別でき(`jev.rs` が所有する安定した文字列で、reqwest / hyper の文言には依存しない)、接続拒否・DNS 失敗・TLS 失敗などそれ以外の送出エラーは `call jev evaluate api` の下に原因チェーンが続く。応答ヘッダ受信後の本文読み込み中(`response.chunk()`)のタイムアウトはこの固有文言が付かず、`read jev evaluate api response body` の下に原因チェーンが続く。
 
 **応答時間は従来と同一にはならない。** `resolve_jev_has_enough_info` は `evaluate` を `await`
 する同期呼び出しであり、トリガー条件(上記 3 条件)を満たした対象ターンに限り、Jev の 1 往復分
