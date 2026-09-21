@@ -1,0 +1,92 @@
+{
+  "is_hardware_failure": {
+    "type": "noul",
+    "instructions": "顧客は製品の故障・破損・保証交換について相談しているか",
+    "criteria": {
+      "true": "電源が入らない、動かない、壊れた等、ハードウェアの不具合の申告がある",
+      "false": "操作方法や仕様の質問、検討の相談、雑談"
+    }
+  },
+  "is_emergency": {
+    "type": "noul",
+    "instructions": "身の危険が差し迫っている状況を訴えているか",
+    "criteria": {
+      "true": "侵入されている、不審者がいる、危害を加えられそう等",
+      "false": "製品や防犯一般の相談"
+    }
+  },
+  "has_enough_info": {
+    "type": "noul",
+    "instructions": "サポート担当者が調査に着手するのに十分な情報が揃っているか",
+    "criteria": {
+      "true": "対象の製品と具体的な症状の両方が分かる",
+      "false": "製品か症状のどちらかが特定できない"
+    }
+  },
+  "product": {
+    "type": "choice",
+    "instructions": "顧客が言及している製品はどれか",
+    "criteria": {
+      "ADC-V523": "屋内用Wi-Fiカメラ",
+      "ADC-V523X": "屋内用Wi-Fiカメラの後継機",
+      "ADC-V724": "屋外用カメラ",
+      "ADC-V724X": "屋外用カメラの後継機",
+      "ADC-VC729P": "屋外用フラッドライト付きカメラ",
+      "ADC-VC727P": "屋内外対応のミニバレット型カメラ",
+      "ADC-VC827P": "屋内外対応のドーム型カメラ",
+      "none": "製品への具体的な言及がない",
+      "other_vendor": "上記の一覧にない製品への言及"
+    }
+  },
+  "intent": {
+    "type": "choice",
+    "instructions": "問い合わせの種類はどれか",
+    "criteria": {
+      "how_to": "操作方法・設定方法の質問",
+      "trouble": "不具合・故障の相談",
+      "compare": "製品の比較・検討",
+      "other": "上記のいずれでもない"
+    }
+  },
+  "is_recording_topic": {
+    "type": "noul",
+    "instructions": "録画・再生に関する話題か"
+  },
+  "is_app_topic": {
+    "type": "noul",
+    "instructions": "スマートフォンアプリの不具合・操作に関する話題か"
+  },
+  "is_network_topic": {
+    "type": "noul",
+    "instructions": "Wi-Fi・ネットワーク接続に関する話題か"
+  },
+  "is_install_topic": {
+    "type": "noul",
+    "instructions": "設置・工事・取り付けに関する話題か"
+  },
+  "is_billing_topic": {
+    "type": "noul",
+    "instructions": "料金・契約に関する話題か"
+  },
+  "wants_human": {
+    "type": "noul",
+    "instructions": "担当者(人間)に対応してほしいと求めているか"
+  },
+  "is_repeat_contact": {
+    "type": "noul",
+    "instructions": "以前にも同じ件で問い合わせたと述べているか"
+  },
+  "is_purchase_intent": {
+    "type": "noul",
+    "instructions": "購入・導入を検討していると読み取れるか"
+  },
+  "urgency": {
+    "type": "score",
+    "instructions": "対応の緊急度",
+    "criteria": [
+      "すぐでなくてよい一般的な質問",
+      "業務や生活に支障が出ており早めの対応が要る",
+      "安全に関わり即時の対応が要る"
+    ]
+  }
+}
