@@ -39,6 +39,8 @@ Content-Type: application/json
 | `history` | 任意。最大 20 要素。各 `text` は 1〜2,000 字。時系列昇順（古い→新しい） | 400 |
 | `case_id` | 任意。最大 128 字 | 400 |
 
+**`history` の入力契約（呼び出し側の責務。サーバは検証できない）**: `history` は**同一 case・同一相談対象**の時系列履歴に限る。相談対象（製品・事象）が変わったら、呼び出し側は `history` を空にし `case_id` も渡さず、新しい相談として送ること。守られない場合、古い製品名 + 今ターンの症状の組み合わせで Jev の `has_enough_info` が不当に上がり、誤った製品文脈で即時エスカレーションしうる（`[jev] enabled = true` のときのみ。§5 の例外と `2026-09-21-jev-shadow-design.md` §7 を参照）。
+
 レスポンス（200 のみ）:
 
 ```json
@@ -91,9 +93,10 @@ MCP 経由で case_id を打ち間違えたときに黙って新規 case へ合�
 
 - v1 は呼び出し側（LINE アダプタ）が原文の履歴を保持し、リクエストの `history` で渡す。サーバは履歴を保存しない
 - サーバ側の使用規則: 新しい側から最大 6 ターン・合計 4,000 字まで採用し、超過分は古い側から捨てる。採用した履歴は応答文生成プロンプトの会話履歴ブロックにのみ注入する
-- 履歴は**生成にのみ**使う。evaluate の判定（signal 抽出・escalation 判定・signal 累積）には使わない。判定のターン間文脈は既存の case 機構（`case_id` による signal 累積）が担う
+- 履歴は原則**生成にのみ**使う。evaluate 本体の判定（signal 抽出・第1〜3層の escalation 判定・signal 累積）には使わない。判定のターン間文脈は既存の case 機構（`case_id` による signal 累積）が担う。**例外**: Issue #58 で導入した、ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）の聞き返し判定（Jev の `has_enough_info`）に限り、顧客発話の履歴が「聞き返し（Clarify）か即エスカレーション（EscalationReply）か」の分岐材料になる。この経路は `[jev] enabled = true` のときだけ動く（現状どの config も `false`）。state の組み立て規律・閾値・fail-back・監査の正本は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7 とする
 - egress gate は履歴注入後の生成物にも従来どおり適用する
 - 運用注意: 履歴注入により Anthropic への送信量が最大で約 4,000 字ぶん増える（顧客本文の外部送信に関する既存の運用注意の適用範囲が広がる）
+- 運用注意: `[jev] enabled = true` のとき、ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）にマッチしたターンに限り（`contract-billing` にマッチしたターンでは送信しない）、今ターンの顧客発話に加えて過去の顧客発話（最大 6 件・合計 2,000 字まで、時系列昇順。発話は切り詰めず、超過分は古い側から丸ごと落とす）が前置されて TypeSafe（Jev）へ送信される。assistant 発話は送信しない（組み立ては `server/src/api.rs` の `build_jev_state`）
 
 ## 6. LINE アダプタ
 

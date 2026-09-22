@@ -162,9 +162,21 @@ vegapunk / PunkRecord
 | 学習 | 効かない | 効かない（絶対線） | 効く（GMR + 人間検証） |
 | メモ化 | しない | しない | する |
 
-### 追記: Jev（TypeSafe System One）shadow 判定（Issue #56、2026-09-21）
+### 追記: Jev（TypeSafe System One）の適用範囲（Issue #56 / #58、2026-09-21）
 
-外部の型付き判断器 Jev（TypeSafe System One）を、上記いずれの層の判定にも使わず並行実行し、記録のみ行う（shadow run。目的は較正の実測）。現時点ではクライアントと質問定義のみが存在し（`server/src/jev.rs`）、どの層の判定・分岐・ルーティングにも接続していない。「各層の判定材料の抽出は LLM が担い、判定・ルーティングの決定は必ず Rust ハーネスが持つ」という上記の不変条件は変わらない。詳細は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md`。次段階（実会話記録による較正確認後の判定置き換え検討）は同 design doc §6 を参照。
+外部の型付き判断器 Jev（TypeSafe System One、`server/src/jev.rs`）を、**第1層のうちヒアリング契約 `product_and_symptom` を宣言したルール（実データでは `warranty-failure` のみ）にマッチしたターンに限り**、聞き返し（Clarify）か即エスカレーション（EscalationReply）かの分岐に使う（Issue #58）。Jev の `has_enough_info`（0〜1。質問定義は `server/data/urtect/jev-questions.json`）が「顧客が話した情報の十分性（対象の製品と具体的な症状の両方が分かるか）」を測る。マニュアル材料のカバレッジ不足で決まる `missing` は顧客情報の十分性を表さないため、この経路に限り置き換えた。
+
+- **適用対象**: `/{project_id}/api/reply` の、**マッチした第1層ルールが `product_and_symptom` のヒアリング契約を宣言しているターンのみ**（`layer == 1` かつ `AnswerDecision::Escalate.hearing == Some(HearingContract::ProductAndSymptom)`、抽出が lexicon fallback に落ちておらず、case が確定済みでないこと）。`rules.json` の `escalation_rules[].hearing` でルール自身が宣言し、`warranty-failure` にだけ付ける。
+- **なぜ binding（advisory か）で判別しないか**: `rules.json` の advisory は 2 件あり情報の契約が違う。`warranty-failure`（製品の故障）は型番と症状が要るが、`contract-billing`（契約・請求）は型番も症状も関係ない。`has_enough_info` の基準と聞き返し文言は型番と症状を対象にしているため、advisory 全件を対象にすると、十分に具体的な契約・請求の問い合わせが無関係なヒアリングへ流れ、Issue #58 が直そうとした「質問ばかりで話が進まない」不具合が別の入口で再現する（PR #60 の Copilot 指摘）。rule_id では分岐せず、宣言で判別する。**宣言の無い advisory ルール（`contract-billing`）は Jev を呼ばず、従来の `missing` ベース判定のまま**。mandatory ルールは宣言があっても無効（実行時に `EscalationRule::hearing_contract()` が `None` にする。`ingest_rules` も投入前に拒否する）。
+- **第三者（TypeSafe）への送信範囲**: 送信されるのは今ターンの顧客発話に加えて、過去の顧客発話（最大 6 件・合計 2,000 字まで、時系列昇順）。発話は途中で切り詰めず、超過分は古い側から丸ごと落とす。assistant 発話は送信しない。送信が発生するのは対象ターン（上記の、`warranty-failure` にマッチしたターン）に限る。**`contract-billing` にマッチしたターンでは顧客発話を送信しない。** 現状どの config も `[jev] enabled = false` のため、本番ではまだ送信は発生していない。
+- **従来どおり Jev を使わない**: 宣言の無い第1層ルール（`contract-billing` を含む）・第1層 mandatory・第2層・第3層・MCP `evaluate_answerability` 経路。mandatory の即時エスカレーション契約は不変。
+- **宣言の永続化**: vegapunk の `EscalationRule` ノードの `hearing` 属性（`schema/cs-schema.yml` / `schema/cs-support.yml` に宣言）。`ingest_rules` が書き、`harness::knowledge::escalation_rule_from_attributes` が読む。**`hearing` は MCP の出力契約には載せない**（`AnswerDecision::Escalate.hearing` は `#[serde(skip)]`）。
+- **投入前の検証（mandatory の保証を綴りミスで失わせない）**: `ingest_rules` は rules ファイルの未知フィールド名（`deny_unknown_fields`）・**`binding` の省略（`binding` は必須で既定値は無い）と未知の `binding` 値**（`"manadatory"` / `"Mandatory"` 等。完全一致のみ受理。`escalation_rules` と `prohibited_domains` の両方）・未知の `hearing` 値・mandatory への `hearing` 宣言を、vegapunk へ接続する前にエラーで拒否する。実行時のローダは未知の `binding`・属性なしを advisory に倒す（fail-back）ため、投入側で落とさないと mandatory の綴りミスや書き忘れが黙って advisory になり、mandatory の即時エスカレーション保証（`match_layer1` の mandatory 優先・`decide` の `missing` 抑止・`hearing` の mandatory ガード）が同時に破れる。ローダは未知の値へ倒すときに warn（種別・ID・値）を残す（属性なしは旧ノード互換として advisory に倒すが warn は出さない。ルールのロードは evaluate ごとに走るため）。CLI が fail-closed、ローダが fail-back という非対称は意図した設計（ローダを fail-closed にすると 1 件のエラーで第1層・第2層の全ルールが読めなくなる）。
+- **fail-back（fail-closed にしない）**: Jev の無効設定（`[jev] enabled = false`）・HTTP エラー・タイムアウト・応答欠落はすべて、従来の `missing` ベース判定（`decide_reply_action`）へ倒す。Jev の障害で応答を止めない。
+- **不変条件との関係**: 「各層の判定材料の抽出は LLM が担い、判定・ルーティングの決定は必ず Rust ハーネスが持つ」（上記）は保たれている。Jev が返すのは判定材料（顧客情報の十分性スコア）だけであり、閾値（`[jev] enough_info_threshold`、既定 0.5）との比較と分岐の決定は Rust 側（`server/src/api.rs::decide_jev_hearing_action`）が持つ。
+- **導入状況**: 現状どの config も `[jev] enabled = false` であり、本番ではこの経路はまだ動いていない。Issue #56 設計の「全質問の結果を記録する shadow ログ」自体は未実装。
+
+詳細は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7（Jev へ渡す state・閾値・フォールバック・監査を含む）。他の層・質問への拡張（実会話記録による較正確認後の判定置き換え検討）は同 design doc §6 を参照。
 
 ## 課題 1: ノウハウの蓄積（GMR + 人間検証ループ）
 
@@ -994,7 +1006,7 @@ S1-0 の三原則に加え、Step 2 / Step 3 を無改修で載せるために S
 
 - **判定・応答文生成・egress_gate はすべて `Harness::evaluate()`（本ドキュメントが定義する decision ハーネス）に閉じる。** `/api/reply` はその薄い HTTP アダプタであり、`evaluate()` が返す `decision` と `customer_reply_draft` から応答文を選ぶ純関数（`reply_text_for`）を持つだけで、判定ロジックを持たない。
 - **MCP インターフェース（`evaluate_answerability` 等）とは判定経路を共有し、レスポンス整形だけが異なる。** 3 層判定・signal 抽出・escalation 判定・grade 運用は、本ドキュメント本文（S1-1〜S1-11）で定義したものと**同一**で、この節による変更はない。未知 `case_id` の扱いだけ経路ごとに分岐する（`/api/reply` は新規 case へフォールバック、MCP 経路は従来どおり拒否。理由は design doc §2）。
-- **LINE アダプタは判断ゼロ。** 署名検証・応答生成 API への 1 コール・LINE への返信・ユーザ単位の会話履歴保持（プロセス内メモリ）のみを行い、判定・生成ロジックを一切持たない。会話履歴は生成プロンプトへの注入にのみ使い、判定（signal 抽出・escalation 判定）には使わない（既存の case 機構が判定側のターン間文脈を担う）。
+- **LINE アダプタは判断ゼロ。** 署名検証・応答生成 API への 1 コール・LINE への返信・ユーザ単位の会話履歴保持（プロセス内メモリ）のみを行い、判定・生成ロジックを一切持たない。会話履歴は原則、生成プロンプトへの注入にのみ使い、判定（signal 抽出・第1〜3層の escalation 判定・signal 累積）には使わない（既存の case 機構が判定側のターン間文脈を担う）。**例外**: ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）の聞き返し判定（Jev の `has_enough_info`）に限り、顧客発話の履歴が判定入力になる（`[jev] enabled = true` のときのみ動く。適用範囲は「追記: Jev（TypeSafe System One）の適用範囲（Issue #56 / #58、2026-09-21）」節、正本は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
 
 ## フェーズロードマップとの関係
 

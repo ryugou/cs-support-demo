@@ -87,6 +87,10 @@ nodes:
       sensitivity: { type: string }
       route: { type: string, required: true }
       binding: { type: string }
+      # ルール自身が宣言するヒアリング契約（Issue #58）。値は harness::rules::HearingContract の
+      # 識別子（例: product_and_symptom）。空文字・未設定は「宣言なし」。ingest_rules が書き、
+      # harness::knowledge::escalation_rule_from_attributes が読む。
+      hearing: { type: string }
   ProhibitedDomain:
     attributes:
       domain_id: { type: string, required: true }

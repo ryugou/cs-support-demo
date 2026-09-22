@@ -43,7 +43,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub api: ApiConfig,
     /// Jev（TypeSafe System One）shadow 判定クライアントの設定。既定は無効。
-    /// Issue #56 時点では判定には一切未接続（クライアントと config のみ）。
+    /// Issue #56 時点では判定には一切未接続だったが、Issue #58 で「ヒアリング契約
+    /// `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）にマッチしたターン」の
+    /// 聞き返し判定にのみ接続した（`api.rs::reply_handler`）。他の経路は引き続き
+    /// shadow-only（詳細: `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
     #[serde(default)]
     pub jev: JevConfig,
     /// 管理 SPA（`/admin` 配下）の静的ビルド成果物ディレクトリ（`index.html` を含む）。
@@ -215,6 +218,14 @@ pub struct JevConfig {
     pub model: String,
     pub questions_path: String,
     pub timeout_secs: u64,
+    /// Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルールの聞き返し判定に
+    /// 使う `has_enough_info` の閾値。
+    /// `has_enough_info < enough_info_threshold` かつ聞き返し予算内なら聞き返し(Clarify)、
+    /// それ以外はエスカレーション確定(EscalationReply)。実測値（2026-09-21、
+    /// `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）: 「電源が入らなくなった」
+    /// 0.14 / 「なんか調子がおかしいんだけど?」0.06 / 「ADC-V523 の録画がうまく再生できない」
+    /// （製品と症状が揃う）0.69 を踏まえ、両群のほぼ中間に置く。
+    pub enough_info_threshold: f64,
 }
 
 impl Default for JevConfig {
@@ -225,6 +236,7 @@ impl Default for JevConfig {
             model: "jev-latest".to_string(),
             questions_path: "data/urtect/jev-questions.json".to_string(),
             timeout_secs: 3,
+            enough_info_threshold: 0.5,
         }
     }
 }
@@ -516,12 +528,18 @@ schema = "s"
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert!(
             !cfg.jev.enabled,
-            "jev must default to disabled (shadow-only, unwired)"
+            "jev must default to disabled: unless enabled, the layer-1 product-and-symptom \
+             hearing decision path (Issue #58) is never exercised"
         );
         assert_eq!(cfg.jev.endpoint, "https://api.typesafe.ai/v1/systemone");
         assert_eq!(cfg.jev.model, "jev-latest");
         assert_eq!(cfg.jev.questions_path, "data/urtect/jev-questions.json");
         assert_eq!(cfg.jev.timeout_secs, 3);
+        assert_eq!(
+            cfg.jev.enough_info_threshold, 0.5,
+            "Issue #58: enough_info_threshold must default to 0.5 so that existing config \
+             files without a [jev] section keep working unchanged"
+        );
     }
 
     #[test]
@@ -538,6 +556,7 @@ endpoint = "https://jev.test/v1/systemone"
 model = "jev-test"
 questions_path = "data/test/jev-questions.json"
 timeout_secs = 7
+enough_info_threshold = 0.42
 "#;
         let cfg: AppConfig = toml::from_str(toml).unwrap();
         assert!(cfg.jev.enabled);
@@ -545,6 +564,7 @@ timeout_secs = 7
         assert_eq!(cfg.jev.model, "jev-test");
         assert_eq!(cfg.jev.questions_path, "data/test/jev-questions.json");
         assert_eq!(cfg.jev.timeout_secs, 7);
+        assert_eq!(cfg.jev.enough_info_threshold, 0.42);
     }
 
     /// 既存の全 config ファイルが無改訂でロードでき、いずれも `[jev]` を明示していないため

@@ -2,11 +2,38 @@ use crate::harness::signal::SignalSet;
 use crate::resolve::normalize_key;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Binding {
     Mandatory,
     Advisory,
+}
+
+impl Binding {
+    /// 取りうる拘束度の全件。`ingest_rules` の検証エラーで有効な値を列挙するために使う。
+    pub const ALL: [Binding; 2] = [Binding::Mandatory, Binding::Advisory];
+
+    /// 永続属性（`rules.json` の `binding` と vegapunk の `binding` 属性）の正本表現
+    /// （serde の snake_case 名と一致させる）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Binding::Mandatory => "mandatory",
+            Binding::Advisory => "advisory",
+        }
+    }
+
+    /// 属性文字列からの復元。**完全一致のみ**受理する（大文字・前後空白・綴りの揺れ・空文字は
+    /// `None`）。`None` の扱いは呼び出し側が決める: 書き込み側（`ingest_rules`）は投入前に拒否し、
+    /// 実行時のローダ（`knowledge::parse_binding`）は advisory に倒して warn する。
+    ///
+    /// 綴りミスを黙って advisory 扱いにすると、mandatory の即時エスカレーション契約
+    /// （`match_layer1` の mandatory 優先・`decide` の `missing` 抑止・`hearing_contract` の
+    /// 無効化）が同時に破れる。
+    pub fn parse(value: &str) -> Option<Binding> {
+        Self::ALL
+            .into_iter()
+            .find(|binding| binding.as_str() == value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +87,49 @@ impl RootCause {
     }
 }
 
+/// 第1層ルールが宣言する「聞き返し（ヒアリング）で満たすべき情報の契約」。
+///
+/// 「advisory だから聞き返す」という暗黙の結合をやめ、**ルール自身が**どの情報が揃えば話が進むかを
+/// 宣言する。`api.rs` は rule_id にも binding にも依存せず、この宣言だけを見て Jev の
+/// `has_enough_info` による聞き返し判定へ流すかを決める。
+///
+/// なぜ binding で判別してはいけないか: `rules.json` の advisory は 2 件あり、情報の契約が違う。
+/// 製品の故障（`warranty-failure`）は型番と症状が揃って初めて話が進むが、契約・請求
+/// （`contract-billing`）は型番も症状も関係ない。`has_enough_info` の基準は「対象の製品と具体的な
+/// 症状の両方が分かる」で、聞き返し文言も型番と症状を尋ねる固定文なので、binding だけで判別すると
+/// 十分に具体的な契約・請求の問い合わせまで無関係なヒアリングに流れ、Issue #58 が直そうとした
+/// 「質問ばかりで話が進まない」不具合が別の入口で再現する。
+///
+/// 永続化: vegapunk の `EscalationRule` ノードの `hearing` 属性（識別子は [`Self::as_str`]。
+/// 空文字・欠落は「宣言なし」）。書き込みは `ingest_rules`、読み込みは
+/// `knowledge::escalation_rule_from_attributes`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HearingContract {
+    /// 「対象の製品の型番」と「具体的な症状」の両方が分かって初めて話が進む問い合わせ（製品の故障）。
+    /// Jev の質問 `has_enough_info`（`server/data/urtect/jev-questions.json`）がこの契約に対応する。
+    ProductAndSymptom,
+}
+
+impl HearingContract {
+    /// 宣言できる契約の全件。`ingest_rules` の検証エラーで有効な識別子を列挙するために使う。
+    pub const ALL: [HearingContract; 1] = [HearingContract::ProductAndSymptom];
+
+    /// 永続属性（`rules.json` の `hearing` と vegapunk の `hearing` 属性）の正本表現。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HearingContract::ProductAndSymptom => "product_and_symptom",
+        }
+    }
+
+    /// 属性文字列からの復元。完全一致のみ受理する（大文字・前後空白・綴りの揺れは `None`）。
+    /// `None` の扱い（未宣言に倒すか、投入を拒否するか）は呼び出し側が決める。
+    pub fn parse(value: &str) -> Option<HearingContract> {
+        Self::ALL
+            .into_iter()
+            .find(|contract| contract.as_str() == value)
+    }
+}
+
 /// 第1層: 明示エスカレーションルール（具体条件 → 固有ルーティング）。学習・メモ化しない。
 #[derive(Debug, Clone)]
 pub struct EscalationRule {
@@ -68,6 +138,25 @@ pub struct EscalationRule {
     pub route: String,
     pub owner: Option<String>,
     pub binding: Binding,
+    /// このルールが宣言するヒアリング契約（未宣言は `None`）。直接読まず
+    /// [`EscalationRule::hearing_contract`] を使うこと（mandatory では宣言を無効にする）。
+    pub hearing: Option<HearingContract>,
+}
+
+impl EscalationRule {
+    /// このルールにマッチしたターンで、Jev による聞き返し判定に流してよい契約。
+    ///
+    /// **`Binding::Mandatory` は宣言があっても常に `None`。** mandatory は「情報の有無を問わず
+    /// 問答無用で即エスカレーションする」拘束度そのもの（`decision::decide` の doc）で、設定ミスで
+    /// 宣言が付いても聞き返しへ開放しない（担当者取次のような脱出手段が聞き返しループへ吸収される
+    /// 自己矛盾の防止）。投入側（`ingest_rules`）も同じ組み合わせを拒否するが、実行時にも
+    /// 独立に守る（多層防御）。
+    pub fn hearing_contract(&self) -> Option<HearingContract> {
+        match self.binding {
+            Binding::Mandatory => None,
+            Binding::Advisory => self.hearing,
+        }
+    }
 }
 
 /// 第2層: 禁止領域（面のブラックリスト）。学習で緩まない絶対線。
@@ -108,13 +197,31 @@ impl KnownResolution {
 }
 
 /// 第1層照合: rule.condition ⊆ question のとき確定ルーティング。空条件はマッチしない。
+///
+/// マッチする候補が複数あるとき、**配列順ではなく binding を優先**して選ぶ
+/// （`Binding::Mandatory` が `Binding::Advisory` より必ず優先される）。同一 binding 内では
+/// 従来どおり配列の先頭を優先する。
+///
+/// なぜ配列順で決めてはいけないか: `decide`（`decision.rs`）の doc コメントが定める
+/// 「第1層 mandatory は情報の有無を問わず問答無用で即エスカレーションし、Jev の聞き返し
+/// 判定に一切左右されない」という不変条件が、素朴な `find`（先頭一致）実装のもとでは
+/// `rules.json` の**配列順**という脆い前提の上に成り立ってしまう。累積 signal 集合が
+/// advisory ルールと mandatory ルールの両方にマッチしたとき、advisory がたまたま配列で
+/// 先にあるだけで mandatory が隠れ、本来即時確定すべきターン（例: 「人に代わってください」
+/// による `human-handoff` mandatory）が advisory 扱いになって Jev 起点の聞き返しループへ
+/// 吸収されてしまう（reviewer Stage 2 codex レビュー Critical 1）。この関数が binding を
+/// 見て選ぶことで、`rules.json` の並び替えではこの契約が壊れないようにする。
 pub fn match_layer1<'a>(
     rules: &'a [EscalationRule],
     question: &SignalSet,
 ) -> Option<&'a EscalationRule> {
+    fn matches(rule: &EscalationRule, question: &SignalSet) -> bool {
+        !rule.condition.is_empty() && rule.condition.is_subset(question)
+    }
     rules
         .iter()
-        .find(|rule| !rule.condition.is_empty() && rule.condition.is_subset(question))
+        .find(|rule| matches(rule, question) && rule.binding == Binding::Mandatory)
+        .or_else(|| rules.iter().find(|rule| matches(rule, question)))
 }
 
 /// 第2層照合: signal 一致 or raw text パターン一致で必ず止める（面で塞ぐ）。
@@ -218,6 +325,7 @@ mod tests {
             route: "safety_team".to_string(),
             owner: None,
             binding: Binding::Mandatory,
+            hearing: None,
         }];
         assert!(match_layer1(
             &rules,
@@ -225,6 +333,89 @@ mod tests {
         )
         .is_some());
         assert!(match_layer1(&rules, &signals(&["discoloration"])).is_none());
+    }
+
+    // reviewer Stage 2 codex レビュー Critical 1 の回帰防止: 配列上 advisory が mandatory
+    // より前にあり、両方の condition が同一 signal 集合にマッチするとき、match_layer1 は
+    // 配列順ではなく binding で mandatory を優先して返さなければならない。
+    #[test]
+    fn match_layer1_prefers_mandatory_over_earlier_advisory_when_both_match() {
+        let rules = vec![
+            EscalationRule {
+                id: "advisory-first".to_string(),
+                condition: signals(&["warranty_hardware_failure"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Advisory,
+                hearing: None,
+            },
+            EscalationRule {
+                id: "mandatory-second".to_string(),
+                condition: signals(&["human_handoff_request"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Mandatory,
+                hearing: None,
+            },
+        ];
+        // 累積 signal 集合が両方の condition を包含する（1ターン目で warranty_hardware_failure、
+        // 2ターン目で human_handoff_request が累積したケースを模す）。
+        let question = signals(&["warranty_hardware_failure", "human_handoff_request"]);
+        let matched = match_layer1(&rules, &question).expect("expected a match");
+        assert_eq!(matched.id, "mandatory-second");
+    }
+
+    // mandatory が1件もマッチしないときは、従来どおり最初にマッチした advisory を返す
+    // （binding 優先ロジックが advisory オンリーのケースを壊していないことの確認）。
+    #[test]
+    fn match_layer1_returns_first_advisory_when_no_mandatory_matches() {
+        let rules = vec![
+            EscalationRule {
+                id: "advisory-a".to_string(),
+                condition: signals(&["warranty_hardware_failure"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Advisory,
+                hearing: None,
+            },
+            EscalationRule {
+                id: "advisory-b".to_string(),
+                condition: signals(&["contract_billing_question"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Advisory,
+                hearing: None,
+            },
+        ];
+        let question = signals(&["warranty_hardware_failure", "contract_billing_question"]);
+        let matched = match_layer1(&rules, &question).expect("expected a match");
+        assert_eq!(matched.id, "advisory-a");
+    }
+
+    // mandatory が複数マッチするときは、同一 binding 内の順序（配列の先頭優先）が保たれる。
+    #[test]
+    fn match_layer1_returns_first_mandatory_when_multiple_mandatory_match() {
+        let rules = vec![
+            EscalationRule {
+                id: "mandatory-a".to_string(),
+                condition: signals(&["security_incident"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Mandatory,
+                hearing: None,
+            },
+            EscalationRule {
+                id: "mandatory-b".to_string(),
+                condition: signals(&["physical_damage_smell_heat"]),
+                route: "support_desk".to_string(),
+                owner: None,
+                binding: Binding::Mandatory,
+                hearing: None,
+            },
+        ];
+        let question = signals(&["security_incident", "physical_damage_smell_heat"]);
+        let matched = match_layer1(&rules, &question).expect("expected a match");
+        assert_eq!(matched.id, "mandatory-a");
     }
 
     #[test]
@@ -235,8 +426,134 @@ mod tests {
             route: "x".to_string(),
             owner: None,
             binding: Binding::Advisory,
+            hearing: None,
         }];
         assert!(match_layer1(&rules, &signals(&["discoloration"])).is_none());
+    }
+
+    // --- Binding の識別子（Issue #58 reviewer Warning 1） ---
+    //
+    // 拘束度の綴りミス（`"manadatory"` / `"Mandatory"`）を黙って advisory 扱いにすると、
+    // mandatory の即時エスカレーション契約（`match_layer1` の mandatory 優先・`decide` の
+    // `missing` 抑止・`hearing_contract` の無効化）が同時に破れる。識別子の照合は完全一致のみ。
+
+    #[test]
+    fn binding_parse_accepts_only_the_exact_known_identifiers() {
+        assert_eq!(Binding::parse("mandatory"), Some(Binding::Mandatory));
+        assert_eq!(Binding::parse("advisory"), Some(Binding::Advisory));
+        for unknown in [
+            "",
+            "Mandatory",
+            "MANDATORY",
+            " mandatory",
+            "mandatory ",
+            "manadatory",
+            "mandatry",
+            "advisery",
+        ] {
+            assert_eq!(
+                Binding::parse(unknown),
+                None,
+                "{unknown:?} must not be accepted as a binding"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_identifier_round_trips_through_parse() {
+        for binding in Binding::ALL {
+            assert_eq!(
+                Binding::parse(binding.as_str()),
+                Some(binding),
+                "{binding:?} must be recoverable from its own persisted identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_identifier_matches_its_serde_name() {
+        // 永続属性の識別子（`as_str`）と serde の名前が乖離すると、片方だけが通る値が生まれる。
+        for binding in Binding::ALL {
+            assert_eq!(
+                serde_json::to_string(&binding).expect("Binding must serialize"),
+                format!("\"{}\"", binding.as_str())
+            );
+        }
+    }
+
+    // --- 第1層: ヒアリング契約の宣言（Issue #58） ---
+
+    fn rule_with_hearing(binding: Binding, hearing: Option<HearingContract>) -> EscalationRule {
+        EscalationRule {
+            id: "r-hearing".to_string(),
+            condition: signals(&["warranty_hardware_failure"]),
+            route: "support_desk".to_string(),
+            owner: None,
+            binding,
+            hearing,
+        }
+    }
+
+    #[test]
+    fn hearing_contract_parse_accepts_only_the_exact_known_identifier() {
+        assert_eq!(
+            HearingContract::parse("product_and_symptom"),
+            Some(HearingContract::ProductAndSymptom)
+        );
+        // 綴りの揺れ・大文字・前後空白を黙って受理すると、typo した宣言が「宣言なし」ではなく
+        // 別の契約として通ってしまう。完全一致だけを受理することを固定する。
+        for unknown in [
+            "",
+            "PRODUCT_AND_SYMPTOM",
+            " product_and_symptom",
+            "product-and-symptom",
+            "product_and_sympton",
+        ] {
+            assert_eq!(
+                HearingContract::parse(unknown),
+                None,
+                "{unknown:?} must not be accepted as a hearing contract"
+            );
+        }
+    }
+
+    #[test]
+    fn hearing_contract_identifier_round_trips_through_parse() {
+        for contract in HearingContract::ALL {
+            assert_eq!(
+                HearingContract::parse(contract.as_str()),
+                Some(contract),
+                "{contract:?} must be recoverable from its own persisted identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn hearing_contract_is_the_declaration_of_an_advisory_rule() {
+        let rule = rule_with_hearing(Binding::Advisory, Some(HearingContract::ProductAndSymptom));
+        assert_eq!(
+            rule.hearing_contract(),
+            Some(HearingContract::ProductAndSymptom)
+        );
+    }
+
+    #[test]
+    fn hearing_contract_is_none_for_an_advisory_rule_that_declares_nothing() {
+        let rule = rule_with_hearing(Binding::Advisory, None);
+        assert_eq!(rule.hearing_contract(), None);
+    }
+
+    // mandatory は「情報の有無を問わず問答無用で即エスカレーションする」拘束度そのもの
+    // （`decision::decide` の doc）。設定ミスで mandatory ルールに宣言が付いても、聞き返しには
+    // 開放しない（担当者取次のような脱出手段が聞き返しループへ吸収される自己矛盾の防止）。
+    #[test]
+    fn hearing_contract_is_none_for_a_mandatory_rule_even_if_it_declares_one() {
+        let rule = rule_with_hearing(Binding::Mandatory, Some(HearingContract::ProductAndSymptom));
+        assert_eq!(
+            rule.hearing_contract(),
+            None,
+            "a mandatory rule must never be opened to a hearing, whatever it declares"
+        );
     }
 
     // --- 第2層 ---

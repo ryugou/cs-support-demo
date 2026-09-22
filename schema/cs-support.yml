@@ -45,6 +45,8 @@ nodes:
       sensitivity: { type: string }
       route: { type: string, required: true }
       binding: { type: string }
+      # ルール自身が宣言するヒアリング契約（cs-schema.yml と同一。Issue #58）。
+      hearing: { type: string }
   ProhibitedDomain:
     attributes:
       domain_id: { type: string, required: true }

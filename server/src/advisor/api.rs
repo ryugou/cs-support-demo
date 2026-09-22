@@ -2316,6 +2316,7 @@ mod tests {
             reply_drafter: None,
             reply_draft_max_tokens: 700,
             product_gate: None,
+            jev_client: None,
         }
     }
 
@@ -2688,6 +2689,7 @@ clarify_max_turns = 3
                     allowlist_models.into_iter().map(str::to_string).collect(),
                 ),
             )),
+            jev_client: None,
         };
         state.support_harness = Arc::new(support_harness);
         state.support_schema = support_schema.to_string();

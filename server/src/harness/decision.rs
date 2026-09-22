@@ -1,6 +1,6 @@
 use crate::harness::rules::{
-    match_known_resolution, match_layer1, match_layer2, Binding, EscalationRule, KnownResolution,
-    KrMatch, ProhibitedDomain,
+    match_known_resolution, match_layer1, match_layer2, Binding, EscalationRule, HearingContract,
+    KnownResolution, KrMatch, ProhibitedDomain,
 };
 use crate::harness::signal::SignalSet;
 use serde::Serialize;
@@ -132,6 +132,24 @@ pub enum AnswerDecision {
         disclosure_scope: DisclosureScope,
         audit_required: bool,
         missing: Vec<EvidenceRequirement>,
+        /// Issue #58: 第1層（明示エスカレーションルール）マッチ時に、**マッチしたルール自身が
+        /// 宣言した**ヒアリング契約（`EscalationRule::hearing_contract`）を保持する。宣言の無い
+        /// ルール・mandatory ルール・第2・3層は `None`。
+        ///
+        /// 呼び出し側（`api.rs`）はこのフィールドが `Some(ProductAndSymptom)` のターンにだけ、
+        /// Jev の `has_enough_info`（「対象の製品と具体的な症状の両方が分かる」）による聞き返し
+        /// 判定（`missing` の中身に依存しない別経路）へ流す。`route_to` も binding も「どの情報が
+        /// 揃えば話が進むか」を語らないため判別に使えない。とくに advisory は 2 件あり
+        /// （`warranty-failure` は型番と症状が要るが、`contract-billing` は型番も症状も関係ない）、
+        /// binding で判別すると契約・請求の問い合わせが無関係なヒアリングへ流れる。
+        ///
+        /// このフィールドは `api.rs` の内部判定専用であり、MCP の出力契約には載せない
+        /// （`#[serde(skip)]`）。`AnswerDecision` は `evaluate_answerability` の応答へそのまま
+        /// シリアライズされ生成スキーマにも出るため、skip しないと社内の分類が MCP
+        /// クライアントへ露出し、「MCP tool の入出力の形は変更しない」不変条件に反する。
+        /// `Deserialize` は derive していないので、skip による round-trip の破壊は起きない。
+        #[serde(skip)]
+        hearing: Option<HearingContract>,
     },
 }
 
@@ -152,6 +170,13 @@ pub struct DecisionInput<'a> {
 /// (B) 3 層判定の decision function。LLM 非介在・同じ入力なら必ず同じ判定（純関数）。
 /// 先に止まった層で確定し、後段は評価しない。第1・2層にメモ化を適用しない。
 ///
+/// 第1層のルール選択（`match_layer1` 呼び出し）は `rules.json` の配列順ではなく binding を
+/// 優先する（`Binding::Mandatory` が `Binding::Advisory` より必ず優先される。詳細は
+/// `rules::match_layer1` の doc コメント）。累積 signal が advisory ルールと mandatory ルールの
+/// 両方にマッチしたターンでも mandatory が選ばれ、下記の「mandatory は常に `missing:
+/// Vec::new()`」という契約がルールの並び順に依存せず成り立つ（reviewer Stage 2 codex レビュー
+/// Critical 1）。
+///
 /// Issue #54: stakes/threshold の算出は副作用の無い純関数のため、第1層判定より前に計算しても
 /// 「先に止まった層で確定する」という上記の原則は壊れない。第1層（明示エスカレーションルール）
 /// マッチ時、**`rule.binding == Binding::Advisory` のときだけ** `evidence_sufficient` で情報
@@ -164,6 +189,13 @@ pub struct DecisionInput<'a> {
 /// 上がり、危険度が高い mandatory 事象ほど evidence_sufficient が Insufficient になりやすいと
 /// いう反転も生む）。第2層（禁止ドメイン）は fail-closed の核であり、この分岐の対象外
 /// （常に `missing: Vec::new()` の即時エスカレーションのまま変更しない）。
+///
+/// Issue #58: 第1層マッチ時、`hearing` には**マッチしたルール自身が宣言した**ヒアリング契約
+/// だけを載せる（`EscalationRule::hearing_contract`。mandatory は宣言があっても `None`）。Jev の
+/// 聞き返し判定へ流すかは `api.rs` がこの宣言だけで決める。binding では決めない: advisory の
+/// `contract-billing` は型番も症状も関係なく、`has_enough_info`（製品と症状が分かるか）で測ると
+/// 無関係なヒアリングへ流れるため。`missing`（マニュアル材料のカバレッジ）は従来どおり binding
+/// だけで決まり、この宣言とは独立。
 pub fn decide(input: &DecisionInput) -> AnswerDecision {
     let stakes = classify_stakes(&input.stakes_input);
     let threshold = answerability_threshold(input.thresholds, stakes);
@@ -184,6 +216,8 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             disclosure_scope: DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing,
+            // mandatory では宣言があっても `None`（`hearing_contract` の doc）。
+            hearing: rule.hearing_contract(),
         };
     }
     // 第2層: 禁止領域（変更しない。fail-closed の核。missing は常に空・情報の有無を問わない）
@@ -195,6 +229,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             disclosure_scope: DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: Vec::new(),
+            hearing: None,
         };
     }
     // 第3層: 回答可能性
@@ -229,6 +264,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
                 disclosure_scope: DisclosureScope::ConfirmingWithTeam,
                 audit_required: true,
                 missing,
+                hearing: None,
             }
         }
     }
@@ -238,10 +274,11 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
 mod tests {
     use super::*;
     use crate::harness::rules::{
-        Binding, EscalationRule, Grade, KnownResolution, ProhibitedDomain, RootCause,
-        SourceAuthority,
+        Binding, EscalationRule, Grade, HearingContract, KnownResolution, ProhibitedDomain,
+        RootCause, SourceAuthority,
     };
     use crate::harness::signal::{Signal, SignalSet};
+    use crate::test_support::load_bundled_escalation_rules;
 
     fn signals(values: &[&str]) -> SignalSet {
         values.iter().map(|v| Signal::new(*v)).collect()
@@ -384,6 +421,7 @@ mod tests {
             route: "safety_team".to_string(),
             owner: None,
             binding: Binding::Mandatory,
+            hearing: None,
         }];
         let resolutions = vec![kr("kr1", &["post_ingestion_symptom"])];
         let q = signals(&["post_ingestion_symptom"]);
@@ -440,6 +478,7 @@ mod tests {
             route: "safety_team".to_string(),
             owner: None,
             binding: Binding::Advisory,
+            hearing: None,
         }];
         let q = signals(&["post_ingestion_symptom"]);
         // best_manual_score が閾値(low=0.6)を大きく下回る = 製品未特定・症状要点不足を模す。
@@ -487,6 +526,7 @@ mod tests {
             route: "safety_team".to_string(),
             owner: None,
             binding: Binding::Mandatory,
+            hearing: None,
         }];
         let q = signals(&["post_ingestion_symptom"]);
         // best_manual_score が閾値を大きく下回っても(製品未特定・症状要点不足を模しても)
@@ -522,6 +562,7 @@ mod tests {
             route: "safety_team".to_string(),
             owner: None,
             binding: Binding::Advisory,
+            hearing: None,
         }];
         let q = signals(&["post_ingestion_symptom"]);
         let d = decide(&input(
@@ -543,6 +584,198 @@ mod tests {
                 );
             }
             other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    // --- Issue #58: `hearing` は第1層マッチ時に、マッチしたルールの宣言だけを運ぶ ---
+    //
+    // 「advisory だから聞き返す」という暗黙の結合をやめ、ルール自身が「どの情報契約で
+    // ヒアリングするか」を宣言する。`route_to` も binding も「どの情報で聞き返すか」を語らない
+    // ため、呼び出し側（`api.rs`）はこのフィールドだけを見て Jev への問い合わせ可否を決める。
+
+    /// `hearing` を宣言できる第1層ルール 1 件だけで `decide` を回し、その `hearing` を返す。
+    fn hearing_of_layer1_decision(
+        binding: Binding,
+        hearing: Option<HearingContract>,
+    ) -> Option<HearingContract> {
+        let rules = vec![EscalationRule {
+            id: "r1".to_string(),
+            condition: signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding,
+            hearing,
+        }];
+        let q = signals(&["post_ingestion_symptom"]);
+        // 0.1 は閾値未満（情報不足）。binding/宣言だけで `hearing` が決まり、マニュアルの
+        // カバレッジ（`missing`）には依存しないことも合わせて固定する。
+        match decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        )) {
+            AnswerDecision::Escalate { layer, hearing, .. } => {
+                assert_eq!(layer, 1);
+                hearing
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer1_advisory_rule_declaring_a_hearing_carries_it() {
+        assert_eq!(
+            hearing_of_layer1_decision(Binding::Advisory, Some(HearingContract::ProductAndSymptom)),
+            Some(HearingContract::ProductAndSymptom)
+        );
+    }
+
+    #[test]
+    fn layer1_advisory_rule_without_a_declaration_carries_no_hearing() {
+        // 契約・請求のように「型番も症状も関係ない」advisory ルールは、advisory であっても
+        // 型番と症状を尋ねるヒアリングの対象ではない。
+        assert_eq!(hearing_of_layer1_decision(Binding::Advisory, None), None);
+    }
+
+    #[test]
+    fn layer1_mandatory_rule_never_carries_a_hearing_even_if_it_declares_one() {
+        assert_eq!(
+            hearing_of_layer1_decision(
+                Binding::Mandatory,
+                Some(HearingContract::ProductAndSymptom)
+            ),
+            None,
+            "mandatory must escalate unconditionally; a misdeclared hearing must not open it"
+        );
+    }
+
+    #[test]
+    fn layer2_escalation_has_no_hearing() {
+        let domains = vec![ProhibitedDomain {
+            id: "d1".to_string(),
+            domain_signals: signals(&["skin_irritation"]),
+            text_patterns: Vec::new(),
+            route: "derm_liaison".to_string(),
+            binding: Binding::Mandatory,
+        }];
+        let q = signals(&["skin_irritation"]);
+        let d = decide(&input(
+            &q,
+            &[],
+            &domains,
+            &[],
+            Some(1.0),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { hearing, .. } => {
+                assert_eq!(
+                    hearing, None,
+                    "layer 2 (prohibited domain) must never carry a hearing contract"
+                );
+            }
+            other => panic!("expected layer2 escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer3_gray_escalation_has_no_hearing() {
+        let resolutions = vec![kr("kr1", &["discoloration"])];
+        let q = signals(&["discoloration", "mold"]);
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &resolutions,
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        match d {
+            AnswerDecision::Escalate { hearing, .. } => {
+                assert_eq!(hearing, None, "layer 3 must never carry a hearing contract");
+            }
+            other => panic!("expected layer3 escalate, got {other:?}"),
+        }
+    }
+
+    // --- Issue #58: `hearing` は MCP の出力契約（payload とスキーマ）に載せない ---
+    //
+    // `AnswerDecision` は `EvaluateAnswerabilityResponse.decision` として MCP tool
+    // `evaluate_answerability` の応答へそのままシリアライズされ、生成スキーマにも出る。
+    // `hearing` は「どの情報契約で Jev に聞き返しを判定させるか」という社内の分類で、`api.rs` の
+    // 内部判定専用。specs/production-cs-mcp.md の「MCP tool（`evaluate_answerability`）の入出力の
+    // 形は変更しない」に従い、外へ出してはならない。同じ理由で先行した `rule_binding`
+    // （拘束度の内部分類。この宣言に置き換えて廃止した）も、再導入されたら検知する。
+
+    fn escalate_with_hearing(hearing: Option<HearingContract>) -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            hearing,
+        }
+    }
+
+    #[test]
+    fn escalate_payload_keeps_its_pre_issue_58_shape_and_hides_hearing() {
+        // Issue #58 以前の Escalate のキー集合（tag の `decision` を含む）。`hearing` の値に
+        // 関わらず（Some / None）この集合と完全一致すること。「hearing が無い」だけでなく
+        // 「他のキーが増減していない」ことまで固定する。
+        const PRE_ISSUE_58_ESCALATE_KEYS: [&str; 7] = [
+            "audit_required",
+            "decision",
+            "disclosure_scope",
+            "layer",
+            "missing",
+            "reason",
+            "route_to",
+        ];
+        for hearing in [Some(HearingContract::ProductAndSymptom), None] {
+            let value = serde_json::to_value(escalate_with_hearing(hearing))
+                .expect("AnswerDecision must serialize");
+            let object = value
+                .as_object()
+                .expect("AnswerDecision must serialize to a JSON object");
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys, PRE_ISSUE_58_ESCALATE_KEYS,
+                "the MCP payload for hearing={hearing:?} must not gain or lose keys \
+                 (hearing is an internal classification), got: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn answer_decision_json_schema_hides_hearing() {
+        let schema = schemars::schema_for!(AnswerDecision);
+        let rendered = serde_json::to_string(&schema).expect("schema must serialize");
+        // 空振り防止: 同じ variant の他フィールドがスキーマに出ていること（スキーマ生成自体が
+        // 成功して内容を持っていること）を先に確かめる。
+        assert!(
+            rendered.contains("route_to"),
+            "the generated schema must describe the Escalate fields, got: {rendered}"
+        );
+        // プロパティ名としての出現を見る（引用符付き）。`rule_binding` は廃止済みの旧内部
+        // フィールド名で、再導入の検知用。
+        for internal_field in ["\"hearing\"", "\"rule_binding\""] {
+            assert!(
+                !rendered.contains(internal_field),
+                "{internal_field} must not appear in the generated schema advertised to MCP \
+                 clients, got: {rendered}"
+            );
         }
     }
 
@@ -720,10 +953,6 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/urtect/signal-lexicon.json")
     }
 
-    fn bundled_rules_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/urtect/rules.json")
-    }
-
     #[test]
     fn bundled_lexicon_extracts_human_handoff_request_for_known_surface_forms() {
         use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
@@ -782,43 +1011,8 @@ mod tests {
         }
     }
 
-    /// ingest_rules.rs の RuleInput と同形（rule_id/condition/owner/route/binding）の
-    /// テスト専用パース struct。CLI 側の構造体をテストから直接 import できないため複製する。
-    #[derive(Debug, serde::Deserialize)]
-    struct BundledRuleInput {
-        rule_id: String,
-        condition: Vec<String>,
-        owner: Option<String>,
-        route: String,
-        binding: String,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct BundledRulesFile {
-        escalation_rules: Vec<BundledRuleInput>,
-    }
-
-    fn load_bundled_escalation_rules() -> Vec<EscalationRule> {
-        let body =
-            std::fs::read_to_string(bundled_rules_path()).expect("read bundled urtect rules.json");
-        let parsed: BundledRulesFile =
-            serde_json::from_str(&body).expect("parse bundled urtect rules.json");
-        parsed
-            .escalation_rules
-            .into_iter()
-            .map(|r| EscalationRule {
-                id: r.rule_id,
-                condition: r.condition.into_iter().map(Signal::new).collect(),
-                route: r.route,
-                owner: r.owner,
-                binding: match r.binding.as_str() {
-                    "mandatory" => Binding::Mandatory,
-                    "advisory" => Binding::Advisory,
-                    other => panic!("unknown binding in bundled urtect rules.json: {other}"),
-                },
-            })
-            .collect()
-    }
+    // `data/urtect/rules.json` の読み込みは `crate::test_support::load_bundled_escalation_rules`
+    // （api.rs のテストとも共有。冒頭の `use` 参照）。
 
     #[test]
     fn bundled_rules_contain_human_handoff_rule_and_layer1_matches_it() {
@@ -1009,6 +1203,199 @@ mod tests {
             }
             other => {
                 panic!("expected layer1 escalate for warranty_hardware_failure, got {other:?}")
+            }
+        }
+    }
+
+    // reviewer Stage 2 codex レビュー Critical 1 の実データ回帰。
+    //
+    // data/urtect/rules.json の配列順は
+    // [security-incident(mandatory), physical-damage(mandatory), warranty-failure(advisory),
+    //  contract-billing(advisory), construction-risk(mandatory), human-handoff(mandatory)]。
+    // warranty-failure（advisory）は human-handoff（mandatory）より配列で先にある。
+    // 素朴な配列順 find だと、累積 signal に両方の condition が含まれるターンで
+    // warranty-failure が先に確定してしまい、「人に代わってください」という明示的な脱出要求
+    // （human_handoff_request）が Jev 起点の聞き返しループへ誤って吸収される
+    // （specs/production-cs-mcp.md・decision.rs decide の doc コメントが定める不変条件違反）。
+    // ここでは binding 優先ロジックにより mandatory（human-handoff）が選ばれ、missing が
+    // 常に空になることを実データで固定する。
+    #[test]
+    fn bundled_warranty_failure_and_human_handoff_conflict_resolves_to_mandatory() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["warranty_hardware_failure", "human_handoff_request"]);
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        // 勝者の名指し。`decide` の結果（下）だけでは「どのルールが勝ったか」を直接は
+        // 観測できないため、同じ選択ロジック `match_layer1` の結果で固定する。
+        assert_eq!(
+            match_layer1(&rules, &question).map(|rule| rule.id.as_str()),
+            Some("human-handoff"),
+            "human-handoff (mandatory) must win over warranty-failure (advisory) even \
+             though warranty-failure appears earlier in rules.json"
+        );
+        match d {
+            AnswerDecision::Escalate {
+                layer,
+                hearing,
+                missing,
+                ..
+            } => {
+                assert_eq!(layer, 1);
+                // warranty-failure が勝っていたら `hearing` は Some になり、missing も積まれる
+                // （manual score 0.1 は閾値未満）。どちらも空であることが mandatory 勝利の証拠。
+                assert_eq!(
+                    hearing, None,
+                    "the winning mandatory rule must never carry a hearing contract, even though \
+                     the losing warranty-failure declares one"
+                );
+                assert!(
+                    missing.is_empty(),
+                    "the winning mandatory rule must never carry a missing list"
+                );
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    // reviewer Stage 2 codex レビュー Critical 1 の実データ回帰（2件目）。
+    //
+    // contract-billing（advisory）は construction-risk（mandatory、高所作業・電気工事の
+    // hazard）より配列で先にある。同様の組み合わせでも mandatory が優先されることを固定する。
+    #[test]
+    fn bundled_contract_billing_and_construction_risk_conflict_resolves_to_mandatory() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["contract_billing_question", "physical_construction_risk"]);
+        let d = decide(&input(
+            &question,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        ));
+        assert_eq!(
+            match_layer1(&rules, &question).map(|rule| rule.id.as_str()),
+            Some("construction-risk"),
+            "construction-risk (mandatory) must win over contract-billing (advisory) \
+             even though contract-billing appears earlier in rules.json"
+        );
+        match d {
+            AnswerDecision::Escalate {
+                layer,
+                hearing,
+                missing,
+                ..
+            } => {
+                assert_eq!(layer, 1);
+                assert_eq!(hearing, None);
+                // contract-billing（advisory）が勝っていたら manual score 0.1（閾値未満）で
+                // missing が積まれる。空であることが mandatory 勝利の証拠。
+                assert!(
+                    missing.is_empty(),
+                    "the winning mandatory rule must never carry a missing list"
+                );
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    // --- Issue #58（PR #60 Copilot 指摘）: ヒアリング契約を宣言するのは warranty-failure だけ ---
+    //
+    // `has_enough_info` の判定基準は「対象の製品と具体的な症状の両方が分かる」で、聞き返し文言も
+    // 型番と症状を尋ねる固定文。製品の故障（warranty-failure）にだけ意味があり、型番も症状も
+    // 関係ない契約・請求（contract-billing）を同じヒアリングに流すと、「質問ばかりで話が
+    // 進まない」という Issue #58 が直そうとした不具合が別の入口で再現する。rule_id では分岐せず
+    // ルール自身の宣言で判別する（下のテストは、その宣言が実データで意図どおりであることの固定）。
+
+    #[test]
+    fn bundled_only_warranty_failure_declares_the_product_and_symptom_hearing() {
+        let rules = load_bundled_escalation_rules();
+        let declared: Vec<(&str, HearingContract)> = rules
+            .iter()
+            .filter_map(|rule| rule.hearing.map(|hearing| (rule.id.as_str(), hearing)))
+            .collect();
+        assert_eq!(
+            declared,
+            vec![("warranty-failure", HearingContract::ProductAndSymptom)],
+            "exactly warranty-failure may declare a hearing contract in data/urtect/rules.json \
+             (contract-billing needs neither a model number nor a symptom; the mandatory rules \
+             must escalate unconditionally)"
+        );
+    }
+
+    #[test]
+    fn bundled_warranty_failure_escalation_carries_the_product_and_symptom_hearing() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["warranty_hardware_failure"]);
+        // manual score の高低（`missing` の有無）に関わらず宣言が運ばれる。
+        for best_manual_score in [0.1_f32, 1.0] {
+            let d = decide(&input(
+                &question,
+                &rules,
+                &[],
+                &[],
+                Some(best_manual_score),
+                calm(),
+                &thresholds(),
+                &[],
+            ));
+            match d {
+                AnswerDecision::Escalate { layer, hearing, .. } => {
+                    assert_eq!(layer, 1);
+                    assert_eq!(
+                        hearing,
+                        Some(HearingContract::ProductAndSymptom),
+                        "best_manual_score={best_manual_score}"
+                    );
+                }
+                other => panic!("expected layer1 escalate, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_contract_billing_escalation_carries_no_hearing_although_it_is_advisory() {
+        let rules = load_bundled_escalation_rules();
+        // テストの前提: contract-billing は advisory（＝「advisory だから聞き返す」だと Jev の
+        // 対象になってしまう側）。この前提が崩れたらこのテストの意味が変わるため先に固定する。
+        let contract_billing = rules
+            .iter()
+            .find(|rule| rule.id == "contract-billing")
+            .expect("data/urtect/rules.json must define contract-billing");
+        assert_eq!(contract_billing.binding, Binding::Advisory);
+
+        let question = signals(&["contract_billing_question"]);
+        for best_manual_score in [0.1_f32, 1.0] {
+            let d = decide(&input(
+                &question,
+                &rules,
+                &[],
+                &[],
+                Some(best_manual_score),
+                calm(),
+                &thresholds(),
+                &[],
+            ));
+            match d {
+                AnswerDecision::Escalate { layer, hearing, .. } => {
+                    assert_eq!(layer, 1);
+                    assert_eq!(
+                        hearing, None,
+                        "a contract/billing question must not be routed to the model-number and \
+                         symptom hearing (best_manual_score={best_manual_score})"
+                    );
+                }
+                other => panic!("expected layer1 escalate, got {other:?}"),
             }
         }
     }

@@ -887,6 +887,7 @@ mod tests {
                     allowlist_models.into_iter().map(str::to_string).collect(),
                 ),
             )),
+            jev_client: None,
         }
     }
 
@@ -1042,6 +1043,7 @@ mod tests {
                 required: 0.8,
                 best: 0.5,
             }],
+            hearing: None,
         }
     }
 

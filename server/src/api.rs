@@ -378,6 +378,302 @@ pub fn decide_reply_action(
     }
 }
 
+/// Issue #58: Jev の `has_enough_info` による聞き返し判定へ流すべきターンか（マッチした第1層
+/// ルールが `product_and_symptom` のヒアリング契約を宣言しているターンか）。
+///
+/// - layer=1 かつ、マッチしたルールが `HearingContract::ProductAndSymptom` を宣言している
+///   `Escalate` であること（`decision::decide` が第1層マッチ時に `hearing` へ積む。mandatory
+///   ルール・宣言の無いルール・第2層・第3層はすべて `None` で対象外）。`missing` の中身には
+///   依存しない。背景の不具合: 「電源が入らなくなった」は advisory ルールにマッチしたが
+///   `missing`（マニュアル材料のカバレッジ不足で決まる）がたまたま空になり、聞き返しに入らず
+///   即エスカレーションしていた。`missing` に依存しないことがこの是正の核
+/// - 今ターンの signal 抽出が `LexiconFallback` に落ちていないこと（抽出 LLM 不調時は
+///   `decide_reply_action` 自身が fail-closed で `EscalationReply` に倒すため、Jev を呼んでも
+///   結果を使わない）
+/// - `conv.is_already_escalated()` でないこと（確定済み case は `decide_reply_action` 自身が
+///   `!conv.is_already_escalated()` ガードで `EscalationReply` に倒すため、Jev を呼んでも結果を
+///   使わず無駄な待ちとコストが発生するだけ。二重実装を避け、既存の契約に委ねる）
+///
+/// **なぜ binding（advisory か否か）ではなくヒアリング契約で判別するのか**: `rules.json` の
+/// advisory は 2 件あり、情報の契約が違う。`warranty-failure`（製品の故障）は型番と症状が揃って
+/// 初めて話が進むが、`contract-billing`（契約・請求）は型番も症状も関係ない。一方
+/// `has_enough_info` の判定基準は「対象の製品と具体的な症状の両方が分かる」
+/// （`server/data/urtect/jev-questions.json`）で、聞き返し文言も型番と症状を尋ねる固定文
+/// （`JEV_HEARING_MISSING_TEXT`）。したがって binding だけで判別すると、十分に具体的な契約・請求の
+/// 問い合わせが型番と症状を尋ねる無関係なヒアリングへ流れ、Issue #58 が直そうとした「質問ばかりで
+/// 話が進まない」不具合が別の入口で再現する（PR #60 Copilot 指摘）。加えて、契約・請求の顧客発話を
+/// 不要に第三者（TypeSafe）へ送ることにもなる。宣言の無いルール（`contract-billing`）は Jev を
+/// 呼ばず、従来の `decide_reply_action`（`missing` ベース）に委ねる。rule_id では分岐しない
+/// （ルールを足しても、宣言を付けるだけで対象にできる）。
+///
+/// 判別は `matches!` で `ProductAndSymptom` を名指ししている（`is_some()` ではない）。将来別の
+/// 契約が増えても、その契約は別の質問が要るので、この経路（`has_enough_info` 専用）へ自動では
+/// 流れない。
+fn is_product_and_symptom_hearing_turn(
+    outcome: &crate::harness::EvaluationOutcome,
+    conv: &crate::harness::CaseConvState,
+) -> bool {
+    outcome.extraction_mode != crate::harness::extraction::ExtractionMode::LexiconFallback
+        && matches!(
+            &outcome.decision,
+            AnswerDecision::Escalate {
+                layer: 1,
+                hearing: Some(crate::harness::rules::HearingContract::ProductAndSymptom),
+                ..
+            }
+        )
+        && !conv.is_already_escalated()
+}
+
+/// Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルールの聞き返し判定
+/// そのもの（純関数）。`decide_reply_action` の
+/// decision table とは独立に存在し、`decide_reply_action` 自体は変更しない。
+///
+/// `has_enough_info` が閾値未満、かつ聞き返し予算内なら聞き返し（`Clarify`）、そうでなければ
+/// エスカレーション確定（`EscalationReply`）。実測値・閾値の根拠は
+/// `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7 を参照。
+fn decide_jev_hearing_action(
+    has_enough_info: f64,
+    clarify_turns: u32,
+    clarify_max_turns: u32,
+    enough_info_threshold: f64,
+) -> ReplyAction {
+    if has_enough_info < enough_info_threshold && clarify_turns < clarify_max_turns {
+        ReplyAction::Clarify
+    } else {
+        ReplyAction::EscalationReply
+    }
+}
+
+/// Issue #58: Jev へ `has_enough_info` を問い合わせる。`state` は [`build_jev_state`] で組み立てた
+/// 「過去の顧客発話 + 今ターンの発話」（呼び出し元は `resolve_jev_has_enough_info`）。HTTP 呼び出し失敗・タイムアウト・
+/// 応答に `has_enough_info` の `noul` 回答が無いのいずれも `None`（呼び出し側は
+/// `decide_reply_action` へフォールバックすること。fail-closed にせず fail-back する）。
+///
+/// `noul` 以外が返ったときの warn は、回答の**種別名だけ**を `answer_kind` に出し、値
+/// （`choice` の選択値・`confidence`・`probabilities`・`legend`・`score`）は出さない。これらは
+/// モデル生成値で顧客由来のデータを含みうるため、`{:?}` で丸ごと出すとアプリケーションログへ
+/// 顧客データが載る。`jev.rs::parse_answers` の warn（id / type / 理由のみ）とログ衛生の規律を
+/// 揃えている。`answer_kind=missing` は「エントリが無い、またはパースに失敗して捨てられた」場合
+/// （後者の理由は同リクエストの `jev.rs` 側 warn に出る）で、型の取り違えとは切り分けられる。
+/// `jev.rs` 側の warn も `request_id` を持つ（`JevClient::evaluate` の引数で伝播）ため、
+/// `answer_kind=missing` を観測したら同じ `request_id` の warn で破棄理由を引ける。
+///
+/// 数値 `noul` の範囲エラー（`jev.rs` の `noul value {noul} is out of ...`）だけは、診断のため
+/// 実値を `reason` に出す例外とする。f64 は顧客由来のテキストを運べないため許容している。
+///
+/// 失敗時の warn（`Err` 分岐）は `error` に**原因チェーンまで**出す（`{err:#}`）。anyhow の
+/// `Display` は最外層の context しか出さず、`{err}` だと接続拒否・DNS 失敗・TLS 失敗・
+/// タイムアウトがすべて同じ 1 行になり、運用者が原因を区別できない。タイムアウトのうち
+/// **`send()` 中（接続・リクエスト送出・応答ヘッダ受信まで）のタイムアウト**は
+/// `jev evaluate api timed out after <timeout_secs>s` という、`jev.rs` が所有する安定した
+/// 文言で判別できる（reqwest の文言には依存しない）。**応答ヘッダ受信後の本文読み込み中
+/// （`response.chunk()`）のタイムアウトはこの固有文言が付かず、`read jev evaluate api
+/// response body` の下に原因チェーンが続く**（`jev.rs::describe_send_error` の doc 参照）。
+/// **チェーンには endpoint の URL が含まれうる**
+/// （config 由来の公開値。API キーは `Authorization` ヘッダで送るため URL には載らない。endpoint の
+/// userinfo・クエリ文字列・フラグメントは起動時検証 `jev.rs::validate_endpoint` が拒否する。
+/// **パスは検証対象外**（正当な endpoint のパスと資格情報を機械的に区別できないため）なので、
+/// パスに資格情報を置くとこのログへ載る）。
+/// **API キーと顧客発話（`state`）は含まれない**（reqwest のエラーはリクエスト本文もヘッダも
+/// 持たない。`assert_jev_failure_logged_once_without_leaking` が固定）。
+async fn query_jev_has_enough_info(
+    jev: &crate::jev::JevClient,
+    state: &str,
+    request_id: &str,
+) -> Option<f64> {
+    match jev.evaluate(state, request_id).await {
+        Ok(outcome) => match outcome.answers.get("has_enough_info") {
+            Some(crate::jev::JevAnswer::Noul { noul }) => Some(*noul),
+            other => {
+                let answer_kind = other.map_or("missing", crate::jev::JevAnswer::kind);
+                tracing::warn!(
+                    request_id = %request_id,
+                    answer_kind = %answer_kind,
+                    "jev hearing evaluate response has no usable has_enough_info noul answer; \
+                     falling back to the missing-based clarify decision"
+                );
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %format_args!("{err:#}"),
+                request_id = %request_id,
+                "jev hearing evaluate failed; falling back to the missing-based clarify decision"
+            );
+            None
+        }
+    }
+}
+
+/// Issue #58: `is_product_and_symptom_hearing_turn` が true（マッチした第1層ルールが
+/// `product_and_symptom` のヒアリング契約を宣言している）で、かつ Jev が有効
+/// （`harness.jev_client.is_some()`）なときだけ Jev を呼ぶ。対象外のターン（宣言の無い
+/// advisory ルール `contract-billing` を含む）・Jev 無効（`[jev] enabled = false`）のいずれも
+/// Jev を呼ばずに `None` を返す。
+///
+/// 戻り値が `Some` のときだけ、呼び出し側は `decide_jev_hearing_action` を使い、かつ
+/// `Harness::record_jev_hearing_decision` で専用の監査行を書くこと（`None` のターンは
+/// 通常どおり `decide_reply_action` に委譲し、この監査行を書かない）。
+///
+/// Jev へ送る `state` は、完成済みの文字列ではなく `history` と `message`（今ターンの発話）を
+/// 受け取り、対象ターンと判定した**後**にこの関数の中で [`build_jev_state`] を呼んで組み立てる。
+/// 理由は 2 つ。(1) 呼び出し側（`reply_handler`）が将来 `message` だけを渡す形へ退行しても、
+/// wiremock が受信した `state` を検証するテストで検出できる（完成済みの `state` を受ける
+/// シグネチャだと、この結線が退行しても既存テストが全て通ってしまう）。(2) `[jev] enabled = false`
+/// や対象外のターン（大半のリクエスト）で、使わない `state` の組み立て（履歴の走査・文字数集計）
+/// を毎回払わない。
+///
+/// **テスト方針（`reply_handler` 全体を駆動する統合テストを置かない理由）**: `Harness.knowledge`
+/// は具象型 `KnowledgeStore`（vegapunk gRPC クライアントを内包）で差し替えられず、
+/// `/api/reply` の 200 経路は実 vegapunk が無いと通せない（`reply_handler` の 401/400/404/500
+/// のみ `oneshot` で検証する、という既存の裁定。`mod tests` 内「/api/reply ルーティング」節の
+/// コメント参照）。このためこの関数と `decide_jev_hearing_action` を部品として単体で検証している。
+/// Clarify 応答・clarify 予算の永続化・後続のエスカレーション到達の通し検証は、`KnowledgeStore`
+/// をトレイト化する変更が要り Issue #58 のスコープ外。
+async fn resolve_jev_has_enough_info(
+    harness: &Harness,
+    outcome: &crate::harness::EvaluationOutcome,
+    conv: &crate::harness::CaseConvState,
+    history: &[ReplyHistoryTurn],
+    message: &str,
+    request_id: &str,
+) -> Option<f64> {
+    if !is_product_and_symptom_hearing_turn(outcome, conv) {
+        return None;
+    }
+    let jev = harness.jev_client.as_ref()?;
+    let state = build_jev_state(history, message, request_id);
+    query_jev_has_enough_info(jev, &state, request_id).await
+}
+
+/// Issue #58: Jev の `state` に渡す文字列を組み立てる純関数。過去の顧客発話（時系列昇順）を
+/// 前置し、最後に今ターンの `message` を足して `\n` で連結する。履歴に顧客発話が 1 件も無い
+/// ときは `message` のみを返す（余計な改行を付けない）。
+///
+/// **なぜ履歴を含めるか**: `has_enough_info` の判定基準は「対象の製品と具体的な症状の両方が
+/// 分かる」（`server/data/urtect/jev-questions.json`）。今ターンの発話だけを渡すと、顧客が
+/// 1 ターン目に症状、2 ターン目に型番を答えた多ターンのヒアリングで、どのターン単体でも
+/// 「両方分かる」にならず `has_enough_info` が上がらない。結果 `clarify_max_turns` に達する
+/// まで聞き返しを繰り返してからエスカレーションする。累積 signal や `build_known_facts` の
+/// 把握済み事項は既に履歴を見ているため、Jev だけが履歴を見ない不整合の是正でもある。
+///
+/// **なぜ assistant 発話を含めないか**: `has_enough_info` は「顧客が伝えた情報の十分性」を測る
+/// 指標であり、聞き返し文など自社発話が判定を押し上げてはならない。
+///
+/// **なぜ [`select_customer_history_for_known_facts`] を使わないか（表示用の要約予算を判定入力へ
+/// 流用しない）**: あちらは把握済み事項リストへ載せる**表示用**に 1 発話を 100 字 + `…` へ切り詰める。
+/// これを Jev の**判定入力**へ流用すると、発話が途中で切られて意味が反転する経路が生まれる。
+/// 決定的情報（型番）が 101 字目以降なら Jev から見えず `has_enough_info` が不当に下がる。より
+/// 重いのは、訂正・否定（「ADC-V523 ではなく実際の型番は不明です」等）が 101 字目以降で切り落とされ、
+/// 誤った型番だけが残って `has_enough_info` が不当に上がる場合で、症状のみの今ターンが「誤った型番
+/// + 症状」に見えて、聞き返すべきところが即エスカレーションになる。しかも切り詰めは warn に
+/// 出ないため痕跡が残らない。そのため発話は**途中で切らず**、予算超過は古い側の発話を**丸ごと**
+/// 落とす（[`select_customer_history_for_jev`]）。
+///
+/// **発話単位の削除にも「安全側にしか振れない」保証は無い**（是正: 当初この doc コメントは
+/// 「丸ごと落ちるなら意味反転は構造的に起きない」と断言していたが、これは誤りだった）。
+/// 発話内の切り詰めより厳密に安全ではある（訂正・否定が発話の一部だけ生き残って文意が変わる
+/// 経路は無い）が、古いターンが後続ターンの言及を**限定・否定**しているケースでは、その古い
+/// ターンを丸ごと落とすことで逆に `has_enough_info` が不当に**上がる**方向へ振れうる。例:
+/// 古い発話「後で例に出す ADC-V523 は他人の製品です。私の型番は不明です」が丸ごと落ち、
+/// 「ADC-V523 の症状」に触れる新しい発話だけが残ると、型番が確定して見えてしまう。そのため
+/// 除外（件数窓・予算超過のいずれも）は必ず warn に記録し（[`select_customer_history_for_jev`]）、
+/// 事後に会話を突き合わせて再構成できるようにしている。
+///
+/// 今ターンの `message` は切り詰めない（入力上限は `validate` の `MAX_MESSAGE_CHARS` が既に持つ）。
+/// ただし過去発話と同じ改行潰しの正規化（[`crate::harness::prompt_input::collapse_to_single_line`]）
+/// は掛ける。「1 顧客発話 = 必ず 1 行」という不変条件が、state の末尾行（今ターン）だけ崩れて
+/// いたため。正規化後に空になる場合（制御文字だけの発話。`validate` は通過しうる）は、state の
+/// 末尾に空行を残さないよう行ごと省く。
+///
+/// `request_id` は予算超過の warn を該当リクエストと突き合わせるためだけに使う。
+fn build_jev_state(history: &[ReplyHistoryTurn], message: &str, request_id: &str) -> String {
+    let mut lines = select_customer_history_for_jev(history, request_id);
+    let current_turn = crate::harness::prompt_input::collapse_to_single_line(message);
+    if !current_turn.is_empty() {
+        lines.push(current_turn);
+    }
+    lines.join("\n")
+}
+
+/// Jev の判定入力に載せる過去の顧客発話の合計文字数（`chars().count()` の総和。正規化後の値で、
+/// 今ターンの `message` と行区切りの `\n` は含まない）の上限。
+///
+/// `/api/reply` の `history[].text` 上限（[`MAX_HISTORY_TEXT_CHARS`]）と同値。したがって
+/// `validate` を通った入力では 1 発話だけで予算を超えることはなく、超過は複数発話の合計でのみ
+/// 起きる。1 発話で超える分岐（丸ごと落として過去発話 0 件になる）は、`validate` を経由しない
+/// 呼び出しや将来の上限変更に対する防御であり、切り詰めで代替しない。
+///
+/// state が今ターンだけの場合から最大でこの字数ぶん増えるため、Jev の入力トークン・
+/// レイテンシは有効化前に実測し直すこと（`docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
+const MAX_JEV_HISTORY_CHARS: usize = 2_000;
+
+/// Jev の**判定入力**専用の過去の顧客発話の選択。時系列昇順で返す。**発話を途中で切らない**。
+///
+/// 1. `role == Customer` に絞り、各発話へ改行潰しの正規化**のみ**を掛ける（切り詰めを伴う
+///    [`normalize_customer_turn_to_single_line`] は使わない）。正規化後に空になるもの
+///    （制御文字だけの発話等）は除外する。先に除外するのは、`validate` は `trim()` 後の非空しか
+///    見ないため、空になる発話が枠を消費して有効な発話を押し出す事故を防ぐ
+///    （[`select_customer_history_for_known_facts`] と同じ理由）。
+/// 2. 新しい側から最大 [`crate::harness::reply::MAX_HISTORY_TURNS`] 件を採る（把握済み事項の窓と
+///    件数を揃える）。この件数窓による除外も、下記の予算超過と同じく warn に出す
+///    （`window_dropped_turns` フィールド）。件数窓は固定長で除外理由も機械的だが、除外自体は
+///    観測できないと事後に会話を再構成できないため、対象外にしない。
+/// 3. 合計文字数が [`MAX_JEV_HISTORY_CHARS`] を超える間、古い側の発話を 1 件ずつ**丸ごと**落とす。
+///    1 件だけで超える発話も切り詰めず丸ごと落とす（過去発話 0 件になりうる）。
+///
+/// **表示用の要約予算（1 発話 100 字 + `…`）を判定入力へ流用しない**こと。理由（訂正・否定が
+/// 切り落とされて `has_enough_info` が不当に上がる意味反転）は [`build_jev_state`] の doc コメント
+/// を参照。同コメントが記す既知の限界（発話単位の削除も安全側にしか振れない保証は無いこと）も
+/// 参照。
+///
+/// 手順 2（件数窓）または手順 3（予算超過）のいずれかで 1 件以上落としたときは `tracing::warn!`
+/// を 1 回出す。件数窓で落ちた件数は `window_dropped_turns`、予算超過で落ちた件数は
+/// `dropped_turns`（既存フィールド名を維持）に分けて出す。**発話本文は絶対に出さない**
+/// （個人情報を含みうる）。`request_id` は該当リクエストと突き合わせるための相関 ID で、本文ではない。
+fn select_customer_history_for_jev(history: &[ReplyHistoryTurn], request_id: &str) -> Vec<String> {
+    let mut turns: Vec<String> = history
+        .iter()
+        .filter(|turn| turn.role == ReplyHistoryRole::Customer)
+        .map(|turn| crate::harness::prompt_input::collapse_to_single_line(&turn.text))
+        .filter(|text| !text.is_empty())
+        .collect();
+    let window_skip = turns
+        .len()
+        .saturating_sub(crate::harness::reply::MAX_HISTORY_TURNS);
+    turns.drain(..window_skip);
+
+    // 古い側から順に、合計が予算に収まるまで丸ごと落とす。`total_chars` は `turns` の総和なので、
+    // 全件落とせば 0 になりループは必ず終わる（`turns` が空でも panic しない）。
+    let mut total_chars: usize = turns.iter().map(|turn| turn.chars().count()).sum();
+    let mut dropped_turns = 0;
+    for turn in &turns {
+        if total_chars <= MAX_JEV_HISTORY_CHARS {
+            break;
+        }
+        total_chars -= turn.chars().count();
+        dropped_turns += 1;
+    }
+    turns.drain(..dropped_turns);
+
+    if window_skip > 0 || dropped_turns > 0 {
+        tracing::warn!(
+            request_id = %request_id,
+            window_dropped_turns = window_skip,
+            dropped_turns,
+            kept_turns = turns.len(),
+            reason = "jev_history_budget",
+            "past customer turns were dropped whole from jev's judgment input (via the history \
+             window and/or the character budget; turns are never truncated). if a dropped turn \
+             limited or negated something mentioned in a later turn, has_enough_info can come out \
+             either higher or lower than the whole conversation warrants"
+        );
+    }
+    turns
+}
+
 /// Issue #54 A-2 (b): `ReplyAction::EscalationReply` の応答文を組み立てる（`reply_handler` の
 /// 同分岐から抽出した部品）。
 ///
@@ -486,6 +782,10 @@ fn normalize_customer_turn_to_single_line(text: &str) -> String {
 /// 「把握済み事項リスト」専用の customer 発話選択（Warning 1 修正、2 巡目の Warning で
 /// 選択と正規化の順序を修正）。
 ///
+/// **これは表示用（LLM プロンプトへ載せる要約）。判定入力には使わないこと。** 1 発話を 100 字 +
+/// `…` へ切り詰めるため、判定に使うと訂正・否定が切り落とされて意味が反転する。Jev の判定入力は
+/// 発話を切らない [`select_customer_history_for_jev`] を使う。
+///
 /// **なぜ `reply::select_history` をそのまま使わないか**: あちらは「新しい側から最大
 /// [`crate::harness::reply::MAX_HISTORY_TURNS`] ターン・合計 4000 字」を**全 role・原文長**で
 /// 選ぶ。把握済み事項は assistant 発話を読まず、customer 発話も 100 字へ切り詰めて使うため、
@@ -587,15 +887,51 @@ fn is_clarify_exhausted(
         && conv.clarify_turns >= cfg.clarify_max_turns
 }
 
+/// Issue #58 Warning 2: 「聞き返し上限到達でエスカレーションへ落ちた」を計測する
+/// `clarify_exhausted` ログを出すべきかどうかを、Jev 経由の聞き返し判定にも対応させて判定する。
+/// `reply_handler` はこの関数 1 つだけを呼び、Jev / 非 Jev の分岐をインライン展開しない。
+///
+/// - `jev_has_enough_info == None`（非 Jev 経路）: 従来の `is_clarify_exhausted` の判定結果を
+///   そのまま返す。発火条件は本関数の追加前後で一切変えていない（既存の `is_clarify_exhausted_*`
+///   テストがそのまま通ることで担保する）。
+/// - `jev_has_enough_info == Some(has_enough_info)`（Jev 経路）: `decide_jev_hearing_action` が
+///   聞き返し予算切れ（`has_enough_info < enough_info_threshold` かつ
+///   `clarify_turns >= clarify_max_turns`）を理由に `EscalationReply` を返したときだけ true。
+///   `has_enough_info >= enough_info_threshold`（Jev が情報十分と判定した即エスカレーション）は
+///   予算切れではないため false のまま返す。この 2 つを取り違えると、即エスカレーションの
+///   たびに「聞き返し上限到達」という誤ったログが出て計測が無意味になる。
+///
+/// `outcome` / `cfg` は非 Jev 経路にのみ使う。Jev 経路では `outcome.clarification_allowed` が
+/// 契約上 false になる（Jev トリガー条件がヒアリング契約を宣言した第1層 `Escalate`
+/// （`is_product_and_symptom_hearing_turn`）に限られるため、
+/// `harness::mod::clarification_allowed()` の契約上ほぼ常に false）ため参照しない。
+fn is_reply_clarify_exhausted(
+    jev_has_enough_info: Option<f64>,
+    enough_info_threshold: f64,
+    outcome: &crate::harness::EvaluationOutcome,
+    conv: &crate::harness::CaseConvState,
+    cfg: &crate::config::ApiConfig,
+) -> bool {
+    match jev_has_enough_info {
+        Some(has_enough_info) => {
+            has_enough_info < enough_info_threshold && conv.clarify_turns >= cfg.clarify_max_turns
+        }
+        None => is_clarify_exhausted(outcome, conv, cfg),
+    }
+}
+
 /// 「今回の聞き返しが最終ターンか」を判定する純関数（B4: 会話フロー v1.2 design doc §3
 /// 「残り確認回数の可視化」）。`Warning 2` 対応: 以前は `reply_handler` 内に
 /// `conv.clarify_turns + 1 >= max` としてインライン化されていてテストが無く、
 /// オフバイワンが仕込まれてもコメントでしか守られていなかった。`is_clarify_exhausted` と
 /// 同じ理由で純関数へ切り出す。
 ///
-/// **前提**: この関数は `decide_reply_action` が `ReplyAction::Clarify` を返した後にのみ
-/// 呼ぶこと。その分岐に入る時点で `conv.clarify_turns < cfg.clarify_max_turns` が保証されて
-/// いる（`decide_reply_action` の decision table）。加算オーバーフローを避けるため
+/// **前提**: この関数は `decide_reply_action` または `decide_jev_hearing_action`（Issue #58）が
+/// `ReplyAction::Clarify` を返した後にのみ呼ぶこと。どちらの分岐に入る時点でも
+/// `conv.clarify_turns < cfg.clarify_max_turns` が保証されている（`decide_reply_action` の
+/// decision table、および `decide_jev_hearing_action` が `Clarify` を返す条件そのもの
+/// `has_enough_info < enough_info_threshold && clarify_turns < clarify_max_turns`）。加算
+/// オーバーフローを避けるため
 /// `clarify_turns + 1 >= max` ではなく `clarify_turns >= max - 1`（`saturating_sub`）の形で書く。
 /// `cfg.clarify_max_turns == 0` の場合 `saturating_sub(1)` は 0 を返すため単体では常に `true`
 /// になるが、上記の前提（`clarify_turns < max`）が保証する呼び出し経路では `max == 0` は
@@ -627,6 +963,13 @@ fn missing_to_text(missing: &[decision::EvidenceRequirement]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Issue #58: Jev 起点の聞き返し（`resolve_jev_has_enough_info` が `Some` を返したターンの
+/// `Clarify`）で使う固定文言。マニュアルカバレッジ由来の `missing_to_text` とは無関係
+/// （Jev は「顧客が話した情報の十分性」を見ており、マニュアル材料の一致度とは異なる指標のため、
+/// 同じ文言を使い回さない）。
+const JEV_HEARING_MISSING_TEXT: &str =
+    "対象の製品の型番と、具体的な症状（いつから・どんな状態か）が確認できていません。";
 
 /// `Harness::evaluate` が返す `anyhow::Error` を HTTP ステータスへ分類する純関数
 /// （design doc §2 のエラー表: 503 `upstream_unavailable` / 500 `internal`）。
@@ -1283,13 +1626,59 @@ async fn reply_handler(
                 &outcome.case_id,
             );
 
-            let action = decide_reply_action(&outcome, &conv, &state.config.api);
+            // Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルール
+            // （`warranty-failure`）にマッチしたターンにのみ Jev の has_enough_info を使う。
+            // 対象外のターン・Jev 無効・HTTPエラー・タイムアウト・応答欠落のいずれでも
+            // `None` になり、その場合は従来どおり `decide_reply_action`（missing ベース）に
+            // 委譲する（fail-back。詳細は `resolve_jev_has_enough_info` の doc コメント）。
+            // Jev には今ターンの発話だけでなく過去の顧客発話も渡す（`build_jev_state` の
+            // doc コメント参照）。state の組み立ては対象ターンと判定した後に
+            // `resolve_jev_has_enough_info` の中で行う（ここで先に作らない）。
+            let jev_has_enough_info = resolve_jev_has_enough_info(
+                &state.harness,
+                &outcome,
+                &conv,
+                &history,
+                &req.message,
+                &request_id,
+            )
+            .await;
+
+            let action = match jev_has_enough_info {
+                Some(has_enough_info) => decide_jev_hearing_action(
+                    has_enough_info,
+                    conv.clarify_turns,
+                    state.config.api.clarify_max_turns,
+                    state.config.jev.enough_info_threshold,
+                ),
+                None => decide_reply_action(&outcome, &conv, &state.config.api),
+            };
+
+            // Jev を実際に使って判定したターンのみ、専用の監査行を追記する
+            // （`Harness::record_jev_hearing_decision` の doc コメント参照）。
+            if let Some(has_enough_info) = jev_has_enough_info {
+                let jev_hearing_label = if action == ReplyAction::Clarify {
+                    "jev_hearing:clarify"
+                } else {
+                    "jev_hearing:escalate"
+                };
+                state
+                    .harness
+                    .record_jev_hearing_decision(&ctx, jev_hearing_label, has_enough_info)
+                    .await;
+            }
 
             // 計測: 「聞き返し上限到達でエスカレーションへ落ちた」事象を運用者が追える info ログ。
             // `arm_time_pref_solicitation` が `conv.clarify_turns` を 0 にリセットする**前**に
             // 判定する（リセット後だと `is_clarify_exhausted` が常に false になる）。
             if action == ReplyAction::EscalationReply
-                && is_clarify_exhausted(&outcome, &conv, &state.config.api)
+                && is_reply_clarify_exhausted(
+                    jev_has_enough_info,
+                    state.config.jev.enough_info_threshold,
+                    &outcome,
+                    &conv,
+                    &state.config.api,
+                )
             {
                 tracing::info!(
                     case_id = %outcome.case_id,
@@ -1313,21 +1702,33 @@ async fn reply_handler(
                     .await
                 }
                 ReplyAction::Clarify => {
-                    let missing: &[decision::EvidenceRequirement] = match &outcome.decision {
-                        AnswerDecision::Escalate { missing, .. } => missing,
-                        other => {
-                            tracing::error!(
-                                request_id = %request_id,
-                                decision = ?other,
-                                "decide_reply_action returned Clarify for a non-Escalate decision; \
-                                 this is a bug in decide_reply_action's decision-table logic. \
-                                 Falling back to an empty missing list so the clarify prompt still \
-                                 degrades gracefully instead of panicking"
-                            );
-                            &[]
-                        }
+                    // Issue #58: Jev 起点の聞き返しは、マニュアルカバレッジ由来の
+                    // `missing_to_text` ではなく固定文言を使う（Jev は「顧客が話した情報の
+                    // 十分性」を見ており、`outcome.decision` の `missing`（マニュアル材料との
+                    // 一致度）とは無関係な指標のため）。`jev_has_enough_info.is_some()` は、
+                    // このターンの `action` が `decide_jev_hearing_action` 経由で決まった
+                    // ことを意味する（`resolve_jev_has_enough_info` が `None` を返した場合は
+                    // 必ず従来どおり `decide_reply_action` に委譲されている）。
+                    let missing_text = if jev_has_enough_info.is_some() {
+                        JEV_HEARING_MISSING_TEXT.to_string()
+                    } else {
+                        let missing: &[decision::EvidenceRequirement] = match &outcome.decision {
+                            AnswerDecision::Escalate { missing, .. } => missing,
+                            other => {
+                                tracing::error!(
+                                    request_id = %request_id,
+                                    decision = ?other,
+                                    "decide_reply_action returned Clarify for a non-Escalate \
+                                     decision; this is a bug in decide_reply_action's \
+                                     decision-table logic. Falling back to an empty missing \
+                                     list so the clarify prompt still degrades gracefully \
+                                     instead of panicking"
+                                );
+                                &[]
+                            }
+                        };
+                        missing_to_text(missing)
                     };
-                    let missing_text = missing_to_text(missing);
                     // B1: 把握済み事項リスト（design doc §3 v1.2 追記）。聞き返しのたびに
                     // 既知の情報を再質問してしまう退行を防ぐ。
                     let known_facts = build_known_facts(
@@ -1795,10 +2196,16 @@ mod tests {
                 required: 0.8,
                 best: 0.5,
             }],
+            hearing: None,
         }
     }
 
-    /// 第1層（明示エスカレーションルール、rule_match）相当の escalate。
+    /// 第1層（明示エスカレーションルール、rule_match）相当の escalate。`hearing` を `None` に
+    /// しているのは既存呼び出し元（このテストファイルの他の多数のテスト）が「ヒアリング契約を
+    /// 宣言した第1層ルール」判定に該当しないことを前提にしているため（Issue #58: Jev 起点の
+    /// 聞き返し判定は `hearing == Some(HearingContract::ProductAndSymptom)` のときだけ発火する。
+    /// 既存テストの意図を変えないよう、宣言を明示するテストは別ヘルパー
+    /// `layer1_hearing_escalate_decision` / `layer1_escalate_without_hearing_decision` を使う）。
     fn rule_match_escalate_decision() -> AnswerDecision {
         AnswerDecision::Escalate {
             reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
@@ -1807,7 +2214,76 @@ mod tests {
             disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
             audit_required: true,
             missing: vec![],
+            hearing: None,
         }
+    }
+
+    /// Issue #58: ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（実データでは
+    /// `warranty-failure`）にマッチした escalate。Jev 起点の聞き返し判定の対象。
+    fn layer1_hearing_escalate_decision() -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: vec![],
+            hearing: Some(crate::harness::rules::HearingContract::ProductAndSymptom),
+        }
+    }
+
+    /// Issue #58: ヒアリング契約を宣言していない第1層ルールにマッチした escalate（Jev 起点の
+    /// 聞き返し判定の対象外）。mandatory ルール、および宣言の無い advisory ルール（実データでは
+    /// `contract-billing`）がこの形になる。この 2 つは decision の上では区別されない
+    /// （区別しないことが設計。判別は宣言だけで行う）。
+    fn layer1_escalate_without_hearing_decision() -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: vec![],
+            hearing: None,
+        }
+    }
+
+    /// 実際に配布される `data/urtect/rules.json` で `decide()` を回した decision。手組みの
+    /// decision ではなく**実データの宣言**を通して、Jev を呼ぶか否かを固定するためのヘルパ。
+    /// `best_manual_score` は閾値（low=0.6）未満の 0.1 にして、`missing` が積まれる
+    /// （＝従来なら advisory が聞き返しに入りうる）状況で判別が宣言だけで決まることも見る。
+    fn bundled_layer1_decision(signal_values: &[&str]) -> AnswerDecision {
+        let rules = crate::test_support::load_bundled_escalation_rules();
+        let question: crate::harness::signal::SignalSet = signal_values
+            .iter()
+            .map(|v| crate::harness::signal::Signal::new(*v))
+            .collect();
+        let thresholds = decision::Thresholds {
+            low: 0.6,
+            mid: 0.8,
+            high: 0.95,
+        };
+        let decision = decision::decide(&decision::DecisionInput {
+            question_signals: &question,
+            question_raw: "質問",
+            rules: &rules,
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: decision::StakesInput {
+                mandatory_domain_near: false,
+                ng_near_hit: false,
+                hazard_signal_count: 0,
+            },
+            thresholds: &thresholds,
+            default_route: "triage",
+        });
+        assert!(
+            matches!(decision, AnswerDecision::Escalate { layer: 1, .. }),
+            "the bundled rules must escalate {signal_values:?} at layer 1, got {decision:?}"
+        );
+        decision
     }
 
     fn base_outcome(
@@ -2096,6 +2572,671 @@ mod tests {
         conv.clarify_turns = 0;
         let action = decide_reply_action(&outcome, &conv, &default_api_config());
         assert_eq!(action, ReplyAction::Clarify);
+    }
+
+    // ---- Issue #58: ヒアリング契約を宣言した第1層ルールの聞き返し判定に Jev の has_enough_info を使う ----
+
+    // --- decide_jev_hearing_action（純関数。実測値は背景 section・design doc §7 参照） ---
+
+    #[test]
+    fn decide_jev_hearing_action_clarifies_when_below_threshold_and_turns_remain() {
+        // 実測: 「電源が入らなくなった」has_enough_info = 0.14（閾値 0.5 未満）。
+        let action = decide_jev_hearing_action(0.14, 0, 3, 0.5);
+        assert_eq!(action, ReplyAction::Clarify);
+    }
+
+    #[test]
+    fn decide_jev_hearing_action_escalates_when_at_or_above_threshold() {
+        // 実測: 「ADC-V523 の録画がうまく再生できない」has_enough_info = 0.69（閾値以上）。
+        let action = decide_jev_hearing_action(0.69, 0, 3, 0.5);
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    #[test]
+    fn decide_jev_hearing_action_escalates_when_below_threshold_but_turns_exhausted() {
+        let action = decide_jev_hearing_action(0.14, 3, 3, 0.5);
+        assert_eq!(
+            action,
+            ReplyAction::EscalationReply,
+            "insufficient info must not clarify forever; the clarify budget still applies"
+        );
+    }
+
+    #[test]
+    fn decide_jev_hearing_action_treats_the_threshold_value_itself_as_sufficient() {
+        // 境界値: `has_enough_info == threshold` は「閾値未満」ではないため Clarify にならない。
+        let action = decide_jev_hearing_action(0.5, 0, 3, 0.5);
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    // --- is_product_and_symptom_hearing_turn（純関数。対象/対象外の切り分け） ---
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_true_for_a_fresh_layer1_escalation_declaring_the_hearing(
+    ) {
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
+        let conv = default_conv_state();
+        assert!(is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_for_a_layer1_escalation_without_a_declaration() {
+        // Issue #58 必須テスト4: 宣言の無いルール（mandatory 全件と、契約・請求のような
+        // advisory）は has_enough_info の値に関わらず対象外（Jev をそもそも呼ばない）。
+        let outcome = base_outcome(layer1_escalate_without_hearing_decision(), false);
+        let conv = default_conv_state();
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    // reviewer Stage 2 codex レビュー Critical 1 の回帰防止（名指し）。
+    //
+    // `rules::match_layer1` を binding 優先に直す前は、advisory ルールと mandatory ルールが
+    // 同一ターンで同時マッチすると、配列順によっては advisory（warranty-failure）が先に確定し、
+    // その宣言が decision に載ってしまい得た。その結果 `is_product_and_symptom_hearing_turn` が
+    // true になり、本来問答無用で即エスカレーションすべき mandatory 事象（例:「人に代わって
+    // ください」による human-handoff）が Jev 起点の聞き返しループへ吸収される。`match_layer1`
+    // 修正後は同時マッチ時に必ず mandatory が選ばれ、宣言は載らない。実データで `decide` を回し、
+    // その decision に対して `is_product_and_symptom_hearing_turn` が false であり続けることを
+    // 名指しに固定する（`decision.rs::bundled_warranty_failure_and_human_handoff_conflict_
+    // resolves_to_mandatory` と対になる、api.rs 側の回帰ガード）。
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_for_the_mandatory_winner_of_a_warranty_failure_conflict(
+    ) {
+        let decision =
+            bundled_layer1_decision(&["warranty_hardware_failure", "human_handoff_request"]);
+        let outcome = base_outcome(decision, false);
+        let conv = default_conv_state();
+        assert!(
+            !is_product_and_symptom_hearing_turn(&outcome, &conv),
+            "human-handoff (mandatory) must never be treated as the Jev-hearing target, even \
+             when warranty-failure (which declares the hearing) matches in the same turn"
+        );
+    }
+
+    // PR #60 Copilot 指摘の回帰防止（実データ）。契約・請求は advisory だが型番も症状も関係ない。
+    // 「advisory だから聞き返す」結合に戻ると、十分に具体的な契約・請求の問い合わせが型番と
+    // 症状を尋ねるヒアリングへ流れる。
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_for_the_bundled_contract_billing_rule() {
+        let outcome = base_outcome(
+            bundled_layer1_decision(&["contract_billing_question"]),
+            true,
+        );
+        let conv = default_conv_state();
+        assert!(
+            !is_product_and_symptom_hearing_turn(&outcome, &conv),
+            "contract-billing needs neither a model number nor a symptom, so it must not be \
+             a target of the product-and-symptom hearing"
+        );
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_true_for_the_bundled_warranty_failure_rule() {
+        let outcome = base_outcome(
+            bundled_layer1_decision(&["warranty_hardware_failure"]),
+            true,
+        );
+        let conv = default_conv_state();
+        assert!(is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_for_layer2_prohibited_domain() {
+        let decision = AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 2,
+            route_to: "derm_liaison".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            hearing: None,
+        };
+        let outcome = base_outcome(decision, false);
+        let conv = default_conv_state();
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_for_layer3_gray_insufficient_directness() {
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let conv = default_conv_state();
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_for_layer3_gray_unknown_added_signal() {
+        let decision = AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::UnknownAddedSignal,
+            layer: 3,
+            route_to: "triage".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::NoInternalDetails,
+            audit_required: true,
+            missing: vec![decision::EvidenceRequirement::DirectManualCoverage {
+                required: 0.8,
+                best: 0.5,
+            }],
+            hearing: None,
+        };
+        let outcome = base_outcome(decision, true);
+        let conv = default_conv_state();
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_when_extraction_fell_back_to_lexicon() {
+        let mut outcome = base_outcome(layer1_hearing_escalate_decision(), true);
+        outcome.extraction_mode = crate::harness::extraction::ExtractionMode::LexiconFallback;
+        let conv = default_conv_state();
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_when_already_escalated_via_confirmed_flag() {
+        // Issue #58 必須テスト7: 確定済み case では Jev を呼ばない
+        // （`decide_reply_action` 自身のガードに委ねる。二重実装を避ける）。
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.escalation_confirmed = true;
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_when_already_escalated_via_awaiting_time_pref() {
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true;
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    #[test]
+    fn is_product_and_symptom_hearing_turn_false_when_already_escalated_via_preferred_contact_time()
+    {
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.preferred_contact_time = Some("平日午後".to_string());
+        assert!(!is_product_and_symptom_hearing_turn(&outcome, &conv));
+    }
+
+    // --- resolve_jev_has_enough_info（Jev 呼び出しの最小限の統合テスト、wiremock） ---
+
+    /// `JevClient::build`（Issue #58 で `pub(crate)` に拡張）を wiremock 相手に組み立てる。
+    /// `jev.rs::tests::test_client` と同じ「env を汚染しない」構築経路（api.rs は同一 crate 内
+    /// だが別モジュールのため、`jev.rs` のテスト専用 `test_client` は private で使えない）。
+    fn jev_questions_file() -> String {
+        let dir = std::env::temp_dir().join(format!("api-jev-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("questions.json");
+        std::fs::write(&path, r#"{"has_enough_info": {"type": "noul"}}"#)
+            .expect("write questions file");
+        path.to_string_lossy().to_string()
+    }
+
+    /// テスト用 Jev クライアントの API キー。ログへ漏れないことを検証するテストが参照する。
+    const JEV_TEST_API_KEY: &str = "test-key";
+
+    fn build_test_jev_client(endpoint: String, timeout_secs: u64) -> crate::jev::JevClient {
+        let cfg = crate::config::JevConfig {
+            enabled: true,
+            endpoint,
+            model: "jev-test".to_string(),
+            questions_path: jev_questions_file(),
+            timeout_secs,
+            enough_info_threshold: 0.5,
+        };
+        crate::jev::JevClient::build(
+            JEV_TEST_API_KEY.to_string(),
+            &cfg,
+            std::path::Path::new("/unused-because-questions-path-is-absolute"),
+        )
+        .expect("build jev client for a loopback http endpoint")
+    }
+
+    /// `template` を返す Jev スタブ（wiremock）と、そのスタブを向いた Jev 有効の `Harness` を
+    /// 組み立てる。`MockServer` は戻り値を保持している間だけ生きる（落とすとスタブが止まる）ため、
+    /// 受信リクエストを検証しないテストも `_server` として束縛し続けること。
+    async fn jev_stub_harness(
+        template: wiremock::ResponseTemplate,
+        timeout_secs: u64,
+    ) -> (wiremock::MockServer, Harness) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let mut harness = test_harness();
+        harness.jev_client = Some(build_test_jev_client(server.uri(), timeout_secs));
+        (server, harness)
+    }
+
+    /// HTTP 200 で `{"answers": <answers_json>, "usage": ...}` を返すテンプレート。
+    fn jev_answers_response(answers_json: serde_json::Value) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "answers": answers_json,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+    }
+
+    /// 聞き返し判定の対象ターン（ヒアリング契約を宣言した第1層ルール・未確定 case）で
+    /// `resolve_jev_has_enough_info` を
+    /// 1 回実行し、`(戻り値, 捕捉した生ログ)` を返す。生ログは INFO 以上を全て含む（WARN だけに
+    /// 絞ると、別レベルへの漏洩を見逃すため、漏洩の否定 assert には生ログを使う）。
+    async fn resolve_on_hearing_turn(
+        harness: &Harness,
+        history: &[ReplyHistoryTurn],
+        message: &str,
+        request_id: &str,
+    ) -> (Option<f64>, String) {
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
+        let conv = default_conv_state();
+        crate::test_support::capture_logs_async(resolve_jev_has_enough_info(
+            harness, &outcome, &conv, history, message, request_id,
+        ))
+        .await
+    }
+
+    /// Jev が `answers` として `answers_json` を返す状況で、対象ターンの
+    /// `resolve_jev_has_enough_info` を 1 回実行する（履歴なし・固定の発話）。
+    async fn resolve_with_jev_answers(
+        answers_json: serde_json::Value,
+        request_id: &str,
+    ) -> (Option<f64>, String) {
+        let (_server, harness) = jev_stub_harness(jev_answers_response(answers_json), 5).await;
+        resolve_on_hearing_turn(&harness, &[], "電源が入らなくなった", request_id).await
+    }
+
+    /// Jev 呼び出しの失敗（HTTP エラー・タイムアウト）で fail-back したときのログ契約を検証する。
+    ///
+    /// - WARN / ERROR がちょうど 1 件で、fail-back を名指しし、`error=` と `request_id` を持つ。
+    ///   `[jev] enabled = true` 後に実際に起こる経路で、運用者に残る手掛かりはこの warn だけ
+    ///   なので、欠落だけでなく重複（同じ失敗の二重報告）も固定する
+    /// - 顧客発話（Jev へ送る `state`）と API キーが、全レベルのログのどこにも載っていない
+    fn assert_jev_failure_logged_once_without_leaking(
+        logs: &str,
+        request_id: &str,
+        customer_utterance: &str,
+    ) {
+        let warnings = crate::test_support::filter_warn_and_error_lines(logs);
+        assert_eq!(
+            warnings.lines().count(),
+            1,
+            "a jev failure must emit exactly one WARN/ERROR line, got: {warnings:?}"
+        );
+        assert!(
+            warnings.contains("jev hearing evaluate failed"),
+            "an operator-facing warning must name the failure, got: {warnings}"
+        );
+        assert!(
+            warnings.contains("error="),
+            "the warning must carry the underlying error, got: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("request_id={request_id}")),
+            "the warning must carry the request_id, got: {warnings}"
+        );
+        for (what, secret) in [
+            ("customer utterance", customer_utterance),
+            ("api key", JEV_TEST_API_KEY),
+        ] {
+            assert!(
+                !logs.contains(secret),
+                "the {what} must never reach the logs ({secret}), got: {logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_none_when_jev_disabled() {
+        let harness = test_harness(); // jev_client: None（`[jev] enabled = false` 相当）
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), true);
+        let conv = default_conv_state();
+
+        let result = resolve_jev_has_enough_info(
+            &harness,
+            &outcome,
+            &conv,
+            &[],
+            "電源が入らなくなった",
+            "req-1",
+        )
+        .await;
+
+        assert_eq!(
+            result, None,
+            "jev disabled must fall back to the missing-based decision, not fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_the_noul_value_on_success() {
+        let (server, harness) = jev_stub_harness(
+            jev_answers_response(serde_json::json!({
+                "has_enough_info": {"type": "noul", "noul": 0.14}
+            })),
+            5,
+        )
+        .await;
+        let history = vec![
+            customer_turn("録画が再生できません"),
+            assistant_turn("型番を教えていただけますか？"),
+            customer_turn("先週から映らなくなりました"),
+        ];
+
+        let (result, logs) =
+            resolve_on_hearing_turn(&harness, &history, "型番は ADC-V523 です", "req-1").await;
+
+        assert_eq!(result, Some(0.14));
+        // 正常系では WARN / ERROR を一切出さない。`noul` が正常に返ったターンで無駄な warn が
+        // 出る退行は、Cloud Run のログノイズになり、運用者に誤った障害調査をさせる。
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.is_empty(),
+            "a successful jev call must not emit any WARN/ERROR line, got: {warnings}"
+        );
+        // 結線の固定: `resolve_jev_has_enough_info` が `history` と `message` から state を
+        // 組み立て、それが HTTP で実際に送信されること。将来ここが `message` のみの送信へ
+        // 退行すると、多ターンのヒアリングで `has_enough_info` が上がらなくなる（Issue #58）。
+        let received = server.received_requests().await.expect("recording enabled");
+        assert_eq!(received.len(), 1, "jev must be called exactly once");
+        let sent: serde_json::Value = received[0].body_json().expect("request body is json");
+        assert_eq!(
+            sent["state"], "録画が再生できません\n先週から映らなくなりました\n型番は ADC-V523 です",
+            "state must be past customer turns (chronological) + the current message"
+        );
+        assert!(
+            !sent["state"]
+                .as_str()
+                .expect("state is a string")
+                .contains("教えていただけますか"),
+            "assistant turns must never reach jev: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_none_on_http_error() {
+        // Issue #58 必須テスト5: HTTP エラー時は missing ベースの挙動へフォールバックする
+        // （fail-closed にしない）。
+        let (_server, harness) = jev_stub_harness(wiremock::ResponseTemplate::new(500), 5).await;
+        let utterance = "電源が入らなくなった";
+
+        let (result, logs) = resolve_on_hearing_turn(&harness, &[], utterance, "req-1").await;
+
+        assert_eq!(result, None);
+        assert_jev_failure_logged_once_without_leaking(&logs, "req-1", utterance);
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_returns_none_on_timeout() {
+        // Issue #58 必須テスト5: タイムアウト時も missing ベースの挙動へフォールバックする。
+        // timeout_secs は config 経由では整数秒単位が最小のため、確実にタイムアウトさせるため
+        // モック側の遅延(2秒)より短い 1 秒に設定する。
+        let (_server, harness) = jev_stub_harness(
+            wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(2)),
+            1,
+        )
+        .await;
+        let utterance = "電源が入らなくなった";
+
+        let (result, logs) = resolve_on_hearing_turn(&harness, &[], utterance, "req-1").await;
+
+        assert_eq!(result, None);
+        // タイムアウトは `[jev] enabled = true` 後に実際に起こる fail-back 経路で、運用者が
+        // 「Jev が倒れた」と気付く手掛かりは warn だけ。HTTP エラーと同じ水準で固定する。
+        assert_jev_failure_logged_once_without_leaking(&logs, "req-1", utterance);
+
+        // タイムアウトは、こちらが所有する安定した文言（`[jev] timeout_secs` の実値入り。この
+        // テストは 1 秒）で判別できること。reqwest / hyper の文言には依存しない。
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("jev evaluate api timed out after 1s"),
+            "the warn must say it was a timeout and the configured value, got: {warnings}"
+        );
+        // 最外層だけでなく原因チェーンまで出していること（`{err:#}`）。安定文言の直後に
+        // anyhow のチェーン区切り `: ` で原因が続く。文言そのものには立ち入らない。
+        assert!(
+            warnings.contains("jev evaluate api timed out after 1s: "),
+            "the warn must print the whole error chain, not only the outermost context, \
+             got: {warnings}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_falls_back_and_logs_kind_missing_when_the_answer_entry_is_absent(
+    ) {
+        // 応答に has_enough_info のエントリが無いとき、fail-closed にせず missing ベースの判定へ
+        // 委ねること（`None`）と、運用者が「Jev が答えを返さなかった」ケースを「型が違った」
+        // ケース（choice / score）と切り分けられること（`answer_kind=missing`）を固定する。
+        let (result, logs) = resolve_with_jev_answers(serde_json::json!({}), "req-1").await;
+
+        assert_eq!(
+            result, None,
+            "an absent has_enough_info entry must fall back to the missing-based decision"
+        );
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("answer_kind=missing"),
+            "an absent has_enough_info entry must be reported as kind=missing, got: {warnings}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_falls_back_and_logs_only_the_kind_when_answer_is_a_choice()
+    {
+        // 値（choice / confidence / probabilities）はモデル生成で、顧客由来のデータを含みうる。
+        // 8 桁以上の数値は、タイムスタンプ（小数部は最大 6 桁）と偶然一致しないための選択。
+        let (result, logs) = resolve_with_jev_answers(
+            serde_json::json!({
+                "has_enough_info": {
+                    "type": "choice",
+                    "choice": "SENTINEL-CHOICE-VALUE",
+                    "confidence": 0.87313131,
+                    "probabilities": {
+                        "SENTINEL-CHOICE-VALUE": 0.87313131, "SENTINEL-OTHER": 0.12686869
+                    }
+                }
+            }),
+            "req-1",
+        )
+        .await;
+
+        assert_eq!(
+            result, None,
+            "a non-noul has_enough_info must fall back to the missing-based decision"
+        );
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("answer_kind=choice"),
+            "the returned kind must be logged so operators can tell the type mismatch, got: {warnings}"
+        );
+        for leaked in ["SENTINEL", "87313131", "12686869"] {
+            assert!(
+                !logs.contains(leaked),
+                "model-generated answer values must never reach the logs ({leaked}), got: {logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_falls_back_and_logs_only_the_kind_when_answer_is_a_score()
+    {
+        let (result, logs) = resolve_with_jev_answers(
+            serde_json::json!({
+                "has_enough_info": {
+                    "type": "score",
+                    "score": 3.14159265,
+                    "confidence": 0.87313131,
+                    "probabilities": {"3": 0.87313131},
+                    "legend": {"3": "SENTINEL-LEGEND-TEXT"}
+                }
+            }),
+            "req-1",
+        )
+        .await;
+
+        assert_eq!(
+            result, None,
+            "a non-noul has_enough_info must fall back to the missing-based decision"
+        );
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("answer_kind=score"),
+            "the returned kind must be logged so operators can tell the type mismatch, got: {warnings}"
+        );
+        for leaked in ["SENTINEL", "14159265", "87313131"] {
+            assert!(
+                !logs.contains(leaked),
+                "model-generated answer values must never reach the logs ({leaked}), got: {logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_joins_the_parse_failure_warn_and_the_missing_warn_by_request_id(
+    ) {
+        // Jev が has_enough_info を未知の `type` で返すと、jev.rs が破棄理由を warn し、api.rs は
+        // 続けて `answer_kind=missing` を warn する。`/api/reply` が並行処理される本番で運用者が
+        // 他リクエストの warn と取り違えずにこの 2 行を結べるよう、両方が同じ request_id を持つこと。
+        let (result, logs) = resolve_with_jev_answers(
+            serde_json::json!({"has_enough_info": {"type": "vector", "vector": [1, 2, 3]}}),
+            "req-correlate-42",
+        )
+        .await;
+
+        assert_eq!(result, None);
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        let find_line = |needle: &str| -> String {
+            warnings
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no WARN line contains {needle:?}, got: {warnings}"))
+                .to_string()
+        };
+        for (which, line) in [
+            (
+                "jev.rs parse-failure warn",
+                find_line("answer_id=has_enough_info"),
+            ),
+            (
+                "api.rs answer_kind=missing warn",
+                find_line("answer_kind=missing"),
+            ),
+        ] {
+            assert!(
+                line.contains("request_id=req-correlate-42"),
+                "the {which} must carry the request_id so the two warns can be joined, got: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_never_calls_jev_for_a_mandatory_escalation() {
+        // Issue #58 必須テスト4の補強: Jev が正常に動作していても、mandatory ルールでは
+        // そもそもリクエストが飛ばないことを実測する（値に関わらず対象外、ではなく本当に
+        // 呼んでいないことの証拠）。
+        let (server, harness) = jev_stub_harness(
+            jev_answers_response(serde_json::json!({
+                "has_enough_info": {"type": "noul", "noul": 0.14}
+            })),
+            5,
+        )
+        .await;
+        let outcome = base_outcome(layer1_escalate_without_hearing_decision(), false);
+        let conv = default_conv_state();
+
+        let result = resolve_jev_has_enough_info(
+            &harness,
+            &outcome,
+            &conv,
+            &[],
+            "電源が入らなくなった",
+            "req-1",
+        )
+        .await;
+
+        assert_eq!(result, None);
+        let received = server.received_requests().await.expect("recording enabled");
+        assert!(
+            received.is_empty(),
+            "a mandatory layer-1 escalation must never call jev, got {} request(s)",
+            received.len()
+        );
+    }
+
+    /// 実データ（`data/urtect/rules.json`）で `decide()` した第1層 decision を対象に、Jev が
+    /// 正常に動作している状況（`has_enough_info = 0.14`）で `resolve_jev_has_enough_info` を
+    /// 1 回実行し、`(戻り値, Jev スタブへ届いたリクエスト数)` を返す。
+    async fn resolve_bundled_layer1_turn(
+        signal_values: &[&str],
+        message: &str,
+    ) -> (Option<f64>, usize) {
+        let (server, harness) = jev_stub_harness(
+            jev_answers_response(serde_json::json!({
+                "has_enough_info": {"type": "noul", "noul": 0.14}
+            })),
+            5,
+        )
+        .await;
+        let outcome = base_outcome(bundled_layer1_decision(signal_values), true);
+        let conv = default_conv_state();
+
+        let result =
+            resolve_jev_has_enough_info(&harness, &outcome, &conv, &[], message, "req-1").await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("recording enabled")
+            .len();
+        (result, requests)
+    }
+
+    // PR #60 Copilot 指摘。契約・請求（contract-billing）は advisory だが、型番も症状も関係ない
+    // 問い合わせ。`has_enough_info` は「対象の製品と具体的な症状の両方が分かる」ことを測り、聞き返し
+    // 文言も型番と症状を尋ねる固定文なので、十分に具体的な契約・請求の問い合わせがそこへ流れると
+    // 無関係なヒアリングになる（Issue #58 が直そうとした「質問ばかりで話が進まない」の再現）。
+    // Jev には**リクエストすら飛ばない**こと（顧客発話を第三者へ送らないこと）まで固定する。
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_never_calls_jev_for_the_bundled_contract_billing_rule() {
+        let (result, requests) = resolve_bundled_layer1_turn(
+            &["contract_billing_question"],
+            "先月の請求額が契約プランの料金と違っています",
+        )
+        .await;
+
+        assert_eq!(
+            result, None,
+            "contract-billing must fall back to the missing-based decision, not the hearing"
+        );
+        assert_eq!(
+            requests, 0,
+            "a contract/billing turn must never send the customer's utterance to jev"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_calls_jev_for_the_bundled_warranty_failure_rule() {
+        let (result, requests) =
+            resolve_bundled_layer1_turn(&["warranty_hardware_failure"], "電源が入らなくなった")
+                .await;
+
+        assert_eq!(result, Some(0.14));
+        assert_eq!(requests, 1, "warranty-failure must call jev exactly once");
+    }
+
+    // Critical 1（mandatory の脱出手段が聞き返しに吸収される）の、Jev 呼び出しまで含めた実データ回帰。
+    #[tokio::test]
+    async fn resolve_jev_has_enough_info_never_calls_jev_when_human_handoff_beats_warranty_failure()
+    {
+        let (result, requests) = resolve_bundled_layer1_turn(
+            &["warranty_hardware_failure", "human_handoff_request"],
+            "人に代わってください",
+        )
+        .await;
+
+        assert_eq!(result, None);
+        assert_eq!(
+            requests, 0,
+            "the mandatory human-handoff escape hatch must never be routed to the hearing"
+        );
     }
 
     // ---- build_escalation_reply_text（Issue #54 A-2 (b)） ----
@@ -2664,6 +3805,529 @@ mod tests {
         );
     }
 
+    // ---- build_jev_state（Issue #58: Jev へ渡す state。過去の顧客発話 + 今ターンの発話） ----
+
+    fn customer_turn(text: &str) -> ReplyHistoryTurn {
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: text.to_string(),
+        }
+    }
+
+    fn assistant_turn(text: &str) -> ReplyHistoryTurn {
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Assistant,
+            text: text.to_string(),
+        }
+    }
+
+    /// `build_jev_state` の戻り値と、その実行中に出た WARN / ERROR ログ（無ければ空文字）を返す。
+    fn build_jev_state_capturing_warnings(
+        history: &[ReplyHistoryTurn],
+        message: &str,
+    ) -> (String, String) {
+        let (state, logs) =
+            crate::test_support::capture_logs(|| build_jev_state(history, message, "req-1"));
+        (
+            state,
+            crate::test_support::filter_warn_and_error_lines(&logs),
+        )
+    }
+
+    /// 履歴が空（初回ターン）なら今ターンの発話だけを返し、先頭・末尾に余計な改行を付けない。
+    #[test]
+    fn build_jev_state_returns_only_the_message_when_history_is_empty() {
+        let state = build_jev_state(&[], "電源が入らなくなった", "req-1");
+        assert_eq!(state, "電源が入らなくなった");
+    }
+
+    /// 履歴に assistant 発話しか無い（過去の顧客発話が 0 件）ときも、今ターンの発話だけを返す。
+    #[test]
+    fn build_jev_state_returns_only_the_message_when_history_has_only_assistant_turns() {
+        let history = vec![
+            assistant_turn("型番を教えていただけますか？"),
+            assistant_turn("いつ頃から発生していますか？"),
+        ];
+        let state = build_jev_state(&history, "電源が入らなくなった", "req-1");
+        assert_eq!(state, "電源が入らなくなった");
+    }
+
+    /// 顧客が症状（1 ターン目）→ 型番（2 ターン目）と別ターンで答えた場合の再現ケース。
+    /// 過去の顧客発話が時系列昇順で並び、最後に今ターンの発話が来て `\n` で連結されること。
+    #[test]
+    fn build_jev_state_joins_past_customer_turns_then_the_message_in_chronological_order() {
+        let history = vec![
+            customer_turn("録画が再生できません"),
+            customer_turn("先週から映らなくなりました"),
+        ];
+        let state = build_jev_state(&history, "型番は ADC-V523 です", "req-1");
+        assert_eq!(
+            state,
+            "録画が再生できません\n先週から映らなくなりました\n型番は ADC-V523 です"
+        );
+    }
+
+    /// assistant 発話は state に含めない（顧客が伝えた情報の十分性を測る指標のため、
+    /// 聞き返し文などの自社発話が「情報が揃った」判定を押し上げてはならない）。
+    #[test]
+    fn build_jev_state_excludes_assistant_turns() {
+        let history = vec![
+            customer_turn("録画が再生できません"),
+            assistant_turn("型番を教えていただけますか？"),
+        ];
+        let state = build_jev_state(&history, "型番は ADC-V523 です", "req-1");
+        assert_eq!(state, "録画が再生できません\n型番は ADC-V523 です");
+        assert!(
+            !state.contains("教えていただけますか"),
+            "assistant 発話が state に混入している: {state}"
+        );
+    }
+
+    /// customer 発話が `MAX_HISTORY_TURNS`(6) 件を超えるとき、新しい側 6 件だけが採られ、
+    /// 今ターンの発話がその後ろに付くこと（古い 2 件は落ちる）。
+    #[test]
+    fn build_jev_state_keeps_only_the_newest_max_history_turns_of_customer_turns() {
+        let history: Vec<ReplyHistoryTurn> = (0..crate::harness::reply::MAX_HISTORY_TURNS + 2)
+            .map(|i| customer_turn(&format!("過去発話{i}")))
+            .collect();
+        let state = build_jev_state(&history, "今ターンの発話", "req-1");
+
+        let lines: Vec<&str> = state.lines().collect();
+        assert_eq!(
+            lines.len(),
+            crate::harness::reply::MAX_HISTORY_TURNS + 1,
+            "新しい側 MAX_HISTORY_TURNS 件 + 今ターンの発話の行数になること: {state}"
+        );
+        assert!(
+            !state.contains("過去発話0") && !state.contains("過去発話1"),
+            "枠に収まらない古い 2 件は落ちること: {state}"
+        );
+        assert_eq!(lines.first().copied(), Some("過去発話2"));
+        assert_eq!(lines.last().copied(), Some("今ターンの発話"));
+    }
+
+    /// `/api/reply` の入力検証は `trim()` 後の非空しか見ないため、制御文字（BEL）だけの発話は
+    /// 検証を通過する。正規化後に空になる発話が `MAX_HISTORY_TURNS` の枠を消費して有効な発話を
+    /// 押し出してはならず、空行も state に出してはならない。
+    #[test]
+    fn build_jev_state_does_not_let_control_character_only_turns_consume_the_window() {
+        let mut history = vec![customer_turn("型番は URT-2 です")];
+        history.extend(
+            (0..crate::harness::reply::MAX_HISTORY_TURNS)
+                .map(|_| customer_turn("\u{0007}\u{0007}")),
+        );
+        let state = build_jev_state(&history, "今ターンの発話", "req-1");
+        assert_eq!(state, "型番は URT-2 です\n今ターンの発話");
+    }
+
+    /// 件数窓（手順 2）による除外も、予算超過（手順 3）と同じく warn に出ること。窓のみで落ち、
+    /// 予算超過は発生しないケースを固定する。件数と reason は出るが、落ちた発話の本文は出ない。
+    #[test]
+    fn build_jev_state_window_drop_is_logged_and_never_contains_customer_text() {
+        let history: Vec<ReplyHistoryTurn> = (0..crate::harness::reply::MAX_HISTORY_TURNS + 2)
+            .map(|i| customer_turn(&format!("過去発話{i}")))
+            .collect();
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert!(
+            !state.contains("過去発話0") && !state.contains("過去発話1"),
+            "枠に収まらない古い 2 件は落ちること: {state}"
+        );
+        assert_eq!(
+            warnings.lines().count(),
+            1,
+            "warn は 1 回だけ出ること: {warnings}"
+        );
+        assert!(
+            warnings.contains("window_dropped_turns=2"),
+            "件数窓で落ちた件数が出ること: {warnings}"
+        );
+        assert!(
+            warnings.contains("dropped_turns=0"),
+            "このケースは予算超過を伴わないこと: {warnings}"
+        );
+        assert!(warnings.contains("jev_history_budget"), "{warnings}");
+        for leaked in ["過去発話0", "過去発話1", "過去発話2", "過去発話3"] {
+            assert!(
+                !warnings.contains(leaked),
+                "顧客発話の本文（{leaked}）が warn に出ている: {warnings}"
+            );
+        }
+    }
+
+    /// 件数窓（手順 2）と予算超過（手順 3）が**同時に**発生する複合ケース。`window_dropped_turns`
+    /// と `dropped_turns` は意味の異なる 2 つの監査フィールドであり、どちらか一方しか非ゼロに
+    /// ならない入力（上のテストと下の「既知の限界」テスト）だけでは、両者を取り違えて出力する
+    /// 回帰を検出できない。
+    #[test]
+    fn build_jev_state_window_and_budget_drops_are_both_logged_independently() {
+        let max_turns = crate::harness::reply::MAX_HISTORY_TURNS;
+        // 窓を通過した max_turns 件をそのまま合計すると予算を超えるが、最も古い 1 件を落とせば
+        // 収まる長さにする（1 発話だけで単独に予算を超える分岐は既存テストが固定済みなので、
+        // ここでは混ぜない）。
+        let turn_chars = MAX_JEV_HISTORY_CHARS / max_turns + 1;
+        assert!(
+            turn_chars <= MAX_JEV_HISTORY_CHARS,
+            "前提: 1 件の長さが単独で予算を超えないこと"
+        );
+        assert!(
+            max_turns * turn_chars > MAX_JEV_HISTORY_CHARS,
+            "前提: 窓を通過した max_turns 件をそのまま合計すると予算を超えること"
+        );
+
+        // 予算超過（手順 3）で実際に落ちる件数を、本体と同じ「古い側から 1 件ずつ、合計が予算に
+        // 収まるまで丸ごと落とす」規則で先に導出する。全件同じ長さなので落ちる件数は決定的。
+        let mut remaining = max_turns;
+        let mut total_chars = max_turns * turn_chars;
+        let mut expected_budget_dropped = 0;
+        while total_chars > MAX_JEV_HISTORY_CHARS {
+            total_chars -= turn_chars;
+            remaining -= 1;
+            expected_budget_dropped += 1;
+        }
+        assert!(
+            expected_budget_dropped > 0 && remaining > 0,
+            "前提: 予算超過で 1 件以上落ち、かつ全滅はしないこと（複合ケースとして両方を観測するため）"
+        );
+
+        // 件数窓（手順 2）で落ちる件数。予算計算を汚さないよう、窓外の発話は短くする。
+        let window_dropped: usize = 2;
+        let pad = |label: &str| {
+            let label_chars = label.chars().count();
+            format!("{label}{}", "あ".repeat(turn_chars - label_chars))
+        };
+
+        let mut history: Vec<ReplyHistoryTurn> = (0..window_dropped)
+            .map(|i| customer_turn(&format!("窓外{i}")))
+            .collect();
+        history.extend((0..max_turns).map(|i| customer_turn(&pad(&format!("窓内{i}")))));
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(
+            warnings.lines().count(),
+            1,
+            "warn は 1 回だけ出ること: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("window_dropped_turns={window_dropped}")),
+            "件数窓で落ちた件数が出ること: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("dropped_turns={expected_budget_dropped}")),
+            "予算超過で落ちた件数が出ること（非ゼロであること自体がこのテストの主眼）: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("kept_turns={remaining}")),
+            "残った件数が出ること: {warnings}"
+        );
+
+        for i in 0..window_dropped {
+            let leaked = format!("窓外{i}");
+            assert!(
+                !state.contains(&leaked) && !warnings.contains(&leaked),
+                "件数窓で落ちたはずの発話（{leaked}）が state/warn に残っている: \
+                 state={state} warnings={warnings}"
+            );
+        }
+        for i in 0..expected_budget_dropped {
+            let leaked = format!("窓内{i}");
+            assert!(
+                !state.contains(&leaked) && !warnings.contains(&leaked),
+                "予算超過で落ちたはずの発話（{leaked}）が state/warn に残っている: \
+                 state={state} warnings={warnings}"
+            );
+        }
+
+        let expected_state = (expected_budget_dropped..max_turns)
+            .map(|i| pad(&format!("窓内{i}")))
+            .chain(std::iter::once("今ターンの発話".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            state, expected_state,
+            "残った窓内発話が時系列昇順で並び、末尾に今ターンの発話が付くこと"
+        );
+    }
+
+    /// **既知の限界（望ましい挙動ではない）**: 古いターンが後続ターンの型番言及を限定・否定して
+    /// いても、予算超過でその古いターンが丸ごと落ちると、型番を含む新しいターンだけが state に
+    /// 残る。この場合 `has_enough_info` は本来より高く出る可能性がある。この挙動を「正しい」と
+    /// して固定するテストではなく、`build_jev_state` の doc コメントが記す限界を再現可能な形で
+    /// 記録するためのテストである。正本は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md`
+    /// §7。
+    #[test]
+    fn build_jev_state_known_limitation_dropping_a_qualifying_older_turn_can_leave_a_misleading_model_reference(
+    ) {
+        let qualifying_older_turn = format!(
+            "後で例に出す ADC-V523 は他人の製品です。私の型番は不明です。{}",
+            "あ".repeat(MAX_JEV_HISTORY_CHARS)
+        );
+        let newer_turn_referencing_the_model = "ADC-V523 の録画障害と似た症状です";
+        let history = [
+            customer_turn(&qualifying_older_turn),
+            customer_turn(newer_turn_referencing_the_model),
+        ];
+
+        let (state, warnings) =
+            build_jev_state_capturing_warnings(&history, "映像が保存されません");
+
+        assert_eq!(
+            state,
+            format!("{newer_turn_referencing_the_model}\n映像が保存されません"),
+            "限定・否定していた古いターンが丸ごと落ち、型番言及だけが新しいターンとして \
+             残ること（既知の限界。望ましい挙動として assert しているわけではない）"
+        );
+        assert!(warnings.contains("dropped_turns=1"), "{warnings}");
+        assert!(warnings.contains("window_dropped_turns=0"), "{warnings}");
+    }
+
+    // ---- 判定入力に「発話の途中切り」を持ち込まない規律（Issue #58 reviewer 指摘） ----
+    //
+    // 表示用の要約予算（`select_customer_history_for_known_facts` の 1 発話 100 字 + `…`）を
+    // Jev の判定入力へ流用すると、訂正・否定が 101 字目以降で切り落とされて意味が反転する。
+    // 以下は「発話は途中で切らない。予算超過は古い側の発話を丸ごと落とす」の固定。
+
+    /// 100 字を超える過去の顧客発話（150 字）は、途中で切られず全文のまま state に入る。
+    #[test]
+    fn build_jev_state_does_not_truncate_a_150_char_past_customer_turn() {
+        let turn_of_150_chars = "あ".repeat(150);
+        let state = build_jev_state(
+            &[customer_turn(&turn_of_150_chars)],
+            "今ターンの発話",
+            "req-1",
+        );
+        assert_eq!(state, format!("{turn_of_150_chars}\n今ターンの発話"));
+        assert!(
+            !state.contains('…'),
+            "切り詰めの省略記号が混入している: {state}"
+        );
+    }
+
+    /// 意味反転の回帰ガード: 「誤った型番 → 長い説明 → 末尾で訂正」という 100 字超の過去発話は、
+    /// 訂正部分まで含めて全文が state に入る。表示用の 100 字切り詰めを流用すると訂正が
+    /// 切り落とされ、誤った型番だけが残る。今ターンが症状のみのとき、変更前は「症状だけ」で
+    /// 聞き返しだったものが「誤った型番 + 症状」に見えて `has_enough_info` が不当に上がり、
+    /// 聞き返すべきところが即エスカレーションになる。
+    #[test]
+    fn build_jev_state_keeps_the_correction_at_the_tail_of_a_long_past_turn() {
+        let correction = "確認したところ ADC-V523 ではなく実際の型番は不明です";
+        let long_turn = format!(
+            "型番は ADC-V523 だと思います。{}{correction}",
+            "設置して二年ほど経ちますが、".repeat(10)
+        );
+        let correction_starts_at = long_turn
+            .find(correction)
+            .map(|byte_index| long_turn[..byte_index].chars().count())
+            .expect("the fixture contains the correction");
+        assert!(
+            correction_starts_at > 100,
+            "前提: 訂正は表示用の 100 字予算より後ろにあること（{correction_starts_at} 字目）"
+        );
+
+        let state = build_jev_state(
+            &[customer_turn(&long_turn)],
+            "電源が入らなくなった",
+            "req-1",
+        );
+
+        assert!(
+            state.contains(correction),
+            "末尾の訂正が切り落とされている: {state}"
+        );
+        assert_eq!(state, format!("{long_turn}\n電源が入らなくなった"));
+    }
+
+    /// 過去の顧客発話の合計がちょうど `MAX_JEV_HISTORY_CHARS` なら 1 件も落とさず、warn も出さない
+    /// （境界: 上限「以下」は残る）。「あ」は 1 字 3 バイトなので、文字数ではなくバイト数で
+    /// 数える実装だと（合計 6,000 バイト）落ちてしまい、このテストで検出できる。
+    #[test]
+    fn build_jev_state_keeps_every_past_turn_when_the_total_is_exactly_the_budget() {
+        let older = "あ".repeat(MAX_JEV_HISTORY_CHARS / 2);
+        let newer = "い".repeat(MAX_JEV_HISTORY_CHARS / 2);
+        let history = [customer_turn(&older), customer_turn(&newer)];
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(state, format!("{older}\n{newer}\n今ターンの発話"));
+        assert!(
+            warnings.is_empty(),
+            "予算内では警告を出さないこと: {warnings}"
+        );
+    }
+
+    /// 合計が予算を 1 字でも超えたら、古い側の発話を丸ごと落とす。残った発話は全文のまま。
+    #[test]
+    fn build_jev_state_drops_the_oldest_whole_turn_when_the_total_exceeds_the_budget_by_one_char() {
+        let oldest = "あ".repeat(MAX_JEV_HISTORY_CHARS / 2);
+        let newest = "い".repeat(MAX_JEV_HISTORY_CHARS / 2 + 1);
+        let history = [customer_turn(&oldest), customer_turn(&newest)];
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(state, format!("{newest}\n今ターンの発話"));
+        assert!(
+            !state.contains('あ'),
+            "落とした発話は一字も残らない（途中切りではなく丸ごと）: {state}"
+        );
+        assert!(warnings.contains("dropped_turns=1"), "{warnings}");
+        assert!(warnings.contains("kept_turns=1"), "{warnings}");
+    }
+
+    /// 最古の 1 件を落としても予算内に収まらないときは、収まるまで古い側から 1 件ずつ丸ごと落とす。
+    /// 残るのは常に「新しい側の連続区間」で、各発話は全文のまま。
+    #[test]
+    fn build_jev_state_keeps_dropping_whole_turns_from_the_oldest_until_the_rest_fits() {
+        // 4 件 × 予算の 40% = 予算の 160%。最古 2 件を落として 80% になる。
+        let turn_chars = MAX_JEV_HISTORY_CHARS * 2 / 5;
+        let first = "あ".repeat(turn_chars);
+        let second = "い".repeat(turn_chars);
+        let third = "う".repeat(turn_chars);
+        let fourth = "え".repeat(turn_chars);
+        let history = [
+            customer_turn(&first),
+            customer_turn(&second),
+            customer_turn(&third),
+            customer_turn(&fourth),
+        ];
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(state, format!("{third}\n{fourth}\n今ターンの発話"));
+        assert!(!state.contains('あ') && !state.contains('い'), "{state}");
+        assert!(warnings.contains("dropped_turns=2"), "{warnings}");
+        assert!(warnings.contains("kept_turns=2"), "{warnings}");
+    }
+
+    /// 1 件だけで予算を超える発話は切り詰めず丸ごと落とす。過去発話が 0 件になっても、今ターンの
+    /// `message` は（切り詰められず）そのまま残る。
+    #[test]
+    fn build_jev_state_drops_a_single_over_budget_turn_whole_and_keeps_the_current_message() {
+        let over_budget_turn = "あ".repeat(MAX_JEV_HISTORY_CHARS + 1);
+
+        let (state, warnings) = build_jev_state_capturing_warnings(
+            &[customer_turn(&over_budget_turn)],
+            "今ターンの発話",
+        );
+
+        assert_eq!(state, "今ターンの発話");
+        assert!(warnings.contains("dropped_turns=1"), "{warnings}");
+        assert!(warnings.contains("kept_turns=0"), "{warnings}");
+    }
+
+    /// 最新の 1 件だけで予算を超えるときは、それより古い（予算内に収まる）発話も含めて全て落ちる。
+    /// 残るのが新しい側の連続区間である以上、最新を残して古い側だけ残すことはしない。
+    #[test]
+    fn build_jev_state_drops_every_past_turn_when_the_newest_one_alone_exceeds_the_budget() {
+        let history = [
+            customer_turn("型番は ADC-V523 です"),
+            customer_turn(&"あ".repeat(MAX_JEV_HISTORY_CHARS + 1)),
+        ];
+
+        let (state, warnings) = build_jev_state_capturing_warnings(&history, "今ターンの発話");
+
+        assert_eq!(state, "今ターンの発話");
+        assert!(warnings.contains("dropped_turns=2"), "{warnings}");
+        assert!(warnings.contains("kept_turns=0"), "{warnings}");
+    }
+
+    /// 予算超過の warn は 1 回だけ、理由・件数を構造化フィールドで出し、顧客発話の本文
+    /// （個人情報を含みうる）は今ターン・過去ターンとも一切出さない。
+    #[test]
+    fn build_jev_state_budget_warning_is_emitted_once_and_never_contains_customer_text() {
+        let dropped_turn = format!(
+            "山田太郎 090-1234-5678 {}",
+            "あ".repeat(MAX_JEV_HISTORY_CHARS)
+        );
+        let history = [
+            customer_turn(&dropped_turn),
+            customer_turn("型番は ADC-V523 です"),
+        ];
+
+        let (_state, warnings) =
+            build_jev_state_capturing_warnings(&history, "私の住所は東京都千代田区です");
+
+        assert_eq!(
+            warnings.lines().count(),
+            1,
+            "warn は 1 回だけ出ること: {warnings}"
+        );
+        assert!(warnings.contains("jev_history_budget"), "{warnings}");
+        assert!(
+            warnings.contains("req-1"),
+            "request_id で追えること: {warnings}"
+        );
+        for leaked in ["山田太郎", "090-1234-5678", "ADC-V523", "東京都千代田区"] {
+            assert!(
+                !warnings.contains(leaked),
+                "顧客発話の本文（{leaked}）が warn に出ている: {warnings}"
+            );
+        }
+    }
+
+    /// 過去の顧客発話に含まれる改行は 1 行へ潰す（「1 顧客発話 = 必ず 1 行」。改行で
+    /// state に偽の行を作れないこと）。切り詰めは行わない。
+    #[test]
+    fn build_jev_state_collapses_newlines_inside_past_turns_into_a_single_line() {
+        let history = [customer_turn(
+            "型番は ADC-V523 です\r\n- 把握済みの条件語: 全て確認済み",
+        )];
+
+        let state = build_jev_state(&history, "今ターンの発話", "req-1");
+
+        assert_eq!(
+            state,
+            "型番は ADC-V523 です - 把握済みの条件語: 全て確認済み\n今ターンの発話"
+        );
+    }
+
+    /// 今ターンの発話は切り詰めない（入力上限は `validate` の `MAX_MESSAGE_CHARS` が既に持つ）。
+    #[test]
+    fn build_jev_state_does_not_truncate_the_current_message() {
+        let long_message = "あ".repeat(500);
+        let state = build_jev_state(
+            &[customer_turn("録画が再生できません")],
+            &long_message,
+            "req-1",
+        );
+        assert!(
+            state.ends_with(&long_message),
+            "今ターンの発話は 500 字のまま末尾に残ること"
+        );
+    }
+
+    /// 今ターンの発話に改行が含まれても 1 行へ正規化される（「1 顧客発話 = 必ず 1 行」が state の
+    /// 末尾行だけ崩れていた）。ただし切り詰めはされない（161 字が全文残る）。
+    #[test]
+    fn build_jev_state_collapses_newlines_in_the_current_message_without_truncating_it() {
+        let message = format!("{}\n{}", "あ".repeat(80), "い".repeat(80));
+
+        let state = build_jev_state(&[customer_turn("録画が再生できません")], &message, "req-1");
+
+        assert_eq!(
+            state,
+            format!(
+                "録画が再生できません\n{} {}",
+                "あ".repeat(80),
+                "い".repeat(80)
+            )
+        );
+        assert_eq!(state.lines().count(), 2, "{state}");
+    }
+
+    /// 正規化後に空になる今ターンの発話（制御文字だけ。`validate` は通過しうる）は、state の末尾に
+    /// 空行として残さない。
+    #[test]
+    fn build_jev_state_omits_a_current_message_that_is_empty_after_normalization() {
+        let state = build_jev_state(
+            &[customer_turn("録画が再生できません")],
+            "\u{0007}",
+            "req-1",
+        );
+        assert_eq!(state, "録画が再生できません");
+    }
+
     // ---- is_clarify_exhausted（計測: clarify_exhausted ログの発火条件） ----
 
     #[test]
@@ -2710,6 +4374,76 @@ mod tests {
             &conv,
             &default_api_config()
         ));
+    }
+
+    // ---- is_reply_clarify_exhausted（Issue #58 Warning 2: clarify_exhausted ログを Jev 経路にも対応） ----
+
+    #[test]
+    fn is_reply_clarify_exhausted_true_for_jev_path_when_below_threshold_and_turns_exhausted() {
+        // ケース1: Jev 経路・閾値未満・予算切れ → decide_jev_hearing_action は予算切れを理由に
+        // EscalationReply を返す。これは「聞き返し上限到達」そのものなので true。
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), false);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3; // == clarify_max_turns(3)
+        assert!(is_reply_clarify_exhausted(
+            Some(0.14),
+            0.5,
+            &outcome,
+            &conv,
+            &default_api_config(),
+        ));
+    }
+
+    #[test]
+    fn is_reply_clarify_exhausted_false_for_jev_path_when_info_is_sufficient() {
+        // ケース2: Jev 経路・閾値以上（情報十分と判定した即エスカレーション）・予算切れの
+        // 状態であっても、EscalationReply の理由は「情報十分」であって「予算切れ」ではない
+        // ため false（取り違えると即エスカレーションのたびに誤った計測ログが出る）。
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), false);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3;
+        assert!(!is_reply_clarify_exhausted(
+            Some(0.69),
+            0.5,
+            &outcome,
+            &conv,
+            &default_api_config(),
+        ));
+    }
+
+    #[test]
+    fn is_reply_clarify_exhausted_false_for_jev_path_when_turns_remain() {
+        // ケース3: Jev 経路・閾値未満・予算内 → decide_jev_hearing_action は Clarify を返す
+        // （そもそも EscalationReply に落ちないケース）ため false。
+        let outcome = base_outcome(layer1_hearing_escalate_decision(), false);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 0;
+        assert!(!is_reply_clarify_exhausted(
+            Some(0.14),
+            0.5,
+            &outcome,
+            &conv,
+            &default_api_config(),
+        ));
+    }
+
+    #[test]
+    fn is_reply_clarify_exhausted_matches_is_clarify_exhausted_for_non_jev_path() {
+        // ケース4: 非 Jev 経路（jev_has_enough_info == None）では、既存の is_clarify_exhausted
+        // と完全に同じ結果を返すこと（発火条件を一切変えていないことの直接証拠）。
+        let outcome = base_outcome(gray_escalate_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3; // == clarify_max_turns(3)
+        let cfg = default_api_config();
+        assert_eq!(
+            is_reply_clarify_exhausted(None, 0.5, &outcome, &conv, &cfg),
+            is_clarify_exhausted(&outcome, &conv, &cfg),
+        );
+        assert!(
+            is_reply_clarify_exhausted(None, 0.5, &outcome, &conv, &cfg),
+            "sanity: this scenario must actually be an exhausted case, otherwise the equality \
+             assertion above would trivially pass even if both sides were always false"
+        );
     }
 
     // ---- is_final_clarify_turn（Warning 2: B4「残り確認回数の可視化」の最終ターン判定） ----
@@ -3013,6 +4747,7 @@ mod tests {
                     "ADC-V724".to_string()
                 ]),
             )),
+            jev_client: None,
         }
     }
 

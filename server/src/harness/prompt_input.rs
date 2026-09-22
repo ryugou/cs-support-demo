@@ -59,9 +59,11 @@ pub(crate) const MARKDOWN_BAN_RULE: &str =
 /// 切り詰めは行わない。長さの制約が必要な呼び出し側は、この関数の戻り値に対して
 /// [`truncate_chars`] 等を別途重ねること。
 ///
-/// `harness::api::normalize_customer_turn_to_single_line`（顧客発話。改行で偽の箇条書き行を
-/// 注入されないため）と `harness::signal::LexiconNormalizer`（lexicon の `customer_label`。
-/// JSON に改行を紛れ込ませても顧客向けプロンプトが崩れないため）の 2 箇所が使う。
+/// `api::normalize_customer_turn_to_single_line`（顧客発話。改行で偽の箇条書き行を
+/// 注入されないため）、`api::select_customer_history_for_jev` / `api::build_jev_state`
+/// （Jev の判定入力。発話を切り詰めず改行だけを潰すため、この関数を直接使う）、
+/// `harness::signal::LexiconNormalizer`（lexicon の `customer_label`。JSON に改行を紛れ込ませても
+/// 顧客向けプロンプトが崩れないため）が使う。
 pub(crate) fn collapse_to_single_line(text: &str) -> String {
     let control_collapsed: String = text
         .trim()
