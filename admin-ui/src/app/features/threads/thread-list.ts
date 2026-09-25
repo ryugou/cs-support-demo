@@ -6,6 +6,7 @@ import type { StatsSummary, ThreadSummary } from '../../core/models';
 import { extractErrorMessage } from '../../shared/http-error';
 import { replyKindLabel } from '../../shared/reply-kind';
 import { StatTileComponent } from '../../shared/stat-tile';
+import { filterThreadsAfterCutoff } from '../../shared/thread-cutoff';
 import { ThreadsTableComponent } from '../../shared/threads-table';
 
 /** `GET /threads` の既定 limit（design doc §5「limit=20 で GET /threads 呼び出し」）。
@@ -94,7 +95,7 @@ export class ThreadListComponent implements OnInit {
     this.threadsError.set(null);
     this.api.listThreads(THREADS_PAGE_LIMIT, cursor).subscribe({
       next: (page) => {
-        this.threads.set(page.threads);
+        this.threads.set(filterThreadsAfterCutoff(page.threads));
         this.nextCursor.set(page.next_cursor);
         this.atFirstPage.set(cursor === null);
         this.threadsLoading.set(false);

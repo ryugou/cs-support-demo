@@ -3,6 +3,7 @@ import { Router } from '@angular/router';
 import { AdminApiService } from '../../core/admin-api.service';
 import type { ThreadSummary } from '../../core/models';
 import { extractErrorMessage } from '../../shared/http-error';
+import { filterThreadsAfterCutoff } from '../../shared/thread-cutoff';
 import { ThreadsTableComponent } from '../../shared/threads-table';
 
 /** `GET /users/{end_user_id}/threads` の既定 limit（`ThreadListComponent` と同じ値）。 */
@@ -60,7 +61,7 @@ export class UserThreadsComponent {
     this.error.set(null);
     this.api.listUserThreads(endUserId, THREADS_PAGE_LIMIT, cursor).subscribe({
       next: (page) => {
-        this.threads.set(page.threads);
+        this.threads.set(filterThreadsAfterCutoff(page.threads));
         this.nextCursor.set(page.next_cursor);
         this.atFirstPage.set(cursor === null);
         this.loading.set(false);
