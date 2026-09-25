@@ -72,8 +72,9 @@ Jev は「解釈」だけを担い、判定はコードに残す(既存の原則
 
 ## 5. 運用
 
-- 本番有効化の手順: secret `typesafe-api-key` を作成 → ランタイム SA へ `secretAccessor` を付与 → service へ注入 → `config.cloudrun.toml` の `[jev] enabled = true`
-- 顧客の発話が第三者(TypeSafe)へ送信される。CLAUDE.md の Anthropic に関する記載と同じ扱いで明記する
+- 本番有効化の手順: secret `typesafe-api-key` を作成 → ランタイム SA へ `secretAccessor` を付与 → service へ注入 → `config.cloudrun.toml` の `[jev] enabled = true`。
+  **前 3 段階（secret 作成・`secretAccessor` 付与・service への注入）は完了済み**(revision `cs-support-mcp-00044-scz` で注入を確認済み)。**4 段階目の `config.cloudrun.toml` の `[jev] enabled = true` は本変更に含まれ、main マージ後の CI デプロイで反映される**。
+- 顧客の発話が第三者(TypeSafe)へ送信される。CLAUDE.md の Anthropic に関する記載と同じ扱いで明記する(反映済み)
 
 ## 6. 次段階(本タスクの範囲外)
 
@@ -304,30 +305,46 @@ Jev を呼ばなかった/使わなかったターンではこの新規監査行
   自体は共有ロジックだが、`hearing` を見て Jev を呼ぶかどうかを決めるのは `api.rs::
   reply_handler` だけであり、MCP 経路は従来どおり `missing` ベースのまま
 
-### 有効化前の確認項目(`[jev] enabled = true` にする前に)
+### 有効化条件の確認記録(2026-09-25、`config.cloudrun.toml` で `[jev] enabled = true` にした)
 
-- **本番 vegapunk の `EscalationRule` ノードに `hearing` 属性が入っていること。** ヒアリング契約は
-  vegapunk 上のルールノードから実行時に読むため、`rules.json` を変えただけでは反映されない。
-  `server/data/**` / `schema/**` の変更をマージすると CI の `auto-ingest` が `ingest-rules` を
-  自動実行し、schema 登録(`hearing` 属性の加算)→ ノード再投入の順で反映する(`ingest_rules` は
-  schema 登録を先に行う)。未反映・失敗の間は `warranty-failure` も「宣言なし」として読まれ、
-  Jev を呼ばず従来の `missing` ベース判定へ fail-back する(安全側だが、この機能は効かない)。
-  `ingest-rules` job の成功を確認してから有効化する。`ingest_rules` は未知の `hearing` 値・
-  `binding` の省略・未知の `binding` 値・mandatory への `hearing` 宣言・未知のフィールド名を
-  投入前に拒否するため、綴りミス・書き忘れは job の失敗として見える
-- **Jev の入力トークン・レイテンシの再実測。** §1 の実測値(5 問で入力 945 トークン等)は今ターン
-  1 発話だけを `state` に送った時点の測定。この経路では過去の顧客発話が加わり `state` が最大
-  約 2,000 字(`MAX_JEV_HISTORY_CHARS`)増えるため、有効化前に多ターンの `state` で測り直す。
-  TypeSafe へ送る `state` 本文は最大で約 7,000 字になりうる(内訳: 過去発話
-  `MAX_JEV_HISTORY_CHARS` = 2,000 字 + 今ターン `MAX_MESSAGE_CHARS` = 5,000 字。
-  `server/src/api.rs` の該当定数を参照)
-- **E2E: 同一利用者が別製品の相談へ切り替えるケース。** `/api/reply` の `history` は同一 case・
-  同一相談対象に限る契約(`2026-08-11-answer-api-line-adapter-design.md` §2)だが、現状の LINE
-  アダプタは 60 分 TTL での失効のみで、相談対象の切り替えを検知してリセットする機構を持たない。
-  切り替え後も古い製品名が `history` に残ると、古い製品名 + 今ターンの症状で `has_enough_info`
-  が不当に上がり、誤った製品文脈で即時エスカレーションしうる。実会話で挙動を確認してから有効化する
-- **履歴の除外が起きたターンの挙動確認。** 件数窓(`MAX_HISTORY_TURNS`)・予算超過
+以下のうち、`hearing` 属性・トークン/レイテンシ再実測・E2E 別製品切替・履歴除外時の挙動の
+4 項目は、元々「有効化前の確認項目」として列挙していたもの。閾値 `enough_info_threshold = 0.5`
+の分離確認は、2026-09-25 に本番 Cloud Run を有効化するにあたり追加で実測した項目であり、
+元々の「有効化前の確認項目」には無かった。以下は 2026-09-25 に確認・実測した結果を記録する。
+**未消化の項目は消さず、未消化のまま残す。**
+
+- **[消化済み] 本番 vegapunk の `EscalationRule` ノードに `hearing` 属性が入っていること。**
+  ヒアリング契約は vegapunk 上のルールノードから実行時に読むため、`rules.json` を変えただけ
+  では反映されない。`ingest-rules` job の成功を 2026-09-22 に確認済み(`upserted_nodes: 9`)。
+  未反映・失敗の間は `warranty-failure` も「宣言なし」として読まれ、Jev を呼ばず従来の
+  `missing` ベース判定へ fail-back する(安全側だが、この機能は効かない)。`ingest_rules` は
+  未知の `hearing` 値・`binding` の省略・未知の `binding` 値・mandatory への `hearing` 宣言・
+  未知のフィールド名を投入前に拒否するため、綴りミス・書き忘れは job の失敗として見える。
+- **[消化済み] Jev の入力トークン・レイテンシの再実測。** §1 の実測値(5 問で入力 945 トークン
+  等)は今ターン 1 発話だけを `state` に送った時点の測定だった。2026-09-21、実 TypeSafe に対し、
+  本番と同じ 14 問・`build_jev_state` と同じ形の `state` で 2 段階測り直した。
+  - state 324 字(小規模): 所要 0.52〜0.71 秒、入力トークン 1,217〜1,528(+311 トークン)。
+  - state 7,070 字(worst case。内訳: 過去発話 `MAX_JEV_HISTORY_CHARS` = 2,000 字級 + 今ターン
+    `MAX_MESSAGE_CHARS` = 5,000 字級。`server/src/api.rs` の該当定数を参照): 3 回とも HTTP 200、
+    所要 1.25 秒 / 0.64 秒 / 0.69 秒(1 回目が最も遅い)、入力トークン 7,894(3 回とも同一)、
+    出力トークン 389(3 回とも同一)。`has_enough_info` は 0.87(型番と症状が揃った state のため
+    エスカレーション側になる想定どおりの値)。
+  - state の長さが小規模(324 字)→ worst case(7,070 字)へ約 22 倍になっても、入力トークンは
+    約 6.4 倍(1,217〜1,528 → 7,894)、レイテンシは最悪でも 1.25 秒に収まった。
+  - **結論: `[jev] timeout_secs = 3` は worst case(最悪観測値 1.25 秒)でも余裕がある。**
+- **[消化済み] 閾値 `enough_info_threshold = 0.5` の分離確認。** 2026-09-21、実 TypeSafe に対し、
+  聞き返し側とエスカレーション側それぞれを想定した発話パターンで `has_enough_info` を実測し、
+  0.5 を挟んで分離することを確認した: 症状のみ 0.13 / 型番のみ 0.09 / 訂正あり全文 0.13(聞き
+  返し側)、履歴に症状+今ターン型番 0.80 / 同じ発話を 100 字で切った版 0.78 / 長い履歴 0.85
+  (エスカレーション側)。顧客発話の本文はこの記録に残さない(§3 の 3 と同じ規律)。
+- **[未消化] E2E: 同一利用者が別製品の相談へ切り替えるケース。** `/api/reply` の `history` は
+  同一 case・同一相談対象に限る契約(`2026-08-11-answer-api-line-adapter-design.md` §2)だが、
+  現状の LINE アダプタは 60 分 TTL での失効のみで、相談対象の切り替えを検知してリセットする
+  機構を持たない(根本原因は Issue #61)。切り替え後も古い製品名が `history` に残ると、古い
+  製品名 + 今ターンの症状で `has_enough_info` が不当に上がり、誤った製品文脈で即時
+  エスカレーションしうる。Issue #61 の対応後、実会話で挙動を確認する。
+- **[未消化] 履歴の除外が起きたターンの挙動確認。** 件数窓(`MAX_HISTORY_TURNS`)・予算超過
   (`MAX_JEV_HISTORY_CHARS`)のいずれかで過去発話が丸ごと落ちた実会話を使い、`has_enough_info` が
   不当に上振れ(誤って `EscalationReply` 側に倒れる)していないかを、warn ログの
-  `window_dropped_turns` / `dropped_turns` と実際の会話内容を突き合わせて確認する(「Jev へ渡す
-  state」の既知の限界を参照)
+  `window_dropped_turns` / `dropped_turns` と実際の会話内容を突き合わせて確認する必要がある
+  (「Jev へ渡す state」の既知の限界を参照)。本番投入後の実会話蓄積を待って確認する。
