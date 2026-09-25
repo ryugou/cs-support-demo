@@ -236,6 +236,14 @@ fn dedup_conditions_last_wins(
 /// 短い文字列(最大 5 key)なので、この上限規律の対象外でよい。3 つとも
 /// [`neutralize_delimiters`] を通し、顧客発話が `</...>` `<資料>` のような区切りタグを偽装して
 /// 「サーバが渡した資料」を騙る経路を塞ぐ(`time_pref::build_time_pref_prompt` と同じ理由)。
+///
+/// **`in_domain` の言い直し拾い上げは `history_digest` に依存する**: system prompt の
+/// `in_domain` 判定は、直前発話への言い直し・補足(「さっきのはセキュリティに関しての質問です」
+/// 等)を `history_digest` と突き合わせて拾う設計である。したがって `history_digest` が空の
+/// ターン(初回ターン等。`api::build_history_digest(&[])` は空文字列を返す)では言い直しの
+/// 救済は働かず、発話単独で判定される。2026-09-25 本番実測の 2 ターン目は非空の
+/// `history_digest` を伴うターンであり、この突き合わせによって救済される側のケースである
+/// (救済が働かないのは、あくまで `history_digest` が空のターンである)。
 fn build_understand_prompt(
     message: &str,
     history_digest: &str,
@@ -251,8 +259,13 @@ fn build_understand_prompt(
          \"conditions\": [{\"key\": string, \"value\": string}, ...]}\n\
          \n\
          各フィールドの判定基準:\n\
-         - in_domain: 発話がホームセキュリティ相談(防犯・見守り・防災の機器選定や不安の\
-         相談)に関係するかどうか。無関係な雑談・別件は false。\n\
+         - in_domain: 発話が住まいに関わる話題かどうか。防犯・見守り・防災の機器選定\
+         や不安の相談はもちろん、住宅の購入・入居・リフォーム・設備、近隣環境、在宅時の安全\
+         など住まい全般の相談・一般的な助言を求める質問も true とする(機器の話でなくても\
+         よい)。直前の発話を指す言い直し・補足(「さっきの質問は〜」「今のはセキュリティに\
+         関することです」等)も、<会話履歴の要約> と合わせて住まいに関する話題であれば true \
+         とする。住まいと明らかに無関係な話題(投資信託・株式などの金融投資、料理、芸能、\
+         住まいと無関係な雑談等)のみ false とする。\n\
          - emergency: 侵入進行中・身の危険・ストーカー被害の切迫のみ true とする。それ以外の\
          一般的な不安・過去の被害の相談は false。\n\
          - urtect_support: 既に URTECT 製品を所有しており、その操作・不具合の個別サポートを\
@@ -588,6 +601,43 @@ mod tests {
     }
 
     // --- build_understand_prompt ---
+
+    /// 2026-09-25 本番実測(Issue: 「家を買う時に気を付けるべき事は？」が2ターン連続で
+    /// out_of_domain 退場した)の修正。旧定義は「防犯・見守り・防災の機器選定や不安の相談」
+    /// に限定しており、機器選定でも不安の相談でもない住まい全般の助言要求(住宅購入時の
+    /// 注意点等)が false に落ちていた。定義を住まい全般へ広げ、false は住まいと明らかに
+    /// 無関係な話題のみに限定することを固定する。
+    #[test]
+    fn prompt_defines_in_domain_broadly_as_housing_topics_not_just_device_selection() {
+        let (system, _) = build_understand_prompt("発話", "履歴", "累積");
+        assert!(
+            system.contains("住まい全般"),
+            "in_domain の判定基準は「住まい全般」まで広げること: {system}"
+        );
+        assert!(
+            system.contains("機器の話でなくてもよい"),
+            "機器選定に限定されないことを明記すること: {system}"
+        );
+        assert!(
+            system.contains("明らかに無関係"),
+            "false にする条件は「明らかに無関係」な話題に限定すること: {system}"
+        );
+    }
+
+    /// 同じ実測ケースの2ターン目(「さっきのはセキュリティに関しての質問です」)。直前の発話を
+    /// 指す言い直し・補足も in_domain の判定対象に含めることを明記していることを固定する。
+    #[test]
+    fn prompt_declares_rephrasing_the_previous_utterance_as_in_domain_relevant() {
+        let (system, _) = build_understand_prompt("発話", "履歴", "累積");
+        assert!(
+            system.contains("直前の発話を指す言い直し"),
+            "直前の発話への言い直し・補足も in_domain 判定に含めることを明記すること: {system}"
+        );
+        assert!(
+            system.contains("と合わせて住まいに関する話題であれば true"),
+            "言い直しは会話履歴の要約と突き合わせて住まいの話題か判定することを明記すること: {system}"
+        );
+    }
 
     #[test]
     fn prompt_defines_emergency_as_intrusion_danger_or_stalking_only() {
