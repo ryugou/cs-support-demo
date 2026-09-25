@@ -93,7 +93,7 @@ MCP 経由で case_id を打ち間違えたときに黙って新規 case へ合�
 
 - v1 は呼び出し側（LINE アダプタ）が原文の履歴を保持し、リクエストの `history` で渡す。サーバは履歴を保存しない
 - サーバ側の使用規則: 新しい側から最大 6 ターン・合計 4,000 字まで採用し、超過分は古い側から捨てる。採用した履歴は応答文生成プロンプトの会話履歴ブロックにのみ注入する
-- 履歴は原則**生成にのみ**使う。evaluate 本体の判定（signal 抽出・第1〜3層の escalation 判定・signal 累積）には使わない。判定のターン間文脈は既存の case 機構（`case_id` による signal 累積）が担う。**例外**: Issue #58 で導入した、ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）の聞き返し判定（Jev の `has_enough_info`）に限り、顧客発話の履歴が「聞き返し（Clarify）か即エスカレーション（EscalationReply）か」の分岐材料になる。この経路は `[jev] enabled = true` のときだけ動く（現状どの config も `false`）。state の組み立て規律・閾値・fail-back・監査の正本は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7 とする
+- 履歴は原則**生成にのみ**使う。evaluate 本体の判定（signal 抽出・第1〜3層の escalation 判定・signal 累積）には使わない。判定のターン間文脈は既存の case 機構（`case_id` による signal 累積）が担う。**例外**: Issue #58 で導入した、ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）の聞き返し判定（Jev の `has_enough_info`）に限り、顧客発話の履歴が「聞き返し（Clarify）か即エスカレーション（EscalationReply）か」の分岐材料になる。この経路は `[jev] enabled = true` のときだけ動く（本番 `config.cloudrun.toml` のみ `true`、他の config は既定の `false`）。state の組み立て規律・閾値・fail-back・監査の正本は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7 とする
 - egress gate は履歴注入後の生成物にも従来どおり適用する
 - 運用注意: 履歴注入により Anthropic への送信量が最大で約 4,000 字ぶん増える（顧客本文の外部送信に関する既存の運用注意の適用範囲が広がる）
 - 運用注意: `[jev] enabled = true` のとき、ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）にマッチしたターンに限り（`contract-billing` にマッチしたターンでは送信しない）、今ターンの顧客発話に加えて過去の顧客発話（最大 6 件・合計 2,000 字まで、時系列昇順。発話は切り詰めず、超過分は古い側から丸ごと落とす）が前置されて TypeSafe（Jev）へ送信される。assistant 発話は送信しない（組み立ては `server/src/api.rs` の `build_jev_state`）

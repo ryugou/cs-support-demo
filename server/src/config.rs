@@ -567,20 +567,20 @@ enough_info_threshold = 0.42
         assert_eq!(cfg.jev.enough_info_threshold, 0.42);
     }
 
-    /// 既存の全 config ファイルが無改訂でロードでき、いずれも `[jev]` を明示していないため
-    /// 既定（無効）のまま読めることを固定する（受け入れ基準: Issue #56 は既存 config を
-    /// 一切変更しない）。
+    /// Issue #58 で本番 Cloud Run のみ `[jev] enabled = true` にした（他の config は `[jev]` を
+    /// 明示せず既定の無効のまま）。`config.cloudrun.toml` は第三者（TypeSafe）へ実際に送信する
+    /// 経路の設定のため、`enabled` 以外の値もすべて期待値で固定し、意図しない変更が入ったら
+    /// このテストで落ちるようにする。
     #[test]
-    fn all_existing_config_files_load_with_jev_disabled() {
-        let paths = [
+    fn config_files_load_with_jev_enabled_only_on_cloudrun() {
+        let disabled_paths = [
             concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/config.cloudrun.toml"),
             concat!(env!("CARGO_MANIFEST_DIR"), "/config.gce.toml"),
             concat!(env!("CARGO_MANIFEST_DIR"), "/config.homesec.toml"),
             concat!(env!("CARGO_MANIFEST_DIR"), "/config.local-https.toml"),
             concat!(env!("CARGO_MANIFEST_DIR"), "/config.urtect.toml"),
         ];
-        for path in paths {
+        for path in disabled_paths {
             let cfg = AppConfig::load(std::path::Path::new(path))
                 .unwrap_or_else(|err| panic!("{path} must load: {err}"));
             assert!(
@@ -588,6 +588,79 @@ enough_info_threshold = 0.42
                 "{path} does not declare [jev] and must default to disabled"
             );
         }
+
+        let cloudrun_path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.cloudrun.toml");
+        let cloudrun_cfg = AppConfig::load(std::path::Path::new(cloudrun_path))
+            .unwrap_or_else(|err| panic!("{cloudrun_path} must load: {err}"));
+        assert!(
+            cloudrun_cfg.jev.enabled,
+            "{cloudrun_path} must declare [jev] enabled = true (Issue #58 production rollout)"
+        );
+        assert_eq!(
+            cloudrun_cfg.jev.endpoint, "https://api.typesafe.ai/v1/systemone",
+            "{cloudrun_path} jev.endpoint must not change without updating the design doc \
+             and the fail-closed credential checks it documents"
+        );
+        assert_eq!(cloudrun_cfg.jev.model, "jev-latest");
+        assert_eq!(
+            cloudrun_cfg.jev.questions_path, "data/urtect/jev-questions.json",
+            "{cloudrun_path} jev.questions_path must keep pointing at the image-bundled \
+             question set"
+        );
+        assert_eq!(cloudrun_cfg.jev.timeout_secs, 3);
+        assert_eq!(
+            cloudrun_cfg.jev.enough_info_threshold, 0.5,
+            "{cloudrun_path} jev.enough_info_threshold must not drift from the 2026-09-21 \
+             measured separation (clarify side 0.09/0.13/0.13, escalate side 0.78/0.80/0.85; \
+             see docs/superpowers/specs/2026-09-21-jev-shadow-design.md §7) without \
+             re-measuring"
+        );
+    }
+
+    /// `config_files_load_with_jev_enabled_only_on_cloudrun` は `[jev]` の**値**を固定するだけで、
+    /// その値で実際に本番起動が成功するかは検証しない。値の文字列を一切変えなくても、
+    /// `questions_path` が指す `server/data/urtect/jev-questions.json` を移動・改名・空 object 化
+    /// すれば、上記テストは緑のまま本番 Cloud Run の起動だけが fail closed で落ちる
+    /// （`server/src/main.rs:109` の `Harness::build` → `server/src/harness/mod.rs` の
+    /// `crate::jev::JevClient::from_config` が `Err` を返し、全リビジョンが起動不能になり、
+    /// デプロイ経路全体が止まる）。このテストは値の固定ではなく、その起動経路そのものを再現する。
+    ///
+    /// `JevClient::build`（`api_key` を引数で受ける `pub(crate)` 版。env `TYPESAFE_API_KEY` を
+    /// 読まないのは意図的で、テストをプロセス全体の環境変数から独立させるため。
+    /// `server/src/jev.rs:163-173` 参照）を呼ぶことで、`validate_endpoint` →
+    /// `validate_enough_info_threshold` → `questions_path` の解決・読み込み・JSON 非空 object 検査
+    /// → reqwest クライアント構築という、本番起動時と同一の fail-closed チェックを全て通す。
+    ///
+    /// `config_dir` に `CARGO_MANIFEST_DIR`（`server/`）を渡すのは、Dockerfile が
+    /// `WORKDIR /app/server` の下に `COPY server/data ./data` するため、本番では
+    /// `questions_path = "data/urtect/jev-questions.json"` が
+    /// `/app/server/data/urtect/jev-questions.json` に解決されるのと同じ「config ファイルの
+    /// ディレクトリ基準」の解決規則を、ローカルの `server/` を基準に再現するため
+    /// （`JevClient::build` の doc、`server/src/jev.rs:140-148` 参照）。
+    #[test]
+    fn cloudrun_jev_config_actually_builds_a_jev_client() {
+        let cloudrun_path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.cloudrun.toml");
+        let cfg = AppConfig::load(std::path::Path::new(cloudrun_path))
+            .unwrap_or_else(|err| panic!("{cloudrun_path} must load: {err:#}"));
+        let config_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        const DUMMY_TEST_API_KEY: &str = "test-dummy-jev-api-key-not-a-real-secret";
+        crate::jev::JevClient::build(DUMMY_TEST_API_KEY.to_string(), &cfg.jev, config_dir)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "config.cloudrun.toml [jev] must produce a working JevClient via \
+                     JevClient::build; this assert failing means every Cloud Run revision \
+                     would fail to start with [jev] enabled = true (Harness::build → \
+                     JevClient::from_config fails closed), taking down the whole deploy path. \
+                     Check that jev.endpoint ({endpoint}) is a valid https URL without \
+                     credentials/query/fragment, and that jev.questions_path \
+                     ({questions_path}) resolves under {config_dir} (Dockerfile: WORKDIR \
+                     /app/server + COPY server/data ./data) to an existing file containing a \
+                     non-empty JSON object. Root cause: {err:#}",
+                    endpoint = cfg.jev.endpoint,
+                    questions_path = cfg.jev.questions_path,
+                    config_dir = config_dir.display(),
+                )
+            });
     }
 
     #[test]

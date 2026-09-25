@@ -95,3 +95,22 @@ days = "mon-fri"
 start = "10:00"
 end = "18:00"
 tz = "Asia/Tokyo"
+
+# 外部判定器 Jev（TypeSafe System One）。ヒアリング契約 product_and_symptom を宣言した
+# 第1層ルール（warranty-failure）にマッチしたターンに限り、聞き返し（Clarify）か即エスカレー
+# ション（EscalationReply）かの分岐に has_enough_info を使う（Issue #58）。有効化すると、
+# 対象ターンの顧客発話（今ターン + 直近の顧客発話）が TypeSafe へ送信される。
+# API キーは env TYPESAFE_API_KEY（Secret Manager injection）から注入する。
+# enabled = true で鍵を解決できない場合は起動時 fail closed で失敗する
+# （server/src/jev.rs::JevClient::from_config）。
+# 正本: docs/superpowers/specs/2026-09-21-jev-shadow-design.md §7
+[jev]
+enabled = true
+endpoint = "https://api.typesafe.ai/v1/systemone"
+model = "jev-latest"
+questions_path = "data/urtect/jev-questions.json"
+timeout_secs = 3
+# enough_info_threshold: 2026-09-21 の実測で分離を確認した値の中間に置く。
+# 聞き返し側 has_enough_info = 0.09 / 0.13 / 0.13、エスカレーション側 = 0.78 / 0.80 / 0.85
+# （詳細: docs/superpowers/specs/2026-09-21-jev-shadow-design.md §7）。
+enough_info_threshold = 0.5
