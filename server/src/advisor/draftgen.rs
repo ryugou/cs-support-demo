@@ -51,9 +51,10 @@ pub const URTECT_MODELS: [&str; 7] = [
 /// マーカーにしていた旧版は、codex レビュー2巡目で誤検知が実測された):
 /// - 「担当者に連絡する必要はありません」のような**否定文**で「担当者」が出る
 ///   (提案していないのに `lead_offered` が焼かれ、以後リード提案の機会を永久に失う)
-/// - design doc §5.2 の `partner_product` 材料には警備会社サービスが含まれる。
-///   「警備会社の担当者が駆けつけます」のような他社サービスの説明文で「担当者」が出る
-///   (同上)
+/// - `scenario:koureisha-mimamori` 材料(design doc §5.2)の本文が「駆けつけ対応が必要なら
+///   警備会社の駆けつけ型サービスを…提案する」のように他社サービスへ言及する。これに続く
+///   「警備会社の担当者が駆けつけます」のような説明文で「担当者」が出る(同上。`partner_product`
+///   材料は現在ゼロ件だが、scenario 材料の本文経由でも同じ誤検知シナリオが成立する)
 ///
 /// この文字列照合方式である以上、LLM が指示に反してこの一文を言い換えた場合は検知漏れになり、
 /// 同一会話で2回提案されうる(design doc §9 不変条件6 違反)。恒久対処は `draft_advisor_reply`
@@ -152,16 +153,28 @@ fn condition_vocabulary_ja(key: ConditionKey) -> &'static str {
 /// テストで `system.contains(...)` により固定する要素(spec 由来):
 /// - ペルソナ規則(§2.1): 専属アドバイザーとして話す、企業 CS 定型句を使わない、
 ///   自社製品を「URTECT の」と呼ぶ
+/// - 内部情報の秘匿規則(本番実害是正、2026-10): 「資料」等の内部用語・判定の仕組みを\
+///   顧客へ書かせない。答えを持たない場合は、自社事項(製品・料金・契約・サポート)なら\
+///   当社で確認すべきことである旨、他社・一般事項なら分からない旨の案内で書き分け、\
+///   「お答えできません」という素っ気ない定型文は使わせない(Critical 是正、2026-10:\
+///   システムプロンプトは `AdvisorAction` 確定後に組み立てられるため、取次・折り返しの\
+///   約束は実際に取次へ遷移する経路にのみ置く。回答・聞き返し経路には置かない)
 /// - 接地2層規則・安全下限(§2.2)
 /// - 解決策の提示順序規則(§2.3): 提案は (1) お金のかからない習慣・設定 → (2) 汎用の対策\
 ///   カテゴリ → (3) 製品、の順。製品の中でだけURTECTを先に挙げる(7型番の列挙)。自社製品\
 ///   言及は1応答あたり最大2件。own_product材料は「使える選択肢」であり毎回言及する義務では\
 ///   ない
+/// - 他社サービスの扱い(reviewer 指摘 Critical 是正、2026-10: `ingest_homesec` に削除経路が\
+///   無く、vegapunk に残存した `partner_product` が `CATEGORY_MATERIAL_LIMITS` 経由で\
+///   注入されうるため(物理削除は Issue #63)、材料に書かれていても書かせない規則にした)。\
+///   他社に触れること自体は差し支えないが、具体的な条件(料金・契約条件・プラン等)は書かせず、\
+///   各社の公式情報での確認へ誘導させる
 /// - 概念的な質問への回答規則(§2.3): 考え方と根拠で答え、製品を挟まない
 /// - 除外・限定の尊重規則(§2.3、解決策の提示順序規則・`DraftMode::Answer` の提案ファースト\
 ///   規則より優先): 顧客が除外・限定した種類は提案しない。除外されていない範囲を、他社\
-///   材料を中心とした資料の範囲で答える。提案ファースト規則の「必ず名指しで提案する」も\
-///   この規則の対象(除外された種類)を除く(reviewer 指摘 Critical 1 是正、Issue #34 実害 (b))
+///   サービスの扱いの規則に従って一般的な対策で答える。提案ファースト規則の「必ず名指しで\
+///   提案する」もこの規則の対象(除外された種類)を除く(reviewer 指摘 Critical 1 是正、\
+///   Issue #34 実害 (b))
 /// - リード提案規則(§4.4 手順1、`lead_offered == false` のときだけ注入)。§2.3 により、\
 ///   価格・購入方法・設置依頼・機種の絞り込み等の明確な導入意欲シグナルが読み取れたターン\
 ///   だけに限定する
@@ -211,6 +224,15 @@ pub fn build_advisor_system_prompt(
         p.push_str(CONTINUATION_OPENER_RULE);
     }
     p.push_str(
+        "\n内部情報の秘匿規則:\n\
+         顧客へ返す文では、こちらの内部の仕組みに言及しない。材料の有無、判定の仕組み、社内の\
+         分類名を書かない。\n\
+         答えを持っていないときは、その事柄を自社が答えるべきかで書き分ける。\n\
+         - 自社の製品・料金・契約・サポートのこと → 当社で確認すべきことである旨を書く。\n\
+         - 他社のことや世間一般のこと → 分からないと書き、公式の案内で確認するよう添える。\n\
+         どちらの場合も「お答えできません」とは書かない。\n",
+    );
+    p.push_str(
         "\n接地2層規則:\n\
          - 事実主張(統計値・傾向、製品・サービスの仕様/価格帯/名称、効果の断定)は、\
          与えられた資料に書かれていることだけを根拠にする。資料に無い事実・数値を補わない。\n\
@@ -239,17 +261,25 @@ pub fn build_advisor_system_prompt(
          解決策の提示順序規則:\n\
          - 通常の相談では、提案は (1) お金のかからない習慣・設定(施錠の徹底・インターホン\
          対応の見直し等) → (2) 汎用の対策カテゴリ(補助錠・センサーライト・見守りサービス等、\
-         他社材料を含む) → (3) 製品、の順に検討する。製品だけを単独で提案しない。ただし、\
-         製品を直接尋ねられた場合はこの限りではなく、名指しで製品を提案してよい。\n\
+         他社サービスの種類を含む) → (3) 製品、の順に検討する。製品だけを単独で提案しない。\
+         ただし、製品を直接尋ねられた場合はこの限りではなく、名指しで製品を提案してよい。\n\
          - 製品を挙げる場面では、その中でだけURTECT製品を先に挙げる。URTECTの取扱型番は\
          次の7つ: ADC-V523 / ADC-V523X / ADC-V724 / ADC-V724X / ADC-VC729P / \
-         ADC-VC727P / ADC-VC827P。合致するURTECT製品が無ければ、資料の範囲で他社の\
-         カテゴリ・製品を紹介し、詳細確認は公式サイトへ誘導する。他社を貶めない。\n\
+         ADC-VC727P / ADC-VC827P。合致するURTECT製品が無ければ、他社サービスの扱いの\
+         規則に従って一般的な種類だけを紹介し、詳細確認は各社の公式情報へ誘導する。他社を\
+         貶めない。\n\
          - 複数の手段が同等に成立する場面では、嘘にならない範囲でカメラ(自社製品)を\
          優先的に挙げてよい。成立しない・明らかに劣る場面では優先しない。\n\
          - 1つの応答で自社製品(URTECT製品)に言及するのは多くても2件までにする。\n\
          - 資料として渡されたown_product(自社製品)材料は「使える選択肢」であり、毎回\
          言及する義務ではない。相談内容に合わなければ言及しなくてよい。\n\
+         \n\
+         他社サービスの扱い:\n\
+         - 他社の料金、契約条件、キャンペーン、プラン内容、機能の有無は、材料に書かれていても\
+         書かない。推測で補わない。\n\
+         - 選択肢として他社に触れること自体は差し支えない。ただし触れてよいのは\
+         「どういう種類のサービスがあるか」までで、その会社の条件には踏み込まない。\n\
+         - 具体的な条件を聞かれたら、各社の公式情報で確認するよう案内して終える。\n\
          \n\
          概念的な質問への回答規則:\n\
          - 「カメラは意味ある?」「防犯って何から?」のような、意味や考え方を問う概念的な\
@@ -258,7 +288,8 @@ pub fn build_advisor_system_prompt(
          \n\
          除外・限定の尊重規則(解決策の提示順序規則・提案ファースト規則より優先):\n\
          - 顧客が特定の種類の対策を除外・限定した場合(例:「カメラ以外で」)、その種類は\
-         提案しない。除外されていない範囲を、他社材料を中心とした資料の範囲で答える。\n",
+         提案しない。除外されていない範囲で、他社サービスの扱いの規則に従って一般的な\
+         対策を答える。\n",
     );
     if !lead_offered {
         p.push_str(
@@ -354,9 +385,11 @@ pub fn build_advisor_system_prompt(
     // 前半に書け」は `DraftMode::Answer` のときだけ追加する。
     if materials.is_empty() {
         p.push_str(
-            "\n今回は使える資料がありません。事実主張(統計・製品仕様・価格帯の言及)は\
-             せず、一般的な助言と聞き取りだけで応答してください。製品名・型番・価格・\
-             統計値には触れないこと。\n",
+            "\n今回は根拠にできる具体的な情報が手元にありません。事実主張(統計・製品仕様・\
+             価格帯の言及)はせず、一般的な助言と聞き取りだけで応答してください。製品名・\
+             型番・価格・統計値には触れないこと。この状況そのものを顧客に書かない\
+             (「資料がありません」「情報がなく」等、内部の事情は一切書かない。内部情報の\
+             秘匿規則に従う)。\n",
         );
         if matches!(mode, DraftMode::Answer) {
             p.push_str(
@@ -1634,7 +1667,10 @@ mod tests {
     #[test]
     fn system_prompt_notes_general_advice_only_when_materials_are_empty() {
         let empty = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false, 0);
-        assert!(empty.contains("使える資料がありません"), "{empty}");
+        assert!(
+            empty.contains("根拠にできる具体的な情報が手元にありません"),
+            "{empty}"
+        );
 
         let with_material = material("タイトル", "本文", Some("https://example.com"));
         let non_empty = build_advisor_system_prompt(
@@ -1644,7 +1680,114 @@ mod tests {
             false,
             0,
         );
-        assert!(!non_empty.contains("使える資料がありません"), "{non_empty}");
+        assert!(
+            !non_empty.contains("根拠にできる具体的な情報が手元にありません"),
+            "{non_empty}"
+        );
+    }
+
+    // --- 本番実害是正(2026-10): 顧客への返信に内部用語「資料」が漏れ、意味が伝わらない
+    // 事故が実際に起きた(「今回は使える資料がありません」「資料に記載がありません」)。
+    // システムプロンプトが顧客向け本文にこの定型句をそのまま書かせていたことが原因の
+    // 一つだったため、その定型句自体を言い換え、かつ「この状況を顧客に明かさない」と
+    // 明示する指示を追加した。 ---
+
+    #[test]
+    fn system_prompt_materials_empty_block_forbids_leaking_internal_jargon_to_the_customer() {
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false, 0);
+        assert!(
+            p.contains("この状況そのものを顧客に書かない"),
+            "the materials-empty block must tell the model not to expose this internal state \
+             to the customer: {p}"
+        );
+        assert!(
+            !p.contains("今回は使える資料がありません。"),
+            "the old copy-pastable sentence that leaked into production customer replies must \
+             be gone: {p}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_states_internal_information_nondisclosure_rule() {
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false, 0);
+        assert!(p.contains("内部情報の秘匿規則"), "{p}");
+        assert!(
+            p.contains("材料の有無、判定の仕組み、社内の分類名を書かない"),
+            "{p}"
+        );
+        assert!(p.contains("当社で確認すべきことである旨を書く"), "{p}");
+        assert!(
+            p.contains("分からないと書き、公式の案内で確認するよう添える"),
+            "{p}"
+        );
+        assert!(p.contains("「お答えできません」とは書かない"), "{p}");
+    }
+
+    #[test]
+    fn system_prompt_internal_information_nondisclosure_rule_is_mode_independent() {
+        // 接地2層規則・安全下限と同様、mode に関わらない共通ブロックであることを固定する。
+        let missing = [ConditionKey::Concern];
+        let p = build_advisor_system_prompt(
+            &DraftMode::Clarify { missing: &missing },
+            &[],
+            false,
+            false,
+            0,
+        );
+        assert!(p.contains("内部情報の秘匿規則"), "{p}");
+    }
+
+    /// Critical 是正（2026-10、CS 側の同種不具合と対になる是正）の回帰テスト: システム
+    /// プロンプトは `AdvisorAction` 確定後に組み立てられるため、`DraftMode::Answer` /
+    /// `DraftMode::Clarify`（回答・聞き返し経路）のプロンプトが取次・折り返しを約束しても、
+    /// コード側は実際には取次受付経路（`LeadSolicit`）へ遷移しない。約束がこの 2 経路に
+    /// 混入していないことを固定する。`lead_offered = true` で呼び、リード提案規則
+    /// （「担当者から詳しくご案内できます」注入）が無関係な別経路として紛れ込まないようにする。
+    #[test]
+    fn answer_and_clarify_prompts_do_not_promise_handoff() {
+        let missing = [ConditionKey::Concern];
+        for mode in [DraftMode::Answer, DraftMode::Clarify { missing: &missing }] {
+            let p = build_advisor_system_prompt(&mode, &[], false, true, 0);
+            for forbidden in ["取次", "折り返", "改めて連絡", "改めて案内"] {
+                assert!(
+                    !p.contains(forbidden),
+                    "回答・聞き返し経路に取次・折り返しの約束（{forbidden}）が混入している: {p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn system_prompt_states_partner_service_handling_rule() {
+        // reviewer 指摘 Critical 是正(2026-10): `ingest_homesec` に削除経路が無く、
+        // vegapunk に残存した partner_product が CATEGORY_MATERIAL_LIMITS 経由で注入
+        // されうる(物理削除は Issue #63)。材料の有無に依存すると残存材料経由で古い他社
+        // 情報を引用できてしまうため、材料に書かれていても書かせない規則にした。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false, 0);
+        assert!(p.contains("他社サービスの扱い"), "{p}");
+        assert!(
+            p.contains("料金、契約条件、キャンペーン、プラン内容、"),
+            "{p}"
+        );
+        assert!(
+            p.contains("材料に書かれていても書かない"),
+            "材料ストアの状態に依存しない規則であることを固定する: {p}"
+        );
+        assert!(p.contains("どういう種類のサービスがあるか"), "{p}");
+        assert!(
+            p.contains("各社の公式情報で確認するよう案内して終える"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_no_longer_assumes_partner_product_materials_are_available() {
+        // partner_product 材料を全件削除した(2026-10)ため、「資料の範囲で他社の…」
+        // 「他社材料を中心とした資料の範囲で答える」のような、他社材料の存在を前提にした
+        // 文言が残っていないことを固定する。
+        let p = build_advisor_system_prompt(&DraftMode::Answer, &[], false, false, 0);
+        assert!(!p.contains("資料の範囲で他社の"), "{p}");
+        assert!(!p.contains("他社材料を中心とした資料の範囲で答える"), "{p}");
     }
 
     #[test]
@@ -1688,7 +1831,10 @@ mod tests {
             "the answer-only degrade addendum must not leak into Clarify mode: {p}"
         );
         assert!(p.contains("1問だけ"), "{p}");
-        assert!(p.contains("使える資料がありません"), "{p}");
+        assert!(
+            p.contains("根拠にできる具体的な情報が手元にありません"),
+            "{p}"
+        );
         assert!(p.contains("製品名"), "{p}");
         assert!(p.contains("型番"), "{p}");
         assert!(p.contains("価格"), "{p}");
@@ -1841,7 +1987,7 @@ mod tests {
             .find("提案ファースト規則")
             .expect("propose-first rule must be present in Answer mode");
         let materials_empty_pos = p
-            .find("使える資料がありません")
+            .find("根拠にできる具体的な情報が手元にありません")
             .expect("materials-empty degrade block must be present when materials is empty");
         assert!(
             materials_empty_pos > propose_first_pos,
