@@ -840,11 +840,38 @@ mod tests {
             .expect("server/data/homesec/materials.json must parse and validate");
         assert!(!entries.is_empty());
         let summary = kind_summary(&entries);
+        // 2026-10: 他社の料金・契約条件は運用で更新を追跡できないため、partner_product 材料を
+        // 全件削除した(fix/no-internal-jargon-and-competitor-data、12 件)。kind 自体が
+        // VALID_KINDS に残っているのは、新規投入を想定した余地ではなく、Issue #63 完了まで
+        // vegapunk に残存するデータ(12 件、物理削除は Issue #63)を安全に読める互換経路を
+        // 保つためである(`docs/superpowers/specs/2026-08-17-homesec-advisor-design.md` §5.2)。
+        // したがって materials.json(入力記録)に partner_product が存在しないのが現状の
+        // 正しい状態であり、この kind だけ非空の要求から除く。
         for kind in VALID_KINDS {
+            if kind == "partner_product" {
+                continue;
+            }
             assert!(
                 summary.contains_key(kind),
                 "seed materials.json must contain at least one entry of kind {kind:?}"
             );
         }
+        // Suggestion 是正(2026-10): 上のループは kind の「存在」だけを見ており、件数までは
+        // 固定していない。他社材料(partner_product)が将来誤って再追加されても、件数を
+        // 固定していなければこのテストは気付けない。現在の実測件数(2026-10 時点)を固定する。
+        assert_eq!(
+            entries.len(),
+            37,
+            "materials.json の総エントリ数が変化している"
+        );
+        assert_eq!(summary.get("statistic").copied(), Some(25));
+        assert_eq!(summary.get("own_product").copied(), Some(7));
+        assert_eq!(summary.get("scenario").copied(), Some(5));
+        assert_eq!(
+            summary.get("partner_product"),
+            None,
+            "partner_product material was re-added to materials.json; it must stay removed per \
+             the 2026-10 competitor-data policy (docs/superpowers/specs/2026-08-17-homesec-advisor-design.md §5.2)"
+        );
     }
 }

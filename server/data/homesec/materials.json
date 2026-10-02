@@ -271,136 +271,6 @@
     "card_match_terms": "ADC-VC827P,ドームカメラ,屋外カメラ,防犯カメラ"
   },
   {
-    "material_key": "partner_product:alsok-home-security",
-    "kind": "partner_product",
-    "title_ja": "ALSOK ホームセキュリティ(戸建て・マンション向け)",
-    "body_ja": "ALSOK(綜合警備保障)が提供する駆けつけ型ホームセキュリティサービスです。異常を検知すると警備員が駆けつけます。戸建て向け「HOME ALSOK Connect」はお買い上げプラン月額4,070円、レンタルプラン月額7,865円、初期費用0円の「ゼロスタートプラン」月額8,668円です。マンション向け「HOME ALSOKアパート・マンションプラン」はお買い上げ月額3,300円、レンタル月額6,105円、ゼロスタート月額6,754円です(いずれも税込)。",
-    "source_url": "https://www.alsok.co.jp/person/price/",
-    "category": "intrusion",
-    "price_band": "月額3,300円〜8,668円程度(プラン・住宅形態による、税込)",
-    "card_description": "駆けつけ対応のホームセキュリティサービス",
-    "card_match_terms": "ALSOK,ホームセキュリティ,駆けつけ"
-  },
-  {
-    "material_key": "partner_product:secom-home-security",
-    "kind": "partner_product",
-    "title_ja": "セコム・ホームセキュリティ(戸建て・マンション向け)",
-    "body_ja": "セコムが提供する駆けつけ型ホームセキュリティサービスです。防犯・火災監視・非常通報に対応します。戸建て向け「セコム・ホームセキュリティNEO」はレンタルプラン月額7,700円(税込8,470円)、お買い取りプラン月額4,700円(税込5,170円)です。マンション向け「スマートNEO」はレンタル月額5,000円(税込5,500円)、お買い取り月額3,200円(税込3,520円)です。",
-    "source_url": "https://www.secom.co.jp/homesecurity/price/",
-    "category": "intrusion",
-    "price_band": "月額3,520円〜8,470円程度(プラン・住宅形態による、税込)",
-    "card_description": "駆けつけ対応のホームセキュリティサービス",
-    "card_match_terms": "セコム,SECOM,ホームセキュリティ,駆けつけ"
-  },
-  {
-    "material_key": "partner_product:alsok-mimamori-support",
-    "kind": "partner_product",
-    "title_ja": "HOME ALSOK みまもりサポート",
-    "body_ja": "離れて暮らす高齢の家族の見守りに特化したALSOKのサービスです。体調が悪いときに緊急ボタンを押すと警備員が駆けつけ、看護師資格を持つスタッフへの相談ボタンもあります。お買い上げプラン月額1,870円、レンタルプラン月額2,838円、初期費用0円の「ゼロスタートプラン」月額3,069円です(いずれも税込)。緊急以外の駆けつけは1回7,700円の出動料金がかかります。",
-    "source_url": "https://www.alsok.co.jp/person/mimamori/",
-    "category": "monitoring",
-    "price_band": "月額1,870円〜3,069円程度(プランによる、税込)",
-    "card_description": "緊急ボタンで警備員が駆けつける見守りサービス",
-    "card_match_terms": "ALSOK,みまもりサポート,見守り,駆けつけ"
-  },
-  {
-    "material_key": "partner_product:sesame-smart-lock",
-    "kind": "partner_product",
-    "title_ja": "セサミ スマートロック",
-    "body_ja": "CANDY HOUSEが提供するスマートロックです。既存のドアの鍵(サムターン)に取り付け、スマートフォンからの解錠・施錠や、スマホが近づくと自動解錠する機能に対応します。工事不要で、必要な工具はすべて同梱されています。電池寿命は約500日で、残量が減るとスマホに通知が届きます。価格はセール価格で14,800円(税込16,280円)です。",
-    "source_url": "https://jp.candyhouse.co/products/sesame",
-    "category": "intrusion",
-    "price_band": "1万円台程度(税込)",
-    "card_description": "工事不要・スマホで解錠できるスマートロック",
-    "card_match_terms": "セサミ,SESAME,スマートロック,鍵"
-  },
-  {
-    "material_key": "partner_product:musashi-sensor-light",
-    "kind": "partner_product",
-    "title_ja": "ムサシ(RITEX) 屋外用センサーライト",
-    "body_ja": "センサーライト国内大手ムサシが展開する屋外用LEDセンサーライトです。コンセント式・ソーラー式・乾電池式・充電式から設置場所に合わせて選べます。マルチアーム式(1灯〜3灯)は9,240円〜17,380円程度、ガーデンソーラーライトは10,549円〜19,690円程度です(いずれも参考価格)。人の動きを感知して点灯し、暗がりでの侵入者への抑止効果が期待できます。",
-    "source_url": "https://musashi.inc/products/category/led-lights/sensor-lights/out-of-house/",
-    "category": "intrusion",
-    "price_band": "9,000円台〜2万円程度(電源方式・灯数による)",
-    "card_description": "人の動きを感知して点灯する屋外センサーライト",
-    "card_match_terms": "センサーライト,人感センサー,ムサシ,RITEX"
-  },
-  {
-    "material_key": "partner_product:elpa-window-alarm",
-    "kind": "partner_product",
-    "title_ja": "ELPA 窓ピタッアラーム(開閉検知アラーム)",
-    "body_ja": "朝日電器(ELPA)が展開する窓・ドア用の開閉検知アラームです。窓やドアが開くと約90dBの大音量アラームが約25秒間鳴り続け、侵入者への警告になります。厚さ8mmの薄型設計で窓の開閉の妨げになりにくく、付属の両面テープで貼るだけで設置でき、工事は不要です。2個セットで3,278円(税込3,605円)です。",
-    "source_url": "https://www.elpadirect.jp/products/4901087226375/",
-    "category": "intrusion",
-    "price_band": "3,000円台(2個セット、税込)",
-    "card_description": "貼るだけの窓・ドア用開閉検知アラーム",
-    "card_match_terms": "窓センサー,開閉アラーム,ELPA,エルパ"
-  },
-  {
-    "material_key": "partner_product:switchbot-contact-sensor",
-    "kind": "partner_product",
-    "title_ja": "SwitchBot 開閉センサー",
-    "body_ja": "SwitchBotが展開するIoT型の開閉センサーです。ドアや窓に取り付けたセンサーが開閉を検知し、スマートフォンへ通知します。Alexa・Google Homeなどスマートホーム機器との連携にも対応します。電池式(単4形電池2本)で工事は不要です。価格は数千円台です。",
-    "source_url": "https://item.rakuten.co.jp/switchbot/10000030/",
-    "category": "intrusion",
-    "price_band": "数千円台",
-    "card_description": "開閉をスマホに通知するIoTセンサー",
-    "card_match_terms": "開閉センサー,SwitchBot,スイッチボット,窓センサー"
-  },
-  {
-    "material_key": "partner_product:3m-cp-film",
-    "kind": "partner_product",
-    "title_ja": "3M 窓ガラス用防犯フィルム(CPマーク認定)",
-    "body_ja": "3Mが展開する窓ガラス用の防犯フィルムで、CPマーク認定品です。CPマーク取得には、フィルムの厚みが350マイクロメートル以上であること、日本ウインドウ・フィルム工業会が指定する接着剤を使うこと、防犯フィルム施工技能者(国家検定技能士)による施工であることが要件です。防犯性能を発揮させるため、窓ガラス全面に貼る「全面貼り」が必要です。価格は窓のサイズ・枚数・施工店により異なります。",
-    "source_url": "https://www.3mcompany.jp/3M/ja_JP/building-window-solutions-jp/scotchtint-window-film/crimeprevention/",
-    "category": "intrusion",
-    "card_description": "CPマーク認定の窓ガラス用防犯フィルム",
-    "card_match_terms": "防犯フィルム,CPマーク,3M,ガラス"
-  },
-  {
-    "material_key": "partner_product:hairenu-window-lock",
-    "kind": "partner_product",
-    "title_ja": "はいれーぬ 窓用補助錠",
-    "body_ja": "日本ロックサービスが扱う窓用の後付け補助錠「はいれーぬ」です。既存の鍵と併用して窓の防犯性を高めます。ネジ止めタイプで工事は不要、ドライバーで簡単に設置できます。二重ステンレス構造で、レールに沿ってスライドさせて使う仕組みです。価格は2,500円(税抜、税込2,750円)です。",
-    "source_url": "https://e-store.lock.co.jp/shopdetail/000000000177/",
-    "category": "intrusion",
-    "price_band": "2,000円台(税込2,750円)",
-    "card_description": "後付けできるネジ止め式の窓用補助錠",
-    "card_match_terms": "補助錠,窓,はいれーぬ"
-  },
-  {
-    "material_key": "partner_product:nasta-box-soft",
-    "kind": "partner_product",
-    "title_ja": "ナスタボックスソフト(簡易宅配ボックス)",
-    "body_ja": "集合住宅向け宅配ボックスの大手ナスタが展開する、折りたたみ式の簡易宅配ボックスです。ワイヤーで固定するだけで工事不要、届いたその日から使えます。使わないときは約5cmまで折りたたんで収納できます。撥水生地で荷物を雨から守ります。Sサイズ6,600円(税込)、Lサイズ7,700円(税込)です。",
-    "source_url": "https://www.nasta.co.jp/product/delivery-box/box-soft/",
-    "category": "package_theft",
-    "price_band": "6,600円〜7,700円程度(サイズによる、税込)",
-    "card_description": "工事不要・折りたたみ式の簡易宅配ボックス",
-    "card_match_terms": "宅配ボックス,置き配,ナスタ"
-  },
-  {
-    "material_key": "partner_product:panasonic-kemuritouban",
-    "kind": "partner_product",
-    "title_ja": "パナソニック けむり当番(ワイヤレス連動型 住宅用火災警報器)",
-    "body_ja": "パナソニックの住宅用火災警報器「けむり当番」ワイヤレス連動型です。親器1台に子器を最大14台まで連動でき、どこか1か所で煙を感知すると家中の警報器が一斉に鳴ります。専用リチウム電池1本で約10年動作し、電池切れ・故障・交換時期などのメンテナンス情報はAiSEG3経由でスマートフォンでも確認できます。価格は機種により異なります。",
-    "source_url": "https://panasonic.jp/bosai/feature/fire-alarm/wireless2020.html",
-    "category": "fire_disaster",
-    "card_description": "家中で連動して鳴るワイヤレス火災警報器",
-    "card_match_terms": "火災警報器,けむり当番,パナソニック,火災"
-  },
-  {
-    "material_key": "partner_product:zojirushi-mimamori",
-    "kind": "partner_product",
-    "title_ja": "象印 みまもりほっとライン",
-    "body_ja": "象印マホービンが提供する見守りサービスで、専用の電気ポット(iポット)の使用状況を離れて暮らす家族にメールで知らせます。カメラを使わない生活リズム型の見守りで、機器の操作が苦手な方にも負担がありません。初期費用5,500円(税込)、利用料は月額3,300円(税込、ポット1台につき)で、最初の1か月は利用料が無料です。",
-    "source_url": "https://www.zojirushi.co.jp/syohin/pot_kettle/mimamori/product/",
-    "category": "monitoring",
-    "price_band": "月額3,300円(税込、初期費用5,500円)",
-    "card_description": "ポットの使用状況で家族を見守るサービス",
-    "card_match_terms": "みまもりほっとライン,象印,見守り,ポット"
-  },
-  {
     "material_key": "scenario:chintai-hitorigurashi",
     "kind": "scenario",
     "title_ja": "賃貸マンション・アパートの一人暮らし",
@@ -418,7 +288,7 @@
     "material_key": "scenario:koureisha-mimamori",
     "kind": "scenario",
     "title_ja": "離れて暮らす高齢の親の見守り",
-    "body_ja": "聞くべき条件: target(parent_home)、concern(体調面の心配か防犯面の心配か)、親本人が機器の操作を得意とするか。提案の骨格: 「監視」ではなく「安心の共有」であることを伝え、本人の同意を前提にする。機械の操作が苦手なら操作不要のカメラ(URTECT ADC-V523等)、カメラに抵抗があれば映像を伴わない生活リズム型の見守りサービス(象印みまもりほっとライン等)、駆けつけ対応が必要なら見守りサービス(ALSOKみまもりサポート等)を状況に応じて提案する。",
+    "body_ja": "聞くべき条件: target(parent_home)、concern(体調面の心配か防犯面の心配か)、親本人が機器の操作を得意とするか。提案の骨格: 「監視」ではなく「安心の共有」であることを伝え、本人の同意を前提にする。機械の操作が苦手なら操作不要のカメラ(URTECT ADC-V523等)、カメラに抵抗があれば映像を伴わない生活リズム型の見守りサービス、駆けつけ対応が必要なら警備会社の駆けつけ型サービスを状況に応じて提案する。",
     "category": "monitoring"
   },
   {
@@ -432,7 +302,7 @@
     "material_key": "scenario:takuhai-okihai",
     "kind": "scenario",
     "title_ja": "置き配・宅配の盗難対策",
-    "body_ja": "聞くべき条件: housing(戸建てか集合住宅か。集合住宅は管理規約の確認が必要)、concern(package_theft)、install(宅配ボックス設置や玄関先カメラの設置可否)。提案の骨格: まず持ち去りは窃盗であることと被害届・警察相談専用電話#9110の案内を行う。戸建ては簡易宅配ボックス(ナスタボックスソフト等)、集合住宅は管理組合への確認を前提にした簡易宅配ボックスやコンビニ受取・宅配ロッカーへの切り替えを提案する。共用部を映すカメラは近隣のプライバシーに配慮し、自宅玄関前だけが映る角度に限定するよう案内する。",
+    "body_ja": "聞くべき条件: housing(戸建てか集合住宅か。集合住宅は管理規約の確認が必要)、concern(package_theft)、install(宅配ボックス設置や玄関先カメラの設置可否)。提案の骨格: まず持ち去りは窃盗であることと被害届・警察相談専用電話#9110の案内を行う。戸建ては簡易宅配ボックス、集合住宅は管理組合への確認を前提にした簡易宅配ボックスやコンビニ受取・宅配ロッカーへの切り替えを提案する。共用部を映すカメラは近隣のプライバシーに配慮し、自宅玄関前だけが映る角度に限定するよう案内する。",
     "category": "package_theft"
   }
 ]
