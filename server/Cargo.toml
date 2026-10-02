@@ -106,3 +106,7 @@ path = "src/bin/homesec_advisor.rs"
 [[bin]]
 name = "ingest_homesec"
 path = "src/bin/ingest_homesec.rs"
+
+[[bin]]
+name = "ingest_urtect_lp"
+path = "src/bin/ingest_urtect_lp.rs"
