@@ -1400,6 +1400,358 @@ mod tests {
         }
     }
 
+    // --- Issue #73: 公開価格表への問い合わせを契約・請求の個別案件から分離する ---
+    //
+    // 本番実測（2026-10-03）: 「月額いくらですか？」が contract_billing_question を立て、
+    // 第1層 contract-billing（advisory）でエスカレーションされていた。マニュアル側には
+    // 該当記事（urtectlp-price）が score 1.0 でヒットしていたにもかかわらず、第1層が先に
+    // 確定するため材料が使われなかった。原因は `contract_billing_question` の surface_forms
+    // に「料金」「月額」が含まれ、単なる価格照会（買う前の人が公開情報を聞いているだけ）を
+    // 契約・解約・請求といった個別案件と区別できていなかったこと。
+    //
+    // 「料金」「月額」を contract_billing_question から外して新設の `price_question` へ
+    // 移し、`price_question` は第1層のどのルールにも condition として登録しない
+    // （`data/urtect/rules.json` は無変更）ことで、価格照会は材料（manual search）で回答され、
+    // 解約・契約内容変更・請求額の相違・支払い方法変更といった個別案件は従来どおり
+    // contract-billing で取次になる。
+
+    #[test]
+    fn bundled_lexicon_extracts_price_question_without_flagging_contract_billing() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+
+        for utterance in [
+            "月額いくらですか？",
+            "初期費用はいくらですか",
+            "何台だといくらになりますか",
+            "料金を教えてください",
+            "価格を知りたいです",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&Signal::new("price_question")),
+                "expected price_question signal for utterance: {utterance}"
+            );
+            assert!(
+                !extracted.contains(&Signal::new("contract_billing_question")),
+                "a plain price inquiry must not flag contract_billing_question: {utterance}"
+            );
+        }
+    }
+
+    // surface form の変更は signal 抽出の挙動を直接変えるため、個別案件側の境界発話を
+    // 複数固定する（解約・契約内容変更・請求額の相違・支払い方法変更のいずれも従来どおり
+    // contract_billing_question を立てること、かつ price_question を誤って立てないこと）。
+    #[test]
+    fn bundled_lexicon_still_flags_contract_billing_question_for_individual_case_phrases() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+
+        for utterance in [
+            "解約したいです",
+            "契約内容を変更したい",
+            "請求額が違います",
+            "支払い方法を変更したい",
+            "プラン変更をお願いします",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&Signal::new("contract_billing_question")),
+                "expected contract_billing_question signal for utterance: {utterance}"
+            );
+            assert!(
+                !extracted.contains(&Signal::new("price_question")),
+                "an individual contract/billing case must not flag price_question: {utterance}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_price_question_does_not_match_any_layer1_rule() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["price_question"]);
+        assert!(
+            match_layer1(&rules, &question).is_none(),
+            "price_question must not be included in any data/urtect/rules.json escalation rule, \
+             so a plain price inquiry is not stopped at layer 1"
+        );
+    }
+
+    #[test]
+    fn bundled_contract_billing_rule_still_matches_contract_billing_question_at_layer1() {
+        let rules = load_bundled_escalation_rules();
+        let question = signals(&["contract_billing_question"]);
+        let matched = match_layer1(&rules, &question);
+        assert_eq!(
+            matched.map(|rule| rule.id.as_str()),
+            Some("contract-billing"),
+            "contract_billing_question must still match data/urtect/rules.json's \
+             contract-billing rule unchanged"
+        );
+    }
+
+    // --- Issue #73 reviewer 差し戻し Critical 1: 第1層の取次床が失われている ---
+    //
+    // 「料金」「月額」を contract_billing_question から外した直接の副作用として、価格語を含むが
+    // main に残る「解約」「契約」「プラン変更」「支払い」のいずれも含まない個別案件
+    // （引き落とし・返金・カード変更・明細・内訳等）が第1層のどのルールにもマッチしなくなって
+    // いた。第2層 prohibited_domains は legal-privacy / security-guarantee / electrical-work の
+    // 3件のみで請求系を一切カバーしないため、これらは第3層のマニュアルスコア判定に落ち、
+    // #69/#72 で ingest 済みの urtectlp-price（価格 LP）に「価格表で回答済み」にされうる
+    // fail-closed の破れだった。contract_billing_question に「個別案件を示す語」を加算して
+    // 床を戻す（料金・月額は price_question 側に残したままでよい。個別案件の発話は価格語と
+    // 個別案件語の両方を立て、match_layer1 は subset 判定なので contract-billing にマッチする）。
+    #[test]
+    fn bundled_lexicon_extracts_contract_billing_question_for_price_bearing_individual_cases() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+
+        for utterance in [
+            "月額料金が引き落とされていないのですが",
+            "料金が二重に引き落とされています",
+            "口座から料金が引かれていません",
+            "料金を払いすぎたようです",
+            "未払いの料金があると言われました",
+            "月額料金の内訳がおかしい",
+            "料金プランを見直したい",
+            "返金してほしい",
+            "クレジットカードを変えたいのですが",
+        ] {
+            assert!(
+                lex.normalize(utterance)
+                    .contains(&Signal::new("contract_billing_question")),
+                "expected contract_billing_question signal for price-bearing individual-case \
+                 utterance: {utterance}"
+            );
+        }
+    }
+
+    // 上記の signal 抽出だけでなく、第1層までを固定する（signal が立っても match_layer1 が
+    // 拾わなければ床は戻らない）。
+    #[test]
+    fn bundled_price_bearing_individual_case_matches_layer1_contract_billing() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        let extracted = lex.normalize("料金を払いすぎたようです");
+        let matched = match_layer1(&rules, &extracted);
+        assert_eq!(
+            matched.map(|rule| rule.id.as_str()),
+            Some("contract-billing"),
+            "a price-bearing individual-case utterance must reach data/urtect/rules.json's \
+             contract-billing rule at layer 1, not fall through to layer 3 manual scoring"
+        );
+    }
+
+    // --- Issue #73 codex 指摘: 価格語 + 「支払日」「決済日」の個別案件が第1層から漏れる ---
+    //
+    // main では「月額」「料金」が contract_billing_question に一致して取次になっていた
+    // 「月額の支払日を変更したい」「料金の決済日を変更したい」が、価格語を外した結果
+    // price_question のみになる。「支払日」は「支払い」に部分一致しないため、
+    // 「支払」「決済日」を個別案件語として持ち、第1層 contract-billing へ落とす。
+    #[test]
+    fn bundled_price_bearing_payment_date_change_matches_layer1_contract_billing() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in ["月額の支払日を変更したい", "料金の決済日を変更したい"]
+        {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&Signal::new("contract_billing_question")),
+                "expected contract_billing_question to fire for: {utterance}"
+            );
+            assert_eq!(
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+                Some("contract-billing"),
+                "a price-bearing payment-date change must reach contract-billing at layer 1: \
+                 {utterance}"
+            );
+        }
+    }
+
+    // --- Issue #73 reviewer 差し戻し Critical 2: price_question の「いくら」が広すぎる ---
+    //
+    // 「いくら」単独は価格以外の疑問文にも部分一致する（「電池はいくらもちますか」
+    // 「いくらでも相談に乗ってください」等）。余計な signal 1 つで
+    // `match_known_resolution`（第3層）が `KrMatch::BlockedByAddedSignal` に倒れて
+    // `UnknownAddedSignal` エスカレーションになったり、`build_known_facts` が無関係な質問に
+    // 「料金・価格に関するご質問」を把握済み条件語として混入させたりする。価格照会の形
+    // （「いくらですか」「いくらでしょう」「いくらかかり」「いくらになり」「おいくら」）に
+    // 限定し、単なる「いくら」は signal を立てないようにする。
+    #[test]
+    fn bundled_lexicon_does_not_flag_price_question_for_unrelated_ikura_phrases() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+
+        for utterance in ["電池はいくらもちますか", "いくらでも相談に乗ってください"]
+        {
+            assert!(
+                !lex.normalize(utterance)
+                    .contains(&Signal::new("price_question")),
+                "expected price_question to NOT fire for non-price ikura phrase: {utterance}"
+            );
+        }
+    }
+
+    // 解約意向の発話（「やめたい」）は変更前に取次だったため、価格語を含んでいても
+    // contract_billing_question が立ち第1層 contract-billing にマッチし続けること。
+    #[test]
+    fn bundled_cancellation_intent_with_price_words_matches_layer1_contract_billing() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in [
+            "料金が高いのでやめたいです",
+            "サービスをやめたいのですが月額はどうなりますか",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&Signal::new("contract_billing_question")),
+                "expected contract_billing_question for cancellation-intent utterance: {utterance}"
+            );
+            assert_eq!(
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+                Some("contract-billing"),
+                "cancellation-intent utterance must reach layer 1 contract-billing: {utterance}"
+            );
+        }
+    }
+
+    // --- Issue #73 round 3: 請求系の個別案件語の加算と、公開情報への質問の分離 ---
+    //
+    // 個別の契約・請求案件は lexicon で第1層取次を維持し、公開情報への質問（価格・料金プランの
+    // 一覧・資料請求）は第1層で止めない。`請求` 単独は「資料請求」にも部分一致するため廃し、
+    // 個別案件を示す語形（請求額・請求書・請求され・二重請求 等）に置き換えた。
+    // `料金プラン` 単独も「料金プランを教えてください」を取次にしてしまうため外し、
+    // 見直し・変更を示す語形（プランを見直 等）へ置き換えた。
+
+    fn cb_signal() -> Signal {
+        Signal::new("contract_billing_question")
+    }
+
+    #[test]
+    fn bundled_lexicon_flags_contract_billing_for_arrears_double_charge_and_refund_phrases() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in [
+            "料金が二重に取られている",
+            "月額料金を返してほしい",
+            "料金を滞納している",
+            "料金が上がったのはなぜですか",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&cb_signal()),
+                "expected contract_billing_question for individual billing case: {utterance}"
+            );
+            assert_eq!(
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+                Some("contract-billing"),
+                "individual billing case must reach layer 1 contract-billing: {utterance}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_lexicon_flags_billing_amount_phrases_but_not_document_request() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in [
+            "請求額が違います",
+            "二重に請求されている",
+            "今月の請求はいくらですか",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&cb_signal()),
+                "expected contract_billing_question for billing utterance: {utterance}"
+            );
+            assert_eq!(
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+                Some("contract-billing"),
+                "billing utterance must reach layer 1 contract-billing: {utterance}"
+            );
+        }
+
+        for utterance in [
+            "資料請求したいです",
+            "資料を請求したい",
+            "カタログを請求できますか",
+        ] {
+            assert!(
+                !lex.normalize(utterance).contains(&cb_signal()),
+                "a document request must not flag contract_billing_question: {utterance}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_plan_listing_questions_do_not_reach_layer1_but_plan_review_does() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in ["料金プランを教えてください", "どんな料金プランがありますか"]
+        {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&Signal::new("price_question")),
+                "expected price_question for plan listing question: {utterance}"
+            );
+            assert!(
+                !extracted.contains(&cb_signal()),
+                "a plan listing question must not flag contract_billing_question: {utterance}"
+            );
+            assert!(
+                match_layer1(&rules, &extracted).is_none(),
+                "a plan listing question must not match any layer1 rule: {utterance}"
+            );
+        }
+
+        let extracted = lex.normalize("料金プランを見直したい");
+        assert!(extracted.contains(&cb_signal()));
+        assert_eq!(
+            match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+            Some("contract-billing"),
+            "reviewing one's own plan is an individual case and must reach layer 1"
+        );
+    }
+
+    #[test]
+    fn bundled_cancellation_and_billing_amount_utterances_reach_contract_billing_end_to_end() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in ["解約したいです", "請求額が違います"] {
+            let extracted = lex.normalize(utterance);
+            assert_eq!(
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+                Some("contract-billing"),
+                "lexicon extraction through match_layer1 must yield contract-billing: {utterance}"
+            );
+        }
+    }
+
     #[test]
     fn decide_is_deterministic() {
         let resolutions = vec![kr("kr1", &["discoloration"])];
