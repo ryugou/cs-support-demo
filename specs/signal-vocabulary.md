@@ -130,7 +130,7 @@ main の `contract_billing_question` の surface_forms は `解約` `契約` `�
 
 ### `price_question` が `KnownResolution` 適用に与える影響
 
-`価格` `値段` `初期費用` `おいくら` `いくらですか` 系の語は main では signal を立てなかった。現行 lexicon では `price_question` が立つ（実測: 「初期費用はいくらですか」「価格を知りたい」「おいくらですか」「値段はいくら」「法人だといくらになりますか」）。signal は会話単位で累積するため、これらの発話が会話に含まれると、後続ターンで `match_known_resolution`（`server/src/harness/rules.rs`）が `KrMatch::BlockedByAddedSignal` を返しうる（累積 signal に `price_question` が余り、KnownResolution の条件に含まれないため）。
+`価格` `値段` `おいくら` `いくらですか` 系の語は main では signal を立てなかった。現行 lexicon では `price_question` が立つ（実測: 「初期費用はいくらですか」（`いくらですか` による。`初期費用` 自体は Issue #76 で `initial_cost_question` へ移設済み。次節参照）「価格を知りたい」「おいくらですか」「値段はいくら」「法人だといくらになりますか」）。signal は会話単位で累積するため、これらの発話が会話に含まれると、後続ターンで `match_known_resolution`（`server/src/harness/rules.rs`）が `KrMatch::BlockedByAddedSignal` を返しうる（累積 signal に `price_question` が余り、KnownResolution の条件に含まれないため）。
 
 `BlockedByAddedSignal` は `clarification_allowed` では `InsufficientDirectness` と同扱いのため、聞き返しの挙動は変わらない。失われるのは当該ターンでの `KnownResolution` の適用のみである。
 
@@ -141,3 +141,24 @@ main の `contract_billing_question` の surface_forms は `解約` `契約` `�
 `ingest_alarmcom` も同じ lexicon で MENTIONS_SIGNAL を作るが、差分判定のハッシュは英語原文（`content_hash(&body_en)`）のみで決まる。lexicon を変更しても未変更の記事は再処理されず、MENTIONS_SIGNAL は記事の本文が変わったときにだけ新しい lexicon で再生成される。alarm.com の既存 section の MENTIONS_SIGNAL を新 lexicon に揃える手段は、この CLI には無い。
 
 `description` フィールド（LLM 分類プロンプトに埋め込まれる。`server/src/harness/signal.rs` の `LexiconNormalizer::vocabulary_for_prompt`）には語義のみを記述し、ルーティングの可否・方針は書かない（分類器が語義ではなく方針で判断する方向へ引っ張られるため）。`price_question` の `description` は「公開されている価格表・費用の照会（特定の契約や請求の個別案件ではなく、一般的な価格の問い合わせ）」とし、「第1層のエスカレーション対象外」のような運用方針の記述はしない。`customer_label`（顧客向け表示専用、「料金・価格に関するご質問」）は語義の言い換えであり変更していない。
+
+## `initial_cost_question`（初期費用・設置工事費の問い合わせを第1層で即時取次、Issue #76）
+
+初期費用は設置環境（配線の有無・設置場所の構造・既存設備の状況等）によって決まり、マニュアル上の一般論では答えられない。聞き返しても公開情報で埋まる見込みが無いため、第1層 advisory（情報不足なら聞き返しに開放する）ではなく mandatory（問答無用で即時取次）で扱う。設計判断の詳細は `docs/superpowers/specs/2026-10-05-initial-cost-handoff-design.md` §1 を参照。
+
+`server/data/urtect/signal-lexicon.json` に `initial_cost_question`（`class: context`）を新設し、surface_forms は次の11語とした: `初期費用` `初期コスト` `設置費` `工事費` `導入費` `取り付け費` `取付費` `設置料金` `工事料金` `設置代金` `工事代金`。`price_question` の surface_forms からは `初期費用` を削除し（前節の修正）、こちらへ移した。
+
+`設置代` `工事代` は採用しない。「設置代行」（カメラの設置作業そのものの代行サービス、費用の話ではない）に部分一致するため（`設置代行はありますか` が誤って取次になる）。
+
+`server/data/urtect/rules.json` の `escalation_rules` に第1層ルール `initial-cost-quote`（`condition: ["initial_cost_question"]`, `owner: "contract"`, `route: "support_desk"`, `binding: "mandatory"`）を追加した。「初期費用はいくらですか」は `いくらですか` により引き続き `price_question` も立つが（前節）、第1層は `match_layer1` の mandatory 優先（`server/src/harness/rules.rs`）により `initial-cost-quote` で確定する（`price_question` は第1層のどの `condition` にも含まれないため、単独では取次を発生させない）。
+
+このルールは顧客向けの受け止め文（`customer_ack` 属性）を宣言している: 「初期費用はお客様の状況によって異なりますので、担当者におつなぎします。」累積 signal 集合（会話単位）にマッチする第 1 層ルールがちょうど 1 件のときだけ、`/{project_id}/api/reply` は LLM で受け止め文を生成せず、この宣言文をそのまま使う（NG 表現ゲート・取扱製品ゲートは通す）。2 件以上マッチしたときは宣言文を使わず LLM が作る。属性の型・検証・伝搬経路は design doc §3 が正本。
+
+### 受容した誤発火・既知の限界（実測、2026-10-05、`LexiconNormalizer` に候補発話を通した結果）
+
+実測は変更後の `server/data/urtect/signal-lexicon.json` を `LexiconNormalizer::from_path` で読み、候補発話を `normalize()` に通して確認した（一時ファイルは実測後に削除済み。本番コードには含まれない）。
+
+- 意図した該当発話はすべて `initial_cost_question` を立てた: 「初期費用はいくらですか」「初期コストはどれくらいですか」「設置費はいくらかかりますか」「工事費はいくらですか」「導入費はどれくらいですか」「取り付け費を教えてください」「取付費はいくらですか」「設置料金を教えてください」「工事料金はいくらですか」「設置代金はどれくらいですか」「工事代金の見積もりをお願いします」。
+- 既存の回帰対象（「月額いくらですか」「設置方法を教えてください」「設置代行はありますか」）はいずれも `initial_cost_question` を立てなかった（`設置代行はありますか` は `camera_installation` のみ。`設置代` を採用しなかった判断どおり）。
+- **受容した誤発火**: 請求・支払いの個別案件（契約・請求の相談であって初期費用の見積もり相談ではない）の発話に `initial_cost_question` の語（`初期費用` `工事費` `設置費` `導入費` `取り付け費` `取付費` `工事代金` `設置代金`）が含まれると、`contract_billing_question` と同時に立つ。実測（`customer_ack` の適用を第 1 層のマッチ件数 1 件に限る実装で `decide` まで通した結果）: 「工事費の請求書を再発行してください」「初期費用を返金してほしいです」「設置費が二重に請求されています」「導入費の支払いが完了していません」「取り付け費の請求額が間違っています」「工事代金の請求書を再発行してください」「設置代金の支払いが完了していません」「初期費用の請求書の宛名を変更したい」はいずれも両 signal を立て（`設置費` `取り付け費` `設置代金` の発話は `camera_installation` も立つ）、第 1 層で `contract-billing`（advisory）と `initial-cost-quote`（mandatory）の 2 件にマッチする。`match_layer1`（`server/src/harness/rules.rs`）は mandatory を advisory より優先するため mandatory の `initial-cost-quote` で取次が確定し、`contract-billing` の聞き返しには回らない。マッチが 2 件のため `customer_ack` は `None` になり、宣言文は使われず LLM が相談内容に沿った受け止め文を作る。両ルールの `owner`（`contract`）と `route`（`support_desk`）は同一なので取次先は変わらない。過剰エスカレーション側に倒す既存方針（`contract_billing_question` 節の「やめたい」と同種の受容）に従い、取次が成立することは受容する。なお「取付費の領収書を送ってください」は `contract_billing_question` が立たず `initial_cost_question` のみで、第 1 層のマッチは `initial-cost-quote` の 1 件になり、宣言文が使われる。
+- **既知の限界**: 11語のいずれも連続する部分文字列として含まない言い回しは lexicon で拾えない。実測: 「初期設定費用はかかりますか」（「初期」と「費用」の間に「設定」が入るため `初期費用` に部分一致しない）、「導入にかかる費用を教えてください」（`導入費` に部分一致しない）、「設置にいくらかかりますか」（design doc §9 に記載の既知の限界どおり、`price_question` のみが立ち `initial_cost_question` は立たない）はいずれも signal が立たない、または `initial_cost_question` を欠く。本番は LLM 分類との和集合（`server/src/harness/extraction.rs`）が補うが、LLM 分類が失敗したときは補われない。

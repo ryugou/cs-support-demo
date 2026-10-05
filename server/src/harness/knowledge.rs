@@ -281,6 +281,21 @@ fn parse_hearing(rule_id: &str, value: Option<&String>) -> Option<HearingContrac
     parsed
 }
 
+/// `customer_ack` 属性（取次ルールが宣言する顧客向けの受け止め文）の復元。欠落・空文字は
+/// 「宣言なし」。値がある場合は前後の空白を除いて `Some` にする。
+///
+/// 読み出し時に長さ・改行の検証はしない（投入時に `ingest_rules::resolve_customer_ack` が
+/// 済ませているため）。`hearing` と同じく、属性が無い旧データでもルールの読み込みを失敗させない
+/// （design doc `2026-10-05-initial-cost-handoff-design.md` §3.2）。
+fn parse_customer_ack(value: Option<&String>) -> Option<String> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub fn escalation_rule_from_attributes(attrs: &HashMap<String, String>) -> Result<EscalationRule> {
     let id = attrs
         .get("rule_id")
@@ -304,6 +319,7 @@ pub fn escalation_rule_from_attributes(attrs: &HashMap<String, String>) -> Resul
         owner: attrs.get("owner").cloned().filter(|v| !v.is_empty()),
         binding: parse_binding("escalation_rule", &id, attrs.get("binding")),
         hearing: parse_hearing(&id, attrs.get("hearing")),
+        customer_ack: parse_customer_ack(attrs.get("customer_ack")),
         id,
         condition,
     })
@@ -1348,6 +1364,52 @@ mod tests {
             "the warn must name the rule and the unknown value so an operator can act, \
              got: {warnings:?}"
         );
+    }
+
+    // ---- EscalationRule.customer_ack（Issue #76: 取次ルールが宣言する受け止め文） ----
+
+    fn rule_attrs_with_customer_ack(customer_ack: Option<&str>) -> Vec<(&str, &str)> {
+        let mut pairs = vec![
+            ("rule_id", "initial-cost-quote"),
+            ("condition", "initial_cost_question"),
+            ("route", "support_desk"),
+            ("binding", "mandatory"),
+        ];
+        if let Some(value) = customer_ack {
+            pairs.push(("customer_ack", value));
+        }
+        pairs
+    }
+
+    #[test]
+    fn escalation_rule_from_attributes_reads_the_customer_ack_declaration_trimmed() {
+        let rule = escalation_rule_from_attributes(&attrs(&rule_attrs_with_customer_ack(Some(
+            "  初期費用はお客様の状況によって異なりますので、担当者におつなぎします。  ",
+        ))))
+        .expect("parses");
+        assert_eq!(
+            rule.customer_ack,
+            Some(
+                "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn escalation_rule_from_attributes_treats_absent_or_empty_customer_ack_as_undeclared() {
+        // 欠落（旧ノード・宣言なしのルール）と空文字（`ingest_rules` が「宣言なし」を明示的に
+        // 書き込む表現）を区別しない（`hearing` と同じ規約）。
+        for customer_ack in [None, Some("")] {
+            let rule = escalation_rule_from_attributes(&attrs(&rule_attrs_with_customer_ack(
+                customer_ack,
+            )))
+            .expect("parses");
+            assert_eq!(
+                rule.customer_ack, None,
+                "customer_ack attribute = {customer_ack:?}"
+            );
+        }
     }
 
     // ---- binding の値（Issue #58 reviewer Warning 1）----

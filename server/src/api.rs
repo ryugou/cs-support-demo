@@ -674,6 +674,17 @@ fn select_customer_history_for_jev(history: &[ReplyHistoryTurn], request_id: &st
     turns
 }
 
+/// Issue #76: `outcome.decision` から、マッチした第1層ルールが宣言した顧客向けの受け止め文を
+/// 取り出す。`AnswerDecision::Allowed`、および第1層ルールが宣言していない取次（第2・3層を含む）
+/// では `None`。`reply_handler` の `ReplyAction::EscalationReply` 分岐から抽出した部品
+/// （`AnswerDecision` から読む部分だけを独立に単体テストできるようにするため）。
+fn escalation_customer_ack(decision: &AnswerDecision) -> Option<&str> {
+    match decision {
+        AnswerDecision::Escalate { customer_ack, .. } => customer_ack.as_deref(),
+        AnswerDecision::Allowed { .. } => None,
+    }
+}
+
 /// Issue #54 A-2 (b): `ReplyAction::EscalationReply` の応答文を組み立てる（`reply_handler` の
 /// 同分岐から抽出した部品）。
 ///
@@ -698,6 +709,12 @@ fn select_customer_history_for_jev(history: &[ReplyHistoryTurn], request_id: &st
 /// だけを正しさの根拠にしていた。戻り値を `(String, bool)` にすることで、「保存するか」の根拠が
 /// この関数自身の戻り値になり、将来 `load_conv_state` とこの呼び出しの間に conv を変更する処理が
 /// 割り込んでも、先読みした古い判定に基づいて黙って書き込みを捨てる事故が起きない。
+/// `customer_ack`（Issue #76）: マッチした第1層ルールが顧客向けの受け止め文を宣言している場合
+/// （`outcome.decision` の `AnswerDecision::Escalate.customer_ack`）、LLM 生成（`drafter` の有無に
+/// 関わらず）を一切行わず、その宣言文をそのまま受け止め文にする。`is_continuation` の値によらず
+/// 同じ文を使う（design doc `2026-10-05-initial-cost-handoff-design.md` §4.1）。宣言文も
+/// NG 表現ゲート（`escalation_reply::gate_declared_ack_text`）と、直後の取扱製品ゲート
+/// （`gate_generated_text`）の両方を通す。
 #[allow(clippy::too_many_arguments)]
 async fn build_escalation_reply_text(
     drafter: Option<&crate::llm::AnthropicClient>,
@@ -705,6 +722,7 @@ async fn build_escalation_reply_text(
     max_tokens: u32,
     question: &str,
     is_continuation: bool,
+    customer_ack: Option<&str>,
     allowlist: &product_gate::ProductAllowlist,
     request_id: &str,
     case_id: &str,
@@ -723,17 +741,20 @@ async fn build_escalation_reply_text(
             false,
         );
     }
-    let ack_text = match drafter {
-        Some(drafter) => {
-            escalation_reply::draft_ack_text(drafter, ng, max_tokens, question, is_continuation)
-                .await
-        }
-        None => escalation_reply::fallback_ack(is_continuation)
-            .0
-            .to_string(),
+    let ack_text = match customer_ack {
+        Some(declared) => escalation_reply::gate_declared_ack_text(declared, ng, is_continuation),
+        None => match drafter {
+            Some(drafter) => {
+                escalation_reply::draft_ack_text(drafter, ng, max_tokens, question, is_continuation)
+                    .await
+            }
+            None => escalation_reply::fallback_ack(is_continuation)
+                .0
+                .to_string(),
+        },
     };
     // Issue #28 §3.5: 応答側ゲート その 3/3。受け止め文。決定的ブロック（受付番号等）より前で
-    // チェックする。
+    // チェックする。`customer_ack` 宣言経由でも、LLM 生成経由と同じこのゲートを必ず通す。
     let ack_text = gate_generated_text(
         ack_text,
         allowlist,
@@ -1809,12 +1830,16 @@ async fn reply_handler(
                         chrono::Utc::now(),
                     );
                     let hours_label = hours::business_hours_label(&state.config.api.business_hours);
+                    // Issue #76: マッチした第1層ルールが顧客向けの受け止め文を宣言していれば、
+                    // それを使う（`build_escalation_reply_text` 内で LLM 生成を一切行わない）。
+                    let customer_ack = escalation_customer_ack(&outcome.decision);
                     let (reply_text, conv_mutated) = build_escalation_reply_text(
                         state.harness.reply_drafter.as_ref(),
                         &state.harness.ng,
                         state.harness.reply_draft_max_tokens,
                         &req.message,
                         is_continuation,
+                        customer_ack,
                         &allowlist,
                         &request_id,
                         &outcome.case_id,
@@ -2197,6 +2222,7 @@ mod tests {
                 best: 0.5,
             }],
             hearing: None,
+            customer_ack: None,
         }
     }
 
@@ -2215,6 +2241,7 @@ mod tests {
             audit_required: true,
             missing: vec![],
             hearing: None,
+            customer_ack: None,
         }
     }
 
@@ -2229,6 +2256,7 @@ mod tests {
             audit_required: true,
             missing: vec![],
             hearing: Some(crate::harness::rules::HearingContract::ProductAndSymptom),
+            customer_ack: None,
         }
     }
 
@@ -2245,7 +2273,42 @@ mod tests {
             audit_required: true,
             missing: vec![],
             hearing: None,
+            customer_ack: None,
         }
+    }
+
+    /// Issue #76: 取次ルールが顧客向けの受け止め文を宣言した escalate（実データでは
+    /// `initial-cost-quote`）。`build_escalation_reply_text` がこの宣言を受け取ったとき LLM を
+    /// 呼ばずそのまま受け止め文に使うことを検証するためのヘルパ。
+    fn layer1_escalate_with_customer_ack_decision(customer_ack: &str) -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: vec![],
+            hearing: None,
+            customer_ack: Some(customer_ack.to_string()),
+        }
+    }
+
+    // --- Issue #76: escalation_customer_ack ---
+
+    #[test]
+    fn escalation_customer_ack_returns_the_declared_text_for_a_layer1_escalation_with_a_declaration(
+    ) {
+        let decision = layer1_escalate_with_customer_ack_decision("宣言文です。");
+        assert_eq!(escalation_customer_ack(&decision), Some("宣言文です。"));
+    }
+
+    #[test]
+    fn escalation_customer_ack_is_none_without_a_declaration_or_for_allowed() {
+        assert_eq!(
+            escalation_customer_ack(&rule_match_escalate_decision()),
+            None
+        );
+        assert_eq!(escalation_customer_ack(&allowed_decision()), None);
     }
 
     /// 実際に配布される `data/urtect/rules.json` で `decide()` を回した decision。手組みの
@@ -2284,6 +2347,18 @@ mod tests {
             "the bundled rules must escalate {signal_values:?} at layer 1, got {decision:?}"
         );
         decision
+    }
+
+    // Issue #76: 実データ（`data/urtect/rules.json` の `initial-cost-quote`）で `decide()` を
+    // 回したとき、`escalation_customer_ack` が宣言文をそのまま返すことを固定する。
+    #[test]
+    fn bundled_initial_cost_quote_decision_carries_its_declared_customer_ack() {
+        let decision = bundled_layer1_decision(&["initial_cost_question"]);
+        assert_eq!(
+            escalation_customer_ack(&decision),
+            Some("初期費用はお客様の状況によって異なりますので、担当者におつなぎします。"),
+            "initial-cost-quote must carry its declared customer_ack through decide()"
+        );
     }
 
     fn base_outcome(
@@ -2690,6 +2765,7 @@ mod tests {
             audit_required: true,
             missing: Vec::new(),
             hearing: None,
+            customer_ack: None,
         };
         let outcome = base_outcome(decision, false);
         let conv = default_conv_state();
@@ -2716,6 +2792,7 @@ mod tests {
                 best: 0.5,
             }],
             hearing: None,
+            customer_ack: None,
         };
         let outcome = base_outcome(decision, true);
         let conv = default_conv_state();
@@ -3295,6 +3372,7 @@ mod tests {
             700,
             "エラーが出て困っています",
             false,
+            None,
             &allowlist,
             "req-1",
             "case-12345678-abcd",
@@ -3330,6 +3408,194 @@ mod tests {
         );
     }
 
+    // --- Issue #76: `customer_ack`（取次ルールが宣言した受け止め文） ---
+
+    #[tokio::test]
+    async fn build_escalation_reply_text_uses_the_declared_customer_ack_without_calling_the_llm() {
+        let declared = "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。";
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state();
+
+        let (reply_text, conv_mutated) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "初期費用はいくらですか",
+            false,
+            Some(declared),
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::assemble_escalation_reply(
+                declared,
+                &escalation_reply::build_deterministic_block(
+                    "case-12345678-abcd",
+                    "平日 10:00〜18:00",
+                    false
+                )
+            ),
+            "a declared customer_ack must be used verbatim, followed by the deterministic block"
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "a declared customer_ack must skip the LLM entirely, even though a drafter is \
+             configured"
+        );
+        assert!(
+            conv_mutated,
+            "a new escalation via a declared customer_ack must still arm the time-preference \
+             solicitation, same as the LLM-drafted path"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_escalation_reply_text_ignores_the_declared_customer_ack_when_already_escalated()
+    {
+        let declared = "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。";
+        let (drafter, log) = stub_drafter("この下書きも使われてはならない").await;
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state();
+        conv.awaiting_time_pref = true; // 受付番号発行済みの後続ターンを模す
+
+        let (reply_text, conv_mutated) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "追加の補足です",
+            true,
+            Some(declared),
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::build_already_escalated_reply(
+                "case-12345678-abcd",
+                "平日 10:00〜18:00",
+                true,
+                false
+            ),
+            "an already-escalated case must use the already-escalated reply, not the declared \
+             customer_ack"
+        );
+        assert!(!reply_text.contains(declared));
+        assert_eq!(log.lock().unwrap().len(), 0);
+        assert!(!conv_mutated);
+    }
+
+    // 宣言文も LLM 生成の受け止め文と同じ 2 つのゲート（NG 表現・取扱製品）を通る。却下時は
+    // `fallback_ack` の文へ倒れ、決定的ブロックは変わらず続く（design doc §4.1 / §6）。
+    // LLM を呼ばないことは `stub_drafter` のリクエストログが 0 件であることで検証する。
+    #[tokio::test]
+    async fn build_escalation_reply_text_falls_back_when_the_declared_customer_ack_hits_the_ng_gate(
+    ) {
+        let declared = "この対応で絶対に治ります。担当者におつなぎします。";
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        let ng = crate::harness::egress::NgDictionary::from_json(
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":[]}"#,
+        )
+        .unwrap();
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state();
+
+        let (reply_text, _) = build_escalation_reply_text(
+            Some(&drafter),
+            &ng,
+            700,
+            "初期費用はいくらですか",
+            false,
+            Some(declared),
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::assemble_escalation_reply(
+                escalation_reply::fallback_ack(false).0,
+                &escalation_reply::build_deterministic_block(
+                    "case-12345678-abcd",
+                    "平日 10:00〜18:00",
+                    false
+                )
+            ),
+            "a declared customer_ack rejected by the NG gate must fall back to fallback_ack \
+             followed by the deterministic block"
+        );
+        assert!(!reply_text.contains(declared));
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "the NG-gate fallback must not call the LLM"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_escalation_reply_text_falls_back_when_the_declared_customer_ack_names_an_out_of_scope_model(
+    ) {
+        let declared = "ADC-VDB101の初期費用は担当者におつなぎします。";
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        let allowlist = response_gate_fixture_allowlist(); // 取扱は ADC-V724 のみ
+        let mut conv = default_conv_state();
+
+        let (reply_text, _) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "初期費用はいくらですか",
+            false,
+            Some(declared),
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::assemble_escalation_reply(
+                escalation_reply::fallback_ack(false).0,
+                &escalation_reply::build_deterministic_block(
+                    "case-12345678-abcd",
+                    "平日 10:00〜18:00",
+                    false
+                )
+            ),
+            "a declared customer_ack rejected by the product gate must fall back to \
+             fallback_ack followed by the deterministic block"
+        );
+        assert!(!reply_text.contains("ADC-VDB101"));
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "the product-gate fallback must not call the LLM"
+        );
+    }
+
     #[tokio::test]
     async fn build_escalation_reply_text_skips_the_llm_and_full_block_when_already_escalated() {
         let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
@@ -3343,6 +3609,7 @@ mod tests {
             700,
             "追加の補足です",
             true,
+            None,
             &allowlist,
             "req-1",
             "case-12345678-abcd",
@@ -3403,6 +3670,7 @@ mod tests {
             700,
             "追加の補足です",
             true,
+            None,
             &allowlist,
             "req-1",
             "case-12345678-abcd",
@@ -3455,6 +3723,7 @@ mod tests {
             700,
             "追加の補足です",
             true,
+            None,
             &allowlist,
             "req-1",
             "case-12345678-abcd",

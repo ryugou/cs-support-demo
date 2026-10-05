@@ -1044,6 +1044,7 @@ mod tests {
                 best: 0.5,
             }],
             hearing: None,
+            customer_ack: None,
         }
     }
 

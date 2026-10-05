@@ -91,6 +91,9 @@ nodes:
       # 識別子（例: product_and_symptom）。空文字・未設定は「宣言なし」。ingest_rules が書き、
       # harness::knowledge::escalation_rule_from_attributes が読む。
       hearing: { type: string }
+      # ルール自身が宣言する、顧客向けの受け止め文（Issue #76）。空文字・未設定は「宣言なし」。
+      # ingest_rules が書き、harness::knowledge::escalation_rule_from_attributes が読む。
+      customer_ack: { type: string }
   ProhibitedDomain:
     attributes:
       domain_id: { type: string, required: true }

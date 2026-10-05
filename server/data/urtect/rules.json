@@ -5,7 +5,8 @@
     { "rule_id": "warranty-failure", "condition": ["warranty_hardware_failure"], "owner": "hardware", "route": "support_desk", "binding": "advisory", "hearing": "product_and_symptom" },
     { "rule_id": "contract-billing", "condition": ["contract_billing_question"], "owner": "contract", "route": "support_desk", "binding": "advisory" },
     { "rule_id": "construction-risk", "condition": ["physical_construction_risk"], "owner": "installation", "route": "support_desk", "binding": "mandatory" },
-    { "rule_id": "human-handoff", "condition": ["human_handoff_request"], "owner": "support_desk", "route": "support_desk", "binding": "mandatory" }
+    { "rule_id": "human-handoff", "condition": ["human_handoff_request"], "owner": "support_desk", "route": "support_desk", "binding": "mandatory" },
+    { "rule_id": "initial-cost-quote", "condition": ["initial_cost_question"], "owner": "contract", "route": "support_desk", "binding": "mandatory", "customer_ack": "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。" }
   ],
   "prohibited_domains": [
     { "domain_id": "legal-privacy", "domain_signals": ["legal_privacy_question"], "pattern": [], "route": "support_desk", "binding": "mandatory" },

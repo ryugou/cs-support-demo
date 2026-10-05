@@ -1,6 +1,6 @@
 use crate::harness::rules::{
-    match_known_resolution, match_layer1, match_layer2, Binding, EscalationRule, HearingContract,
-    KnownResolution, KrMatch, ProhibitedDomain,
+    count_layer1_matches, match_known_resolution, match_layer1, match_layer2, Binding,
+    EscalationRule, HearingContract, KnownResolution, KrMatch, ProhibitedDomain,
 };
 use crate::harness::signal::SignalSet;
 use serde::Serialize;
@@ -150,6 +150,16 @@ pub enum AnswerDecision {
         /// `Deserialize` は derive していないので、skip による round-trip の破壊は起きない。
         #[serde(skip)]
         hearing: Option<HearingContract>,
+        /// Issue #76: 第1層（明示エスカレーションルール）マッチ時に、**マッチしたルール自身が
+        /// 宣言した**顧客向けの受け止め文（`EscalationRule::customer_ack`）を保持する。宣言の無い
+        /// ルール・第2・3層は `None`。`hearing` と異なり、`binding` による抑止は無い（mandatory
+        /// の取次ルールも宣言できる。design doc `2026-10-05-initial-cost-handoff-design.md` §3.3）。
+        ///
+        /// 呼び出し側（`api.rs::build_escalation_reply_text`）はこのフィールドが `Some(text)` の
+        /// とき、LLM で受け止め文を生成せず `text` をそのまま使う（NG 表現ゲート・取扱製品ゲートは
+        /// 通す）。`hearing` と同じ理由で MCP の出力契約には載せない（`#[serde(skip)]`）。
+        #[serde(skip)]
+        customer_ack: Option<String>,
     },
 }
 
@@ -196,6 +206,10 @@ pub struct DecisionInput<'a> {
 /// `contract-billing` は型番も症状も関係なく、`has_enough_info`（製品と症状が分かるか）で測ると
 /// 無関係なヒアリングへ流れるため。`missing`（マニュアル材料のカバレッジ）は従来どおり binding
 /// だけで決まり、この宣言とは独立。
+///
+/// Issue #76: `customer_ack` は、第1層でマッチしたルールが**ちょうど1件**のときだけ、そのルールの
+/// 宣言を運ぶ（`count_layer1_matches`）。累積 signal 集合（会話単位）で2件以上マッチしたときは、選ばれたルールが宣言を持って
+/// いても `None`（LLM が受け止め文を作る）。取次の可否・route・`missing`・`hearing` は変えない。
 pub fn decide(input: &DecisionInput) -> AnswerDecision {
     let stakes = classify_stakes(&input.stakes_input);
     let threshold = answerability_threshold(input.thresholds, stakes);
@@ -218,6 +232,16 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             missing,
             // mandatory では宣言があっても `None`（`hearing_contract` の doc）。
             hearing: rule.hearing_contract(),
+            // Issue #76: `hearing_contract()` と異なり binding による抑止は無い。mandatory の
+            // 取次ルールも顧客向けの受け止め文を宣言できる。ただしマッチした第1層ルールが
+            // ちょうど1件のときだけ有効（複合発話では宣言文が主題と食い違うため、LLM の受け止め文
+            // に任せる）。件数で決めるので、ルールの並び順に依存しない（design doc
+            // `2026-10-05-initial-cost-handoff-design.md` §3.3）。
+            customer_ack: if count_layer1_matches(input.rules, input.question_signals) == 1 {
+                rule.customer_ack.clone()
+            } else {
+                None
+            },
         };
     }
     // 第2層: 禁止領域（変更しない。fail-closed の核。missing は常に空・情報の有無を問わない）
@@ -230,6 +254,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             audit_required: true,
             missing: Vec::new(),
             hearing: None,
+            customer_ack: None,
         };
     }
     // 第3層: 回答可能性
@@ -265,6 +290,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
                 audit_required: true,
                 missing,
                 hearing: None,
+                customer_ack: None,
             }
         }
     }
@@ -422,6 +448,7 @@ mod tests {
             owner: None,
             binding: Binding::Mandatory,
             hearing: None,
+            customer_ack: None,
         }];
         let resolutions = vec![kr("kr1", &["post_ingestion_symptom"])];
         let q = signals(&["post_ingestion_symptom"]);
@@ -479,6 +506,7 @@ mod tests {
             owner: None,
             binding: Binding::Advisory,
             hearing: None,
+            customer_ack: None,
         }];
         let q = signals(&["post_ingestion_symptom"]);
         // best_manual_score が閾値(low=0.6)を大きく下回る = 製品未特定・症状要点不足を模す。
@@ -527,6 +555,7 @@ mod tests {
             owner: None,
             binding: Binding::Mandatory,
             hearing: None,
+            customer_ack: None,
         }];
         let q = signals(&["post_ingestion_symptom"]);
         // best_manual_score が閾値を大きく下回っても(製品未特定・症状要点不足を模しても)
@@ -563,6 +592,7 @@ mod tests {
             owner: None,
             binding: Binding::Advisory,
             hearing: None,
+            customer_ack: None,
         }];
         let q = signals(&["post_ingestion_symptom"]);
         let d = decide(&input(
@@ -605,6 +635,7 @@ mod tests {
             owner: None,
             binding,
             hearing,
+            customer_ack: None,
         }];
         let q = signals(&["post_ingestion_symptom"]);
         // 0.1 は閾値未満（情報不足）。binding/宣言だけで `hearing` が決まり、マニュアルの
@@ -675,10 +706,19 @@ mod tests {
             &[],
         ));
         match d {
-            AnswerDecision::Escalate { hearing, .. } => {
+            AnswerDecision::Escalate {
+                hearing,
+                customer_ack,
+                ..
+            } => {
                 assert_eq!(
                     hearing, None,
                     "layer 2 (prohibited domain) must never carry a hearing contract"
+                );
+                // Issue #76: layer2 は declaring rule を経由しないため customer_ack も常に None。
+                assert_eq!(
+                    customer_ack, None,
+                    "layer 2 (prohibited domain) must never carry a customer_ack"
                 );
             }
             other => panic!("expected layer2 escalate, got {other:?}"),
@@ -700,11 +740,93 @@ mod tests {
             &[],
         ));
         match d {
-            AnswerDecision::Escalate { hearing, .. } => {
+            AnswerDecision::Escalate {
+                hearing,
+                customer_ack,
+                ..
+            } => {
                 assert_eq!(hearing, None, "layer 3 must never carry a hearing contract");
+                // Issue #76: layer3 も declaring rule を経由しないため customer_ack も常に None。
+                assert_eq!(
+                    customer_ack, None,
+                    "layer 3 must never carry a customer_ack"
+                );
             }
             other => panic!("expected layer3 escalate, got {other:?}"),
         }
+    }
+
+    // --- Issue #76: `decide` は第1層マッチ時、マッチしたルールの `customer_ack` だけを運ぶ ---
+    //
+    // `hearing_contract()` と異なり、`customer_ack` は `binding` による抑止が無い
+    // （mandatory の取次ルールも宣言できる。design doc
+    // `2026-10-05-initial-cost-handoff-design.md` §3.3）。
+
+    /// `customer_ack` を宣言できる第1層ルール1件だけで `decide` を回し、その `customer_ack` を
+    /// 返す（`hearing_of_layer1_decision` と対になるヘルパー）。
+    fn customer_ack_of_layer1_decision(
+        binding: Binding,
+        customer_ack: Option<&str>,
+    ) -> Option<String> {
+        let rules = vec![EscalationRule {
+            id: "r1".to_string(),
+            condition: signals(&["post_ingestion_symptom"]),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding,
+            hearing: None,
+            customer_ack: customer_ack.map(str::to_string),
+        }];
+        let q = signals(&["post_ingestion_symptom"]);
+        // evidence 充足（1.0）にして missing が空であることも合わせて固定する。
+        match decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(1.0),
+            calm(),
+            &thresholds(),
+            &[],
+        )) {
+            AnswerDecision::Escalate {
+                layer,
+                missing,
+                customer_ack,
+                ..
+            } => {
+                assert_eq!(layer, 1);
+                assert!(
+                    missing.is_empty(),
+                    "sufficient evidence must not carry a missing list"
+                );
+                customer_ack
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer1_rule_declaring_a_customer_ack_carries_it_even_when_mandatory() {
+        assert_eq!(
+            customer_ack_of_layer1_decision(
+                Binding::Mandatory,
+                Some("初期費用はお客様の状況によって異なりますので、担当者におつなぎします。")
+            ),
+            Some(
+                "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。"
+                    .to_string()
+            ),
+            "unlike hearing, a declared customer_ack must survive on a mandatory rule"
+        );
+    }
+
+    #[test]
+    fn layer1_rule_without_a_customer_ack_declaration_carries_none() {
+        assert_eq!(
+            customer_ack_of_layer1_decision(Binding::Mandatory, None),
+            None
+        );
     }
 
     // --- Issue #58: `hearing` は MCP の出力契約（payload とスキーマ）に載せない ---
@@ -725,23 +847,42 @@ mod tests {
             audit_required: true,
             missing: Vec::new(),
             hearing,
+            customer_ack: None,
         }
     }
 
+    /// Issue #76: `customer_ack` も `hearing` と同じ理由で MCP の出力契約に載せない
+    /// （`escalate_with_hearing` の対になるヘルパー）。
+    fn escalate_with_customer_ack(customer_ack: Option<String>) -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            hearing: None,
+            customer_ack,
+        }
+    }
+
+    // Issue #58 以前の Escalate のキー集合（tag の `decision` を含む）。`hearing` /
+    // `customer_ack`（Issue #76 で追加した internal フィールド）の値に関わらず（Some / None）
+    // この集合と完全一致すること。「無い」だけでなく「他のキーが増減していない」ことまで固定する。
+    // `escalate_payload_keeps_its_pre_issue_58_shape_and_hides_hearing` /
+    // `escalate_payload_keeps_its_shape_and_hides_customer_ack` の両方が参照する。
+    const PRE_ISSUE_58_ESCALATE_KEYS: [&str; 7] = [
+        "audit_required",
+        "decision",
+        "disclosure_scope",
+        "layer",
+        "missing",
+        "reason",
+        "route_to",
+    ];
+
     #[test]
     fn escalate_payload_keeps_its_pre_issue_58_shape_and_hides_hearing() {
-        // Issue #58 以前の Escalate のキー集合（tag の `decision` を含む）。`hearing` の値に
-        // 関わらず（Some / None）この集合と完全一致すること。「hearing が無い」だけでなく
-        // 「他のキーが増減していない」ことまで固定する。
-        const PRE_ISSUE_58_ESCALATE_KEYS: [&str; 7] = [
-            "audit_required",
-            "decision",
-            "disclosure_scope",
-            "layer",
-            "missing",
-            "reason",
-            "route_to",
-        ];
         for hearing in [Some(HearingContract::ProductAndSymptom), None] {
             let value = serde_json::to_value(escalate_with_hearing(hearing))
                 .expect("AnswerDecision must serialize");
@@ -758,6 +899,25 @@ mod tests {
         }
     }
 
+    // Issue #76: `customer_ack` も同じ不変条件（internal 判定専用、MCP の出力契約には載せない）。
+    #[test]
+    fn escalate_payload_keeps_its_shape_and_hides_customer_ack() {
+        for customer_ack in [Some("受け止め文です。".to_string()), None] {
+            let value = serde_json::to_value(escalate_with_customer_ack(customer_ack.clone()))
+                .expect("AnswerDecision must serialize");
+            let object = value
+                .as_object()
+                .expect("AnswerDecision must serialize to a JSON object");
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys, PRE_ISSUE_58_ESCALATE_KEYS,
+                "the MCP payload for customer_ack={customer_ack:?} must not gain or lose keys \
+                 (customer_ack is an internal classification), got: {value}"
+            );
+        }
+    }
+
     #[test]
     fn answer_decision_json_schema_hides_hearing() {
         let schema = schemars::schema_for!(AnswerDecision);
@@ -769,8 +929,9 @@ mod tests {
             "the generated schema must describe the Escalate fields, got: {rendered}"
         );
         // プロパティ名としての出現を見る（引用符付き）。`rule_binding` は廃止済みの旧内部
-        // フィールド名で、再導入の検知用。
-        for internal_field in ["\"hearing\"", "\"rule_binding\""] {
+        // フィールド名で、再導入の検知用。`customer_ack` は Issue #76 で追加した internal
+        // フィールド（`hearing` と同じ理由で skip）。
+        for internal_field in ["\"hearing\"", "\"rule_binding\"", "\"customer_ack\""] {
             assert!(
                 !rendered.contains(internal_field),
                 "{internal_field} must not appear in the generated schema advertised to MCP \
@@ -1749,6 +1910,202 @@ mod tests {
                 Some("contract-billing"),
                 "lexicon extraction through match_layer1 must yield contract-billing: {utterance}"
             );
+        }
+    }
+
+    // --- Issue #76: 初期費用の問い合わせを第1層で即時取次にする ---
+    //
+    // 「初期費用」「設置費」等の surface_forms を新設の `initial_cost_question` へ切り出し、
+    // `data/urtect/rules.json` の第1層 mandatory ルール `initial-cost-quote` にマッチさせる。
+    // 初期費用は設置環境で決まり、聞き返しても公開情報からは答えられないため advisory ではなく
+    // mandatory にする（design doc `2026-10-05-initial-cost-handoff-design.md` §1）。
+
+    #[test]
+    fn bundled_lexicon_extracts_initial_cost_question_for_known_surface_forms() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+
+        for utterance in [
+            "初期費用はいくらですか？",
+            "設置工事費はいくらかかりますか",
+            "導入費用を教えてください",
+        ] {
+            assert!(
+                lex.normalize(utterance)
+                    .contains(&Signal::new("initial_cost_question")),
+                "expected initial_cost_question signal for utterance: {utterance}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_lexicon_does_not_flag_initial_cost_question_for_unrelated_phrases() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+
+        for utterance in [
+            "月額いくらですか？",
+            "設置方法を教えてください",
+            "設置代行はありますか",
+        ] {
+            assert!(
+                !lex.normalize(utterance)
+                    .contains(&Signal::new("initial_cost_question")),
+                "expected initial_cost_question to NOT fire for: {utterance}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_initial_cost_phrases_match_layer1_initial_cost_quote() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in [
+            "初期費用はいくらですか？",
+            "設置工事費はいくらかかりますか",
+            "導入費用を教えてください",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert_eq!(
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+                Some("initial-cost-quote"),
+                "expected layer1 to resolve to initial-cost-quote for: {utterance}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_monthly_fee_question_does_not_match_any_layer1_rule() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        let extracted = lex.normalize("月額いくらですか？");
+        assert!(
+            match_layer1(&rules, &extracted).is_none(),
+            "a plain monthly-fee question must not match any layer1 rule, got: {:?}",
+            match_layer1(&rules, &extracted).map(|rule| rule.id.as_str())
+        );
+    }
+
+    const INITIAL_COST_ACK: &str =
+        "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。";
+
+    /// bundled lexicon で発話を抽出し、与えたルール集合で `decide` を回して
+    /// （第1層取次か, `customer_ack`）を返す。想定 signal が立っていることもここで固定する。
+    fn layer1_ack_for(
+        utterance: &str,
+        expected_signals: &[&str],
+        rules: &[EscalationRule],
+    ) -> (bool, Option<String>) {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let extracted = lex.normalize(utterance);
+        for s in expected_signals {
+            assert!(
+                extracted.contains(&Signal::new(*s)),
+                "precondition: signal {s} must fire for: {utterance}, got {extracted:?}"
+            );
+        }
+        match decide(&input(
+            &extracted,
+            rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        )) {
+            AnswerDecision::Escalate {
+                layer,
+                customer_ack,
+                ..
+            } => (layer == 1, customer_ack),
+            other => panic!("expected escalate for {utterance}, got {other:?}"),
+        }
+    }
+
+    /// (発話, 立つべき signal, 期待する customer_ack)。`customer_ack` は第1層でマッチした
+    /// ルールがちょうど1件のときだけ有効（複合発話は None）。
+    fn initial_cost_ack_cases() -> Vec<(&'static str, Vec<&'static str>, Option<&'static str>)> {
+        vec![
+            (
+                "初期費用はいくらですか？",
+                vec!["initial_cost_question"],
+                Some(INITIAL_COST_ACK),
+            ),
+            (
+                "電気工事の工事費はいくらですか",
+                vec!["initial_cost_question", "physical_construction_risk"],
+                None,
+            ),
+            (
+                "初期費用のことで担当者につないでください",
+                vec!["initial_cost_question", "human_handoff_request"],
+                None,
+            ),
+            (
+                "工事費の請求書を再発行してください",
+                vec!["initial_cost_question", "contract_billing_question"],
+                None,
+            ),
+        ]
+    }
+
+    // customer_ack は、その発話にマッチする第1層ルールがちょうど1件のときだけ有効。
+    #[test]
+    fn bundled_customer_ack_applies_only_when_exactly_one_layer1_rule_matches() {
+        let rules = load_bundled_escalation_rules();
+        for (utterance, expected_signals, expected_ack) in initial_cost_ack_cases() {
+            let (is_layer1, ack) = layer1_ack_for(utterance, &expected_signals, &rules);
+            assert!(is_layer1, "must hand off at layer 1 for: {utterance}");
+            assert_eq!(
+                ack.as_deref(),
+                expected_ack,
+                "customer_ack mismatch for: {utterance}"
+            );
+        }
+    }
+
+    // customer_ack の適用可否はルールの並び順（本番は vegapunk の返却順）に依存しない。
+    #[test]
+    fn customer_ack_outcome_is_independent_of_rule_order() {
+        let original = load_bundled_escalation_rules();
+        let mut reversed = original.clone();
+        reversed.reverse();
+        let mut initial_cost_first = original.clone();
+        let pos = initial_cost_first
+            .iter()
+            .position(|r| r.id == "initial-cost-quote")
+            .expect("initial-cost-quote is bundled");
+        let rule = initial_cost_first.remove(pos);
+        initial_cost_first.insert(0, rule);
+
+        for (label, rules) in [
+            ("original", &original),
+            ("reversed", &reversed),
+            ("initial-cost-first", &initial_cost_first),
+        ] {
+            for (utterance, expected_signals, expected_ack) in initial_cost_ack_cases() {
+                let (is_layer1, ack) = layer1_ack_for(utterance, &expected_signals, rules);
+                assert!(
+                    is_layer1,
+                    "[{label}] must hand off at layer 1 for: {utterance}"
+                );
+                assert_eq!(
+                    ack.as_deref(),
+                    expected_ack,
+                    "[{label}] customer_ack mismatch for: {utterance}"
+                );
+            }
         }
     }
 
