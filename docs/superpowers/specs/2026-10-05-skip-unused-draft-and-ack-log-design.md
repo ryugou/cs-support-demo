@@ -58,7 +58,7 @@ pub enum ReplyDraftPolicy<'a> {
 
 `LexiconFallback` で下書きを作らないのは、応答生成 API とアドバイザが LLM 分類失敗のターンを判定（`Allowed` を含む）によらず取次応答にするためである。抽出モードは下書き生成より前に確定している。
 
-二段目ゲートが打ち切るかどうかは、`product_gate::confirmed_foreign_reference(&product_references, question, response_allowlist)` が `Some` を返すかどうかで決める（純関数 `second_stage_short_circuits`）。応答側（`api.rs` / `advisor/cs_support.rs` の `second_stage_out_of_scope_reply`）が呼ぶ述語と同一で、入力も同一である。`product_references` は `EvaluationOutcome.product_references` と同じ値、質問本文は応答側が二段目ゲートに渡すメッセージと同じ値、allowlist は方針に載せた `response_allowlist`（応答側が二段目ゲートに渡すのと同じ変数）である。`evaluate` 内で取得した allowlist はこの事前判定に使わない。したがって事前判定は応答側の判定と必ず一致する。方針が `Always` のときは評価しない。
+二段目ゲートが打ち切るかどうかは、`product_gate::find_confirmed_foreign_reference(&product_references, question, response_allowlist).confirmed` が `Some` かどうかで決める（純関数 `second_stage_short_circuits`）。この関数は、応答側（`api.rs` / `advisor/cs_support.rs` の `second_stage_out_of_scope_reply`）が呼ぶ `product_gate::confirmed_foreign_reference` と同じ判定本体で、入力も同一である。違いはログだけである。判定本体 `find_confirmed_foreign_reference` はログを出さず、veto（取扱内型番と矛盾する `foreign` 分類の打ち消し）が起きたことを戻り値で返す。`confirmed_foreign_reference` はその戻り値から veto の警告（`tracing::warn!`）を出すラッパーである。事前判定は判定本体だけを呼ぶため、同じ入力が事前判定と応答側で 2 回判定されても、veto の警告は応答側の判定で 1 回だけ出る。`product_references` は `EvaluationOutcome.product_references` と同じ値、質問本文は応答側が二段目ゲートに渡すメッセージと同じ値、allowlist は方針に載せた `response_allowlist`（応答側が二段目ゲートに渡すのと同じ変数）である。`evaluate` 内で取得した allowlist はこの事前判定に使わない。したがって事前判定は応答側の判定と必ず一致する。方針が `Always` のときは `false` を返す。
 
 `should_draft_reply` の条件は、応答側（`decide_reply_action` と二段目ゲート）が下書きを読まない条件と一致させる。
 
@@ -117,13 +117,15 @@ pub fn matching_layer1_rules<'a>(rules: &'a [EscalationRule], question: &SignalS
 | `harness/mod.rs`（`evaluate`） | `SkipWhenUnused` で回答（`Allowed`）、`LexiconFallback` 以外、かつ二段目ゲートが打ち切らないターンは下書きが生成される |
 | `harness/mod.rs`（`evaluate`） | `Always` で取次になるターン、または二段目ゲートが打ち切るターンは下書きが生成される |
 | `harness/mod.rs`（`second_stage_short_circuits`） | `Always` は常に `false`。`SkipWhenUnused` は、取扱外が確定する `response_allowlist` で `true`、同じ製品参照・質問でもその型番を取扱製品として含む `response_allowlist` で `false`（方針に載せた allowlist が判定に使われることの固定） |
+| `harness/mod.rs`（`second_stage_short_circuits`） | veto が起きる入力（`matched_model` が取扱内型番）で呼んでも警告が出ない |
+| `harness/product_gate.rs`（`find_confirmed_foreign_reference` / `confirmed_foreign_reference`） | 判定本体とラッパーが、確定あり・参照なし・ambiguous のみ・matched のみ・各 veto 条件で同じ結果を返す。判定本体は警告を出さず veto 情報（種別と文字数）を返す。ラッパーは veto 時に警告を 1 行だけ出し、veto が無いときは出さない |
 | `harness/mod.rs`（`evaluate`） | 3.2 の 3 条件を満たすときログが 1 行出て `matched_rule_ids` が昇順で含まれる。マッチ 1 件のとき、および複数マッチでも宣言を持つルールが無いときは出ない。ログに発話本文が含まれない |
 | `harness/rules.rs` | `matching_layer1_rules` が 0 件・1 件・複数件を返し、空条件のルールを含めない。`count_layer1_matches` の既存テストが変更なしで通る |
 | `harness/knowledge.rs` | 重複した `rule_id` を含む入力で警告が 1 行出て、重複 ID が昇順で含まれる。重複が無いときは出ない |
 
 `evaluate` を通すテストの土台（vegapunk クライアントのスタブ等）が既存テストに無く、新たな仕組みを作らないと書けない場合は、該当する判定部分を純関数に切り出して単体テストする。切り出す関数は次の 3 つとする。
 
-- 二段目ゲートの打ち切り有無: `fn second_stage_short_circuits(policy: &ReplyDraftPolicy, product_references: &[ProductReference], question: &str) -> bool`（`Always` は `false`、`SkipWhenUnused` は `response_allowlist` で `confirmed_foreign_reference` を評価する）
+- 二段目ゲートの打ち切り有無: `fn second_stage_short_circuits(policy: &ReplyDraftPolicy, product_references: &[ProductReference], question: &str) -> bool`（`Always` は `false`、`SkipWhenUnused` は `response_allowlist` で `find_confirmed_foreign_reference` を評価する）
 - 下書きを生成するかどうか: `fn should_draft_reply(policy: &ReplyDraftPolicy, decision: &AnswerDecision, extraction_mode: ExtractionMode, second_stage_short_circuits: bool) -> bool`（`SkipWhenUnused` は取次、`LexiconFallback`、または `second_stage_short_circuits` で `false`、`Always` は常に `true`）
 - ログを出すかどうかと出力する ID: `fn suppressed_ack_rule_ids(decision: &AnswerDecision, rules: &[EscalationRule], signals: &SignalSet) -> Option<Vec<String>>`（3.2 の条件を満たすとき昇順の `rule_id` 一覧、満たさないとき `None`）
 

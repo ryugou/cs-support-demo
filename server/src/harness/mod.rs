@@ -565,8 +565,8 @@ pub enum UnknownCaseIdPolicy {
 ///
 /// 既定値は設けない。`evaluate` の全呼び出し箇所（`rmcp_server.rs` / `api.rs` /
 /// `advisor/cs_support.rs`）が明示的に渡す。`/api/reply` と homesec 経由（`SkipWhenUnused`）は
-/// 取次時、および LLM 分類失敗（`LexiconFallback`）時は、受け止め文と決定的ブロック・または
-/// 聞き返しで応答を組み立て下書きを使わずに捨てるため、その LLM 呼び出しをそもそも発行しない。MCP
+/// 応答側が下書きを使わないと確定しているターン（条件は `SkipWhenUnused` を参照）では、その
+/// LLM 呼び出しをそもそも発行しない。MCP
 /// `evaluate_answerability`（`Always`）は `customer_reply_draft` が出力契約の一部であり、
 /// 取次時も返す。詳細は design doc
 /// `docs/superpowers/specs/2026-10-05-skip-unused-draft-and-ack-log-design.md` §2。
@@ -591,7 +591,9 @@ pub enum ReplyDraftPolicy<'a> {
 
 /// 二段目ゲート（確定した取扱外製品への言及）が、応答側で打ち切るかどうかを事前に求める純関数
 /// （Issue #83）。述語は応答側と同一の `product_gate::confirmed_foreign_reference` で、
-/// 方針に載せられた `response_allowlist` を使う。`Always` は結果を使わないため評価しない。
+/// 方針に載せられた `response_allowlist` を使う。`Always` は結果を使わないため `false`。
+/// 述語はログを出さない版（`find_confirmed_foreign_reference`）を呼び、veto の警告は応答側の
+/// 判定で 1 回だけ出す。
 fn second_stage_short_circuits(
     policy: &ReplyDraftPolicy<'_>,
     product_references: &[product_gate::ProductReference],
@@ -600,11 +602,13 @@ fn second_stage_short_circuits(
     match policy {
         ReplyDraftPolicy::Always => false,
         ReplyDraftPolicy::SkipWhenUnused { response_allowlist } => {
-            product_gate::confirmed_foreign_reference(
+            // ログを出さない版を使う。veto の警告は応答側の判定で 1 回だけ出す。
+            product_gate::find_confirmed_foreign_reference(
                 product_references,
                 question,
                 response_allowlist,
             )
+            .confirmed
             .is_some()
         }
     }
@@ -2316,7 +2320,7 @@ mod tests {
     }
 
     #[test]
-    fn second_stage_short_circuits_is_false_for_always_without_evaluating_the_predicate() {
+    fn second_stage_short_circuits_is_false_for_always() {
         let refs = vec![foreign_reference("ADC-VDB101")];
         assert!(!second_stage_short_circuits(
             &ReplyDraftPolicy::Always,
@@ -2355,6 +2359,34 @@ mod tests {
             "ADC-VDB101について教えてください"
         ));
     }
+
+    #[test]
+    fn second_stage_short_circuits_emits_no_warning_even_when_a_veto_occurs() {
+        // 取扱内型番を matched_model に持つ自己矛盾出力は veto される。この veto の警告は応答側の
+        // 判定で 1 回だけ出すため、事前判定は警告を出さない（Issue #83）。
+        let allow = response_allowlist_fixture();
+        let refs = vec![product_gate::ProductReference {
+            surface: "ADC-VDB101".to_string(),
+            resolution: product_gate::ProductReferenceResolution::Foreign,
+            matched_model: Some("ADC-V724".to_string()),
+        }];
+        let (short_circuits, logs) = crate::test_support::capture_logs(|| {
+            second_stage_short_circuits(
+                &ReplyDraftPolicy::SkipWhenUnused {
+                    response_allowlist: &allow,
+                },
+                &refs,
+                "ADC-VDB101について教えてください",
+            )
+        });
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(!short_circuits, "veto された参照では打ち切らない");
+        assert!(
+            warnings.is_empty(),
+            "事前判定は警告を出してはならない: {warnings}"
+        );
+    }
+
     // `ExtractionMode` の全バリアント。バリアント追加時に網羅が漏れないよう、この match は
     // ワイルドカードを使わない（コンパイルエラーで気づく）。
     fn all_extraction_modes() -> [extraction::ExtractionMode; 3] {
