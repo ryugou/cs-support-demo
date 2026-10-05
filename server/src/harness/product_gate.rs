@@ -465,9 +465,30 @@ fn reflection_unsafe_char_regex() -> &'static regex::Regex {
     })
 }
 
-/// Issue #28 §3.1 二段目のコード判定本体: LLM が `foreign` と分類した参照のうち、
-/// **matched_model の非矛盾**（`matched_model` が決定論の allowlist 上で取扱内製品を指して
-/// いない。resolution=foreign と matched_model=取扱内型番という自己矛盾出力の veto。W1-a
+/// [`find_confirmed_foreign_reference`] が、LLM の `foreign` 分類を打ち消した（veto した）理由。
+/// ログに出す項目だけを持つ（surface / matched_model の生値は反射安全性の観点から持たない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignReferenceVeto {
+    /// `matched_model` が取扱内の製品マスタ型番を指す自己矛盾出力（Issue #28 W1-a）。
+    MatchedModelInScope {
+        matched_model_chars: usize,
+        surface_chars: usize,
+    },
+    /// `surface` が取扱内の製品マスタ型番を指す誤分類（Issue #28 Warning 4）。
+    SurfaceInScope { surface_chars: usize },
+}
+
+/// [`find_confirmed_foreign_reference`] の結果。`vetoes` は、確定した参照（または走査の終端）
+/// より前に起きた veto を走査順に並べたもの。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ForeignReferenceCheck<'a> {
+    pub confirmed: Option<&'a ProductReference>,
+    pub vetoes: Vec<ForeignReferenceVeto>,
+}
+
+/// Issue #28 §3.1 二段目のコード判定本体（ログを出さない純関数）: LLM が `foreign` と分類した
+/// 参照のうち、**matched_model の非矛盾**（`matched_model` が決定論の allowlist 上で取扱内製品を
+/// 指していない。resolution=foreign と matched_model=取扱内型番という自己矛盾出力の veto。W1-a
 /// 是正。`surface` 側と同じ [`ProductAllowlist::matches_in_scope_model`] を使うため、"ADC-"
 /// 接頭辞を欠く型番断片一致も matched_model 側で捕まる。修正1でこの対称性を導入した）、
 /// **幻覚ガード**（`surface` が正規化後の `message` 中に実在する）、**最小長**
@@ -481,13 +502,18 @@ fn reflection_unsafe_char_regex() -> &'static regex::Regex {
 /// 表層、顧客向け応答に反射すると危険な表層、そして製品マスタと矛盾する誤分類（取扱内製品を
 /// `foreign` と誤答するケース）のいずれからも安全側（＝取扱外応答を返さず、以降の通常フローへ
 /// 委ねる）に倒す。
-pub fn confirmed_foreign_reference<'a>(
+///
+/// ログを出さないのは、同じ入力で複数回呼ぶ呼び出し側（`Harness::evaluate` の下書き事前判定と
+/// 応答側）が veto の警告を重複して出さないため（Issue #83）。警告は [`confirmed_foreign_reference`]
+/// が `vetoes` から出す。判定条件はここだけに置く。
+pub fn find_confirmed_foreign_reference<'a>(
     refs: &'a [ProductReference],
     message: &str,
     allowlist: &ProductAllowlist,
-) -> Option<&'a ProductReference> {
+) -> ForeignReferenceCheck<'a> {
     let normalized_message = normalize_for_presence_check(message);
-    refs.iter().find(|r| {
+    let mut vetoes = Vec::new();
+    let confirmed = refs.iter().find(|r| {
         if r.resolution != ProductReferenceResolution::Foreign {
             return false;
         }
@@ -498,13 +524,10 @@ pub fn confirmed_foreign_reference<'a>(
                 // `matches_in_scope_model` を使うため、"ADC-" 接頭辞を欠く型番断片
                 // （例: "V724"）のサフィックス一致も matched_model 側で捕まる（Issue #28 W1-b
                 // 是正の対称化）。
-                tracing::warn!(
-                    matched_model_chars = matched_model.trim().chars().count(),
-                    surface_chars = r.surface.trim().chars().count(),
-                    "llm classified a product reference as foreign but supplied a matched_model \
-                     that matches an in-scope product master model (self-contradictory output); \
-                     vetoing"
-                );
+                vetoes.push(ForeignReferenceVeto::MatchedModelInScope {
+                    matched_model_chars: matched_model.trim().chars().count(),
+                    surface_chars: r.surface.trim().chars().count(),
+                });
                 return false;
             }
         }
@@ -519,19 +542,50 @@ pub fn confirmed_foreign_reference<'a>(
             return false;
         }
         if allowlist.matches_in_scope_model(surface) {
-            // LLM が製品マスタ（決定論の正本）と矛盾する分類を返した。運用上の兆候として
-            // warn するが、surface の生値は出さない（Warning 3 の反射安全性の懸念と同じ理由）。
-            tracing::warn!(
-                surface_chars = surface.chars().count(),
+            // LLM が製品マスタ（決定論の正本）と矛盾する分類を返した。surface の生値は
+            // ログに出さない（Warning 3 の反射安全性の懸念と同じ理由）。
+            vetoes.push(ForeignReferenceVeto::SurfaceInScope {
+                surface_chars: surface.chars().count(),
+            });
+            return false;
+        }
+        true
+    });
+    ForeignReferenceCheck { confirmed, vetoes }
+}
+
+/// [`find_confirmed_foreign_reference`] の結果を返しつつ、veto が起きていれば運用者向けの
+/// `tracing::warn!` を出す。応答側（`api.rs` / `advisor/cs_support.rs`）が使う。
+/// 警告が 1 ターンに 1 回だけになるよう、事前判定（`Harness::evaluate`）は
+/// ログを出さない [`find_confirmed_foreign_reference`] を使う。
+pub fn confirmed_foreign_reference<'a>(
+    refs: &'a [ProductReference],
+    message: &str,
+    allowlist: &ProductAllowlist,
+) -> Option<&'a ProductReference> {
+    let check = find_confirmed_foreign_reference(refs, message, allowlist);
+    for veto in &check.vetoes {
+        match *veto {
+            ForeignReferenceVeto::MatchedModelInScope {
+                matched_model_chars,
+                surface_chars,
+            } => tracing::warn!(
+                matched_model_chars,
+                surface_chars,
+                "llm classified a product reference as foreign but supplied a matched_model \
+                 that matches an in-scope product master model (self-contradictory output); \
+                 vetoing"
+            ),
+            ForeignReferenceVeto::SurfaceInScope { surface_chars } => tracing::warn!(
+                surface_chars,
                 "llm classified a product reference as foreign (out of scope) but the surface \
                  matches an in-scope product master model; vetoing this reference and falling \
                  through to the normal flow (the deterministic product master overrides the \
                  llm's interpretation)"
-            );
-            return false;
+            ),
         }
-        true
-    })
+    }
+    check.confirmed
 }
 
 /// §4 の取扱外定型応答をコードで組み立てる（LLM 不使用・プレーンテキスト）。
@@ -1420,6 +1474,191 @@ mod tests {
             ),
             Some(&refs[0])
         );
+    }
+
+    // ---- find_confirmed_foreign_reference: ログを出さない判定本体（Issue #83） ----
+
+    fn matched_model_veto_refs() -> Vec<ProductReference> {
+        vec![ProductReference {
+            surface: "Ringのドアベル".to_string(),
+            resolution: ProductReferenceResolution::Foreign,
+            matched_model: Some("ADC-V724".to_string()),
+        }]
+    }
+
+    #[test]
+    fn find_confirmed_foreign_reference_agrees_with_the_logging_wrapper_on_every_outcome() {
+        let allow = fixture_allowlist();
+        let ambiguous = vec![ProductReference {
+            surface: "ドアベル".to_string(),
+            resolution: ProductReferenceResolution::Ambiguous,
+            matched_model: None,
+        }];
+        let matched = vec![ProductReference {
+            surface: "ADC-V724".to_string(),
+            resolution: ProductReferenceResolution::Matched,
+            matched_model: Some("ADC-V724".to_string()),
+        }];
+        let cases: Vec<(Vec<ProductReference>, &str)> = vec![
+            (vec![foreign_ref("ADC-VDB101")], "ADC-VDB101について"), // 確定あり
+            (vec![], "ADC-VDB101について"),                          // 参照なし
+            (ambiguous, "ドアベルの設定は?"),                        // ambiguous のみ
+            (matched, "ADC-V724の設定は?"),                          // matched のみ
+            (vec![foreign_ref("ADC-VDB101")], "映像が映りません"),   // 幻覚（実在しない）
+            (vec![foreign_ref("V")], "Vについて"),                   // 最小長未満
+            (vec![foreign_ref("ADC-V724")], "ADC-V724の調子が悪い"), // surface veto
+            (matched_model_veto_refs(), "Ringのドアベルについて"),   // matched_model veto
+        ];
+        for (refs, message) in cases {
+            assert_eq!(
+                find_confirmed_foreign_reference(&refs, message, &allow).confirmed,
+                confirmed_foreign_reference(&refs, message, &allow),
+                "message={message}"
+            );
+        }
+    }
+
+    /// 走査順に 4 件: (1) matched_model veto、(2) surface veto、(3) 確定する取扱外参照、
+    /// (4) 確定より後ろの surface veto（単独なら veto される。surface が 9 文字で (2) の
+    /// 8 文字と区別できる）。
+    fn mixed_veto_and_confirmed_refs() -> (Vec<ProductReference>, &'static str) {
+        let refs = vec![
+            ProductReference {
+                surface: "Ringのドアベル".to_string(),
+                resolution: ProductReferenceResolution::Foreign,
+                matched_model: Some("ADC-V724".to_string()),
+            },
+            foreign_ref("ADC-V724"),
+            foreign_ref("ADC-VDB101"),
+            foreign_ref("ADC-V523X"),
+        ];
+        (
+            refs,
+            "Ringのドアベル、ADC-V724、ADC-VDB101、ADC-V523Xについて",
+        )
+    }
+
+    #[test]
+    fn find_confirmed_foreign_reference_skips_vetoed_references_and_stops_at_the_first_confirmed_one(
+    ) {
+        let (refs, message) = mixed_veto_and_confirmed_refs();
+        let (check, logs) = capture_warnings_sync(|| {
+            find_confirmed_foreign_reference(&refs, message, &fixture_allowlist())
+        });
+        assert_eq!(
+            check.confirmed,
+            Some(&refs[2]),
+            "veto された 1・2 を飛ばして 3 を確定する"
+        );
+        assert_eq!(
+            check.vetoes,
+            vec![
+                ForeignReferenceVeto::MatchedModelInScope {
+                    matched_model_chars: 8,
+                    surface_chars: 9,
+                },
+                ForeignReferenceVeto::SurfaceInScope { surface_chars: 8 },
+            ],
+            "確定より後ろの 4 は評価されず記録されない"
+        );
+        assert!(logs.is_empty(), "判定本体は警告を出さない: {logs}");
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_returns_the_first_confirmed_one_and_warns_for_each_earlier_veto_in_scan_order(
+    ) {
+        let (refs, message) = mixed_veto_and_confirmed_refs();
+        let (result, logs) = capture_warnings_sync(|| {
+            confirmed_foreign_reference(&refs, message, &fixture_allowlist())
+        });
+        assert_eq!(result, Some(&refs[2]));
+        let lines: Vec<&str> = logs.lines().collect();
+        assert_eq!(lines.len(), 2, "{logs}");
+        assert!(lines[0].contains("self-contradictory output"), "{logs}");
+        assert!(lines[0].contains("matched_model_chars=8"), "{logs}");
+        assert!(
+            lines[1].contains("the deterministic product master overrides"),
+            "{logs}"
+        );
+        assert!(lines[1].contains("surface_chars=8"), "{logs}");
+    }
+
+    #[test]
+    fn find_confirmed_foreign_reference_reports_a_matched_model_veto_without_logging() {
+        let refs = matched_model_veto_refs();
+        let (check, logs) = capture_warnings_sync(|| {
+            find_confirmed_foreign_reference(&refs, "Ringのドアベルについて", &fixture_allowlist())
+        });
+        assert_eq!(check.confirmed, None);
+        assert_eq!(
+            check.vetoes,
+            vec![ForeignReferenceVeto::MatchedModelInScope {
+                matched_model_chars: 8,
+                surface_chars: 9,
+            }]
+        );
+        assert!(logs.is_empty(), "判定本体は警告を出さない: {logs}");
+    }
+
+    #[test]
+    fn find_confirmed_foreign_reference_reports_a_surface_veto_without_logging() {
+        let refs = vec![foreign_ref("ADC-V724")];
+        let (check, logs) = capture_warnings_sync(|| {
+            find_confirmed_foreign_reference(&refs, "ADC-V724の調子が悪い", &fixture_allowlist())
+        });
+        assert_eq!(check.confirmed, None);
+        assert_eq!(
+            check.vetoes,
+            vec![ForeignReferenceVeto::SurfaceInScope { surface_chars: 8 }]
+        );
+        assert!(logs.is_empty(), "判定本体は警告を出さない: {logs}");
+    }
+
+    #[test]
+    fn find_confirmed_foreign_reference_has_no_vetoes_for_a_plain_confirmation() {
+        let refs = vec![foreign_ref("ADC-VDB101")];
+        let check =
+            find_confirmed_foreign_reference(&refs, "ADC-VDB101について", &fixture_allowlist());
+        assert_eq!(check.confirmed, Some(&refs[0]));
+        assert!(check.vetoes.is_empty());
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_emits_exactly_one_warning_for_a_matched_model_veto() {
+        let refs = matched_model_veto_refs();
+        let (result, logs) = capture_warnings_sync(|| {
+            confirmed_foreign_reference(&refs, "Ringのドアベルについて", &fixture_allowlist())
+        });
+        assert_eq!(result, None);
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(logs.contains("self-contradictory output"), "{logs}");
+        assert!(logs.contains("matched_model_chars=8"), "{logs}");
+        assert!(logs.contains("surface_chars=9"), "{logs}");
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_emits_exactly_one_warning_for_a_surface_veto() {
+        let refs = vec![foreign_ref("ADC-V724")];
+        let (result, logs) = capture_warnings_sync(|| {
+            confirmed_foreign_reference(&refs, "ADC-V724の調子が悪い", &fixture_allowlist())
+        });
+        assert_eq!(result, None);
+        assert_eq!(logs.lines().count(), 1, "{logs}");
+        assert!(
+            logs.contains("the deterministic product master overrides"),
+            "{logs}"
+        );
+        assert!(logs.contains("surface_chars=8"), "{logs}");
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_emits_no_warning_when_nothing_is_vetoed() {
+        let refs = vec![foreign_ref("ADC-VDB101")];
+        let (result, logs) = capture_warnings_sync(|| {
+            confirmed_foreign_reference(&refs, "ADC-VDB101について", &fixture_allowlist())
+        });
+        assert!(result.is_some());
+        assert!(logs.is_empty(), "{logs}");
     }
 
     // ---- confirmed_foreign_reference: ADC-無し型番断片の suffix veto（Issue #28 W1-b 是正） ----

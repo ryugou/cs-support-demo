@@ -51,7 +51,8 @@ use crate::harness::product_gate::{self, ProductAllowlist};
 use crate::harness::reply::ReplyHistoryTurn;
 use crate::harness::{clarify, escalation_reply, hours, time_pref};
 use crate::harness::{
-    CaseConvState, EvaluationOutcome, Harness, RequestContext, UnknownCaseIdPolicy,
+    CaseConvState, EvaluationOutcome, Harness, ReplyDraftPolicy, RequestContext,
+    UnknownCaseIdPolicy,
 };
 use crate::mcp::ToolService;
 use crate::oauth::VerifiedIdentity;
@@ -232,6 +233,14 @@ pub async fn run_support_turn(
             is_continuation,
             UnknownCaseIdPolicy::StartNew,
             end_user_id,
+            // Issue #78, #83: 取次時・`LexiconFallback` のターン・二段目ゲートが打ち切るターンは、
+            // 受け止め文と決定的ブロック、聞き返し、または取扱外の定型応答で応答を組み立て、
+            // 下書きを使わない（design doc
+            // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。事前判定には、下の
+            // 二段目ゲート（`second_stage_short_circuit`）に渡すのと同じ `allowlist` を使う。
+            ReplyDraftPolicy::SkipWhenUnused {
+                response_allowlist: &allowlist,
+            },
         )
         .await?;
 

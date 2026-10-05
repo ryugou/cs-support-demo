@@ -5,7 +5,7 @@ use crate::{
         grading::AnswerOutcome,
         knowledge::PastCase,
         rules::{KrMatch, SourceAuthority},
-        Harness, RequestContext,
+        Harness, ReplyDraftPolicy, RequestContext,
     },
     mcp::ToolService,
     model::{ProductCandidate, ProductView, SectionHit, SectionView},
@@ -691,6 +691,10 @@ impl CsSupportRmcpServer {
                 // 2026-08-16 admin dashboard design doc §3: end_user_id は /api/reply 経路
                 // 限定（MCP は CS 担当の対話でありスレッド概念が異なる。design doc §7）。
                 None,
+                // Issue #78: customer_reply_draft は evaluate_answerability の出力契約の一部。
+                // 取次時も含め常に生成する（design doc
+                // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。
+                ReplyDraftPolicy::Always,
             )
             .await
             .map_err(to_error)?;

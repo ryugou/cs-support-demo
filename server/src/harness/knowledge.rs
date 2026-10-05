@@ -296,6 +296,41 @@ fn parse_customer_ack(value: Option<&String>) -> Option<String> {
     }
 }
 
+/// `rules` の中で `rule_id` が複数回現れているものだけを、昇順・重複なしで返す。
+/// 重複が無ければ空配列。副作用なし（`warn_on_duplicate_rule_ids` から呼ばれる）。
+fn duplicate_rule_ids(rules: &[EscalationRule]) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut duplicates: BTreeSet<&str> = BTreeSet::new();
+    for rule in rules {
+        if !seen.insert(rule.id.as_str()) {
+            duplicates.insert(rule.id.as_str());
+        }
+    }
+    duplicates.into_iter().map(str::to_string).collect()
+}
+
+/// `load_escalation_rules` が読み込んだ `rules` の中に同じ `rule_id` が複数あれば warn する。
+///
+/// 読み込み自体は失敗させず、重複したルールの除去もしない（第1層の判定挙動を変えない。
+/// `match_layer1` / `matching_layer1_rules` は配列をそのまま走査するため、重複があっても
+/// マッチ件数が増えるだけで判定結果が壊れるわけではない）。運用者が vegapunk 上の
+/// `EscalationRule` ノードの重複（投入元 `rules.json` との不整合）に気づけるようにするだけの
+/// 観測用ログ（design doc `2026-10-05-skip-unused-draft-and-ack-log-design.md` §3.3）。
+fn warn_on_duplicate_rule_ids(schema: &str, rules: &[EscalationRule]) {
+    let duplicates = duplicate_rule_ids(rules);
+    if !duplicates.is_empty() {
+        tracing::warn!(
+            schema = %schema,
+            duplicate_rule_ids = ?duplicates,
+            "multiple EscalationRule nodes share the same rule_id; verify the EscalationRule \
+             nodes in vegapunk for this schema and cross-check them against the rules.json fed \
+             to ingest-rules. Rules are not deduplicated — every matching rule still counts \
+             toward layer-1 matches"
+        );
+    }
+}
+
 pub fn escalation_rule_from_attributes(attrs: &HashMap<String, String>) -> Result<EscalationRule> {
     let id = attrs
         .get("rule_id")
@@ -708,13 +743,17 @@ impl KnowledgeStore {
     }
 
     pub async fn load_escalation_rules(&self, schema: &str) -> Result<Vec<EscalationRule>> {
-        self.client
+        let rules: Vec<EscalationRule> = self
+            .client
             .query_nodes(schema, "EscalationRule", Vec::new(), 1000)
             .await
             .context("load escalation rules")?
             .into_iter()
             .map(|node| escalation_rule_from_attributes(&node.attributes))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // 重複 rule_id は判定の挙動を変えない（除去しない）。運用者が気づけるようにするだけ。
+        warn_on_duplicate_rule_ids(schema, &rules);
+        Ok(rules)
     }
 
     pub async fn load_prohibited_domains(&self, schema: &str) -> Result<Vec<ProhibitedDomain>> {
@@ -2777,5 +2816,77 @@ mod tests {
             "schema/homesec.yml edges is missing edge types that the shared admin corrections \
              path (admin.rs::create_correction) writes: {missing_edges:?}"
         );
+    }
+
+    // ---- 重複 rule_id の警告（Issue #79 / design doc §3.3） ----
+
+    /// `capture_warnings_sync`（`product_gate.rs` と同じパターン）。`duplicate_rule_ids` 自体は
+    /// 副作用が無いが、`warn_on_duplicate_rule_ids` が実際に warn を出すことを固定するために使う。
+    fn capture_warnings_sync<F, T>(f: F) -> (T, String)
+    where
+        F: FnOnce() -> T,
+    {
+        let (result, logs) = crate::test_support::capture_logs(f);
+        (
+            result,
+            crate::test_support::filter_warn_and_error_lines(&logs),
+        )
+    }
+
+    fn rule_without_ack(id: &str) -> EscalationRule {
+        EscalationRule {
+            id: id.to_string(),
+            condition: crate::harness::signal::SignalSet::from_iter([Signal::new("x")]),
+            route: "support_desk".to_string(),
+            owner: None,
+            binding: Binding::Advisory,
+            hearing: None,
+            customer_ack: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_rule_ids_is_empty_when_all_ids_are_unique() {
+        let rules = vec![rule_without_ack("a"), rule_without_ack("b")];
+        assert!(duplicate_rule_ids(&rules).is_empty());
+    }
+
+    #[test]
+    fn duplicate_rule_ids_returns_duplicates_sorted_and_deduplicated() {
+        let rules = vec![
+            rule_without_ack("zeta"),
+            rule_without_ack("alpha"),
+            rule_without_ack("zeta"),
+            rule_without_ack("alpha"),
+            rule_without_ack("alpha"),
+        ];
+        assert_eq!(duplicate_rule_ids(&rules), vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn warn_on_duplicate_rule_ids_warns_once_with_sorted_duplicate_ids_when_duplicates_exist() {
+        let rules = vec![
+            rule_without_ack("zeta"),
+            rule_without_ack("alpha"),
+            rule_without_ack("zeta"),
+            rule_without_ack("alpha"),
+        ];
+        let (_, logs) = capture_warnings_sync(|| warn_on_duplicate_rule_ids("urtect", &rules));
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("urtect"), "{logs}");
+        assert!(logs.contains("alpha"), "{logs}");
+        assert!(logs.contains("zeta"), "{logs}");
+        assert_eq!(
+            logs.lines().count(),
+            1,
+            "exactly one warning line is expected: {logs}"
+        );
+    }
+
+    #[test]
+    fn warn_on_duplicate_rule_ids_does_not_warn_when_rule_ids_are_unique() {
+        let rules = vec![rule_without_ack("a"), rule_without_ack("b")];
+        let (_, logs) = capture_warnings_sync(|| warn_on_duplicate_rule_ids("urtect", &rules));
+        assert!(logs.is_empty(), "{logs}");
     }
 }
