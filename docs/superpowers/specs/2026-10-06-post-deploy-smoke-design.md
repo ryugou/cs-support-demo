@@ -110,13 +110,31 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 - `detail` に顧客の発話本文・会話の内容を出さない。件数だけを出す。`layer1` の `utterance` は期待値ファイルに書いた検査用の発話であり、顧客の発話ではない。
 - 1 つでも `fail` があれば `passed` は `false`、終了コードは 1。すべて `pass` または `skipped` なら 0。
 - 検査の失敗は、原因（どの読み出しが、どのエラーで失敗したか）を標準エラーへ `tracing::error!` で出す。1 つの検査が失敗しても、残りの検査は続行する。
-- 引数や設定の誤り、vegapunk に接続できない場合は、JSON を出さずにエラーで終了する（終了コード 1）。
+- 引数や設定の誤りは、JSON を出さずにエラーで終了する（終了コード 1）。
+- 検査の前に、対象 project ごとに疎通確認（preflight）を行う。読み出しは `ConversationTurn` の 1 件取得（`threads` 検査が使う `load_conversation_turns_page` を `limit` 1 で呼ぶ。`Search` と書き込みは使わない）。1 つでも失敗したら、project・schema・接続先・エラー・エラー種別に応じた確認先（認証情報の環境変数、接続先、VPC）を標準エラーへ `tracing::error!` で出し、JSON を出さずに終了する（終了コード 1）。基盤障害・認証設定の誤りを、スモークの不合格と区別するためである。
+- 疎通確認が全 project で成功した後に起きた個別の失敗は、検査の `fail` として JSON に記録する。
 
 ## 5. 不変条件
 
 - CLI は vegapunk へ書き込まない。
 - CLI は LLM・Jev などの外部サービスを呼ばない。
 - 判定の検査は、サービスが使うのと同じ関数（lexicon の読み込み、ルールの読み込み、`match_layer1`）を使う。判定ロジックを CLI に複製しない。
+
+### 5.1 サービスの設定を読み取り専用にして使う
+
+CLI はサービスと同じ設定ファイルを読むが、そのまま `Harness::build` に渡さない。本番の設定は LLM と Jev を有効にしており、そのままでは API キーが無いと起動に失敗し、監査ログを書き込み用に開く。CLI は `Harness::build` に渡す前に、次の上書きを行う（`read_only_harness_config`）。
+
+| 設定 | 上書き後 |
+| --- | --- |
+| `llm.enabled` | `false` |
+| `jev.enabled` | `false` |
+| `harness.customer_reply_draft_enabled` | `false` |
+| `harness.audit_log_path` | 実行ごとの一時ディレクトリの下 |
+| `harness.search_improvement_queue_path` | 実行ごとの一時ディレクトリの下 |
+
+lexicon、NG 辞書、project の定義、vegapunk の接続設定は上書きしない。
+
+この上書きにより、job に必要な秘密は vegapunk の認証情報（`VEGAPUNK_BEARER_TOKEN`）だけになる。LLM と Jev の API キーを job に注入しない。一時ディレクトリは CLI の終了時（正常終了・エラー終了とも）に削除される。
 
 ## 6. 実行と運用
 
@@ -129,6 +147,15 @@ gcloud run jobs execute verify-deploy --project sivira-cs-support --region asia-
 ```
 
 - `Dockerfile` に `verify_deploy` バイナリの同梱を追加する（既存の検証 CLI と同じ方法）。
+- イメージの ENTRYPOINT は `cs-support-mcp` なので、job の起動コマンドを `/usr/local/bin/verify_deploy` に上書きする。引数は次のとおり。
+
+```sh
+--config /app/server/config.cloudrun.toml --project urtect --expectations /app/server/data/urtect/smoke-expectations.json --expectations-project urtect
+```
+
+- 注入する秘密は `VEGAPUNK_BEARER_TOKEN` のみ（理由は §5.1）。監査ログ用の GCS ボリュームも不要。
+- homesec を検査する場合は、`--config` と `--project` を homesec 用に変えて実行する。期待値ファイルは urtect 用なので `--expectations` は付けない（§3.2）。
+- 結果 JSON は標準出力、ログは標準エラーに出る。終了コードは §4。
 
 ## 7. テスト
 
@@ -139,6 +166,8 @@ gcloud run jobs execute verify-deploy --project sivira-cs-support --region asia-
 | 第 1 層判定の検査 | 期待と一致する場合は `pass`、マッチするルールが違う場合・マッチしないはずがマッチした場合・マッチするはずがしない場合は `fail` |
 | 結果の集約 | `fail` が 1 件でもあれば `passed` が `false`。`skipped` は不合格にしない |
 | 出力 | JSON に顧客の発話本文・会話の内容を含むフィールドが無い |
+| 疎通確認 | 読み出しが成功したら到達可能と分類する。失敗したら、project・schema・接続先・エラーをメッセージに含め、認証拒否・接続断・その他でそれぞれ確認先が変わる |
+| 一時ディレクトリ | スコープを抜けるとディレクトリとその中身が消える。作られていないディレクトリの削除で失敗しない |
 
 管理 API の読み出し検査は実 vegapunk が必要なため、単体テストの対象にしない。検査の組み立て（結果を `pass` / `fail` / `skipped` に分類する部分）を純関数にしてテストする。
 

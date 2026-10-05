@@ -1,0 +1,10 @@
+{
+  "layer1": [
+    { "utterance": "月額いくらですか？", "expect_rule": null },
+    { "utterance": "契約前に料金を知りたいです", "expect_rule": null },
+    { "utterance": "初期費用はいくらですか？", "expect_rule": "initial-cost-quote" },
+    { "utterance": "解約したいです", "expect_rule": "contract-billing" },
+    { "utterance": "請求額が違います", "expect_rule": "contract-billing" },
+    { "utterance": "担当者につないでください", "expect_rule": "human-handoff" }
+  ]
+}
