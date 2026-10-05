@@ -2671,6 +2671,7 @@ mod tests {
             audit_required: true,
             missing,
             hearing: None,
+            customer_ack: None,
         }
     }
 
@@ -2815,6 +2816,7 @@ mod tests {
             owner: None,
             binding: rules::Binding::Mandatory,
             hearing: None,
+            customer_ack: None,
         }];
         let resolutions = vec![contract_test_kr("kr1", &["post_ingestion_symptom"])];
         let q = contract_test_signals(&["post_ingestion_symptom"]);
@@ -2853,6 +2855,7 @@ mod tests {
             owner: None,
             binding: rules::Binding::Advisory,
             hearing: None,
+            customer_ack: None,
         }];
         let q = contract_test_signals(&["post_ingestion_symptom"]);
         let d = decision::decide(&decision::DecisionInput {
@@ -2894,6 +2897,7 @@ mod tests {
             owner: None,
             binding: rules::Binding::Mandatory,
             hearing: None,
+            customer_ack: None,
         }];
         let q = contract_test_signals(&["post_ingestion_symptom"]);
         let d = decision::decide(&decision::DecisionInput {

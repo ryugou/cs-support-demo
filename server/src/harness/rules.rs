@@ -141,6 +141,14 @@ pub struct EscalationRule {
     /// このルールが宣言するヒアリング契約（未宣言は `None`）。直接読まず
     /// [`EscalationRule::hearing_contract`] を使うこと（mandatory では宣言を無効にする）。
     pub hearing: Option<HearingContract>,
+    /// このルールが宣言する、顧客向けの受け止め文（未宣言は `None`）。`hearing` と異なり
+    /// `binding` による抑止は無い（mandatory でも有効。design doc
+    /// `2026-10-05-initial-cost-handoff-design.md` §3.3）。宣言があれば `api.rs` が LLM 生成を
+    /// 行わず、この文をそのまま（NG 表現ゲート・取扱製品ゲートを通した上で）受け止め文として
+    /// 使う。永続化: vegapunk の `EscalationRule` ノードの `customer_ack` 属性（空文字・欠落は
+    /// 「宣言なし」）。書き込みは `ingest_rules`、読み込みは
+    /// `knowledge::escalation_rule_from_attributes`。
+    pub customer_ack: Option<String>,
 }
 
 impl EscalationRule {
@@ -326,6 +334,7 @@ mod tests {
             owner: None,
             binding: Binding::Mandatory,
             hearing: None,
+            customer_ack: None,
         }];
         assert!(match_layer1(
             &rules,
@@ -348,6 +357,7 @@ mod tests {
                 owner: None,
                 binding: Binding::Advisory,
                 hearing: None,
+                customer_ack: None,
             },
             EscalationRule {
                 id: "mandatory-second".to_string(),
@@ -356,6 +366,7 @@ mod tests {
                 owner: None,
                 binding: Binding::Mandatory,
                 hearing: None,
+                customer_ack: None,
             },
         ];
         // 累積 signal 集合が両方の condition を包含する（1ターン目で warranty_hardware_failure、
@@ -377,6 +388,7 @@ mod tests {
                 owner: None,
                 binding: Binding::Advisory,
                 hearing: None,
+                customer_ack: None,
             },
             EscalationRule {
                 id: "advisory-b".to_string(),
@@ -385,6 +397,7 @@ mod tests {
                 owner: None,
                 binding: Binding::Advisory,
                 hearing: None,
+                customer_ack: None,
             },
         ];
         let question = signals(&["warranty_hardware_failure", "contract_billing_question"]);
@@ -403,6 +416,7 @@ mod tests {
                 owner: None,
                 binding: Binding::Mandatory,
                 hearing: None,
+                customer_ack: None,
             },
             EscalationRule {
                 id: "mandatory-b".to_string(),
@@ -411,6 +425,7 @@ mod tests {
                 owner: None,
                 binding: Binding::Mandatory,
                 hearing: None,
+                customer_ack: None,
             },
         ];
         let question = signals(&["security_incident", "physical_damage_smell_heat"]);
@@ -427,6 +442,7 @@ mod tests {
             owner: None,
             binding: Binding::Advisory,
             hearing: None,
+            customer_ack: None,
         }];
         assert!(match_layer1(&rules, &signals(&["discoloration"])).is_none());
     }
@@ -491,6 +507,7 @@ mod tests {
             owner: None,
             binding,
             hearing,
+            customer_ack: None,
         }
     }
 

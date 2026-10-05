@@ -220,6 +220,42 @@ pub async fn draft_ack_text(
     )
 }
 
+/// 取次ルールが宣言した顧客向けの受け止め文（`customer_ack`）を、LLM 生成の受け止め文
+/// （[`draft_ack_text`]）と同じ NG 表現ゲートに通す（design doc
+/// `2026-10-05-initial-cost-handoff-design.md` §4.1）。
+///
+/// 宣言文は LLM 生成物ではないため、[`draft_ack_text`] の前半（生成呼び出し・truncated 判定）を
+/// 経由しない。`ReplyDraft { truncated: false }` として組み、[`draft_ack_text`] の後半と同じ
+/// 引数構成で [`apply_draft_gate_or_fallback`] に通す（却下時は `fallback_ack(is_continuation)`
+/// へ倒し、warn を出す。これは `apply_draft_gate_or_fallback` 自身が担う）。
+///
+/// `route`（`"escalation_ack_declared"`）は `draft_ack_text` の `"escalation_ack"` と区別して
+/// おくが、**NG 表現ゲート自体の却下 warn（`apply_egress_gate_or_fallback`）にはこの `route` は
+/// 出ない**（`route` は `apply_draft_gate_or_fallback` 内の truncated 分岐専用で、宣言文は常に
+/// `truncated: false` のためこの分岐には到達しない）。運用者が却下の原因を「LLM 生成物」と
+/// 「データに書いた宣言文」で区別できるのは、却下 warn に乗る `inspect_hint`
+/// （`"the rule's declared customer_ack text in rules.json"`）の方である。`route` は将来
+/// `apply_draft_gate_or_fallback` が truncated 以外の warn にも `route` を使うようになった場合に
+/// 備えた一貫性のための値。
+pub fn gate_declared_ack_text(declared: &str, ng: &NgDictionary, is_continuation: bool) -> String {
+    let (fallback_text, fallback_name) = fallback_ack(is_continuation);
+    let ctx = EmitContext {
+        channel: EmitChannel::Operator,
+    };
+    apply_draft_gate_or_fallback(
+        crate::llm::ReplyDraft {
+            text: declared.to_string(),
+            truncated: false,
+        },
+        &ctx,
+        ng,
+        fallback_text,
+        fallback_name,
+        "escalation_ack_declared",
+        "the rule's declared customer_ack text in rules.json",
+    )
+}
+
 /// エスカレーション応答の最終形。design doc §4: `ack_text + "\n\n" + deterministic_block`。
 pub fn assemble_escalation_reply(ack_text: &str, deterministic_block: &str) -> String {
     format!("{ack_text}\n\n{deterministic_block}")
@@ -583,5 +619,53 @@ mod tests {
             "question must be truncated to the shared limit plus the ellipsis marker"
         );
         assert!(embedded.ends_with('…'));
+    }
+
+    // ---- gate_declared_ack_text（Issue #76: 取次ルールが宣言した受け止め文のゲート） ----
+
+    #[test]
+    fn gate_declared_ack_text_passes_through_a_clean_declaration() {
+        let declared = "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。";
+        assert_eq!(gate_declared_ack_text(declared, &ng(), false), declared);
+    }
+
+    #[test]
+    fn gate_declared_ack_text_falls_back_to_the_conversation_stage_fallback_when_blocked() {
+        let blocking_ng =
+            NgDictionary::from_json(r#"{"block_terms":["絶対に治ります"],"abstain_terms":[]}"#)
+                .unwrap();
+        let declared = "この方法で絶対に治りますのでご安心ください。";
+
+        assert_eq!(
+            gate_declared_ack_text(declared, &blocking_ng, false),
+            FALLBACK_ACK_TEXT,
+            "a rejected declaration must fall back to the initial-turn fallback text"
+        );
+        assert_eq!(
+            gate_declared_ack_text(declared, &blocking_ng, true),
+            FALLBACK_ACK_TEXT_CONTINUATION,
+            "a rejected declaration must fall back to the continuation fallback text"
+        );
+    }
+
+    #[test]
+    fn gate_declared_ack_text_warns_pointing_at_rules_json_on_rejection() {
+        let blocking_ng =
+            NgDictionary::from_json(r#"{"block_terms":["絶対に治ります"],"abstain_terms":[]}"#)
+                .unwrap();
+        let (_, logs) = crate::test_support::capture_logs(|| {
+            gate_declared_ack_text(
+                "この方法で絶対に治りますのでご安心ください。",
+                &blocking_ng,
+                false,
+            )
+        });
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("the rule's declared customer_ack text in rules.json"),
+            "the warn must point at rules.json's customer_ack (distinct from draft_ack_text's \
+             \"the question\") so an operator knows the declared text needs review, not the LLM \
+             prompt. got: {warnings:?}"
+        );
     }
 }

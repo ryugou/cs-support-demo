@@ -41,6 +41,7 @@ struct BundledRuleInput {
     route: String,
     binding: String,
     hearing: Option<String>,
+    customer_ack: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -83,6 +84,15 @@ pub(crate) fn load_bundled_escalation_rules() -> Vec<EscalationRule> {
                         r.binding
                     )
                 }),
+                // `customer_ack` は自由文字列（enum 検証は無い）。実行時ローダ
+                // `knowledge::escalation_rule_from_attributes` と同じ規約（前後空白を除いた結果が
+                // 空文字なら「宣言なし」）をここでも再現する。
+                customer_ack: r
+                    .customer_ack
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string),
                 id: rule_id,
                 condition: r.condition.into_iter().map(Signal::new).collect(),
                 route: r.route,

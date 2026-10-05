@@ -58,6 +58,10 @@ struct RuleInput {
     /// （`HearingContract` の識別子。例: `product_and_symptom`）。省略は「宣言なし」。
     /// 詳細は `HearingContract` の doc コメント。
     hearing: Option<String>,
+    /// このルールにマッチしたターンで使う、顧客向けの受け止め文の宣言（Issue #76）。省略は
+    /// 「宣言なし」。`binding` による制限は無い（mandatory のルールも宣言できる）。検証は
+    /// [`resolve_customer_ack`] が行う。
+    customer_ack: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +181,44 @@ fn resolve_binding(label: &str, id: &str, value: Option<&str>) -> Result<Binding
     })
 }
 
+/// 顧客向けの受け止め文の最大文字数（design doc
+/// `2026-10-05-initial-cost-handoff-design.md` §3.1）。
+const CUSTOMER_ACK_MAX_CHARS: usize = 120;
+
+/// `customer_ack`（取次ルールが宣言する顧客向けの受け止め文）の検証。省略（`None`）は許容し、
+/// 空文字として書く（`hearing` と同じ「宣言なしは空文字」規律）。`binding` による制限は無い
+/// （advisory のルールも宣言できる。design doc §3.1）。
+///
+/// 宣言された値が次のいずれかに当たる場合、vegapunk へ接続する前にエラーで拒否する:
+/// - 前後の空白を除いた結果が空文字（宣言したつもりで空文字を書いた設定ミス）
+/// - 改行（`\n` `\r`）を含む（決定的ブロックとの連結・`api.rs` の NG 表現ゲートを想定していない
+///   形を顧客に出さないため）
+/// - 文字数（`chars().count()`）が [`CUSTOMER_ACK_MAX_CHARS`] を超える
+///
+/// どのエラーも rule_id を含む（`resolve_binding` / `hearing` の検証と同じ規律）。
+fn resolve_customer_ack(rule_id: &str, value: Option<&str>) -> Result<String> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    if value.trim().is_empty() {
+        anyhow::bail!(
+            "rule {rule_id}: customer_ack must not be blank; omit the field entirely if the \
+             rule declares no customer_ack"
+        );
+    }
+    if value.contains('\n') || value.contains('\r') {
+        anyhow::bail!("rule {rule_id}: customer_ack must not contain a newline");
+    }
+    let char_count = value.chars().count();
+    if char_count > CUSTOMER_ACK_MAX_CHARS {
+        anyhow::bail!(
+            "rule {rule_id}: customer_ack is {char_count} characters, which exceeds the \
+             {CUSTOMER_ACK_MAX_CHARS} character limit"
+        );
+    }
+    Ok(value.to_string())
+}
+
 /// 第2層領域（`prohibited_domains`）を vegapunk の `ProhibitedDomain` ノードへ変換する。
 ///
 /// `binding` は必須で、[`resolve_binding`] が完全一致で検証する（省略は拒否。既定値は無い）。
@@ -219,6 +261,7 @@ fn build_prohibited_domain_nodes(schema: &str, domains: &[DomainInput]) -> Resul
 /// - 未知の `hearing` 識別子（綴りミス・大文字・前後空白）
 /// - `binding = mandatory` のルールへの `hearing` 宣言（mandatory は情報の有無を問わず即
 ///   エスカレーションする拘束度そのもの。実行時にも `EscalationRule::hearing_contract` が無効化する）
+/// - 不正な `customer_ack`（[`resolve_customer_ack`]。空白のみ・改行入り・120 文字超）
 fn build_escalation_rule_nodes(schema: &str, rules: &[RuleInput]) -> Result<Vec<GraphNode>> {
     rules
         .iter()
@@ -245,6 +288,7 @@ fn build_escalation_rule_nodes(schema: &str, rules: &[RuleInput]) -> Result<Vec<
                     contract.as_str()
                 }
             };
+            let customer_ack = resolve_customer_ack(&rule.rule_id, rule.customer_ack.as_deref())?;
             Ok(GraphNode {
                 id: harness_node_id(schema, "EscalationRule", &rule.rule_id),
                 node_type: "EscalationRule".to_string(),
@@ -255,6 +299,7 @@ fn build_escalation_rule_nodes(schema: &str, rules: &[RuleInput]) -> Result<Vec<
                     ("route".to_string(), rule.route.clone()),
                     ("binding".to_string(), binding.as_str().to_string()),
                     ("hearing".to_string(), hearing.to_string()),
+                    ("customer_ack".to_string(), customer_ack),
                 ],
             })
         })
@@ -432,6 +477,155 @@ mod tests {
         assert!(
             err.contains("mandatory"),
             "must explain the binding conflict, got: {err}"
+        );
+    }
+
+    // --- customer_ack の宣言（Issue #76: 取次ルールが宣言する顧客向けの受け止め文） ---
+
+    fn rule_json_with_customer_ack(customer_ack: Option<&str>) -> RulesFile {
+        let mut rule = json!({
+            "rule_id": "probe-rule",
+            "condition": ["probe_signal"],
+            "route": "support_desk",
+            "binding": "mandatory",
+        });
+        if let Some(customer_ack) = customer_ack {
+            rule["customer_ack"] = json!(customer_ack);
+        }
+        parse_rules(&json!({ "escalation_rules": [rule], "prohibited_domains": [] }).to_string())
+    }
+
+    #[test]
+    fn bundled_urtect_rules_parse_and_only_initial_cost_quote_writes_a_customer_ack_attribute() {
+        let rules = parse_rules(BUNDLED_URTECT_RULES);
+        let nodes = build_escalation_rule_nodes("urtect", &rules.escalation_rules)
+            .expect("the bundled rules.json must build into graph nodes");
+        assert_eq!(nodes.len(), rules.escalation_rules.len());
+
+        for node in &nodes {
+            let rule_id = attribute(node, "rule_id").expect("every node carries rule_id");
+            // 宣言の無いルールは「属性なし」ではなく**空文字**を明示的に書く（`hearing` と同じ
+            // 規律。UpsertNodes が部分マージでも、宣言を消した再投入が確実に反映されるため）。
+            let expected = if rule_id == "initial-cost-quote" {
+                "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。"
+            } else {
+                ""
+            };
+            assert_eq!(
+                attribute(node, "customer_ack"),
+                Some(expected),
+                "rule {rule_id}: the customer_ack attribute the CLI writes to vegapunk"
+            );
+        }
+    }
+
+    // CLI が書いた属性を、本番サービスが実際に使うローダ（`escalation_rule_from_attributes`）へ
+    // 通して、宣言が `api.rs` まで届くことを固定する（`bundled_urtect_rules_round_trip_through_
+    // the_runtime_loader` の customer_ack 版）。
+    #[test]
+    fn bundled_customer_ack_round_trips_through_the_runtime_loader() {
+        let rules = parse_rules(BUNDLED_URTECT_RULES);
+        let nodes = build_escalation_rule_nodes("urtect", &rules.escalation_rules)
+            .expect("the bundled rules.json must build into graph nodes");
+
+        let declared: Vec<(String, String)> = nodes
+            .iter()
+            .map(|node| {
+                let attrs: HashMap<String, String> = node.attributes.iter().cloned().collect();
+                escalation_rule_from_attributes(&attrs)
+                    .expect("the runtime loader must accept every node the CLI writes")
+            })
+            .filter_map(|rule| rule.customer_ack.clone().map(|ack| (rule.id.clone(), ack)))
+            .collect();
+
+        assert_eq!(
+            declared,
+            vec![(
+                "initial-cost-quote".to_string(),
+                "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn rules_file_without_any_customer_ack_field_still_parses_and_writes_empty_declarations() {
+        // SAMPLE_RULES は `customer_ack` フィールド自体を持たない旧形式のファイル。
+        let rules = parse_rules(SAMPLE_RULES);
+        let nodes = build_escalation_rule_nodes("sivira-cs-demo", &rules.escalation_rules)
+            .expect("a pre-existing rules file without customer_ack must keep working");
+        assert!(!nodes.is_empty());
+        for node in &nodes {
+            assert_eq!(attribute(node, "customer_ack"), Some(""));
+        }
+    }
+
+    #[test]
+    fn a_mandatory_rule_may_declare_a_customer_ack() {
+        // `binding` による制限は無い（`hearing` と異なる。design doc §3.1）。
+        let rules = rule_json_with_customer_ack(Some("担当者におつなぎします。"));
+        let nodes = build_escalation_rule_nodes("urtect", &rules.escalation_rules)
+            .expect("a mandatory rule may declare a customer_ack");
+        assert_eq!(attribute(&nodes[0], "binding"), Some("mandatory"));
+        assert_eq!(
+            attribute(&nodes[0], "customer_ack"),
+            Some("担当者におつなぎします。")
+        );
+    }
+
+    #[test]
+    fn a_blank_customer_ack_is_rejected_naming_the_rule() {
+        for blank in ["", "   ", "\u{3000}"] {
+            let rules = rule_json_with_customer_ack(Some(blank));
+            let err = build_escalation_rule_nodes("urtect", &rules.escalation_rules)
+                .expect_err(&format!("a blank customer_ack {blank:?} must be rejected"))
+                .to_string();
+            assert!(
+                err.contains("probe-rule"),
+                "must name the rule for {blank:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_customer_ack_containing_a_newline_is_rejected_naming_the_rule() {
+        for with_newline in ["担当者に\nおつなぎします。", "担当者に\r\nおつなぎします。"]
+        {
+            let rules = rule_json_with_customer_ack(Some(with_newline));
+            let err = build_escalation_rule_nodes("urtect", &rules.escalation_rules)
+                .expect_err("a customer_ack containing a newline must be rejected")
+                .to_string();
+            assert!(err.contains("probe-rule"), "must name the rule, got: {err}");
+            assert!(
+                err.contains("newline"),
+                "must explain the newline violation, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_customer_ack_over_120_characters_is_rejected_naming_the_rule() {
+        let too_long: String = "あ".repeat(121);
+        let rules = rule_json_with_customer_ack(Some(&too_long));
+        let err = build_escalation_rule_nodes("urtect", &rules.escalation_rules)
+            .expect_err("a 121-character customer_ack must be rejected")
+            .to_string();
+        assert!(err.contains("probe-rule"), "must name the rule, got: {err}");
+        assert!(
+            err.contains("121") && err.contains("120"),
+            "must echo both the actual and limit character counts, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_customer_ack_at_exactly_120_characters_is_accepted() {
+        let exactly_120: String = "あ".repeat(120);
+        let rules = rule_json_with_customer_ack(Some(&exactly_120));
+        let nodes = build_escalation_rule_nodes("urtect", &rules.escalation_rules)
+            .expect("exactly 120 characters must be accepted (the limit is inclusive)");
+        assert_eq!(
+            attribute(&nodes[0], "customer_ack"),
+            Some(exactly_120.as_str())
         );
     }
 
