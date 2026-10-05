@@ -98,7 +98,7 @@ customer_ack: { type: string }
 
 聞き返し（`ReplyAction::Clarify`）では `customer_ack` を使わない。
 
-Issue #78: `/api/reply` は `Harness::evaluate` を `ReplyDraftPolicy::SkipWhenUnused` で呼ぶため、取次が確定したターン（宣言文を使う場合も含む）と LLM 分類失敗（`LexiconFallback`）のターンは `customer_reply_draft` 自体が生成されない。契約の正本は `docs/superpowers/specs/2026-10-05-skip-unused-draft-and-ack-log-design.md` §2。
+Issue #78: `/api/reply` は `Harness::evaluate` を `ReplyDraftPolicy::SkipWhenUnused` で呼ぶため、取次が確定したターン（宣言文を使う場合も含む）・LLM 分類失敗（`LexiconFallback`）のターン・二段目ゲートが打ち切るターンは `customer_reply_draft` 自体が生成されない。契約の正本は `docs/superpowers/specs/2026-10-05-skip-unused-draft-and-ack-log-design.md` §2。
 
 ### 4.2 MCP `evaluate_answerability` の `customer_reply_draft`（`server/src/harness/reply.rs`）
 

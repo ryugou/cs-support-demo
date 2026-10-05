@@ -1585,10 +1585,14 @@ async fn reply_handler(
             // として処理する（クライアント保存漏れ・再起動由来の未知 id は通常運用）。
             crate::harness::UnknownCaseIdPolicy::StartNew,
             req.end_user_id.as_deref(),
-            // Issue #78: 取次時と `LexiconFallback` のターンは、受け止め文と決定的ブロック、
-            // または聞き返しで応答を組み立て、下書きを使わない（design doc
-            // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。
-            ReplyDraftPolicy::SkipWhenUnused,
+            // Issue #78, #83: 取次時・`LexiconFallback` のターン・二段目ゲートが打ち切るターンは、
+            // 受け止め文と決定的ブロック、聞き返し、または取扱外の定型応答で応答を組み立て、
+            // 下書きを使わない（design doc
+            // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。事前判定には、下の
+            // 二段目ゲート（`second_stage_short_circuit`）に渡すのと同じ `allowlist` を使う。
+            ReplyDraftPolicy::SkipWhenUnused {
+                response_allowlist: &allowlist,
+            },
         )
         .await
     {

@@ -570,33 +570,66 @@ pub enum UnknownCaseIdPolicy {
 /// `evaluate_answerability`（`Always`）は `customer_reply_draft` が出力契約の一部であり、
 /// 取次時も返す。詳細は design doc
 /// `docs/superpowers/specs/2026-10-05-skip-unused-draft-and-ack-log-design.md` §2。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplyDraftPolicy {
+#[derive(Debug, Clone, Copy)]
+pub enum ReplyDraftPolicy<'a> {
     /// 判定によらず生成する。
     Always,
-    /// 呼び出し元が使わないと分かっている下書きは生成しない。次のいずれかのとき生成しない。
+    /// 応答側が下書きを使わないと確定しているターンでは生成しない。次のいずれかのとき生成しない。
     /// - 判定が取次（`AnswerDecision::Escalate`）
     /// - 抽出モードが `ExtractionMode::LexiconFallback`（判定によらない。`decide_reply_action` が
     ///   判定によらず `EscalationReply` へ倒すため、下書きは参照されない）
-    SkipWhenUnused,
+    /// - 二段目ゲート（確定した取扱外製品への言及）が打ち切る（判定によらない。応答側が
+    ///   evaluate() の結果を捨てて定型応答を返すため、下書きは参照されない）
+    ///
+    /// `response_allowlist` は、応答側が二段目ゲート（取扱外製品の打ち切り）に渡すのと同じ
+    /// allowlist。事前判定を応答側と同じ入力で行い、両者の判定を必ず一致させるために呼び出し側が
+    /// 渡す（`evaluate` 内で取得した allowlist は事前判定に使わない）。
+    SkipWhenUnused {
+        response_allowlist: &'a product_gate::ProductAllowlist,
+    },
 }
 
-/// `policy` と確定した `decision` から、`Harness::draft_customer_reply` を呼ぶかどうかを決める
-/// 純関数（Issue #78）。`evaluate` 本体から切り出してあるのは、`harness_for_test()` が
+/// 二段目ゲート（確定した取扱外製品への言及）が、応答側で打ち切るかどうかを事前に求める純関数
+/// （Issue #83）。述語は応答側と同一の `product_gate::confirmed_foreign_reference` で、
+/// 方針に載せられた `response_allowlist` を使う。`Always` は結果を使わないため評価しない。
+fn second_stage_short_circuits(
+    policy: &ReplyDraftPolicy<'_>,
+    product_references: &[product_gate::ProductReference],
+    question: &str,
+) -> bool {
+    match policy {
+        ReplyDraftPolicy::Always => false,
+        ReplyDraftPolicy::SkipWhenUnused { response_allowlist } => {
+            product_gate::confirmed_foreign_reference(
+                product_references,
+                question,
+                response_allowlist,
+            )
+            .is_some()
+        }
+    }
+}
+
+/// `policy` と確定した `decision`・抽出モード・二段目ゲートが打ち切るかどうか
+/// （`second_stage_short_circuits`）から、`Harness::draft_customer_reply` を呼ぶかどうかを決める
+/// 純関数（Issue #78, #83）。`evaluate` 本体から切り出してあるのは、`harness_for_test()` が
 /// `knowledge: None` で構築されており `evaluate()` 自体を通すテストの土台が無いため
 /// （design doc §4）。
 pub fn should_draft_reply(
-    policy: ReplyDraftPolicy,
+    policy: &ReplyDraftPolicy<'_>,
     decision: &decision::AnswerDecision,
     extraction_mode: extraction::ExtractionMode,
+    second_stage_short_circuits: bool,
 ) -> bool {
     match policy {
         ReplyDraftPolicy::Always => true,
-        ReplyDraftPolicy::SkipWhenUnused => {
+        ReplyDraftPolicy::SkipWhenUnused { .. } => {
             let is_escalate = matches!(decision, decision::AnswerDecision::Escalate { .. });
             let is_forced_escalation_by_extraction_failure =
                 extraction_mode == extraction::ExtractionMode::LexiconFallback;
-            !(is_escalate || is_forced_escalation_by_extraction_failure)
+            !(is_escalate
+                || is_forced_escalation_by_extraction_failure
+                || second_stage_short_circuits)
         }
     }
 }
@@ -1189,7 +1222,7 @@ impl Harness {
         // Issue #78: 返信文下書き（customer_reply_draft）を生成するかどうかの方針。各呼び出し
         // 箇所が明示的に渡す（既定値は無い）。design doc
         // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2 の表を参照。
-        policy: ReplyDraftPolicy,
+        policy: ReplyDraftPolicy<'_>,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
@@ -1614,24 +1647,35 @@ impl Harness {
         // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
         // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
         //
-        // Issue #78: `policy == SkipWhenUnused` かつ（判定が取次、または抽出モードが
-        // `LexiconFallback`）のときは、呼び出し元（`/api/reply` / homesec 経由）がこの下書きを
+        // Issue #78: `policy` が `SkipWhenUnused` で、判定が取次、または抽出モードが
+        // `LexiconFallback` のときは、呼び出し元（`/api/reply` / homesec 経由）がこの下書きを
         // 使わず捨てるため、LLM 呼び出し自体を発行しない（`should_draft_reply` は純関数。design doc
-        // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.3）。
-        let reply_draft = if should_draft_reply(policy, &decision_result, extraction_mode) {
-            self.draft_customer_reply(
-                question,
-                &decision_result,
-                &section_hits,
-                &resolutions,
-                history,
-                is_continuation,
-                &allowlist,
-            )
-            .await
-        } else {
-            None
-        };
+        // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.3）。下書きを作らない条件は
+        // この 2 つと、次の段落の二段目ゲートの 3 つ（いずれも `SkipWhenUnused` のときだけ）。
+        //
+        // 二段目ゲートが打ち切るターン（確定した取扱外製品への言及）も同様に、応答側が evaluate()
+        // の結果を捨てて定型応答を返すため下書きを作らない。事前判定
+        // （`second_stage_short_circuits`）は、応答側と同一の述語を、方針に載せられた
+        // `response_allowlist`（応答側が二段目ゲートに渡すのと同じ値）・`product_references`
+        // （`EvaluationOutcome` が返す値と同一）・`question` で評価する。evaluate 内で取得した
+        // `allowlist` は使わない（キャッシュ更新をまたいで別スナップショットになると、事前判定と
+        // 応答側の判定がずれるため）。
+        let short_circuits = second_stage_short_circuits(&policy, &product_references, question);
+        let reply_draft =
+            if should_draft_reply(&policy, &decision_result, extraction_mode, short_circuits) {
+                self.draft_customer_reply(
+                    question,
+                    &decision_result,
+                    &section_hits,
+                    &resolutions,
+                    history,
+                    is_continuation,
+                    &allowlist,
+                )
+                .await
+            } else {
+                None
+            };
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
         let customer_reply_draft = reply_draft.map(|d| d.text);
 
@@ -2256,9 +2300,61 @@ mod tests {
     //
     // `evaluate()` 自体を通すテストの土台（vegapunk クライアントのスタブ等）が既存テストに無い
     // ため（`harness_for_test()` は `knowledge: None` で構築され `evaluate()` は即座に
-    // `Err` を返す）、design doc §4 のとおり純関数を直接テストする。`evaluate()` が
-    // `should_draft_reply(policy, &decision_result, extraction_mode)` を呼ぶだけであることは
-    // コードレビューで担保する。
+    // `Err` を返す）、design doc §4 のとおり純関数（`second_stage_short_circuits` /
+    // `should_draft_reply`）を直接テストする。`evaluate()` がこの 2 関数を呼ぶだけであることと、
+    // 各経路が二段目ゲートと同じ allowlist を方針に載せることはコードレビューで担保する。
+    fn response_allowlist_fixture() -> product_gate::ProductAllowlist {
+        product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()])
+    }
+
+    fn foreign_reference(surface: &str) -> product_gate::ProductReference {
+        product_gate::ProductReference {
+            surface: surface.to_string(),
+            resolution: product_gate::ProductReferenceResolution::Foreign,
+            matched_model: None,
+        }
+    }
+
+    #[test]
+    fn second_stage_short_circuits_is_false_for_always_without_evaluating_the_predicate() {
+        let refs = vec![foreign_reference("ADC-VDB101")];
+        assert!(!second_stage_short_circuits(
+            &ReplyDraftPolicy::Always,
+            &refs,
+            "ADC-VDB101について教えてください"
+        ));
+    }
+
+    #[test]
+    fn second_stage_short_circuits_is_true_when_response_allowlist_confirms_a_foreign_reference() {
+        let allow = response_allowlist_fixture();
+        let refs = vec![foreign_reference("ADC-VDB101")];
+        assert!(second_stage_short_circuits(
+            &ReplyDraftPolicy::SkipWhenUnused {
+                response_allowlist: &allow
+            },
+            &refs,
+            "ADC-VDB101について教えてください"
+        ));
+    }
+
+    #[test]
+    fn second_stage_short_circuits_uses_the_allowlist_carried_by_the_policy() {
+        // 同じ製品参照・同じ質問でも、方針に載せた allowlist がその型番を取扱製品として
+        // 含むなら打ち切らない（matched_model なしの surface 自体が allowlist veto を受ける）。
+        let allow_with_it = product_gate::ProductAllowlist::from_models(vec![
+            "ADC-V724".to_string(),
+            "ADC-VDB101".to_string(),
+        ]);
+        let refs = vec![foreign_reference("ADC-VDB101")];
+        assert!(!second_stage_short_circuits(
+            &ReplyDraftPolicy::SkipWhenUnused {
+                response_allowlist: &allow_with_it
+            },
+            &refs,
+            "ADC-VDB101について教えてください"
+        ));
+    }
     // `ExtractionMode` の全バリアント。バリアント追加時に網羅が漏れないよう、この match は
     // ワイルドカードを使わない（コンパイルエラーで気づく）。
     fn all_extraction_modes() -> [extraction::ExtractionMode; 3] {
@@ -2284,51 +2380,95 @@ mod tests {
 
     #[test]
     fn should_draft_reply_is_false_for_skip_when_unused_when_decision_is_escalate_in_any_mode() {
+        let allow = response_allowlist_fixture();
+        let skip = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+        };
         let decision =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
         for mode in all_extraction_modes() {
-            assert!(
-                !should_draft_reply(ReplyDraftPolicy::SkipWhenUnused, &decision, mode),
-                "Escalate must not draft under SkipWhenUnused (mode={mode:?})"
-            );
+            for short_circuits in [false, true] {
+                assert!(
+                    !should_draft_reply(&skip, &decision, mode, short_circuits),
+                    "Escalate must not draft under SkipWhenUnused \
+                     (mode={mode:?}, second_stage={short_circuits})"
+                );
+            }
         }
     }
 
     #[test]
     fn should_draft_reply_is_false_for_skip_when_unused_when_allowed_but_lexicon_fallback() {
-        assert!(!should_draft_reply(
-            ReplyDraftPolicy::SkipWhenUnused,
-            &allowed_decision(),
-            extraction::ExtractionMode::LexiconFallback
-        ));
+        let allow = response_allowlist_fixture();
+        let skip = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+        };
+        for short_circuits in [false, true] {
+            assert!(
+                !should_draft_reply(
+                    &skip,
+                    &allowed_decision(),
+                    extraction::ExtractionMode::LexiconFallback,
+                    short_circuits
+                ),
+                "second_stage={short_circuits}"
+            );
+        }
     }
 
     #[test]
-    fn should_draft_reply_is_true_for_skip_when_unused_when_allowed_and_not_lexicon_fallback() {
+    fn should_draft_reply_is_false_for_skip_when_unused_when_allowed_but_second_stage_short_circuits(
+    ) {
+        let allow = response_allowlist_fixture();
+        let skip = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+        };
+        for mode in all_extraction_modes() {
+            assert!(
+                !should_draft_reply(&skip, &allowed_decision(), mode, true),
+                "second-stage gate discards the evaluate() outcome, so no draft (mode={mode:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn should_draft_reply_is_true_for_skip_when_unused_when_allowed_and_not_lexicon_fallback_and_no_short_circuit(
+    ) {
+        let allow = response_allowlist_fixture();
+        let skip = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+        };
         for mode in all_extraction_modes()
             .into_iter()
             .filter(|m| *m != extraction::ExtractionMode::LexiconFallback)
         {
             assert!(
-                should_draft_reply(ReplyDraftPolicy::SkipWhenUnused, &allowed_decision(), mode),
+                should_draft_reply(&skip, &allowed_decision(), mode, false),
                 "Allowed must draft under SkipWhenUnused (mode={mode:?})"
             );
         }
     }
 
     #[test]
-    fn should_draft_reply_is_true_for_always_regardless_of_decision_and_mode() {
+    fn should_draft_reply_is_true_for_always_regardless_of_decision_mode_and_second_stage() {
         let escalate =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
         for mode in all_extraction_modes() {
-            assert!(
-                should_draft_reply(ReplyDraftPolicy::Always, &escalate, mode),
-                "Always must draft on Escalate (mode={mode:?})"
-            );
-            assert!(
-                should_draft_reply(ReplyDraftPolicy::Always, &allowed_decision(), mode),
-                "Always must draft on Allowed (mode={mode:?})"
-            );
+            for short_circuits in [false, true] {
+                assert!(
+                    should_draft_reply(&ReplyDraftPolicy::Always, &escalate, mode, short_circuits),
+                    "Always must draft on Escalate (mode={mode:?}, second_stage={short_circuits})"
+                );
+                assert!(
+                    should_draft_reply(
+                        &ReplyDraftPolicy::Always,
+                        &allowed_decision(),
+                        mode,
+                        short_circuits
+                    ),
+                    "Always must draft on Allowed (mode={mode:?}, second_stage={short_circuits})"
+                );
+            }
         }
     }
 
