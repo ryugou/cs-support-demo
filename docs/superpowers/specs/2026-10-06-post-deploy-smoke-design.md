@@ -24,11 +24,11 @@ CLI は vegapunk へ書き込まない。case・会話ターン・監査イベ�
 
 | 引数 | 必須 | 内容 |
 | --- | --- | --- |
-| `--config <path>` | 必須 | サービスと同じ形式の設定ファイル。project と schema の対応、vegapunk の接続先を読む |
-| `--project <project_id>` | 必須（複数指定可） | 検査する project。設定ファイルに無い project はエラーにする |
+| `--target <config_path>:<project_id>` | 必須（複数指定可） | 検査する対象。サービスと同じ形式の設定ファイルのパスと、その設定ファイルに定義された project_id を、**最後の `:`** で区切って指定する。同じ設定ファイルを複数の対象で指定してよい。project_id が空、`:` が無い、設定ファイルに project が無い、同じ project_id が複数の対象に現れる場合はエラーにする |
 | `--expectations <path>` | 省略可 | 期待値ファイル。省略時は第 1 層判定の検査を行わない |
+| `--expectations-project <project_id>` | `--expectations` 指定時は必須 | 期待値ファイルの対象。`--target` のいずれかの project_id と一致しなければならない |
 
-vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEARER_TOKEN` / `VEGAPUNK_BEARER_TOKEN_FILE`）から読む。
+vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEARER_TOKEN` / `VEGAPUNK_BEARER_TOKEN_FILE`）から 1 つ読み、すべての対象で使う。
 
 ### 2.2 期待値ファイル
 
@@ -79,7 +79,7 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 
 1 件ごとに、発話・立った signal・マッチしたルール・期待値・合否を記録する。
 
-期待値ファイルは 1 つの project に対するものである。`--project` を複数指定し、かつ `--expectations` を指定した場合の対象は、引数で 1 つに決める（`--expectations-project <project_id>` を必須にする）。
+期待値ファイルは 1 つの project に対するものである。対象は `--expectations-project` で 1 つに決める（§2.1）。
 
 ## 4. 出力と終了コード
 
@@ -90,6 +90,7 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
   "passed": false,
   "projects": [
     {
+      "config": "/app/server/config.cloudrun.toml",
       "project_id": "urtect",
       "schema": "urtect",
       "checks": [
@@ -106,12 +107,13 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 }
 ```
 
+- `projects` の各要素の `config` は、`--target` で渡された設定ファイルのパスの文字列である。
 - `status` は `pass` / `fail` / `skipped`。
 - `detail` に顧客の発話本文・会話の内容を出さない。件数だけを出す。`layer1` の `utterance` は期待値ファイルに書いた検査用の発話であり、顧客の発話ではない。
 - 1 つでも `fail` があれば `passed` は `false`、終了コードは 1。すべて `pass` または `skipped` なら 0。
 - 検査の失敗は、原因（どの読み出しが、どのエラーで失敗したか）を標準エラーへ `tracing::error!` で出す。1 つの検査が失敗しても、残りの検査は続行する。
 - 引数や設定の誤りは、JSON を出さずにエラーで終了する（終了コード 1）。
-- 検査の前に、対象 project ごとに疎通確認（preflight）を行う。読み出しは `ConversationTurn` の 1 件取得（`threads` 検査が使う `load_conversation_turns_page` を `limit` 1 で呼ぶ。`Search` と書き込みは使わない）。1 つでも失敗したら、project・schema・接続先・エラー・エラー種別に応じた確認先（認証情報の環境変数、接続先、VPC）を標準エラーへ `tracing::error!` で出し、JSON を出さずに終了する（終了コード 1）。基盤障害・認証設定の誤りを、スモークの不合格と区別するためである。
+- 検査の前に、対象 project ごとに疎通確認（preflight）を行う。読み出しは `ConversationTurn` の 1 件取得（`threads` 検査が使う `load_conversation_turns_page` を `limit` 1 で呼ぶ。`Search` と書き込みは使わない）。1 つでも失敗したら、設定ファイル・project・schema・接続先・エラー・エラー種別に応じた確認先（認証情報の環境変数、接続先、VPC）を標準エラーへ `tracing::error!` で出し、JSON を出さずに終了する（終了コード 1）。基盤障害・認証設定の誤りを、スモークの不合格と区別するためである。
 - 疎通確認が全 project で成功した後に起きた個別の失敗は、検査の `fail` として JSON に記録する。
 
 ## 5. 不変条件
@@ -134,6 +136,10 @@ CLI はサービスと同じ設定ファイルを読むが、そのまま `Harne
 
 lexicon、NG 辞書、project の定義、vegapunk の接続設定は上書きしない。
 
+上書き、`Harness::build`、vegapunk クライアントの生成は、**設定ファイルごとに 1 回**行い、同じ設定ファイルを指す複数の対象は同じ Harness を使う。一時ディレクトリは、全体を 1 つの実行ごとのディレクトリの下に置き、設定ファイルごとに別のサブディレクトリ（`config-<連番>`）を使う。異なる設定の監査ログ・キューのパスが衝突しないようにするためである。Harness はすべて、一時ディレクトリより先に drop される。
+
+`Harness::build` が書き込み用に開くのは `[harness]` の `audit_log_path` と `search_improvement_queue_path` だけである（`server/src/harness/mod.rs` の `Harness::build`）。`config.homesec.toml` の `[advisor]` にある `support_audit_log_path` / `support_search_improvement_queue_path` は `server/src/bin/homesec_advisor.rs` だけが読み、この CLI の経路では開かれないため、上書きの対象にしない。
+
 この上書きにより、job に必要な秘密は vegapunk の認証情報（`VEGAPUNK_BEARER_TOKEN`）だけになる。LLM と Jev の API キーを job に注入しない。一時ディレクトリは CLI の終了時（正常終了・エラー終了とも）に削除される。
 
 ## 6. 実行と運用
@@ -150,11 +156,12 @@ gcloud run jobs execute verify-deploy --project sivira-cs-support --region asia-
 - イメージの ENTRYPOINT は `cs-support-mcp` なので、job の起動コマンドを `/usr/local/bin/verify_deploy` に上書きする。引数は次のとおり。
 
 ```sh
---config /app/server/config.cloudrun.toml --project urtect --expectations /app/server/data/urtect/smoke-expectations.json --expectations-project urtect
+--target /app/server/config.cloudrun.toml:urtect --target /app/server/config.homesec.toml:homesec --expectations /app/server/data/urtect/smoke-expectations.json --expectations-project urtect
 ```
 
+`Dockerfile` は `server/config.cloudrun.toml` と `server/config.homesec.toml` を `WORKDIR /app/server` 直下へ、`server/data` を `/app/server/data` へ同梱する。1 回の実行で urtect と homesec の両方の読み出しを検査する。
+
 - 注入する秘密は `VEGAPUNK_BEARER_TOKEN` のみ（理由は §5.1）。監査ログ用の GCS ボリュームも不要。
-- homesec を検査する場合は、`--config` と `--project` を homesec 用に変えて実行する。期待値ファイルは urtect 用なので `--expectations` は付けない（§3.2）。
 - 結果 JSON は標準出力、ログは標準エラーに出る。終了コードは §4。
 
 ## 7. テスト
@@ -166,7 +173,12 @@ gcloud run jobs execute verify-deploy --project sivira-cs-support --region asia-
 | 第 1 層判定の検査 | 期待と一致する場合は `pass`、マッチするルールが違う場合・マッチしないはずがマッチした場合・マッチするはずがしない場合は `fail` |
 | 結果の集約 | `fail` が 1 件でもあれば `passed` が `false`。`skipped` は不合格にしない |
 | 出力 | JSON に顧客の発話本文・会話の内容を含むフィールドが無い |
-| 疎通確認 | 読み出しが成功したら到達可能と分類する。失敗したら、project・schema・接続先・エラーをメッセージに含め、認証拒否・接続断・その他でそれぞれ確認先が変わる |
+| 疎通確認 | 読み出しが成功したら到達可能と分類する。失敗したら、設定ファイル・project・schema・接続先・エラーをメッセージに含め、認証拒否・接続断・その他でそれぞれ確認先が変わる |
+| `--target` の解釈 | `<config_path>:<project_id>` を読める。最後の `:` で分割する（パスに `:` を含む場合）。`:` が無い・project_id が空・設定ファイルのパスが空・同じ project_id の重複を拒否する。同じ設定ファイルを複数の対象で指定できる |
+| 対象の解決 | 設定ファイルに無い project はエラーになる（`config.homesec.toml` に `homesec` はあり、`config.cloudrun.toml` には無い）。`--expectations-project` がどの対象にも無い場合、`--expectations` と `--expectations-project` の片方だけの場合はエラーになる |
+| 設定ファイルごとのまとめ | 同じ設定ファイルの対象が 1 つにまとまり、出現順を保つ |
+| 読み取り専用化（両設定） | `config.cloudrun.toml` と `config.homesec.toml` の両方で、監査ログ・検索改善キューが一時ディレクトリの下になり、LLM・Jev・返信文下書きが無効になる |
+| 一時サブディレクトリ | 設定ファイルごとに別のサブディレクトリになり、両設定の書き込み先が衝突しない |
 | 一時ディレクトリ | スコープを抜けるとディレクトリとその中身が消える。作られていないディレクトリの削除で失敗しない |
 
 管理 API の読み出し検査は実 vegapunk が必要なため、単体テストの対象にしない。検査の組み立て（結果を `pass` / `fail` / `skipped` に分類する部分）を純関数にしてテストする。
