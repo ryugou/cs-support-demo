@@ -40,6 +40,13 @@ struct LexiconEntry {
     signal: String,
     class: SignalClass,
     surface_forms: Vec<String>,
+    /// 正規化後の発話からこの語形の出現箇所を取り除いてから surface_forms を照合する
+    /// （Issue #75: 「契約前に料金を知りたい」のように、個別案件語の部分文字列を含むだけの
+    /// 一般的な質問が誤って signal を立てるのを防ぐ）。省略時は空配列＝抑止なし、従来どおり
+    /// surface_forms をそのまま照合する。詳細は
+    /// `docs/superpowers/specs/2026-10-05-lexicon-suppress-forms-design.md`。
+    #[serde(default)]
+    suppress_forms: Vec<String>,
     /// LLM 抽出専用の signal。文字列照合（surface_forms）には使わず、
     /// 分類（classes マップ）と vocabulary_for_prompt にのみ登録する。
     #[serde(default)]
@@ -65,6 +72,27 @@ struct LexiconFile {
 struct CompiledEntry {
     signal: String,
     normalized_forms: Vec<String>,
+    /// 正規化済み・文字数の長い順にソート済みの抑止語形。空なら抑止なし（現行どおり
+    /// normalized_forms を直接照合する）。
+    suppress_forms: Vec<String>,
+}
+
+/// 抑止語形を取り除いた跡に埋める区切り文字。`normalize_key`（`server/src/resolve.rs`）は
+/// `char::is_alphanumeric` を満たす文字しか出力しないため、非英数の制御文字を選べば
+/// 正規化後の発話に意図せず出現することがない。空文字ではなくこの1文字に置換するのは、
+/// 除去跡の前後の文字が連結して別の surface_form に誤って再マッチするのを防ぐため
+/// （`docs/superpowers/specs/2026-10-05-lexicon-suppress-forms-design.md` §2.3）。
+const SUPPRESS_REMOVAL_MARKER: char = '\u{0}';
+
+/// 正規化済み発話から、与えた抑止語形（文字数の長い順にソート済みである必要がある。
+/// 「契約する前」の一部だけが先に消えて「契約すると」等を誤って残すことを防ぐため）の
+/// 出現箇所を `SUPPRESS_REMOVAL_MARKER` に置換した文字列を返す。
+fn mask_suppressed(normalized: &str, suppress_forms_longest_first: &[String]) -> String {
+    let mut masked = normalized.to_string();
+    for form in suppress_forms_longest_first {
+        masked = masked.replace(form.as_str(), &SUPPRESS_REMOVAL_MARKER.to_string());
+    }
+    masked
 }
 
 /// vocabulary_for_prompt 向けに保持する語彙 1 件分（signal, class, description）。
@@ -123,6 +151,45 @@ impl LexiconNormalizer {
                 description: entry.description.clone(),
             })
             .collect();
+        // suppress_forms の検証は llm_only でのフィルタ前、全エントリに対して行う
+        // （llm_only エントリが suppress_forms を宣言すること自体を拒否する必要があるため）。
+        for entry in &file.signals {
+            if entry.llm_only && !entry.suppress_forms.is_empty() {
+                anyhow::bail!(
+                    "signal {} is llm_only and must not declare suppress_forms (string matching \
+                     is not performed for llm_only signals)",
+                    entry.signal
+                );
+            }
+            let normalized_surface_forms: Vec<String> = entry
+                .surface_forms
+                .iter()
+                .map(|form| normalize_key(form))
+                .collect();
+            for suppress_form in &entry.suppress_forms {
+                let normalized_suppress = normalize_key(suppress_form);
+                if normalized_suppress.is_empty() {
+                    anyhow::bail!(
+                        "signal {} has a suppress_forms entry {:?} that normalizes to an empty \
+                         string",
+                        entry.signal,
+                        suppress_form
+                    );
+                }
+                if !normalized_surface_forms
+                    .iter()
+                    .any(|surface_form| normalized_suppress.contains(surface_form.as_str()))
+                {
+                    anyhow::bail!(
+                        "signal {} has a suppress_forms entry {:?} that does not contain any of \
+                         its surface_forms, so suppressing it would never change the match \
+                         result",
+                        entry.signal,
+                        suppress_form
+                    );
+                }
+            }
+        }
         let entries = file
             .signals
             .into_iter()
@@ -143,9 +210,18 @@ impl LexiconNormalizer {
                         entry.signal
                     );
                 }
+                let mut suppress_forms: Vec<String> = entry
+                    .suppress_forms
+                    .iter()
+                    .map(|form| normalize_key(form))
+                    .collect();
+                // 長い語形から先に取り除く（短い語形が先に一部だけ消費するのを防ぐ。
+                // 設計書 §2.3）。
+                suppress_forms.sort_by_key(|form| std::cmp::Reverse(form.chars().count()));
                 Ok(CompiledEntry {
                     signal: entry.signal,
                     normalized_forms,
+                    suppress_forms,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -216,10 +292,18 @@ impl SignalNormalizer for LexiconNormalizer {
         self.entries
             .iter()
             .filter(|entry| {
-                entry
-                    .normalized_forms
-                    .iter()
-                    .any(|form| normalized.contains(form))
+                if entry.suppress_forms.is_empty() {
+                    entry
+                        .normalized_forms
+                        .iter()
+                        .any(|form| normalized.contains(form))
+                } else {
+                    let masked = mask_suppressed(&normalized, &entry.suppress_forms);
+                    entry
+                        .normalized_forms
+                        .iter()
+                        .any(|form| masked.contains(form))
+                }
             })
             .map(|entry| Signal::new(&entry.signal))
             .collect()
@@ -304,6 +388,122 @@ mod tests {
         assert!(lex.class_of(&Signal::new("unclassified_risk")).is_some());
         let prompt = lex.vocabulary_for_prompt();
         assert!(prompt.contains("unclassified_risk") && prompt.contains("分類できない"));
+    }
+
+    // --- Issue #75: suppress_forms（抑止語形）---
+    //
+    // 設計書 docs/superpowers/specs/2026-10-05-lexicon-suppress-forms-design.md §6 のテスト表に
+    // 対応する。手組みの lexicon で照合規則そのものを固定し、bundled lexicon との結合は
+    // decision.rs 側の回帰テストで固定する。
+
+    #[test]
+    fn suppress_forms_hide_a_signal_only_when_no_other_surface_form_remains() {
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "contract_billing_question", "class": "context",
+                  "surface_forms": ["契約", "解約"], "suppress_forms": ["契約前"] },
+                { "signal": "mold", "class": "hazard", "surface_forms": ["カビ"] }
+            ] }"#,
+        )
+        .expect("lexicon with suppress_forms parses");
+
+        // 抑止語形に一致する箇所しかない発話では signal が立たない。
+        assert!(!lex
+            .normalize("契約前に料金を知りたいです")
+            .contains(&Signal::new("contract_billing_question")));
+
+        // 抑止語形と、別の箇所の surface_forms（解約）の両方を含む発話では立つ。
+        assert!(lex
+            .normalize("契約前ですが解約金はいくらですか")
+            .contains(&Signal::new("contract_billing_question")));
+
+        // suppress_forms を持たないエントリ（mold）は影響を受けない。
+        assert!(lex.normalize("カビが生えた").contains(&Signal::new("mold")));
+    }
+
+    #[test]
+    fn suppress_forms_removal_does_not_join_adjacent_characters_into_a_false_match() {
+        // "ab" が surface_form、"xaby" が suppress_form。空文字へ置換すると
+        // "za" + "xaby" + "bz" から "xaby" を抜いた残り "za" + "bz" = "zabz" に
+        // 新たな "ab" が生まれてしまう（前後の連結）。区切り文字へ置換していれば
+        // "za\0bz" になり "ab" は生まれない。
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "concat_test", "class": "context", "surface_forms": ["ab"],
+                  "suppress_forms": ["xaby"] }
+            ] }"#,
+        )
+        .expect("lexicon with suppress_forms parses");
+
+        assert!(!lex
+            .normalize("zaxabybz")
+            .contains(&Signal::new("concat_test")));
+    }
+
+    #[test]
+    fn suppress_forms_remove_the_longest_shared_prefix_form_first() {
+        // "契約する" は "契約する前" の接頭辞を共有する短い語形。短い方を先に取り除くと
+        // "前"（別の surface_form）だけが残って誤って signal が立つ。長い語形
+        // "契約する前" を丸ごと先に取り除けば "前" も一緒に消え、誤発火しない。
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "contract_billing_question", "class": "context",
+                  "surface_forms": ["契約", "前"],
+                  "suppress_forms": ["契約する前", "契約する"] }
+            ] }"#,
+        )
+        .expect("lexicon with suppress_forms parses");
+
+        assert!(!lex
+            .normalize("契約する前です")
+            .contains(&Signal::new("contract_billing_question")));
+    }
+
+    #[test]
+    fn from_json_rejects_a_suppress_form_that_normalizes_to_an_empty_string() {
+        let result = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "blank_suppress_test", "class": "context",
+                  "surface_forms": ["カビ"], "suppress_forms": ["!!!"] }
+            ] }"#,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a suppress_forms entry that normalizes to empty must be rejected"),
+        };
+        assert!(err.to_string().contains("blank_suppress_test"));
+    }
+
+    #[test]
+    fn from_json_rejects_a_suppress_form_that_does_not_contain_any_surface_form() {
+        let result = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "mismatched_suppress_test", "class": "context",
+                  "surface_forms": ["解約"], "suppress_forms": ["転居"] }
+            ] }"#,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a suppress_forms entry that does not contain any surface_form must be rejected"
+            ),
+        };
+        assert!(err.to_string().contains("mismatched_suppress_test"));
+    }
+
+    #[test]
+    fn from_json_rejects_an_llm_only_entry_that_declares_suppress_forms() {
+        let result = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "llm_only_suppress_test", "class": "hazard",
+                  "surface_forms": [], "llm_only": true, "suppress_forms": ["foo"] }
+            ] }"#,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("an llm_only entry with suppress_forms must be rejected"),
+        };
+        assert!(err.to_string().contains("llm_only_suppress_test"));
     }
 
     #[test]
