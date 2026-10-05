@@ -83,6 +83,17 @@ struct CompiledEntry {
 /// （`docs/superpowers/specs/2026-10-05-lexicon-suppress-forms-design.md` §2.3）。
 const SUPPRESS_REMOVAL_MARKER: char = '\u{0}';
 
+/// surface_forms を正規化し、空文字になるもの（記号のみ等）を除く。
+/// 照合のコンパイルと suppress_forms の検証が同じ基準を使うための共通経路
+/// （空文字は contains("") が常に真になり、検証をすり抜けさせるため）。
+fn normalize_surface_forms(surface_forms: &[String]) -> Vec<String> {
+    surface_forms
+        .iter()
+        .map(|form| normalize_key(form))
+        .filter(|form| !form.is_empty())
+        .collect()
+}
+
 /// 正規化済み発話に対して、全抑止語形の一致範囲（同じ語形の重なり合う出現を含む）を
 /// 先に収集し、重なり・隣接する範囲を統合してから、各範囲を `SUPPRESS_REMOVAL_MARKER`
 /// 1 文字に置き換えた文字列を返す。
@@ -191,11 +202,7 @@ impl LexiconNormalizer {
                     entry.suppress_forms
                 );
             }
-            let normalized_surface_forms: Vec<String> = entry
-                .surface_forms
-                .iter()
-                .map(|form| normalize_key(form))
-                .collect();
+            let normalized_surface_forms = normalize_surface_forms(&entry.surface_forms);
             for suppress_form in &entry.suppress_forms {
                 let normalized_suppress = normalize_key(suppress_form);
                 if normalized_suppress.is_empty() {
@@ -226,12 +233,7 @@ impl LexiconNormalizer {
             // llm_only の signal は文字列照合の対象にしない（classes / vocabulary には登録済み）。
             .filter(|entry| !entry.llm_only)
             .map(|entry| {
-                let normalized_forms: Vec<String> = entry
-                    .surface_forms
-                    .iter()
-                    .map(|form| normalize_key(form))
-                    .filter(|form| !form.is_empty())
-                    .collect();
+                let normalized_forms = normalize_surface_forms(&entry.surface_forms);
                 // 有効な surface form が 1 つも無い signal は「存在するのに決して
                 // 抽出されない」サイレント never-match になるため、ロード時に拒否する。
                 if normalized_forms.is_empty() {
@@ -571,6 +573,51 @@ mod tests {
             ),
         };
         assert!(err.to_string().contains("mismatched_suppress_test"));
+    }
+
+    #[test]
+    fn from_json_ignores_blank_surface_forms_when_validating_suppress_forms() {
+        // "!!!" は正規化後に空文字になり contains("") が常に真になるため、判定対象から除く。
+        let result = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "blank_surface_mixed_test", "class": "context",
+                  "surface_forms": ["!!!", "解約"], "suppress_forms": ["転居"] }
+            ] }"#,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("a suppress_form unrelated to the usable surface_forms must be rejected")
+            }
+        };
+        let message = err.to_string();
+        assert!(message.contains("blank_surface_mixed_test"));
+        assert!(message.contains("転居"));
+    }
+
+    #[test]
+    fn from_json_accepts_a_suppress_form_containing_a_usable_surface_form_next_to_a_blank_one() {
+        let result = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "blank_surface_ok_test", "class": "context",
+                  "surface_forms": ["!!!", "解約"], "suppress_forms": ["解約前"] }
+            ] }"#,
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn from_json_rejects_suppress_forms_when_every_surface_form_is_blank() {
+        let result = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "all_blank_surface_test", "class": "context",
+                  "surface_forms": ["!!!"], "suppress_forms": ["転居"] }
+            ] }"#,
+        );
+        assert!(
+            result.is_err(),
+            "an entry with no usable surface_form must be rejected"
+        );
     }
 
     #[test]

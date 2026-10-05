@@ -31,7 +31,7 @@ lexicon のエントリに、省略可能な属性 `suppress_forms`（抑止語�
 - 読み込み時に、`surface_forms` と同じ正規化（`normalize_key`）を抑止語形にも適用して保持する。
 - 読み込み時に次を検証し、違反があれば `from_json` をエラーにする。エラー文には signal 名と違反した語形を含める。
   - 正規化後の抑止語形が空文字
-  - 正規化後の抑止語形が、同じエントリの正規化後の `surface_forms` のいずれも部分文字列として含まない（抑止しても照合結果が変わらない設定は誤りとして拒否する）
+  - 正規化後の抑止語形が、同じエントリの正規化後の `surface_forms` のいずれも部分文字列として含まない（抑止しても照合結果が変わらない設定は誤りとして拒否する）。正規化後に空文字になる `surface_forms` は判定対象から除く（空文字は常に部分文字列になり検証をすり抜けるため）
 - `llm_only: true` のエントリが `suppress_forms` を持つ場合もエラーにする（文字列照合をしないエントリには意味が無い）。
 
 ### 2.3 照合規則
@@ -79,7 +79,7 @@ lexicon の照合結果は `ingest_urtect` の `MENTIONS_SIGNAL` 辺のハッシ
 | `signal.rs`（手組みの lexicon） | 抑止語形だけを含む発話では signal が立たない。抑止語形と、別の箇所の `surface_forms` の両方を含む発話では立つ。抑止語形を持たないエントリは影響を受けない |
 | `signal.rs`（手組みの lexicon） | 取り除いた箇所の前後が連結して `surface_forms` に一致する入力でも、signal が立たない |
 | `signal.rs`（手組みの lexicon） | 重なり合う抑止語形（異なる語形どうし、同じ語形の重なり合う出現、多バイト文字、接頭辞を共有する長短の語形）がすべてマスクされ、範囲の外にある `surface_forms` では signal が立つ |
-| `signal.rs`（読み込み検証） | 空の抑止語形、`surface_forms` を含まない抑止語形、`llm_only` エントリの抑止語形をそれぞれ拒否し、エラー文に signal 名が含まれる（`llm_only` エントリは宣言された `suppress_forms` も含まれる） |
+| `signal.rs`（読み込み検証） | 空の抑止語形、`surface_forms` を含まない抑止語形、`llm_only` エントリの抑止語形をそれぞれ拒否し、エラー文に signal 名が含まれる（`llm_only` エントリは宣言された `suppress_forms` も含まれる）。記号のみで空に正規化される `surface_forms` が混在しても、使える `surface_forms` を含まない抑止語形は拒否され、含む抑止語形は受理される。使える `surface_forms` が 1 つも無いエントリの抑止語形も拒否される |
 | bundled lexicon | 「契約前に料金を知りたいです」「契約すると月額いくらですか」「契約を検討していますが料金を教えてください」で `contract_billing_question` が立たず、`price_question` が立つ |
 | bundled lexicon + bundled rules | 上記 3 発話が第 1 層のどのルールにもマッチしない |
 | bundled lexicon + bundled rules | 「契約内容を変更したい」「契約を更新したい」「解約したいです」「契約前ですが解約金はいくらですか」が第 1 層 `contract-billing` にマッチする |
