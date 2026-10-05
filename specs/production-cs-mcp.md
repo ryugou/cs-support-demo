@@ -380,7 +380,7 @@ GMR が前提にする「同じ入力なら同じ答えでよい」は CS では
 
 - **権威ではない。** フィールド名・tool description・実装モジュール名すべてに `draft` を含め、「検証前の下書き」であることを型で示す。送信前の担当者確認を前提とする
 - **kill switch**: `[harness] customer_reply_draft_enabled`（既定 **false**）。本番デモ構成でのみ true にする。`[llm] enabled = false` なら下書きは生成されない（起動時 warn のうえ常に `null`）
-- **経路ごとの生成方針（Issue #78）**: 上記 kill switch が有効でも、`Harness::evaluate` の呼び出し経路ごとに下書きを生成するかどうかが異なる。`evaluate_answerability`（MCP）は取次時も含め常に生成するが、`/api/reply` とアドバイザ経由（homesec）は判定が取次のとき生成しない（受け止め文と決定的ブロック・または聞き返しで応答を組み立て、下書きを使わず捨てるため）。契約の正本は `docs/superpowers/specs/2026-10-05-skip-unused-draft-and-ack-log-design.md` §2
+- **経路ごとの生成方針（Issue #78）**: 上記 kill switch が有効でも、`Harness::evaluate` の呼び出し経路ごとに下書きを生成するかどうかが異なる。`evaluate_answerability`（MCP）は取次時も含め常に生成するが、`/api/reply` とアドバイザ経由（homesec）は判定が取次のとき、または LLM 分類失敗（`LexiconFallback`）のターンには生成しない（取次では受け止め文と決定的ブロック・または聞き返しで応答を組み立て、`LexiconFallback` では判定によらず取次応答へ倒すため、いずれも下書きを使わず捨てる）。契約の正本は `docs/superpowers/specs/2026-10-05-skip-unused-draft-and-ack-log-design.md` §2
 - **出口ゲート（S1-4）を必ず通す。** 生成した下書きは `egress_gate` を通し、`block` / `abstain` なら `null` にして理由を warn に残す。本 spec の「egress 位置の固定」（AI 生成 draft も人間製 outbound も同一ゲートを通す・人間製も信頼しない）は、**サーバ生成の下書きにこそ最初に適用される**。この経路を迂回させないこと
 - **Escalate では内部マニュアル本文を LLM に渡さない。** `harness::reply::build_reply_brief` が Escalate のとき抜粋を必ず空にする。プロンプトで「答えるな」と指示するのではなく、**答える材料をそもそも渡さない**構造で担保する（第1層・第2層で回答生成への経路が閉じるという本 spec の判定思想を、文面生成でも再現する）
   - **保証の射程を取り違えないこと。** 構造的に保証されるのは「**内部マニュアル本文が漏れない**」ことであって、「下書きに解決方法が書かれない」ことではない。モデルの事前知識や、顧客が問い合わせ本文に書いた手順は混じりうる。後者はプロンプト指示と区切り無害化（`neutralize_delimiters`）で減らしているだけである

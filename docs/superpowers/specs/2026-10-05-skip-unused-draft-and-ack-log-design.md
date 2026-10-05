@@ -9,7 +9,7 @@
 
 ## 1. 採用する設計
 
-1. `Harness::evaluate` に下書き生成方針 `ReplyDraftPolicy` を引数として追加する。応答生成 API とアドバイザの経路は「取次では生成しない」を、MCP の経路は「常に生成する」を渡す。
+1. `Harness::evaluate` に下書き生成方針 `ReplyDraftPolicy` を引数として追加する。応答生成 API とアドバイザの経路は「使われない下書きは生成しない」（取次、または LLM 分類失敗）を、MCP の経路は「常に生成する」を渡す。
 2. `Harness::evaluate` は、第 1 層の取次で `customer_ack` が複数マッチにより使われなかったとき、ログを 1 行出す。
 3. `load_escalation_rules` は、同じ `rule_id` のルールを複数読み込んだとき、警告を 1 行出す。
 
@@ -27,8 +27,10 @@
 pub enum ReplyDraftPolicy {
     /// 判定によらず生成する。
     Always,
-    /// 判定が取次（`AnswerDecision::Escalate`）のときは生成しない。
-    SkipOnEscalate,
+    /// 呼び出し元が使わないと分かっている下書きは生成しない。次のいずれかのとき生成しない。
+    /// - 判定が取次（`AnswerDecision::Escalate`）
+    /// - 抽出モードが `ExtractionMode::LexiconFallback`（判定によらない）
+    SkipWhenUnused,
 }
 ```
 
@@ -39,15 +41,17 @@ pub enum ReplyDraftPolicy {
 | 呼び出し箇所 | 渡す値 | 理由 |
 | --- | --- | --- |
 | `server/src/rmcp_server.rs`（MCP `evaluate_answerability`） | `Always` | 応答の `customer_reply_draft` は出力契約であり、取次時も返す |
-| `server/src/api.rs`（`/{project_id}/api/reply`） | `SkipOnEscalate` | 取次時は受け止め文と決定的ブロック、または聞き返しで応答を組み立て、下書きを使わない |
-| `server/src/advisor/cs_support.rs`（homesec 経由） | `SkipOnEscalate` | 同上 |
+| `server/src/api.rs`（`/{project_id}/api/reply`） | `SkipWhenUnused` | 取次時は受け止め文と決定的ブロック、または聞き返しで応答を組み立て、`LexiconFallback` 時は判定によらず取次応答へ倒す（`decide_reply_action`）ため、いずれも下書きを使わない |
+| `server/src/advisor/cs_support.rs`（homesec 経由） | `SkipWhenUnused` | 同上 |
 
 ### 2.3 `evaluate` の挙動
 
 判定が確定し監査記録（`audit_with_nodes`）を終えた後、下書き生成の直前で次を判定する。
 
-- 方針が `SkipOnEscalate` で、判定が `AnswerDecision::Escalate` のとき: `draft_customer_reply` を呼ばない。`EvaluationOutcome.customer_reply_draft` は `None`、`customer_reply_draft_truncated` は `false` にする。
+- 方針が `SkipWhenUnused` で、判定が `AnswerDecision::Escalate` である、または抽出モードが `ExtractionMode::LexiconFallback` のとき: `draft_customer_reply` を呼ばない。`EvaluationOutcome.customer_reply_draft` は `None`、`customer_reply_draft_truncated` は `false` にする。
 - それ以外: 現行どおり `draft_customer_reply` を呼ぶ。
+
+`LexiconFallback` で下書きを作らないのは、応答生成 API とアドバイザが LLM 分類失敗のターンを判定（`Allowed` を含む）によらず取次応答にするためである。抽出モードは下書き生成より前に確定している。
 
 `reply_drafter` が無い構成（`customer_reply_draft_enabled = false`）の挙動は変わらない。
 
@@ -82,7 +86,7 @@ pub fn matching_layer1_rules<'a>(rules: &'a [EscalationRule], question: &SignalS
 | `request_id` | リクエスト ID |
 | `case_id` | case の ID |
 | `matched_rule_ids` | マッチした全ルールの `rule_id`（昇順に並べる） |
-| メッセージ | 宣言された受け止め文が、複数ルールのマッチにより使われなかった旨 |
+| メッセージ | 宣言された受け止め文が、case の累積 signal（前のターンの signal を含む）に対する複数ルールのマッチにより使われなかった旨 |
 
 顧客の発話本文、signal の値、宣言文の本文は出力しない。
 
@@ -100,8 +104,8 @@ pub fn matching_layer1_rules<'a>(rules: &'a [EscalationRule], question: &SignalS
 
 | 対象 | 固定する内容 |
 | --- | --- |
-| `harness/mod.rs`（`evaluate`） | `SkipOnEscalate` で取次になるターンは drafter のリクエストが 0 件で、`customer_reply_draft` が `None`、`customer_reply_draft_truncated` が `false` |
-| `harness/mod.rs`（`evaluate`） | `SkipOnEscalate` で回答（`Allowed`）になるターンは下書きが生成される |
+| `harness/mod.rs`（`evaluate`） | `SkipWhenUnused` で取次になるターン、または `LexiconFallback` のターンは drafter のリクエストが 0 件で、`customer_reply_draft` が `None`、`customer_reply_draft_truncated` が `false` |
+| `harness/mod.rs`（`evaluate`） | `SkipWhenUnused` で回答（`Allowed`）かつ `LexiconFallback` 以外のターンは下書きが生成される |
 | `harness/mod.rs`（`evaluate`） | `Always` で取次になるターンは下書きが生成される |
 | `harness/mod.rs`（`evaluate`） | 3.2 の 3 条件を満たすときログが 1 行出て `matched_rule_ids` が昇順で含まれる。マッチ 1 件のとき、および複数マッチでも宣言を持つルールが無いときは出ない。ログに発話本文が含まれない |
 | `harness/rules.rs` | `matching_layer1_rules` が 0 件・1 件・複数件を返し、空条件のルールを含めない。`count_layer1_matches` の既存テストが変更なしで通る |
@@ -109,7 +113,7 @@ pub fn matching_layer1_rules<'a>(rules: &'a [EscalationRule], question: &SignalS
 
 `evaluate` を通すテストの土台（vegapunk クライアントのスタブ等）が既存テストに無く、新たな仕組みを作らないと書けない場合は、該当する判定部分を純関数に切り出して単体テストする。切り出す関数は次の 2 つとする。
 
-- 下書きを生成するかどうか: `fn should_draft_reply(policy: ReplyDraftPolicy, decision: &AnswerDecision) -> bool`
+- 下書きを生成するかどうか: `fn should_draft_reply(policy: ReplyDraftPolicy, decision: &AnswerDecision, extraction_mode: ExtractionMode) -> bool`（`SkipWhenUnused` は取次または `LexiconFallback` で `false`、`Always` は常に `true`）
 - ログを出すかどうかと出力する ID: `fn suppressed_ack_rule_ids(decision: &AnswerDecision, rules: &[EscalationRule], signals: &SignalSet) -> Option<Vec<String>>`（3.2 の条件を満たすとき昇順の `rule_id` 一覧、満たさないとき `None`）
 
 この場合、`evaluate` はこの 2 関数を呼ぶだけにし、呼び出し箇所ごとの方針（2.2 の表）は各経路の既存テスト、または呼び出し箇所のコードレビューで担保する。どちらの方法を採ったかを実装報告に書く。

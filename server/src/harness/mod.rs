@@ -564,9 +564,9 @@ pub enum UnknownCaseIdPolicy {
 /// `Harness::evaluate` が返信文下書き（`customer_reply_draft`）を生成する条件（Issue #78）。
 ///
 /// 既定値は設けない。`evaluate` の全呼び出し箇所（`rmcp_server.rs` / `api.rs` /
-/// `advisor/cs_support.rs`）が明示的に渡す。`/api/reply` と homesec 経由（`SkipOnEscalate`）は
-/// 取次時に受け止め文と決定的ブロック・または聞き返しで応答を組み立て、下書きを使わずに捨てる
-/// ため、取次が確定したターンの LLM 呼び出しをそもそも発行しない。MCP
+/// `advisor/cs_support.rs`）が明示的に渡す。`/api/reply` と homesec 経由（`SkipWhenUnused`）は
+/// 取次時、および LLM 分類失敗（`LexiconFallback`）時は、受け止め文と決定的ブロック・または
+/// 聞き返しで応答を組み立て下書きを使わずに捨てるため、その LLM 呼び出しをそもそも発行しない。MCP
 /// `evaluate_answerability`（`Always`）は `customer_reply_draft` が出力契約の一部であり、
 /// 取次時も返す。詳細は design doc
 /// `docs/superpowers/specs/2026-10-05-skip-unused-draft-and-ack-log-design.md` §2。
@@ -574,19 +574,29 @@ pub enum UnknownCaseIdPolicy {
 pub enum ReplyDraftPolicy {
     /// 判定によらず生成する。
     Always,
-    /// 判定が取次（`AnswerDecision::Escalate`）のときは生成しない。
-    SkipOnEscalate,
+    /// 呼び出し元が使わないと分かっている下書きは生成しない。次のいずれかのとき生成しない。
+    /// - 判定が取次（`AnswerDecision::Escalate`）
+    /// - 抽出モードが `ExtractionMode::LexiconFallback`（判定によらない。`decide_reply_action` が
+    ///   判定によらず `EscalationReply` へ倒すため、下書きは参照されない）
+    SkipWhenUnused,
 }
 
 /// `policy` と確定した `decision` から、`Harness::draft_customer_reply` を呼ぶかどうかを決める
 /// 純関数（Issue #78）。`evaluate` 本体から切り出してあるのは、`harness_for_test()` が
 /// `knowledge: None` で構築されており `evaluate()` 自体を通すテストの土台が無いため
 /// （design doc §4）。
-pub fn should_draft_reply(policy: ReplyDraftPolicy, decision: &decision::AnswerDecision) -> bool {
+pub fn should_draft_reply(
+    policy: ReplyDraftPolicy,
+    decision: &decision::AnswerDecision,
+    extraction_mode: extraction::ExtractionMode,
+) -> bool {
     match policy {
         ReplyDraftPolicy::Always => true,
-        ReplyDraftPolicy::SkipOnEscalate => {
-            !matches!(decision, decision::AnswerDecision::Escalate { .. })
+        ReplyDraftPolicy::SkipWhenUnused => {
+            let is_escalate = matches!(decision, decision::AnswerDecision::Escalate { .. });
+            let is_forced_escalation_by_extraction_failure =
+                extraction_mode == extraction::ExtractionMode::LexiconFallback;
+            !(is_escalate || is_forced_escalation_by_extraction_failure)
         }
     }
 }
@@ -1484,7 +1494,8 @@ impl Harness {
                 case_id = %case_id,
                 matched_rule_ids = ?matched_rule_ids,
                 "a rule-declared customer_ack was not used because multiple layer-1 rules \
-                 matched this turn (customer_ack applies only when exactly one layer-1 rule \
+                 matched the case's accumulated signals (signals from earlier turns included; \
+                 customer_ack applies only when exactly one layer-1 rule \
                  matches); the reply falls back to the path's non-declared acknowledgement \
                  handling. To have the declared text used, review overlapping rule conditions"
             );
@@ -1603,11 +1614,11 @@ impl Harness {
         // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
         // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
         //
-        // Issue #78: `policy == SkipOnEscalate` かつ判定が取次のときは、呼び出し元
-        // （`/api/reply` / homesec 経由）がこの下書きを使わず捨てるため、LLM 呼び出し自体を
-        // 発行しない（`should_draft_reply` は純関数。design doc
+        // Issue #78: `policy == SkipWhenUnused` かつ（判定が取次、または抽出モードが
+        // `LexiconFallback`）のときは、呼び出し元（`/api/reply` / homesec 経由）がこの下書きを
+        // 使わず捨てるため、LLM 呼び出し自体を発行しない（`should_draft_reply` は純関数。design doc
         // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.3）。
-        let reply_draft = if should_draft_reply(policy, &decision_result) {
+        let reply_draft = if should_draft_reply(policy, &decision_result, extraction_mode) {
             self.draft_customer_reply(
                 question,
                 &decision_result,
@@ -2246,8 +2257,20 @@ mod tests {
     // `evaluate()` 自体を通すテストの土台（vegapunk クライアントのスタブ等）が既存テストに無い
     // ため（`harness_for_test()` は `knowledge: None` で構築され `evaluate()` は即座に
     // `Err` を返す）、design doc §4 のとおり純関数を直接テストする。`evaluate()` が
-    // `should_draft_reply(policy, &decision_result)` を呼ぶだけであることはコードレビューで
-    // 担保する。
+    // `should_draft_reply(policy, &decision_result, extraction_mode)` を呼ぶだけであることは
+    // コードレビューで担保する。
+    // `ExtractionMode` の全バリアント。バリアント追加時に網羅が漏れないよう、この match は
+    // ワイルドカードを使わない（コンパイルエラーで気づく）。
+    fn all_extraction_modes() -> [extraction::ExtractionMode; 3] {
+        use extraction::ExtractionMode::{Hybrid, LexiconFallback, LexiconOnly};
+        let modes = [LexiconOnly, Hybrid, LexiconFallback];
+        for m in modes {
+            match m {
+                LexiconOnly | Hybrid | LexiconFallback => {}
+            }
+        }
+        modes
+    }
 
     fn allowed_decision() -> decision::AnswerDecision {
         decision::AnswerDecision::Allowed {
@@ -2260,36 +2283,53 @@ mod tests {
     }
 
     #[test]
-    fn should_draft_reply_is_false_for_skip_on_escalate_when_decision_is_escalate() {
+    fn should_draft_reply_is_false_for_skip_when_unused_when_decision_is_escalate_in_any_mode() {
         let decision =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        for mode in all_extraction_modes() {
+            assert!(
+                !should_draft_reply(ReplyDraftPolicy::SkipWhenUnused, &decision, mode),
+                "Escalate must not draft under SkipWhenUnused (mode={mode:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn should_draft_reply_is_false_for_skip_when_unused_when_allowed_but_lexicon_fallback() {
         assert!(!should_draft_reply(
-            ReplyDraftPolicy::SkipOnEscalate,
-            &decision
+            ReplyDraftPolicy::SkipWhenUnused,
+            &allowed_decision(),
+            extraction::ExtractionMode::LexiconFallback
         ));
     }
 
     #[test]
-    fn should_draft_reply_is_true_for_skip_on_escalate_when_decision_is_allowed() {
-        assert!(should_draft_reply(
-            ReplyDraftPolicy::SkipOnEscalate,
-            &allowed_decision()
-        ));
+    fn should_draft_reply_is_true_for_skip_when_unused_when_allowed_and_not_lexicon_fallback() {
+        for mode in all_extraction_modes()
+            .into_iter()
+            .filter(|m| *m != extraction::ExtractionMode::LexiconFallback)
+        {
+            assert!(
+                should_draft_reply(ReplyDraftPolicy::SkipWhenUnused, &allowed_decision(), mode),
+                "Allowed must draft under SkipWhenUnused (mode={mode:?})"
+            );
+        }
     }
 
     #[test]
-    fn should_draft_reply_is_true_for_always_when_decision_is_escalate() {
-        let decision =
+    fn should_draft_reply_is_true_for_always_regardless_of_decision_and_mode() {
+        let escalate =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
-        assert!(should_draft_reply(ReplyDraftPolicy::Always, &decision));
-    }
-
-    #[test]
-    fn should_draft_reply_is_true_for_always_when_decision_is_allowed() {
-        assert!(should_draft_reply(
-            ReplyDraftPolicy::Always,
-            &allowed_decision()
-        ));
+        for mode in all_extraction_modes() {
+            assert!(
+                should_draft_reply(ReplyDraftPolicy::Always, &escalate, mode),
+                "Always must draft on Escalate (mode={mode:?})"
+            );
+            assert!(
+                should_draft_reply(ReplyDraftPolicy::Always, &allowed_decision(), mode),
+                "Always must draft on Allowed (mode={mode:?})"
+            );
+        }
     }
 
     // ---- suppressed_ack_rule_ids（Issue #79） ----
