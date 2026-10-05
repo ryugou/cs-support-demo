@@ -72,8 +72,7 @@ struct LexiconFile {
 struct CompiledEntry {
     signal: String,
     normalized_forms: Vec<String>,
-    /// 正規化済み・文字数の長い順にソート済みの抑止語形。空なら抑止なし（現行どおり
-    /// normalized_forms を直接照合する）。
+    /// 正規化済みの抑止語形。空なら抑止なし（現行どおり normalized_forms を直接照合する）。
     suppress_forms: Vec<String>,
 }
 
@@ -84,14 +83,44 @@ struct CompiledEntry {
 /// （`docs/superpowers/specs/2026-10-05-lexicon-suppress-forms-design.md` §2.3）。
 const SUPPRESS_REMOVAL_MARKER: char = '\u{0}';
 
-/// 正規化済み発話から、与えた抑止語形（文字数の長い順にソート済みである必要がある。
-/// 「契約する前」の一部だけが先に消えて「契約すると」等を誤って残すことを防ぐため）の
-/// 出現箇所を `SUPPRESS_REMOVAL_MARKER` に置換した文字列を返す。
-fn mask_suppressed(normalized: &str, suppress_forms_longest_first: &[String]) -> String {
-    let mut masked = normalized.to_string();
-    for form in suppress_forms_longest_first {
-        masked = masked.replace(form.as_str(), &SUPPRESS_REMOVAL_MARKER.to_string());
+/// 正規化済み発話に対して、全抑止語形の一致範囲（同じ語形の重なり合う出現を含む）を
+/// 先に収集し、重なり・隣接する範囲を統合してから、各範囲を `SUPPRESS_REMOVAL_MARKER`
+/// 1 文字に置き換えた文字列を返す。
+///
+/// 置換を順に重ねると、先に置いた区切り文字が別の抑止語形の一致を壊す（"abc" を置換した後は
+/// 元の "bcd" が検索できない）ため、必ず元の文字列に対して一度に範囲を確定する。
+/// 範囲は `str` の検索 API が返すバイト位置で、常に UTF-8 の文字境界に乗る。
+fn mask_suppressed(normalized: &str, suppress_forms: &[String]) -> String {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for form in suppress_forms {
+        let mut search_from = 0;
+        while let Some(offset) = normalized[search_from..].find(form.as_str()) {
+            let start = search_from + offset;
+            ranges.push((start, start + form.len()));
+            // match_indices は重ならない出現しか返さないため、1 文字ずつ進めて探す。
+            let first_char_len = normalized[start..].chars().next().map_or(1, char::len_utf8);
+            search_from = start + first_char_len;
+        }
     }
+    ranges.sort_unstable();
+
+    let mut masked = String::with_capacity(normalized.len());
+    let mut cursor = 0;
+    let mut ranges = ranges.into_iter().peekable();
+    while let Some((start, mut end)) = ranges.next() {
+        // 重なる範囲・隣接する範囲（next.start <= end）を 1 つに統合する。
+        while let Some(&(next_start, next_end)) = ranges.peek() {
+            if next_start > end {
+                break;
+            }
+            end = end.max(next_end);
+            ranges.next();
+        }
+        masked.push_str(&normalized[cursor..start]);
+        masked.push(SUPPRESS_REMOVAL_MARKER);
+        cursor = end;
+    }
+    masked.push_str(&normalized[cursor..]);
     masked
 }
 
@@ -156,9 +185,10 @@ impl LexiconNormalizer {
         for entry in &file.signals {
             if entry.llm_only && !entry.suppress_forms.is_empty() {
                 anyhow::bail!(
-                    "signal {} is llm_only and must not declare suppress_forms (string matching \
-                     is not performed for llm_only signals)",
-                    entry.signal
+                    "signal {} is llm_only and must not declare suppress_forms {:?} (string \
+                     matching is not performed for llm_only signals)",
+                    entry.signal,
+                    entry.suppress_forms
                 );
             }
             let normalized_surface_forms: Vec<String> = entry
@@ -210,14 +240,11 @@ impl LexiconNormalizer {
                         entry.signal
                     );
                 }
-                let mut suppress_forms: Vec<String> = entry
+                let suppress_forms: Vec<String> = entry
                     .suppress_forms
                     .iter()
                     .map(|form| normalize_key(form))
                     .collect();
-                // 長い語形から先に取り除く（短い語形が先に一部だけ消費するのを防ぐ。
-                // 設計書 §2.3）。
-                suppress_forms.sort_by_key(|form| std::cmp::Reverse(form.chars().count()));
                 Ok(CompiledEntry {
                     signal: entry.signal,
                     normalized_forms,
@@ -441,10 +468,9 @@ mod tests {
     }
 
     #[test]
-    fn suppress_forms_remove_the_longest_shared_prefix_form_first() {
-        // "契約する" は "契約する前" の接頭辞を共有する短い語形。短い方を先に取り除くと
-        // "前"（別の surface_form）だけが残って誤って signal が立つ。長い語形
-        // "契約する前" を丸ごと先に取り除けば "前" も一緒に消え、誤発火しない。
+    fn suppress_forms_mask_both_ranges_when_two_forms_share_a_prefix() {
+        // "契約する" は "契約する前" の接頭辞を共有する短い語形。どちらの範囲も
+        // マスクされなければ "前"（別の surface_form）が残って誤って signal が立つ。
         let lex = LexiconNormalizer::from_json(
             r#"{ "signals": [
                 { "signal": "contract_billing_question", "class": "context",
@@ -457,6 +483,62 @@ mod tests {
         assert!(!lex
             .normalize("契約する前です")
             .contains(&Signal::new("contract_billing_question")));
+    }
+
+    fn signal_fires(surface_forms: &str, suppress_forms: &str, utterance: &str) -> bool {
+        let json = format!(
+            r#"{{ "signals": [ {{ "signal": "s", "class": "context",
+                "surface_forms": {surface_forms}, "suppress_forms": {suppress_forms} }} ] }}"#
+        );
+        LexiconNormalizer::from_json(&json)
+            .expect("lexicon parses")
+            .normalize(utterance)
+            .contains(&Signal::new("s"))
+    }
+
+    #[test]
+    fn suppress_forms_mask_overlapping_distinct_forms() {
+        // "abc" と "bcd" は "abcd" の中で重なる。順に置換すると "abc" を置換した後
+        // "bcd" が検索できず、元は "bcd" の一部だった "d" が残って signal が立つ。
+        assert!(!signal_fires(r#"["b", "d"]"#, r#"["abc", "bcd"]"#, "abcd"));
+    }
+
+    #[test]
+    fn suppress_forms_mask_overlapping_occurrences_of_the_same_form() {
+        // 語形 "aa" は "aaa" の位置 0 と 1 の両方に出現する（重なり合う出現）。
+        assert!(!signal_fires(r#"["a"]"#, r#"["aa"]"#, "aaa"));
+    }
+
+    #[test]
+    fn suppress_forms_keep_a_surface_form_outside_every_suppressed_range() {
+        assert!(signal_fires(r#"["b", "d"]"#, r#"["abc", "bcd"]"#, "abcdxd"));
+        assert!(signal_fires(r#"["a"]"#, r#"["aa"]"#, "aaaba"));
+    }
+
+    #[test]
+    fn suppress_forms_mask_overlapping_multibyte_forms() {
+        // "契約前" と "前に" は "契約前に" の中で "前" を共有して重なる。surface_form の
+        // "契約"・"に" はどちらの範囲にも含まれるため、全体がマスクされて signal は立たない。
+        assert!(!signal_fires(
+            r#"["契約", "に"]"#,
+            r#"["契約前", "前に"]"#,
+            "契約前に"
+        ));
+        // 抑止範囲の外（"です"）に surface_form があれば立つ。
+        assert!(signal_fires(
+            r#"["契約", "に", "です"]"#,
+            r#"["契約前", "前に"]"#,
+            "契約前にです"
+        ));
+    }
+
+    #[test]
+    fn mask_suppressed_replaces_each_merged_range_with_one_marker() {
+        let masked = mask_suppressed("xabcdy", &["abc".to_string(), "bcd".to_string()]);
+        assert_eq!(masked, format!("x{SUPPRESS_REMOVAL_MARKER}y"));
+        // 隣接する範囲も統合して 1 文字にする。
+        let adjacent = mask_suppressed("abcd", &["ab".to_string(), "cd".to_string()]);
+        assert_eq!(adjacent, SUPPRESS_REMOVAL_MARKER.to_string());
     }
 
     #[test]
@@ -503,7 +585,9 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("an llm_only entry with suppress_forms must be rejected"),
         };
-        assert!(err.to_string().contains("llm_only_suppress_test"));
+        let message = err.to_string();
+        assert!(message.contains("llm_only_suppress_test"));
+        assert!(message.contains("foo"));
     }
 
     #[test]
