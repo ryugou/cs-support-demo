@@ -33,7 +33,7 @@ root の `signal-lexicon.json` と `server/data/rules.sample.json` は変更し�
 
 ### 2.2 `server/data/urtect/rules.json`
 
-`escalation_rules` に次を追加する。
+`escalation_rules` の末尾（`human-handoff` の後）に次を追加する。同じ binding のルールが複数マッチしたときは配列の先頭側が選ばれるため（`harness::rules::match_layer1`）、mandatory 同士で競合したときに安全系（`construction-risk`）と `human-handoff` を優先させる目的で末尾に置く。
 
 ```json
 { "rule_id": "initial-cost-quote", "condition": ["initial_cost_question"], "owner": "contract", "route": "support_desk", "binding": "mandatory", "customer_ack": "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。" }
@@ -147,3 +147,4 @@ customer_ack: { type: string }
 
 - 初期費用の語と他の質問が同じ発話にある場合（「月額と初期費用を教えてください」）は、発話全体が取次になり、月額には答えない。
 - 「設置にいくらかかりますか」のように、2.1 の語を含まない言い回しは lexicon では拾えない。本番は LLM 分類との和集合（`server/src/harness/extraction.rs`）が補うが、LLM 失敗時は補われない。
+- ホームセキュリティアドバイザ（homesec）経由の取次（`server/src/advisor/cs_support.rs`）は `customer_ack` を適用しない。この経路の受け止め文は、drafter があれば `escalation_reply::draft_ack_text`（LLM 生成）、無ければ `fallback_ack` で作る。変更前と同じ生成方法のままである。

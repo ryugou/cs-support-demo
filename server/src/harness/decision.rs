@@ -1984,6 +1984,42 @@ mod tests {
         );
     }
 
+    // 累積 signal が initial-cost-quote と他の mandatory ルールの両方にマッチしたとき、同じ
+    // binding 内では配列の先頭側が選ばれる（`match_layer1` の doc）。安全系（construction-risk）と
+    // human-handoff を優先させるため、initial-cost-quote は rules.json の末尾に置く。
+    #[test]
+    fn bundled_initial_cost_yields_to_construction_risk_and_human_handoff_when_both_match() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for (utterance, other_signal, expected_rule) in [
+            (
+                "電気工事の工事費はいくらですか",
+                "physical_construction_risk",
+                "construction-risk",
+            ),
+            (
+                "初期費用のことで担当者につないでください",
+                "human_handoff_request",
+                "human-handoff",
+            ),
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&Signal::new("initial_cost_question"))
+                    && extracted.contains(&Signal::new(other_signal)),
+                "precondition: both initial_cost_question and {other_signal} must fire for: {utterance}"
+            );
+            assert_eq!(
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+                Some(expected_rule),
+                "expected {expected_rule} to win over initial-cost-quote for: {utterance}"
+            );
+        }
+    }
+
     #[test]
     fn decide_is_deterministic() {
         let resolutions = vec![kr("kr1", &["discoloration"])];

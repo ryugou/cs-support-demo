@@ -3499,6 +3499,103 @@ mod tests {
         assert!(!conv_mutated);
     }
 
+    // 宣言文も LLM 生成の受け止め文と同じ 2 つのゲート（NG 表現・取扱製品）を通る。却下時は
+    // `fallback_ack` の文へ倒れ、決定的ブロックは変わらず続く（design doc §4.1 / §6）。
+    // LLM を呼ばないことは `stub_drafter` のリクエストログが 0 件であることで検証する。
+    #[tokio::test]
+    async fn build_escalation_reply_text_falls_back_when_the_declared_customer_ack_hits_the_ng_gate(
+    ) {
+        let declared = "この対応で絶対に治ります。担当者におつなぎします。";
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        let ng = crate::harness::egress::NgDictionary::from_json(
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":[]}"#,
+        )
+        .unwrap();
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state();
+
+        let (reply_text, _) = build_escalation_reply_text(
+            Some(&drafter),
+            &ng,
+            700,
+            "初期費用はいくらですか",
+            false,
+            Some(declared),
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::assemble_escalation_reply(
+                escalation_reply::fallback_ack(false).0,
+                &escalation_reply::build_deterministic_block(
+                    "case-12345678-abcd",
+                    "平日 10:00〜18:00",
+                    false
+                )
+            ),
+            "a declared customer_ack rejected by the NG gate must fall back to fallback_ack \
+             followed by the deterministic block"
+        );
+        assert!(!reply_text.contains(declared));
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "the NG-gate fallback must not call the LLM"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_escalation_reply_text_falls_back_when_the_declared_customer_ack_names_an_out_of_scope_model(
+    ) {
+        let declared = "ADC-VDB101の初期費用は担当者におつなぎします。";
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        let allowlist = response_gate_fixture_allowlist(); // 取扱は ADC-V724 のみ
+        let mut conv = default_conv_state();
+
+        let (reply_text, _) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "初期費用はいくらですか",
+            false,
+            Some(declared),
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::assemble_escalation_reply(
+                escalation_reply::fallback_ack(false).0,
+                &escalation_reply::build_deterministic_block(
+                    "case-12345678-abcd",
+                    "平日 10:00〜18:00",
+                    false
+                )
+            ),
+            "a declared customer_ack rejected by the product gate must fall back to \
+             fallback_ack followed by the deterministic block"
+        );
+        assert!(!reply_text.contains("ADC-VDB101"));
+        assert_eq!(
+            log.lock().unwrap().len(),
+            0,
+            "the product-gate fallback must not call the LLM"
+        );
+    }
+
     #[tokio::test]
     async fn build_escalation_reply_text_skips_the_llm_and_full_block_when_already_escalated() {
         let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
