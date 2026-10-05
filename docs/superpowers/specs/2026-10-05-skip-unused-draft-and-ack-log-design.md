@@ -118,7 +118,7 @@ pub fn matching_layer1_rules<'a>(rules: &'a [EscalationRule], question: &SignalS
 | `harness/mod.rs`（`evaluate`） | `Always` で取次になるターン、または二段目ゲートが打ち切るターンは下書きが生成される |
 | `harness/mod.rs`（`second_stage_short_circuits`） | `Always` は常に `false`。`SkipWhenUnused` は、取扱外が確定する `response_allowlist` で `true`、同じ製品参照・質問でもその型番を取扱製品として含む `response_allowlist` で `false`（方針に載せた allowlist が判定に使われることの固定） |
 | `harness/mod.rs`（`second_stage_short_circuits`） | veto が起きる入力（`matched_model` が取扱内型番）で呼んでも警告が出ない |
-| `harness/product_gate.rs`（`find_confirmed_foreign_reference` / `confirmed_foreign_reference`） | 判定本体とラッパーが、確定あり・参照なし・ambiguous のみ・matched のみ・各 veto 条件で同じ結果を返す。判定本体は警告を出さず veto 情報（種別と文字数）を返す。ラッパーは veto 時に警告を 1 行だけ出し、veto が無いときは出さない |
+| `harness/product_gate.rs`（`find_confirmed_foreign_reference` / `confirmed_foreign_reference`） | 判定本体とラッパーが、確定あり・参照なし・ambiguous のみ・matched のみ・各 veto 条件で同じ結果を返す。判定本体は警告を出さず veto 情報（種別と文字数）を返す。ラッパーは veto 時に警告を 1 行だけ出し、veto が無いときは出さない。複数の参照が混在する場合（matched_model veto → surface veto → 確定 → 確定より後ろの veto 対象）は、判定本体が veto された参照を飛ばして最初の確定参照を返し、`vetoes` が走査順にちょうど 2 件（確定より後ろは記録しない）で、ラッパーが同じ順序で警告をちょうど 2 行出す |
 | `harness/mod.rs`（`evaluate`） | 3.2 の 3 条件を満たすときログが 1 行出て `matched_rule_ids` が昇順で含まれる。マッチ 1 件のとき、および複数マッチでも宣言を持つルールが無いときは出ない。ログに発話本文が含まれない |
 | `harness/rules.rs` | `matching_layer1_rules` が 0 件・1 件・複数件を返し、空条件のルールを含めない。`count_layer1_matches` の既存テストが変更なしで通る |
 | `harness/knowledge.rs` | 重複した `rule_id` を含む入力で警告が 1 行出て、重複 ID が昇順で含まれる。重複が無いときは出ない |

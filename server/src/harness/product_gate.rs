@@ -1518,6 +1518,71 @@ mod tests {
         }
     }
 
+    /// 走査順に 4 件: (1) matched_model veto、(2) surface veto、(3) 確定する取扱外参照、
+    /// (4) 確定より後ろの surface veto（単独なら veto される。surface が 9 文字で (2) の
+    /// 8 文字と区別できる）。
+    fn mixed_veto_and_confirmed_refs() -> (Vec<ProductReference>, &'static str) {
+        let refs = vec![
+            ProductReference {
+                surface: "Ringのドアベル".to_string(),
+                resolution: ProductReferenceResolution::Foreign,
+                matched_model: Some("ADC-V724".to_string()),
+            },
+            foreign_ref("ADC-V724"),
+            foreign_ref("ADC-VDB101"),
+            foreign_ref("ADC-V523X"),
+        ];
+        (
+            refs,
+            "Ringのドアベル、ADC-V724、ADC-VDB101、ADC-V523Xについて",
+        )
+    }
+
+    #[test]
+    fn find_confirmed_foreign_reference_skips_vetoed_references_and_stops_at_the_first_confirmed_one(
+    ) {
+        let (refs, message) = mixed_veto_and_confirmed_refs();
+        let (check, logs) = capture_warnings_sync(|| {
+            find_confirmed_foreign_reference(&refs, message, &fixture_allowlist())
+        });
+        assert_eq!(
+            check.confirmed,
+            Some(&refs[2]),
+            "veto された 1・2 を飛ばして 3 を確定する"
+        );
+        assert_eq!(
+            check.vetoes,
+            vec![
+                ForeignReferenceVeto::MatchedModelInScope {
+                    matched_model_chars: 8,
+                    surface_chars: 9,
+                },
+                ForeignReferenceVeto::SurfaceInScope { surface_chars: 8 },
+            ],
+            "確定より後ろの 4 は評価されず記録されない"
+        );
+        assert!(logs.is_empty(), "判定本体は警告を出さない: {logs}");
+    }
+
+    #[test]
+    fn confirmed_foreign_reference_returns_the_first_confirmed_one_and_warns_for_each_earlier_veto_in_scan_order(
+    ) {
+        let (refs, message) = mixed_veto_and_confirmed_refs();
+        let (result, logs) = capture_warnings_sync(|| {
+            confirmed_foreign_reference(&refs, message, &fixture_allowlist())
+        });
+        assert_eq!(result, Some(&refs[2]));
+        let lines: Vec<&str> = logs.lines().collect();
+        assert_eq!(lines.len(), 2, "{logs}");
+        assert!(lines[0].contains("self-contradictory output"), "{logs}");
+        assert!(lines[0].contains("matched_model_chars=8"), "{logs}");
+        assert!(
+            lines[1].contains("the deterministic product master overrides"),
+            "{logs}"
+        );
+        assert!(lines[1].contains("surface_chars=8"), "{logs}");
+    }
+
     #[test]
     fn find_confirmed_foreign_reference_reports_a_matched_model_veto_without_logging() {
         let refs = matched_model_veto_refs();
