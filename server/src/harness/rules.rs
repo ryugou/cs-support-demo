@@ -223,13 +223,26 @@ pub fn match_layer1<'a>(
     rules: &'a [EscalationRule],
     question: &SignalSet,
 ) -> Option<&'a EscalationRule> {
-    fn matches(rule: &EscalationRule, question: &SignalSet) -> bool {
-        !rule.condition.is_empty() && rule.condition.is_subset(question)
-    }
     rules
         .iter()
-        .find(|rule| matches(rule, question) && rule.binding == Binding::Mandatory)
-        .or_else(|| rules.iter().find(|rule| matches(rule, question)))
+        .find(|rule| rule_matches(rule, question) && rule.binding == Binding::Mandatory)
+        .or_else(|| rules.iter().find(|rule| rule_matches(rule, question)))
+}
+
+/// 第1層でマッチするルールの件数（binding を問わない）。マッチ条件は `match_layer1` と同一。
+///
+/// 用途: `customer_ack`（取次ルールが宣言する顧客向け受け止め文）の適用条件。宣言文は
+/// 「そのルールの理由」を述べる文なので、他のルールにも当たる発話では相談の主題と食い違う。
+/// ルールの選択順（配列順・vegapunk の返却順）に依存せず適用可否を決めるため、件数だけを見る。
+pub fn count_layer1_matches(rules: &[EscalationRule], question: &SignalSet) -> usize {
+    rules
+        .iter()
+        .filter(|rule| rule_matches(rule, question))
+        .count()
+}
+
+fn rule_matches(rule: &EscalationRule, question: &SignalSet) -> bool {
+    !rule.condition.is_empty() && rule.condition.is_subset(question)
 }
 
 /// 第2層照合: signal 一致 or raw text パターン一致で必ず止める（面で塞ぐ）。
@@ -431,6 +444,41 @@ mod tests {
         let question = signals(&["security_incident", "physical_damage_smell_heat"]);
         let matched = match_layer1(&rules, &question).expect("expected a match");
         assert_eq!(matched.id, "mandatory-a");
+    }
+
+    fn rule_with(id: &str, condition: &[&str], binding: Binding) -> EscalationRule {
+        EscalationRule {
+            id: id.to_string(),
+            condition: signals(condition),
+            route: "support_desk".to_string(),
+            owner: None,
+            binding,
+            hearing: None,
+            customer_ack: None,
+        }
+    }
+
+    #[test]
+    fn count_layer1_matches_counts_zero_one_and_many_regardless_of_binding() {
+        let rules = vec![
+            rule_with("a", &["x"], Binding::Mandatory),
+            rule_with("b", &["y"], Binding::Advisory),
+            rule_with("c", &["x", "y"], Binding::Advisory),
+        ];
+        assert_eq!(count_layer1_matches(&rules, &signals(&["z"])), 0);
+        assert_eq!(count_layer1_matches(&rules, &signals(&["x"])), 1);
+        assert_eq!(count_layer1_matches(&rules, &signals(&["x", "y"])), 3);
+        assert_eq!(count_layer1_matches(&rules, &signals(&["y"])), 1);
+    }
+
+    #[test]
+    fn count_layer1_matches_does_not_count_empty_condition_rules() {
+        let rules = vec![
+            rule_with("empty", &[], Binding::Mandatory),
+            rule_with("a", &["x"], Binding::Mandatory),
+        ];
+        assert_eq!(count_layer1_matches(&rules, &signals(&["x"])), 1);
+        assert_eq!(count_layer1_matches(&rules, &signals(&[])), 0);
     }
 
     #[test]

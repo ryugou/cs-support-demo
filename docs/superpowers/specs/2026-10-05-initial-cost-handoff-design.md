@@ -11,7 +11,7 @@
 
 1. signal `initial_cost_question` を新設する。
 2. 第 1 層ルール `initial-cost-quote`（`binding: mandatory`）を追加し、`initial_cost_question` が立った問い合わせを即時取次にする。
-3. 取次ルールに省略可能な属性 `customer_ack`（顧客向けの受け止め文）を追加する。宣言があるルールで取次になったとき、`/{project_id}/api/reply` は LLM で受け止め文を生成せず、宣言された文をそのまま使う。
+3. 取次ルールに省略可能な属性 `customer_ack`（顧客向けの受け止め文）を追加する。宣言があるルールだけが第 1 層でマッチして取次になったとき（マッチ件数が 1 のとき。§3.3）、`/{project_id}/api/reply` は LLM で受け止め文を生成せず、宣言された文をそのまま使う。
 
 `mandatory` にする理由: 初期費用は設置環境で決まり、聞き返しても公開情報からは答えられない。advisory はマニュアル材料が不足すると聞き返しに開放されるため使わない。
 
@@ -33,7 +33,7 @@ root の `signal-lexicon.json` と `server/data/rules.sample.json` は変更し�
 
 ### 2.2 `server/data/urtect/rules.json`
 
-`escalation_rules` の末尾（`human-handoff` の後）に次を追加する。同じ binding のルールが複数マッチしたときは配列の先頭側が選ばれるため（`harness::rules::match_layer1`）、mandatory 同士で競合したときに安全系（`construction-risk`）と `human-handoff` を優先させる目的で末尾に置く。
+`escalation_rules` の末尾（`human-handoff` の後）に次を追加する。`escalation_rules` 内の並び順に意味は無い（本番は vegapunk の `query_nodes` の返却順でルールを読むため、配列順は保証されない）。
 
 ```json
 { "rule_id": "initial-cost-quote", "condition": ["initial_cost_question"], "owner": "contract", "route": "support_desk", "binding": "mandatory", "customer_ack": "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。" }
@@ -75,7 +75,9 @@ customer_ack: { type: string }
 
 ### 3.3 判定への伝搬
 
-`harness::decision::decide` は、第 1 層でマッチしたルールの `customer_ack` を `AnswerDecision::Escalate.customer_ack` に複製する。第 2 層・第 3 層の取次では常に `None` にする。`binding` による抑止はしない（`hearing_contract` と異なり、mandatory でも宣言を有効にする）。
+`harness::decision::decide` は、第 1 層でマッチしたルールが**ちょうど 1 件**のときだけ、そのルールの `customer_ack` を `AnswerDecision::Escalate.customer_ack` に複製する。マッチ件数は、会話単位で累積した signal 集合に対する件数で、`harness::rules::count_layer1_matches`（`match_layer1` と同一のマッチ条件、binding を問わない）で数える。2 件以上マッチしたときは、選ばれたルールが宣言を持っていても `None` にする（LLM が受け止め文を作る）。第 2 層・第 3 層の取次では常に `None` にする。1 件のときは `binding` による抑止をしない（`hearing_contract` と異なり、mandatory でも宣言を有効にする）。
+
+宣言文は「そのルールの理由」を顧客に述べる文であり、他のルールにも当たる発話では相談の主題と食い違うため、件数で適用可否を決める。取次の可否・route・`missing`・`hearing` と `match_layer1` の選択規則は変えない。
 
 ## 4. 適用箇所
 
@@ -109,6 +111,7 @@ customer_ack: { type: string }
 - `customer_ack` を宣言していないルールの取次応答は、変更前と同じ経路・同じ文面生成になる。
 - `customer_ack` は顧客に見せる文であり、社内の判定理由・ルール ID・スコアを書かない（データ作成時の規約）。
 - 顧客に出る受け止め文は、宣言文であっても NG 表現ゲートと取扱製品ゲートを必ず通る。
+- `customer_ack` の適用可否はルールの並び順・読み込み順に依存しない（第 1 層のマッチ件数だけで決まる）。
 - MCP tool の入出力の形は変更しない。
 
 ## 6. 障害時・移行時の挙動
@@ -130,7 +133,8 @@ customer_ack: { type: string }
 | lexicon 抽出 | 「初期費用はいくらですか？」「設置工事費はいくらかかりますか」「導入費用を教えてください」で `initial_cost_question` が立つ |
 | lexicon 抽出 | 「月額いくらですか？」「設置方法を教えてください」「設置代行はありますか」で `initial_cost_question` が立たない |
 | 第 1 層 | 上記 3 つの初期費用の発話が bundled rules で `initial-cost-quote` にマッチする。「月額いくらですか？」は第 1 層のどのルールにもマッチしない |
-| `decide` | `initial-cost-quote` にマッチしたとき `missing` が空で、`customer_ack` が宣言文と一致する。第 2 層・第 3 層の取次では `customer_ack` が `None` |
+| `decide` | 第 1 層のマッチが `initial-cost-quote` の 1 件だけのとき（「初期費用はいくらですか？」）`customer_ack` が宣言文と一致する。複数マッチする発話（「電気工事の工事費はいくらですか」「初期費用のことで担当者につないでください」「工事費の請求書を再発行してください」）は第 1 層取次のまま `customer_ack` が `None`。bundled rules の逆順・`initial-cost-quote` 先頭でも結果が同じ。第 2 層・第 3 層の取次では `customer_ack` が `None` |
+| `rules.rs` | `count_layer1_matches` が 0 件・1 件・複数件を数え、空条件のルールを数えない |
 | `ingest_rules` | bundled `rules.json` がパースでき、`initial-cost-quote` のノードに `customer_ack` 属性が宣言文で書かれ、他のルールは空文字になる |
 | `ingest_rules` | 空白のみ・改行入り・121 文字の `customer_ack` をそれぞれ拒否し、エラー文に rule_id が含まれる。`customer_ack` を持たない rules ファイルは従来どおりパースできる |
 | `knowledge.rs` | 属性なし・空文字は `None`、値ありは `Some`（前後の空白を除く） |
@@ -146,5 +150,7 @@ customer_ack: { type: string }
 ## 9. 既知の限界
 
 - 初期費用の語と他の質問が同じ発話にある場合（「月額と初期費用を教えてください」）は、発話全体が取次になり、月額には答えない。
+- 初期費用の語が他の第 1 層ルールにも当たる複合発話（「工事費の請求書を再発行してください」）は、`initial-cost-quote`（mandatory）または他の mandatory で取次が成立するが、宣言文は使われず LLM の受け止め文になる。
+- signal は会話単位で累積するため、前のターンで他の第 1 層ルールの signal が立っていると、初期費用を聞いたターンでもマッチが 2 件以上になり宣言文は使われない（LLM の受け止め文になる。取次自体は成立する）。例: 前のターンで「請求書を再発行してほしい」（`contract_billing_question`）が立った後に「初期費用はいくらですか？」と聞くと、`contract-billing` と `initial-cost-quote` の 2 件にマッチする。
 - 「設置にいくらかかりますか」のように、2.1 の語を含まない言い回しは lexicon では拾えない。本番は LLM 分類との和集合（`server/src/harness/extraction.rs`）が補うが、LLM 失敗時は補われない。
 - ホームセキュリティアドバイザ（homesec）経由の取次（`server/src/advisor/cs_support.rs`）は `customer_ack` を適用しない。この経路の受け止め文は、drafter があれば `escalation_reply::draft_ack_text`（LLM 生成）、無ければ `fallback_ack` で作る。変更前と同じ生成方法のままである。

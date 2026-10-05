@@ -1,6 +1,6 @@
 use crate::harness::rules::{
-    match_known_resolution, match_layer1, match_layer2, Binding, EscalationRule, HearingContract,
-    KnownResolution, KrMatch, ProhibitedDomain,
+    count_layer1_matches, match_known_resolution, match_layer1, match_layer2, Binding,
+    EscalationRule, HearingContract, KnownResolution, KrMatch, ProhibitedDomain,
 };
 use crate::harness::signal::SignalSet;
 use serde::Serialize;
@@ -206,6 +206,10 @@ pub struct DecisionInput<'a> {
 /// `contract-billing` は型番も症状も関係なく、`has_enough_info`（製品と症状が分かるか）で測ると
 /// 無関係なヒアリングへ流れるため。`missing`（マニュアル材料のカバレッジ）は従来どおり binding
 /// だけで決まり、この宣言とは独立。
+///
+/// Issue #76: `customer_ack` は、第1層でマッチしたルールが**ちょうど1件**のときだけ、そのルールの
+/// 宣言を運ぶ（`count_layer1_matches`）。累積 signal 集合（会話単位）で2件以上マッチしたときは、選ばれたルールが宣言を持って
+/// いても `None`（LLM が受け止め文を作る）。取次の可否・route・`missing`・`hearing` は変えない。
 pub fn decide(input: &DecisionInput) -> AnswerDecision {
     let stakes = classify_stakes(&input.stakes_input);
     let threshold = answerability_threshold(input.thresholds, stakes);
@@ -229,9 +233,15 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             // mandatory では宣言があっても `None`（`hearing_contract` の doc）。
             hearing: rule.hearing_contract(),
             // Issue #76: `hearing_contract()` と異なり binding による抑止は無い。mandatory の
-            // 取次ルールも顧客向けの受け止め文を宣言できる（design doc
+            // 取次ルールも顧客向けの受け止め文を宣言できる。ただしマッチした第1層ルールが
+            // ちょうど1件のときだけ有効（複合発話では宣言文が主題と食い違うため、LLM の受け止め文
+            // に任せる）。件数で決めるので、ルールの並び順に依存しない（design doc
             // `2026-10-05-initial-cost-handoff-design.md` §3.3）。
-            customer_ack: rule.customer_ack.clone(),
+            customer_ack: if count_layer1_matches(input.rules, input.question_signals) == 1 {
+                rule.customer_ack.clone()
+            } else {
+                None
+            },
         };
     }
     // 第2層: 禁止領域（変更しない。fail-closed の核。missing は常に空・情報の有無を問わない）
@@ -1984,39 +1994,118 @@ mod tests {
         );
     }
 
-    // 累積 signal が initial-cost-quote と他の mandatory ルールの両方にマッチしたとき、同じ
-    // binding 内では配列の先頭側が選ばれる（`match_layer1` の doc）。安全系（construction-risk）と
-    // human-handoff を優先させるため、initial-cost-quote は rules.json の末尾に置く。
-    #[test]
-    fn bundled_initial_cost_yields_to_construction_risk_and_human_handoff_when_both_match() {
+    const INITIAL_COST_ACK: &str =
+        "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。";
+
+    /// bundled lexicon で発話を抽出し、与えたルール集合で `decide` を回して
+    /// （第1層取次か, `customer_ack`）を返す。想定 signal が立っていることもここで固定する。
+    fn layer1_ack_for(
+        utterance: &str,
+        expected_signals: &[&str],
+        rules: &[EscalationRule],
+    ) -> (bool, Option<String>) {
         use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
         let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
             .expect("bundled urtect signal-lexicon.json loads");
-        let rules = load_bundled_escalation_rules();
+        let extracted = lex.normalize(utterance);
+        for s in expected_signals {
+            assert!(
+                extracted.contains(&Signal::new(*s)),
+                "precondition: signal {s} must fire for: {utterance}, got {extracted:?}"
+            );
+        }
+        match decide(&input(
+            &extracted,
+            rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+        )) {
+            AnswerDecision::Escalate {
+                layer,
+                customer_ack,
+                ..
+            } => (layer == 1, customer_ack),
+            other => panic!("expected escalate for {utterance}, got {other:?}"),
+        }
+    }
 
-        for (utterance, other_signal, expected_rule) in [
+    /// (発話, 立つべき signal, 期待する customer_ack)。`customer_ack` は第1層でマッチした
+    /// ルールがちょうど1件のときだけ有効（複合発話は None）。
+    fn initial_cost_ack_cases() -> Vec<(&'static str, Vec<&'static str>, Option<&'static str>)> {
+        vec![
+            (
+                "初期費用はいくらですか？",
+                vec!["initial_cost_question"],
+                Some(INITIAL_COST_ACK),
+            ),
             (
                 "電気工事の工事費はいくらですか",
-                "physical_construction_risk",
-                "construction-risk",
+                vec!["initial_cost_question", "physical_construction_risk"],
+                None,
             ),
             (
                 "初期費用のことで担当者につないでください",
-                "human_handoff_request",
-                "human-handoff",
+                vec!["initial_cost_question", "human_handoff_request"],
+                None,
             ),
-        ] {
-            let extracted = lex.normalize(utterance);
-            assert!(
-                extracted.contains(&Signal::new("initial_cost_question"))
-                    && extracted.contains(&Signal::new(other_signal)),
-                "precondition: both initial_cost_question and {other_signal} must fire for: {utterance}"
-            );
+            (
+                "工事費の請求書を再発行してください",
+                vec!["initial_cost_question", "contract_billing_question"],
+                None,
+            ),
+        ]
+    }
+
+    // customer_ack は、その発話にマッチする第1層ルールがちょうど1件のときだけ有効。
+    #[test]
+    fn bundled_customer_ack_applies_only_when_exactly_one_layer1_rule_matches() {
+        let rules = load_bundled_escalation_rules();
+        for (utterance, expected_signals, expected_ack) in initial_cost_ack_cases() {
+            let (is_layer1, ack) = layer1_ack_for(utterance, &expected_signals, &rules);
+            assert!(is_layer1, "must hand off at layer 1 for: {utterance}");
             assert_eq!(
-                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
-                Some(expected_rule),
-                "expected {expected_rule} to win over initial-cost-quote for: {utterance}"
+                ack.as_deref(),
+                expected_ack,
+                "customer_ack mismatch for: {utterance}"
             );
+        }
+    }
+
+    // customer_ack の適用可否はルールの並び順（本番は vegapunk の返却順）に依存しない。
+    #[test]
+    fn customer_ack_outcome_is_independent_of_rule_order() {
+        let original = load_bundled_escalation_rules();
+        let mut reversed = original.clone();
+        reversed.reverse();
+        let mut initial_cost_first = original.clone();
+        let pos = initial_cost_first
+            .iter()
+            .position(|r| r.id == "initial-cost-quote")
+            .expect("initial-cost-quote is bundled");
+        let rule = initial_cost_first.remove(pos);
+        initial_cost_first.insert(0, rule);
+
+        for (label, rules) in [
+            ("original", &original),
+            ("reversed", &reversed),
+            ("initial-cost-first", &initial_cost_first),
+        ] {
+            for (utterance, expected_signals, expected_ack) in initial_cost_ack_cases() {
+                let (is_layer1, ack) = layer1_ack_for(utterance, &expected_signals, rules);
+                assert!(
+                    is_layer1,
+                    "[{label}] must hand off at layer 1 for: {utterance}"
+                );
+                assert_eq!(
+                    ack.as_deref(),
+                    expected_ack,
+                    "[{label}] customer_ack mismatch for: {utterance}"
+                );
+            }
         }
     }
 
