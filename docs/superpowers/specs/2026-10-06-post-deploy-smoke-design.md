@@ -1,0 +1,154 @@
+# デプロイ後スモークの機械化
+
+| 項目    | 内容 |
+| ----- | ---- |
+| 目的    | デプロイ後に人手で行っている本番確認を、1 コマンドで実行できる検証 CLI に置き換える（Issue #40） |
+| 読者    | 実装者、レビュアー、デプロイ後に確認を行う運用者 |
+| 正本の範囲 | 検証 CLI `verify_deploy` の検査項目・入力・出力・終了コード、期待値ファイルの形式 |
+| 関連文書  | [`../../../specs/production-cs-mcp.md`](../../../specs/production-cs-mcp.md)（3 層判定の正本）、[`2026-08-16-admin-dashboard-design.md`](2026-08-16-admin-dashboard-design.md)（管理 API の正本） |
+
+## 1. 採用する設計
+
+検証 CLI `server/src/bin/verify_deploy.rs` を追加し、同一イメージの Cloud Run job `verify-deploy` として実行する。CLI は本番の vegapunk に対して**読み取りだけ**を行い、次の 2 種類を検査する。
+
+1. **管理 API の読み出し検査**: 管理 API が使う読み出しを、HTTP を介さず同じ関数で実行し、本番のデータ規模で失敗しないことを確かめる。
+2. **第 1 層判定の検査**: 期待値ファイルに書いた発話を、イメージに同梱された lexicon と vegapunk に投入済みのルールで判定し、期待どおりの第 1 層ルールにマッチすること（またはどのルールにもマッチしないこと）を確かめる。
+
+2 は「lexicon はイメージに同梱、ルールは `ingest-rules` で vegapunk に投入」という反映経路の違いから生じる不整合（ルールの投入漏れ、lexicon とルールの食い違い）を検出する。
+
+CLI は vegapunk へ書き込まない。case・会話ターン・監査イベントを作らない。LLM を呼ばない。
+
+## 2. 入力
+
+### 2.1 引数
+
+| 引数 | 必須 | 内容 |
+| --- | --- | --- |
+| `--config <path>` | 必須 | サービスと同じ形式の設定ファイル。project と schema の対応、vegapunk の接続先を読む |
+| `--project <project_id>` | 必須（複数指定可） | 検査する project。設定ファイルに無い project はエラーにする |
+| `--expectations <path>` | 省略可 | 期待値ファイル。省略時は第 1 層判定の検査を行わない |
+
+vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEARER_TOKEN` / `VEGAPUNK_BEARER_TOKEN_FILE`）から読む。
+
+### 2.2 期待値ファイル
+
+`server/data/urtect/smoke-expectations.json` に置く。
+
+```json
+{
+  "layer1": [
+    { "utterance": "初期費用はいくらですか？", "expect_rule": "initial-cost-quote" },
+    { "utterance": "月額いくらですか？", "expect_rule": null }
+  ]
+}
+```
+
+- `expect_rule`: マッチすべき第 1 層ルールの `rule_id`。どのルールにもマッチしないことを期待する場合は `null`。
+- 未知のフィールドは拒否する（`deny_unknown_fields`）。`layer1` が空の場合はエラーにする。
+
+初期の内容は、次の発話とする。期待値は現在の `server/data/urtect/signal-lexicon.json` と `server/data/urtect/rules.json` に対する正しい結果である。
+
+| 発話 | `expect_rule` |
+| --- | --- |
+| 月額いくらですか？ | `null` |
+| 契約前に料金を知りたいです | `null` |
+| 初期費用はいくらですか？ | `initial-cost-quote` |
+| 解約したいです | `contract-billing` |
+| 請求額が違います | `contract-billing` |
+| 担当者につないでください | `human-handoff` |
+
+## 3. 検査項目
+
+### 3.1 管理 API の読み出し検査（project ごと）
+
+管理 API（`server/src/admin.rs`）のハンドラが呼んでいる読み出し関数を、同じ引数の組み立てで直接呼ぶ。HTTP サーバは起動しない。
+
+| 検査 | 内容 | 合格条件 |
+| --- | --- | --- |
+| `threads` | スレッド一覧の 1 ページ目を取得する | エラーにならない |
+| `thread_detail` | `threads` の先頭のスレッドについて、詳細（ターン、会話状態、case の signal）を取得する | エラーにならない。スレッドが 0 件の場合は `skipped` とし、不合格にしない |
+| `stats` | 統計を既定の期間で取得する | エラーにならない |
+
+新たに全域の読み出し（`GetGraphSnapshot` 等）を追加しない。管理 API が現在使っている読み出しだけを使う。
+
+### 3.2 第 1 層判定の検査（期待値ファイルを指定した project のみ）
+
+1. その project の schema から、サービスと同じ関数でエスカレーションルールを読む（`load_escalation_rules`）。
+2. 設定ファイルが指す lexicon を、サービスと同じ方法で読む。
+3. 期待値ファイルの各発話を lexicon だけで signal に変換し（LLM を使わない）、`match_layer1` の結果を `expect_rule` と比べる。
+
+1 件ごとに、発話・立った signal・マッチしたルール・期待値・合否を記録する。
+
+期待値ファイルは 1 つの project に対するものである。`--project` を複数指定し、かつ `--expectations` を指定した場合の対象は、引数で 1 つに決める（`--expectations-project <project_id>` を必須にする）。
+
+## 4. 出力と終了コード
+
+標準出力に JSON を 1 つ出す。
+
+```json
+{
+  "passed": false,
+  "projects": [
+    {
+      "project_id": "urtect",
+      "schema": "urtect",
+      "checks": [
+        { "name": "threads", "status": "pass", "detail": { "count": 20 } },
+        { "name": "thread_detail", "status": "pass", "detail": { "turns": 6 } },
+        { "name": "stats", "status": "pass", "detail": {} },
+        { "name": "layer1", "status": "fail", "detail": { "total": 6, "failed": 1 } }
+      ],
+      "layer1": [
+        { "utterance": "初期費用はいくらですか？", "signals": ["initial_cost_question", "price_question"], "matched_rule": null, "expect_rule": "initial-cost-quote", "status": "fail" }
+      ]
+    }
+  ]
+}
+```
+
+- `status` は `pass` / `fail` / `skipped`。
+- `detail` に顧客の発話本文・会話の内容を出さない。件数だけを出す。`layer1` の `utterance` は期待値ファイルに書いた検査用の発話であり、顧客の発話ではない。
+- 1 つでも `fail` があれば `passed` は `false`、終了コードは 1。すべて `pass` または `skipped` なら 0。
+- 検査の失敗は、原因（どの読み出しが、どのエラーで失敗したか）を標準エラーへ `tracing::error!` で出す。1 つの検査が失敗しても、残りの検査は続行する。
+- 引数や設定の誤り、vegapunk に接続できない場合は、JSON を出さずにエラーで終了する（終了コード 1）。
+
+## 5. 不変条件
+
+- CLI は vegapunk へ書き込まない。
+- CLI は LLM・Jev などの外部サービスを呼ばない。
+- 判定の検査は、サービスが使うのと同じ関数（lexicon の読み込み、ルールの読み込み、`match_layer1`）を使う。判定ロジックを CLI に複製しない。
+
+## 6. 実行と運用
+
+- Cloud Run job `verify-deploy` は、`merge-schema` と同じ VPC connector・service account・Secret Manager 注入で作成する。作成はリポジトリ管理者が `gcloud run jobs create` で行う。
+- `.github/workflows/deploy.yml` の `RUN_JOBS` への追加は、job の実体を作成した後に別の変更として行う（未作成のまま追加するとデプロイ経路全体が止まるため）。本変更では `deploy.yml` を変更しない。
+- 実行はデプロイ後に手動で行う。
+
+```sh
+gcloud run jobs execute verify-deploy --project sivira-cs-support --region asia-northeast1 --wait
+```
+
+- `Dockerfile` に `verify_deploy` バイナリの同梱を追加する（既存の検証 CLI と同じ方法）。
+
+## 7. テスト
+
+| 対象 | 固定する内容 |
+| --- | --- |
+| 期待値ファイルの読み込み | 正しい形式を読める。未知のフィールド・空の `layer1` を拒否する |
+| 同梱の期待値ファイル | `server/data/urtect/smoke-expectations.json` を、同梱の lexicon と同梱の `rules.json` から復元したルールで判定すると、全件が期待どおりになる |
+| 第 1 層判定の検査 | 期待と一致する場合は `pass`、マッチするルールが違う場合・マッチしないはずがマッチした場合・マッチするはずがしない場合は `fail` |
+| 結果の集約 | `fail` が 1 件でもあれば `passed` が `false`。`skipped` は不合格にしない |
+| 出力 | JSON に顧客の発話本文・会話の内容を含むフィールドが無い |
+
+管理 API の読み出し検査は実 vegapunk が必要なため、単体テストの対象にしない。検査の組み立て（結果を `pass` / `fail` / `skipped` に分類する部分）を純関数にしてテストする。
+
+## 8. ドキュメント更新
+
+- `CLAUDE.md` の「Cloud Run デプロイ手順」に、job `verify-deploy` の作成が必要であること、デプロイ後に上記コマンドで実行すること、`RUN_JOBS` へ追加する前に実体を作ることを追記する（Issue #40 の完了条件）。
+- `CLAUDE.md` の Cloud Run jobs の一覧に `verify-deploy` を加える。
+
+## 9. 対象外
+
+- 回答可否の判定全体（第 2 層・第 3 層、LLM による signal 抽出、返信文の生成）の検査。case と監査イベントを作り、LLM を呼ぶため、読み取り専用の検査にできない。
+- CI のデプロイ後ステップへの組み込み。
+- reviewer の観点への追記（`~/.claude/agents/reviewer.md` はリポジトリ外で、依頼文をチャットで提示する）。
