@@ -31,6 +31,7 @@ Production CS MCP の 3 層判定・照合・egress は全てこの語彙の上�
 
 - 語彙の追加は加算のみ。既存 signal の削除・意味変更をしない（I3 と同じ規律）。
 - surface_forms は `resolve::normalize_key` 正規化後の部分一致で照合される。
+- エントリには省略可能な `suppress_forms`（抑止語形）を設定でき、正規化後の発話からその語形の出現箇所を取り除いてから surface_forms を照合する（同じ発話の別箇所に surface_forms が残れば signal は立つ）。型・検証・照合規則の正本は `docs/superpowers/specs/2026-10-05-lexicon-suppress-forms-design.md`。
 - 既知の限界: 辞書外の表現は取りこぼす。第2層の raw text パターン照合と全件人承認で吸収する（S1-11）。
 - **本初版は 2026-07-03 時点のドラフト。業務担当のレビューで確定させること。**
 
@@ -106,7 +107,7 @@ main の `contract_billing_question` の surface_forms は `解約` `契約` `�
 - 既知の限界（main では `contract_billing_question` が立って取次だったが、現行 lexicon では立たなくなる個別案件的な発話。実測）: 「月額を安くできませんか」「月額プランを安いものに変えたい」「料金が高すぎる」は価格語（`price_question`）のみが立ち、第1層に落ちない。個別案件語（`解約` `契約` 等）を含まない価格交渉・不満は、第3層のマニュアルスコア判定に委ねられる。
 - 既知の限界（lexicon の網羅範囲）: lexicon が拾えるのは列挙した個別案件語を含む発話だけである。価格語と未列挙の個別案件語だけから成る発話は `price_question` のみが立ち、第1層を通過する。本番では LLM 分類との和集合（`server/src/harness/extraction.rs`）が補うが、LLM 分類が失敗したときは補われない。
 - main でも立たず現行でも立たない個別案件的な発話（実測、現状維持）: 「退会したい」「サービスを止めたい」「もう使わないので止めたい」「領収書が欲しい」「先月分が払えていない」「カードの有効期限が切れた」「名義変更したい」。
-- 価格・費用の質問と個別案件語が同居する発話は、従来どおり `contract_billing_question` が立って取次になる（実測: 「契約前に料金を知りたいです」「解約金はいくらですか」「支払い方法は何がありますか」「料金の内訳を教えてください」）。
+- 価格・費用の質問と個別案件語が同居する発話は、従来どおり `contract_billing_question` が立って取次になる（実測: 「解約金はいくらですか」「支払い方法は何がありますか」「料金の内訳を教えてください」）。「契約前に料金を知りたいです」は Issue #75 の `suppress_forms` 導入後、`price_question` のみが立ち第1層を通過するため、この実測例から除く（詳細は本ファイル末尾「`suppress_forms`」節）。
 
 ### `いくら` の語形限定（reviewer 差し戻し Critical 2、2026-10-03）
 
@@ -162,3 +163,40 @@ main の `contract_billing_question` の surface_forms は `解約` `契約` `�
 - 既存の回帰対象（「月額いくらですか」「設置方法を教えてください」「設置代行はありますか」）はいずれも `initial_cost_question` を立てなかった（`設置代行はありますか` は `camera_installation` のみ。`設置代` を採用しなかった判断どおり）。
 - **受容した誤発火**: 請求・支払いの個別案件（契約・請求の相談であって初期費用の見積もり相談ではない）の発話に `initial_cost_question` の語（`初期費用` `工事費` `設置費` `導入費` `取り付け費` `取付費` `工事代金` `設置代金`）が含まれると、`contract_billing_question` と同時に立つ。実測（`customer_ack` の適用を第 1 層のマッチ件数 1 件に限る実装で `decide` まで通した結果）: 「工事費の請求書を再発行してください」「初期費用を返金してほしいです」「設置費が二重に請求されています」「導入費の支払いが完了していません」「取り付け費の請求額が間違っています」「工事代金の請求書を再発行してください」「設置代金の支払いが完了していません」「初期費用の請求書の宛名を変更したい」はいずれも両 signal を立て（`設置費` `取り付け費` `設置代金` の発話は `camera_installation` も立つ）、第 1 層で `contract-billing`（advisory）と `initial-cost-quote`（mandatory）の 2 件にマッチする。`match_layer1`（`server/src/harness/rules.rs`）は mandatory を advisory より優先するため mandatory の `initial-cost-quote` で取次が確定し、`contract-billing` の聞き返しには回らない。マッチが 2 件のため `customer_ack` は `None` になり、宣言文は使われず LLM が相談内容に沿った受け止め文を作る。両ルールの `owner`（`contract`）と `route`（`support_desk`）は同一なので取次先は変わらない。過剰エスカレーション側に倒す既存方針（`contract_billing_question` 節の「やめたい」と同種の受容）に従い、取次が成立することは受容する。なお「取付費の領収書を送ってください」は `contract_billing_question` が立たず `initial_cost_question` のみで、第 1 層のマッチは `initial-cost-quote` の 1 件になり、宣言文が使われる。
 - **既知の限界**: 11語のいずれも連続する部分文字列として含まない言い回しは lexicon で拾えない。実測: 「初期設定費用はかかりますか」（「初期」と「費用」の間に「設定」が入るため `初期費用` に部分一致しない）、「導入にかかる費用を教えてください」（`導入費` に部分一致しない）、「設置にいくらかかりますか」（design doc §9 に記載の既知の限界どおり、`price_question` のみが立ち `initial_cost_question` は立たない）はいずれも signal が立たない、または `initial_cost_question` を欠く。本番は LLM 分類との和集合（`server/src/harness/extraction.rs`）が補うが、LLM 分類が失敗したときは補われない。
+
+## `suppress_forms`（抑止語形、Issue #75）
+
+本番実測（2026-10-03）: 「契約前に料金を知りたいです」のように、契約していない見込み客の一般的な質問が `contract_billing_question` の surface_forms「契約」の部分一致で signal を立て、第1層 `contract-billing`（advisory）で取次になっていた。契約前の一般的な質問と、既存契約者の個別案件（解約・プラン変更・請求トラブル等）は性質が異なり、取次の要否も異なる。設計判断の詳細は `docs/superpowers/specs/2026-10-05-lexicon-suppress-forms-design.md` を参照。
+
+`contract_billing_question` に次の抑止語形（`suppress_forms`）を設定した。正規化後の発話からこれらの出現箇所を取り除いてから `surface_forms` を照合するため、抑止語形にしか一致しない発話では `contract_billing_question` が立たなくなる。
+
+```
+"契約前", "契約する前", "契約すると", "契約したら", "契約した場合", "契約を検討", "契約検討", "契約しようか"
+```
+
+併せて `description` を「既に契約している顧客の、契約・解約・プラン変更・請求額・支払い方法に関する個別の相談（契約前の一般的な質問は含まない）」に更新した（語義の明確化。ルーティング方針は記述しない）。
+
+### 実測結果（2026-10-05、`LexiconNormalizer` に候補発話を通した結果）
+
+実測は変更後の `server/data/urtect/signal-lexicon.json` を `LexiconNormalizer::from_path` で読み、候補発話を `normalize()` に通して確認した（一時テストは実測後に削除済み。本番コードには含まれない）。
+
+| 発話 | 立った signal |
+| --- | --- |
+| 契約前に料金を知りたいです | `price_question` |
+| 契約すると月額いくらですか | `price_question` |
+| 契約を検討していますが料金を教えてください | `price_question` |
+| 契約内容を変更したい | `contract_billing_question` |
+| 契約を更新したい | `contract_billing_question` |
+| 解約したいです | `contract_billing_question` |
+| 契約前ですが解約金はいくらですか | `contract_billing_question`, `price_question` |
+| 契約前に聞いた説明と違います | （なし） |
+| 契約するなら | `contract_billing_question` |
+| 契約を考えています | `contract_billing_question` |
+
+意図した該当発話（契約前の価格・検討段階の質問）はいずれも `contract_billing_question` を立てず、`price_question` のみが立った。個別案件語（解約・契約内容変更・契約更新）を含む発話は、抑止語形の有無に関わらず引き続き `contract_billing_question` を立てた。「契約前ですが解約金はいくらですか」は抑止語形「契約前」で「契約」の出現を抑えつつ、別の箇所の「解約」で `contract_billing_question` が立つ（設計書 §4 の不変条件どおり。「いくらですか」により `price_question` も同時に立つが、`match_layer1` は subset 判定のため第1層は従来どおり `contract-billing` で確定する）。
+
+### 既知の限界（実測で確認）
+
+- 既存の契約者が抑止語形を使って個別案件を述べる発話（「契約前に聞いた説明と違います」）は、他の個別案件語を含まないため `contract_billing_question` が立たず（実測: signal が1つも立たない）、第1層を通過する。本番は LLM 分類との和集合（`server/src/harness/extraction.rs`）が補うが、LLM 分類が失敗したときは補われない。
+- 抑止語形に無い言い回し（「契約するなら」「契約を考えています」）は抑止されず、実測でも引き続き `contract_billing_question` を立てて取次になる。
+- 公開されている支払い手段の質問（「支払方法は何がありますか」「クレジットカードは使えますか」「口座振替はできますか」）は本書の対象外で、従来どおり取次になる（`contract_billing_question` 節参照）。

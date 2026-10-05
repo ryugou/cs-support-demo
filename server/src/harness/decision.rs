@@ -2138,4 +2138,85 @@ mod tests {
             serde_json::to_string(&b).unwrap()
         );
     }
+
+    // --- Issue #75: 契約前の一般的な質問を contract_billing_question から分離する ---
+    //
+    // 本番実測: 「契約前に料金を知りたいです」のように、契約していない見込み客の一般的な
+    // 質問が「契約」の部分一致で contract_billing_question を立て、第1層 contract-billing
+    // （advisory）で取次になっていた。suppress_forms（docs/superpowers/specs/
+    // 2026-10-05-lexicon-suppress-forms-design.md）で「契約前」等の語形を抑止し、価格語に
+    // よる price_question は従来どおり立てる。
+
+    #[test]
+    fn bundled_lexicon_suppresses_contract_billing_question_for_pre_contract_price_inquiries() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+
+        for utterance in [
+            "契約前に料金を知りたいです",
+            "契約すると月額いくらですか",
+            "契約を検討していますが料金を教えてください",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                !extracted.contains(&cb_signal()),
+                "a pre-contract price inquiry must not flag contract_billing_question: \
+                 {utterance}"
+            );
+            assert!(
+                extracted.contains(&Signal::new("price_question")),
+                "expected price_question signal for pre-contract price inquiry: {utterance}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_pre_contract_price_inquiries_do_not_match_any_layer1_rule() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in [
+            "契約前に料金を知りたいです",
+            "契約すると月額いくらですか",
+            "契約を検討していますが料金を教えてください",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                match_layer1(&rules, &extracted).is_none(),
+                "a pre-contract price inquiry must not match any layer1 rule: {utterance}, \
+                 got {:?}",
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_individual_contract_cases_survive_suppress_forms() {
+        use crate::harness::signal::{LexiconNormalizer, SignalNormalizer};
+        let lex = LexiconNormalizer::from_path(&bundled_lexicon_path())
+            .expect("bundled urtect signal-lexicon.json loads");
+        let rules = load_bundled_escalation_rules();
+
+        for utterance in [
+            "契約内容を変更したい",
+            "契約を更新したい",
+            "解約したいです",
+            "契約前ですが解約金はいくらですか",
+        ] {
+            let extracted = lex.normalize(utterance);
+            assert!(
+                extracted.contains(&cb_signal()),
+                "expected contract_billing_question for individual case: {utterance}"
+            );
+            assert_eq!(
+                match_layer1(&rules, &extracted).map(|rule| rule.id.as_str()),
+                Some("contract-billing"),
+                "individual contract/billing case must still reach layer1 contract-billing \
+                 after suppress_forms: {utterance}"
+            );
+        }
+    }
 }
