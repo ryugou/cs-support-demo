@@ -561,6 +561,66 @@ pub enum UnknownCaseIdPolicy {
     StartNew,
 }
 
+/// `Harness::evaluate` が返信文下書き（`customer_reply_draft`）を生成する条件（Issue #78）。
+///
+/// 既定値は設けない。`evaluate` の全呼び出し箇所（`rmcp_server.rs` / `api.rs` /
+/// `advisor/cs_support.rs`）が明示的に渡す。`/api/reply` と homesec 経由（`SkipOnEscalate`）は
+/// 取次時に受け止め文と決定的ブロック・または聞き返しで応答を組み立て、下書きを使わずに捨てる
+/// ため、取次が確定したターンの LLM 呼び出しをそもそも発行しない。MCP
+/// `evaluate_answerability`（`Always`）は `customer_reply_draft` が出力契約の一部であり、
+/// 取次時も返す。詳細は design doc
+/// `docs/superpowers/specs/2026-10-05-skip-unused-draft-and-ack-log-design.md` §2。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyDraftPolicy {
+    /// 判定によらず生成する。
+    Always,
+    /// 判定が取次（`AnswerDecision::Escalate`）のときは生成しない。
+    SkipOnEscalate,
+}
+
+/// `policy` と確定した `decision` から、`Harness::draft_customer_reply` を呼ぶかどうかを決める
+/// 純関数（Issue #78）。`evaluate` 本体から切り出してあるのは、`harness_for_test()` が
+/// `knowledge: None` で構築されており `evaluate()` 自体を通すテストの土台が無いため
+/// （design doc §4）。
+pub fn should_draft_reply(policy: ReplyDraftPolicy, decision: &decision::AnswerDecision) -> bool {
+    match policy {
+        ReplyDraftPolicy::Always => true,
+        ReplyDraftPolicy::SkipOnEscalate => {
+            !matches!(decision, decision::AnswerDecision::Escalate { .. })
+        }
+    }
+}
+
+/// 第1層の取次で、宣言された `customer_ack` が複数ルールのマッチにより使われなかったときに、
+/// マッチした全ルールの `rule_id`（昇順）を返す純関数（Issue #79）。
+///
+/// `Some` を返すのは次の 3 条件をすべて満たすときだけ（design doc §3.2）:
+/// - `decision` が第1層の取次（`AnswerDecision::Escalate { layer: 1, .. }`）である
+/// - 累積 signal 集合に対する `rules::matching_layer1_rules` の結果が 2 件以上である
+/// - その中に `customer_ack` を宣言したルールが 1 件以上ある
+///
+/// 条件を満たさないときは `None`。呼び出し側（`evaluate`）はこれをログの出力条件・内容の両方に
+/// 使う。発話本文・signal の値・宣言文の本文はここでも呼び出し側でも出力しない。
+pub fn suppressed_ack_rule_ids(
+    decision: &decision::AnswerDecision,
+    rules: &[rules::EscalationRule],
+    signals: &signal::SignalSet,
+) -> Option<Vec<String>> {
+    if !matches!(
+        decision,
+        decision::AnswerDecision::Escalate { layer: 1, .. }
+    ) {
+        return None;
+    }
+    let matched = rules::matching_layer1_rules(rules, signals);
+    if matched.len() < 2 || !matched.iter().any(|rule| rule.customer_ack.is_some()) {
+        return None;
+    }
+    let mut ids: Vec<String> = matched.into_iter().map(|rule| rule.id.clone()).collect();
+    ids.sort();
+    Some(ids)
+}
+
 impl Harness {
     pub fn build(
         config: &AppConfig,
@@ -1116,6 +1176,10 @@ impl Harness {
         // case 属性 `end_user_id` に設定する（既存 case への上書きはしない）。MCP 経路
         // （`rmcp_server.rs`）は常に `None` を渡す（design doc §3: 対象は /api/reply 経路のみ）。
         end_user_id: Option<&str>,
+        // Issue #78: 返信文下書き（customer_reply_draft）を生成するかどうかの方針。各呼び出し
+        // 箇所が明示的に渡す（既定値は無い）。design doc
+        // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2 の表を参照。
+        policy: ReplyDraftPolicy,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
@@ -1408,6 +1472,23 @@ impl Harness {
             thresholds: &self.thresholds,
             default_route: &self.default_route,
         });
+        // [観測] Issue #79: 第1層の取次で、宣言された customer_ack が複数ルールのマッチにより
+        // 使われなかったことを観測できるようにする。下書き生成方針（policy）とは独立に出す。
+        // 発話本文・signal の値・宣言文の本文は出力しない
+        // （design doc `2026-10-05-skip-unused-draft-and-ack-log-design.md` §3.2）。
+        if let Some(matched_rule_ids) =
+            suppressed_ack_rule_ids(&decision_result, &rules, &accumulated)
+        {
+            tracing::info!(
+                request_id = %ctx.request_id,
+                case_id = %case_id,
+                matched_rule_ids = ?matched_rule_ids,
+                "a rule-declared customer_ack was not used because multiple layer-1 rules \
+                 matched this turn (customer_ack applies only when exactly one layer-1 rule \
+                 matches); the reply falls back to the path's non-declared acknowledgement \
+                 handling. To have the declared text used, review overlapping rule conditions"
+            );
+        }
         // 聞き返し可否（決定論）: 第1層 binding=advisory かつ情報不足、または第3層グレーのみ
         // true（Issue #54 + reviewer 一次レビュー Critical 1）。判定条件そのものは
         // clarification_allowed()（本ファイル冒頭のモジュールレベル関数）が契約として持つ。
@@ -1521,8 +1602,13 @@ impl Harness {
         // [デモ] 顧客向け返信文の下書き。**判定が確定した後**に、その判定の制約下でだけ作る。
         // 生成に失敗しても評価そのものは成功させる（下書きはデモ用の付加情報であり、これが
         // 落ちたせいで回答可否判定まで失敗させるのは本末転倒）。失敗理由は必ず warn に残す。
-        let reply_draft = self
-            .draft_customer_reply(
+        //
+        // Issue #78: `policy == SkipOnEscalate` かつ判定が取次のときは、呼び出し元
+        // （`/api/reply` / homesec 経由）がこの下書きを使わず捨てるため、LLM 呼び出し自体を
+        // 発行しない（`should_draft_reply` は純関数。design doc
+        // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.3）。
+        let reply_draft = if should_draft_reply(policy, &decision_result) {
+            self.draft_customer_reply(
                 question,
                 &decision_result,
                 &section_hits,
@@ -1531,7 +1617,10 @@ impl Harness {
                 is_continuation,
                 &allowlist,
             )
-            .await;
+            .await
+        } else {
+            None
+        };
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
         let customer_reply_draft = reply_draft.map(|d| d.text);
 
@@ -2150,6 +2239,145 @@ mod tests {
             sub: "101572111487015263315".to_string(),
             email: "op@sivira.co".to_string(),
         }
+    }
+
+    // ---- should_draft_reply（Issue #78） ----
+    //
+    // `evaluate()` 自体を通すテストの土台（vegapunk クライアントのスタブ等）が既存テストに無い
+    // ため（`harness_for_test()` は `knowledge: None` で構築され `evaluate()` は即座に
+    // `Err` を返す）、design doc §4 のとおり純関数を直接テストする。`evaluate()` が
+    // `should_draft_reply(policy, &decision_result)` を呼ぶだけであることはコードレビューで
+    // 担保する。
+
+    fn allowed_decision() -> decision::AnswerDecision {
+        decision::AnswerDecision::Allowed {
+            source: decision::AnswerSource::Manual,
+            evidence_section_keys: vec!["sec-a".to_string()],
+            known_resolution_id: None,
+            stakes: decision::Stakes::Low,
+            threshold: 0.6,
+        }
+    }
+
+    #[test]
+    fn should_draft_reply_is_false_for_skip_on_escalate_when_decision_is_escalate() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        assert!(!should_draft_reply(
+            ReplyDraftPolicy::SkipOnEscalate,
+            &decision
+        ));
+    }
+
+    #[test]
+    fn should_draft_reply_is_true_for_skip_on_escalate_when_decision_is_allowed() {
+        assert!(should_draft_reply(
+            ReplyDraftPolicy::SkipOnEscalate,
+            &allowed_decision()
+        ));
+    }
+
+    #[test]
+    fn should_draft_reply_is_true_for_always_when_decision_is_escalate() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        assert!(should_draft_reply(ReplyDraftPolicy::Always, &decision));
+    }
+
+    #[test]
+    fn should_draft_reply_is_true_for_always_when_decision_is_allowed() {
+        assert!(should_draft_reply(
+            ReplyDraftPolicy::Always,
+            &allowed_decision()
+        ));
+    }
+
+    // ---- suppressed_ack_rule_ids（Issue #79） ----
+
+    fn signals_from(values: &[&str]) -> signal::SignalSet {
+        values.iter().map(|v| signal::Signal::new(*v)).collect()
+    }
+
+    fn rule_for_ack_test(
+        id: &str,
+        condition: &[&str],
+        customer_ack: Option<&str>,
+    ) -> rules::EscalationRule {
+        rules::EscalationRule {
+            id: id.to_string(),
+            condition: signals_from(condition),
+            route: "support_desk".to_string(),
+            owner: None,
+            binding: rules::Binding::Mandatory,
+            hearing: None,
+            customer_ack: customer_ack.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn suppressed_ack_rule_ids_is_none_when_decision_is_not_escalate() {
+        let rules = vec![rule_for_ack_test("a", &["x"], Some("受け止め文"))];
+        assert_eq!(
+            suppressed_ack_rule_ids(&allowed_decision(), &rules, &signals_from(&["x"])),
+            None
+        );
+    }
+
+    #[test]
+    fn suppressed_ack_rule_ids_is_none_when_escalate_layer_is_not_1() {
+        let decision =
+            escalate_for_contract_test(2, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        let rules = vec![
+            rule_for_ack_test("a", &["x"], Some("受け止め文a")),
+            rule_for_ack_test("b", &["y"], Some("受け止め文b")),
+        ];
+        assert_eq!(
+            suppressed_ack_rule_ids(&decision, &rules, &signals_from(&["x", "y"])),
+            None
+        );
+    }
+
+    #[test]
+    fn suppressed_ack_rule_ids_is_none_when_only_one_rule_matches() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        let rules = vec![
+            rule_for_ack_test("a", &["x"], Some("受け止め文")),
+            rule_for_ack_test("b", &["y"], Some("別の受け止め文")),
+        ];
+        // 累積 signal 集合は "x" だけ: ルール a のみマッチする。
+        assert_eq!(
+            suppressed_ack_rule_ids(&decision, &rules, &signals_from(&["x"])),
+            None
+        );
+    }
+
+    #[test]
+    fn suppressed_ack_rule_ids_is_none_when_multiple_match_but_none_declare_an_ack() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        let rules = vec![
+            rule_for_ack_test("a", &["x"], None),
+            rule_for_ack_test("b", &["y"], None),
+        ];
+        assert_eq!(
+            suppressed_ack_rule_ids(&decision, &rules, &signals_from(&["x", "y"])),
+            None
+        );
+    }
+
+    #[test]
+    fn suppressed_ack_rule_ids_returns_sorted_ids_when_multiple_match_and_one_declares_an_ack() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        let rules = vec![
+            rule_for_ack_test("zeta-rule", &["x"], None),
+            rule_for_ack_test("alpha-rule", &["y"], Some("受け止め文")),
+        ];
+        assert_eq!(
+            suppressed_ack_rule_ids(&decision, &rules, &signals_from(&["x", "y"])),
+            Some(vec!["alpha-rule".to_string(), "zeta-rule".to_string()])
+        );
     }
 
     #[test]

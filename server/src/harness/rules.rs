@@ -229,16 +229,29 @@ pub fn match_layer1<'a>(
         .or_else(|| rules.iter().find(|rule| rule_matches(rule, question)))
 }
 
+/// 第1層でマッチする全ルールの参照（binding を問わない）。マッチ条件は `match_layer1` と同一
+/// （`rule_matches`）。配列順をそのまま返す（呼び出し側が選択・件数判定に使うための材料であり、
+/// この関数自体は優先順位を決めない）。
+///
+/// 用途: Issue #79 の宣言文不使用ログ（`harness::suppressed_ack_rule_ids`）が、マッチした全ルールの
+/// `rule_id` と `customer_ack` の有無を見るために使う。
+pub fn matching_layer1_rules<'a>(
+    rules: &'a [EscalationRule],
+    question: &SignalSet,
+) -> Vec<&'a EscalationRule> {
+    rules
+        .iter()
+        .filter(|rule| rule_matches(rule, question))
+        .collect()
+}
+
 /// 第1層でマッチするルールの件数（binding を問わない）。マッチ条件は `match_layer1` と同一。
 ///
 /// 用途: `customer_ack`（取次ルールが宣言する顧客向け受け止め文）の適用条件。宣言文は
 /// 「そのルールの理由」を述べる文なので、他のルールにも当たる発話では相談の主題と食い違う。
 /// ルールの選択順（配列順・vegapunk の返却順）に依存せず適用可否を決めるため、件数だけを見る。
 pub fn count_layer1_matches(rules: &[EscalationRule], question: &SignalSet) -> usize {
-    rules
-        .iter()
-        .filter(|rule| rule_matches(rule, question))
-        .count()
+    matching_layer1_rules(rules, question).len()
 }
 
 fn rule_matches(rule: &EscalationRule, question: &SignalSet) -> bool {
@@ -479,6 +492,49 @@ mod tests {
         ];
         assert_eq!(count_layer1_matches(&rules, &signals(&["x"])), 1);
         assert_eq!(count_layer1_matches(&rules, &signals(&[])), 0);
+    }
+
+    // --- matching_layer1_rules（Issue #79: 宣言文不使用ログの材料） ---
+
+    #[test]
+    fn matching_layer1_rules_returns_empty_when_nothing_matches() {
+        let rules = vec![rule_with("a", &["x"], Binding::Mandatory)];
+        assert!(matching_layer1_rules(&rules, &signals(&["z"])).is_empty());
+    }
+
+    #[test]
+    fn matching_layer1_rules_returns_the_single_match() {
+        let rules = vec![
+            rule_with("a", &["x"], Binding::Mandatory),
+            rule_with("b", &["y"], Binding::Advisory),
+        ];
+        let matched = matching_layer1_rules(&rules, &signals(&["x"]));
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, "a");
+    }
+
+    #[test]
+    fn matching_layer1_rules_returns_every_match_regardless_of_binding() {
+        let rules = vec![
+            rule_with("a", &["x"], Binding::Mandatory),
+            rule_with("b", &["y"], Binding::Advisory),
+            rule_with("c", &["x", "y"], Binding::Advisory),
+        ];
+        let matched = matching_layer1_rules(&rules, &signals(&["x", "y"]));
+        let mut ids: Vec<&str> = matched.iter().map(|r| r.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn matching_layer1_rules_excludes_empty_condition_rules() {
+        let rules = vec![
+            rule_with("empty", &[], Binding::Mandatory),
+            rule_with("a", &["x"], Binding::Mandatory),
+        ];
+        let matched = matching_layer1_rules(&rules, &signals(&["x"]));
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, "a");
     }
 
     #[test]

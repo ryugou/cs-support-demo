@@ -13,7 +13,9 @@ use crate::config::AppConfig;
 use crate::harness::decision::{self, AnswerDecision};
 use crate::harness::product_gate;
 use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
-use crate::harness::{clarify, escalation_reply, hours, time_pref, Harness, RequestContext};
+use crate::harness::{
+    clarify, escalation_reply, hours, time_pref, Harness, ReplyDraftPolicy, RequestContext,
+};
 use crate::mcp::ToolService;
 use crate::oauth::VerifiedIdentity;
 use axum::extract::rejection::JsonRejection;
@@ -1583,6 +1585,10 @@ async fn reply_handler(
             // として処理する（クライアント保存漏れ・再起動由来の未知 id は通常運用）。
             crate::harness::UnknownCaseIdPolicy::StartNew,
             req.end_user_id.as_deref(),
+            // Issue #78: 取次時は受け止め文と決定的ブロック、または聞き返しで応答を組み立て、
+            // 下書きを使わない（design doc
+            // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。
+            ReplyDraftPolicy::SkipOnEscalate,
         )
         .await
     {
