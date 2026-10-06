@@ -91,6 +91,13 @@ pub enum AdvisorAction {
 /// 呼び出し側が非同期で確認した結果(`crate::advisor::cs_support::peek_conv_state` 経由)を渡す
 /// (`decide` 自身は非同期にできないため、`decide_time_pref` と同じ理由で呼び出し元に判定を
 /// 前倒しさせる設計)。
+///
+/// `first_turn` / `case_id`: Issue #49 対応(design doc `2026-10-06-advisor-lead-interest-design.md`
+/// §3)で追加した。`first_turn` は「この case で、ボットがまだ一度も応答していない」こと
+/// (呼び出し元が既存の会話状態から決定論で求める。`api.rs` は `!is_continuation` をそのまま
+/// 渡す)。`case_id` は手順5の保険が発火して LeadSolicit を見送った際の `tracing::info!` ログに
+/// 相関キーとして載せるためだけに使う(`decide_in_domain_flow` の doc comment 参照)。
+#[allow(clippy::too_many_arguments)]
 pub fn decide(
     u: &crate::advisor::understand::Understanding,
     conv: &crate::harness::CaseConvState,
@@ -99,6 +106,8 @@ pub fn decide(
     clarify_max: u32,
     support_mode: bool,
     cs_continuing: bool,
+    first_turn: bool,
+    case_id: &str,
 ) -> AdvisorAction {
     // 手順1: emergency は他の何より優先する。
     if u.emergency {
@@ -116,6 +125,8 @@ pub fn decide(
         false,
         support_mode,
         cs_continuing,
+        first_turn,
+        case_id,
     )
 }
 
@@ -176,6 +187,13 @@ fn missing_conditions(
 /// 5〜7. 上記のいずれにも該当しない場合、旧手順5〜7(LeadSolicit → Clarify → Answer)へ
 ///    フォールスルーする(下記の実装参照)。
 ///
+/// 手順5の追加条件(Issue #49 の保険、design doc `2026-10-06-advisor-lead-interest-design.md`
+/// §3): `first_turn && u.product_intent` のとき(ボットがまだ一度も応答しておらず、初回発話から
+/// 具体的な機器の話をしている)は、`lead_interest` が true でも手順5を成立させない
+/// (成立条件は `!(first_turn && u.product_intent)` を含む)。見送った場合は LeadSolicit を返さず
+/// 手順6以降(Clarify → Answer)へ進む。`case_id` は見送り時の `tracing::info!` ログの相関キー
+/// にのみ使い、判定には影響しない。
+///
 /// `suppress_lead_solicit`: true のときは手順5([`AdvisorAction::LeadSolicit`])を評価せず、
 /// 手順6・手順7へそのまま進む。**時間帯受付フローの内側**([`decide_time_pref`] の
 /// `PassToEvaluate` 分岐・打ち切り分岐、[`decide_time_pref_extraction_failed`] の打ち切り分岐)
@@ -209,6 +227,8 @@ fn decide_in_domain_flow(
     suppress_lead_solicit: bool,
     support_mode: bool,
     cs_continuing: bool,
+    first_turn: bool,
+    case_id: &str,
 ) -> AdvisorAction {
     // 優先順1・2: in_domain でない発話。support_mode 中、または urtect_support 自体が
     // 立っているターンは CS サポート文脈の継続とみなし、退場させない。
@@ -226,8 +246,32 @@ fn decide_in_domain_flow(
     if support_mode && cs_continuing {
         return AdvisorAction::SupportMode;
     }
-    // 手順5(抑止時はスキップ。上記 doc comment 参照)
-    if !suppress_lead_solicit && u.lead_interest && !lead_requested {
+    // 手順5(抑止時はスキップ。上記 doc comment 参照)。
+    //
+    // Issue #49 / design doc `2026-10-06-advisor-lead-interest-design.md` §3 の保険:
+    // `first_turn && u.product_intent` が成立する間は LeadSolicit を見送る。最初のターンでは
+    // 担当者連絡の提案(カード・案内)がまだ出ていないため、この時点の `lead_interest == true`
+    // は「利用者が最初から明示的に担当者を求めた」場合か、理解 LLM の誤判定(「提案して」の
+    // ようなボットへの提案要求を担当者連絡の希望と取り違える)のどちらかであり、
+    // `product_intent` も true なら後者の可能性が高い(同設計書 §3 根拠)。`u.lead_interest`
+    // の値自体はここで捨てない — 見送った場合もそのまま手順6(Clarify)以降へ進むだけで、
+    // 次のターン以降は(first_turn が false になるので)通常どおりこの手順5で判定される。
+    let lead_solicit_eligible = !suppress_lead_solicit && u.lead_interest && !lead_requested;
+    let first_turn_product_intent_guard = first_turn && u.product_intent;
+    if lead_solicit_eligible && first_turn_product_intent_guard {
+        // CLAUDE.md: エラー・異常値をログも吐かずに握りつぶすことを禁止。これはエラーではない
+        // が、本来 LeadSolicit になるはずだった判定を保険により見送ったという運用上重要な
+        // 分岐なので、運用者が追えるよう info で残す。発話本文(summary_ja 等)は出さない。
+        tracing::info!(
+            case_id = %case_id,
+            route = "advisor_lead_interest_guard",
+            "suppressed LeadSolicit on the first turn because product_intent is also true \
+             (design doc 2026-10-06-advisor-lead-interest-design.md §3); proposing instead of \
+             soliciting a handoff. lead_interest is preserved and will be re-evaluated on the \
+             next turn"
+        );
+    }
+    if lead_solicit_eligible && !first_turn_product_intent_guard {
         return AdvisorAction::LeadSolicit;
     }
     // 手順6
@@ -306,6 +350,8 @@ pub fn decide_time_pref(
     clarify_max: u32,
     support_mode: bool,
     cs_continuing: bool,
+    first_turn: bool,
+    case_id: &str,
 ) -> AdvisorAction {
     // emergency は時間帯受付モード中でも最優先(design doc §9 不変条件5)。呼び出し側が
     // 事前にチェックしている想定でも、ここでも防御的に確認する(このモード中は
@@ -340,6 +386,8 @@ pub fn decide_time_pref(
                 true,
                 support_mode,
                 cs_continuing,
+                first_turn,
+                case_id,
             )
         }
         crate::harness::time_pref::TimePrefAction::Reply(_) => {
@@ -385,6 +433,8 @@ pub fn decide_time_pref(
                             true,
                             support_mode,
                             cs_continuing,
+                            first_turn,
+                            case_id,
                         )
                     } else {
                         conv.awaiting_time_pref = true;
@@ -500,6 +550,7 @@ const TIME_PREF_EXTRACTION_ERROR_LIMIT: u32 = 3; // api.rs::TIME_PREF_EXTRACTION
 /// `awaiting_time_pref` / `time_pref_false_count`)。返却後、応答を返す前に必ず support_case へ
 /// 保存すること(`api.rs` の `save_conv_state` と同じ)。保存を怠ると `time_pref_extraction_error_count`
 /// が毎ターン 0 起点になり、3 回連続到達による自動解除が永久に到達しない。
+#[allow(clippy::too_many_arguments)]
 pub fn decide_time_pref_extraction_failed(
     u: &crate::advisor::understand::Understanding,
     conv: &mut crate::harness::CaseConvState,
@@ -507,6 +558,8 @@ pub fn decide_time_pref_extraction_failed(
     clarify_max: u32,
     support_mode: bool,
     cs_continuing: bool,
+    first_turn: bool,
+    case_id: &str,
 ) -> AdvisorAction {
     // ここで conv を変更しないのは意図的(抽出インフラ失敗カウンタを積む前に早期returnする
     // ため)だが、awaiting_time_pref の解除自体は呼び出し側の責務(AdvisorAction::Safety の
@@ -542,6 +595,8 @@ pub fn decide_time_pref_extraction_failed(
             true,
             support_mode,
             cs_continuing,
+            first_turn,
+            case_id,
         )
     } else {
         AdvisorAction::TimePrefContinue
@@ -826,7 +881,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::Safety
         );
     }
@@ -838,7 +893,7 @@ mod tests {
         conv.awaiting_time_pref = true;
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::TimePrefContinue
         );
     }
@@ -850,7 +905,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::OutOfDomain
         );
     }
@@ -863,7 +918,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::SupportMode
         );
     }
@@ -875,7 +930,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::LeadSolicit
         );
     }
@@ -886,7 +941,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::Clarify {
                 missing: vec![ConditionKey::Concern]
             }
@@ -901,7 +956,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::Clarify {
                 missing: vec![ConditionKey::Housing]
             }
@@ -916,7 +971,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::Answer
         );
     }
@@ -928,7 +983,7 @@ mod tests {
         conv.clarify_turns = 3;
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::Answer
         );
     }
@@ -943,7 +998,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::Answer
         );
     }
@@ -958,7 +1013,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::Safety
         );
     }
@@ -972,7 +1027,7 @@ mod tests {
         conv.awaiting_time_pref = true;
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::Safety
         );
     }
@@ -985,7 +1040,7 @@ mod tests {
         conv.awaiting_time_pref = true;
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::TimePrefContinue
         );
     }
@@ -1005,7 +1060,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::SupportMode
         );
     }
@@ -1018,7 +1073,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, false, false),
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
             AdvisorAction::SupportMode
         );
     }
@@ -1031,10 +1086,143 @@ mod tests {
 
         // lead_requested = true なので手順5は不成立、後続(手順6: concern 未取得)へ進む。
         assert_eq!(
-            decide(&u, &conv, false, true, 3, false, false),
+            decide(&u, &conv, false, true, 3, false, false, true, "test-case"),
             AdvisorAction::Clarify {
                 missing: vec![ConditionKey::Concern]
             }
+        );
+    }
+
+    // --- decide: 手順5の保険(Issue #49 / design doc
+    // 2026-10-06-advisor-lead-interest-design.md §3)。「提案して」のようなボットへの提案要求が
+    // 誤って lead_interest=true と判定された場合でも、最初のターンでは LeadSolicit を見送り、
+    // 提案(Clarify/Answer)を優先する。---
+
+    #[test]
+    fn first_turn_with_product_intent_defers_lead_solicit_to_clarify_when_conditions_missing() {
+        // 最初のターンで lead_interest == true && product_intent == true のときは LeadSolicit
+        // を見送り、条件が不足していれば Clarify まで進む。
+        let mut u = base_understanding();
+        u.lead_interest = true;
+        u.product_intent = true;
+        let conv = base_conv();
+
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
+            AdvisorAction::Clarify {
+                missing: vec![ConditionKey::Concern]
+            },
+            "first_turn && product_intent の保険により LeadSolicit ではなく Clarify になること"
+        );
+    }
+
+    #[test]
+    fn first_turn_with_product_intent_defers_lead_solicit_to_answer_when_conditions_sufficient() {
+        // 同じ保険だが、提案条件(concern が non-intrusion)が揃っているので Answer まで進む。
+        let mut u = base_understanding();
+        u.lead_interest = true;
+        u.product_intent = true;
+        u.conditions
+            .push((ConditionKey::Concern, "monitoring".to_string()));
+        let conv = base_conv();
+
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
+            AdvisorAction::Answer,
+            "first_turn && product_intent の保険により LeadSolicit ではなく Answer になること"
+        );
+    }
+
+    #[test]
+    fn first_turn_with_lead_interest_but_no_product_intent_still_lead_solicits() {
+        // product_intent が false(機器の話ではなく、担当者連絡だけを明示した発話)なら保険は
+        // 成立せず、最初のターンでも従来どおり LeadSolicit になる。
+        let mut u = base_understanding();
+        u.lead_interest = true;
+        u.product_intent = false;
+        let conv = base_conv();
+
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false, true, "test-case"),
+            AdvisorAction::LeadSolicit
+        );
+    }
+
+    #[test]
+    fn second_turn_with_product_intent_still_lead_solicits() {
+        // 2 ターン目以降(first_turn == false)は保険を適用せず、従来どおり LeadSolicit になる。
+        let mut u = base_understanding();
+        u.lead_interest = true;
+        u.product_intent = true;
+        let conv = base_conv();
+
+        assert_eq!(
+            decide(&u, &conv, false, false, 3, false, false, false, "test-case"),
+            AdvisorAction::LeadSolicit
+        );
+    }
+
+    #[test]
+    fn lead_interest_value_is_preserved_across_turns_after_being_deferred_on_the_first_turn() {
+        // 1ターン目の見送りは u.lead_interest を破棄しない。同じ観測値を次のターンとして
+        // first_turn=false で渡すと、手順5が通常どおり成立して LeadSolicit になることで、値が
+        // どこにも失われていないことを確認する(decide は純関数なので、検証できるのは戻り値の
+        // AdvisorAction のみ)。
+        let mut u = base_understanding();
+        u.lead_interest = true;
+        u.product_intent = true;
+        let conv = base_conv();
+
+        let first_turn_action = decide(&u, &conv, false, false, 3, false, false, true, "test-case");
+        assert_ne!(
+            first_turn_action,
+            AdvisorAction::LeadSolicit,
+            "1ターン目は保険により LeadSolicit を見送ること"
+        );
+
+        let next_turn_action = decide(&u, &conv, false, false, 3, false, false, false, "test-case");
+        assert_eq!(
+            next_turn_action,
+            AdvisorAction::LeadSolicit,
+            "lead_interest の値が失われていなければ、2ターン目は通常どおり LeadSolicit に \
+             なること"
+        );
+    }
+
+    #[test]
+    fn first_turn_product_intent_guard_logs_info_without_leaking_the_utterance_summary() {
+        // 見送りが発生したら運用者が追えるよう info ログを残すが、発話本文(summary_ja)は
+        // 出さない(CLAUDE.md: エラー・異常値をログも吐かずに握りつぶすことを禁止/ログに
+        // 顧客発話本文を含めない)。
+        let mut u = base_understanding();
+        u.lead_interest = true;
+        u.product_intent = true;
+        u.summary_ja = "ログに出てはいけない発話要約マーカー".to_string();
+        let conv = base_conv();
+
+        let (action, logs) = capture_logs(|| {
+            decide(
+                &u,
+                &conv,
+                false,
+                false,
+                3,
+                false,
+                false,
+                true,
+                "case-49-lead-interest-guard",
+            )
+        });
+
+        assert_ne!(action, AdvisorAction::LeadSolicit);
+        assert!(logs.contains("INFO"), "logs: {logs}");
+        assert!(
+            logs.contains("case-49-lead-interest-guard"),
+            "case_id が info ログに残ること: {logs}"
+        );
+        assert!(
+            !logs.contains("ログに出てはいけない発話要約マーカー"),
+            "発話本文(summary_ja)をログへ出してはいけない: {logs}"
         );
     }
 
@@ -1053,7 +1241,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, true, false),
+            decide(&u, &conv, false, false, 3, true, false, true, "test-case"),
             AdvisorAction::SupportMode,
             "優先順1: support_mode=true なら in_domain でなくても SupportMode を継続する"
         );
@@ -1067,7 +1255,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, true, true),
+            decide(&u, &conv, false, false, 3, true, true, true, "test-case"),
             AdvisorAction::SupportMode,
             "優先順4: support_mode=true かつ cs_continuing=true なら SupportMode を継続する"
         );
@@ -1084,7 +1272,7 @@ mod tests {
             .push((ConditionKey::Concern, "monitoring".to_string()));
         let conv = base_conv();
 
-        let action = decide(&u, &conv, false, false, 3, true, false);
+        let action = decide(&u, &conv, false, false, 3, true, false, true, "test-case");
 
         assert_ne!(
             action,
@@ -1103,7 +1291,7 @@ mod tests {
         let u = base_understanding(); // in_domain = true, urtect_support = false
         let conv = base_conv();
 
-        let action = decide(&u, &conv, false, false, 3, false, true);
+        let action = decide(&u, &conv, false, false, 3, false, true, true, "test-case");
 
         assert_ne!(
             action,
@@ -1121,7 +1309,7 @@ mod tests {
         let conv = base_conv();
 
         assert_eq!(
-            decide(&u, &conv, false, false, 3, true, true),
+            decide(&u, &conv, false, false, 3, true, true, true, "test-case"),
             AdvisorAction::Safety
         );
     }
@@ -1204,7 +1392,17 @@ mod tests {
             .conditions
             .push((ConditionKey::Concern, "intrusion".to_string()));
 
-        let action1 = decide(&turn1, &conv, false, false, 3, false, false);
+        let action1 = decide(
+            &turn1,
+            &conv,
+            false,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
         assert_eq!(
             action1,
             AdvisorAction::Clarify {
@@ -1228,7 +1426,17 @@ mod tests {
         let mut turn2 = base_understanding();
         turn2.conditions = merged;
 
-        let action2 = decide(&turn2, &conv, false, false, 3, false, false);
+        let action2 = decide(
+            &turn2,
+            &conv,
+            false,
+            false,
+            3,
+            false,
+            false,
+            false,
+            "test-case",
+        );
 
         assert_eq!(
             action2,
@@ -1573,7 +1781,18 @@ mod tests {
         let extraction = extraction_false("別の話です");
 
         assert_eq!(
-            decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false),
+            decide_time_pref(
+                &u,
+                &extraction,
+                &mut conv,
+                &cfg,
+                false,
+                3,
+                false,
+                false,
+                true,
+                "test-case"
+            ),
             AdvisorAction::Safety
         );
         assert!(
@@ -1591,7 +1810,18 @@ mod tests {
         conv.awaiting_time_pref = true;
         let extraction = extraction_false("別の話です");
 
-        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action1 = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
         assert_eq!(
             action1,
             AdvisorAction::Clarify {
@@ -1601,7 +1831,18 @@ mod tests {
         );
         assert!(conv.awaiting_time_pref, "1回目では自動解除しない");
 
-        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action2 = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
         assert_eq!(
             action2,
             AdvisorAction::Clarify {
@@ -1627,7 +1868,18 @@ mod tests {
         };
         let extraction = extraction_true(vec![w.clone()], "金曜の17時ごろ");
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         match &action {
             AdvisorAction::LeadConfirmed { slot } => {
@@ -1704,7 +1956,18 @@ mod tests {
             conv.awaiting_time_pref = true;
             let extraction = extraction_true(vec![w], "テスト発話");
 
-            let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+            let action = decide_time_pref(
+                &u,
+                &extraction,
+                &mut conv,
+                &cfg,
+                false,
+                3,
+                false,
+                false,
+                true,
+                "test-case",
+            );
             let AdvisorAction::LeadConfirmed { slot } = action else {
                 panic!("expected LeadConfirmed, got {action:?}");
             };
@@ -1727,7 +1990,18 @@ mod tests {
             "土曜の午前中",
         );
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_eq!(action, AdvisorAction::TimePrefContinue);
         assert!(
@@ -1756,7 +2030,18 @@ mod tests {
             "16時から20時なら",
         );
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_eq!(
             action,
@@ -1782,7 +2067,18 @@ mod tests {
             raw: "よくわからない時間帯の話".to_string(),
         };
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_eq!(action, AdvisorAction::TimePrefContinue);
         assert!(conv.awaiting_time_pref);
@@ -1806,7 +2102,18 @@ mod tests {
             "土曜の午前中",
         );
 
-        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action1 = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
         assert_eq!(
             action1,
             AdvisorAction::TimePrefContinue,
@@ -1815,7 +2122,18 @@ mod tests {
         assert!(conv.awaiting_time_pref);
         assert_eq!(conv.time_pref_false_count, 1);
 
-        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action2 = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
         assert_eq!(
             action2,
             AdvisorAction::Answer,
@@ -1846,10 +2164,32 @@ mod tests {
             }],
             "土曜の午前中",
         );
-        decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         let (action2, logs) = capture_logs(|| {
-            decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false)
+            decide_time_pref(
+                &u,
+                &extraction,
+                &mut conv,
+                &cfg,
+                false,
+                3,
+                false,
+                false,
+                true,
+                "test-case",
+            )
         });
 
         assert_eq!(action2, AdvisorAction::Answer);
@@ -1871,7 +2211,16 @@ mod tests {
         let mut conv = base_conv();
         conv.awaiting_time_pref = true;
 
-        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false);
+        let action = decide_time_pref_extraction_failed(
+            &u,
+            &mut conv,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_eq!(action, AdvisorAction::TimePrefContinue);
         assert!(conv.awaiting_time_pref);
@@ -1885,7 +2234,16 @@ mod tests {
         conv.awaiting_time_pref = true;
         conv.time_pref_extraction_error_count = 1;
 
-        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false);
+        let action = decide_time_pref_extraction_failed(
+            &u,
+            &mut conv,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_eq!(action, AdvisorAction::TimePrefContinue);
         assert!(conv.awaiting_time_pref);
@@ -1901,7 +2259,16 @@ mod tests {
         conv.awaiting_time_pref = true;
         conv.time_pref_extraction_error_count = 2;
 
-        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false);
+        let action = decide_time_pref_extraction_failed(
+            &u,
+            &mut conv,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_eq!(action, AdvisorAction::Answer);
         assert!(!conv.awaiting_time_pref);
@@ -1920,7 +2287,16 @@ mod tests {
         conv.time_pref_extraction_error_count = 2;
 
         let (action, logs) = capture_logs(|| {
-            decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false)
+            decide_time_pref_extraction_failed(
+                &u,
+                &mut conv,
+                false,
+                3,
+                false,
+                false,
+                true,
+                "test-case",
+            )
         });
 
         assert_eq!(action, AdvisorAction::Answer);
@@ -1953,14 +2329,36 @@ mod tests {
             "土曜の午前中でお願いします",
         );
 
-        let action1 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action1 = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
         assert_eq!(
             action1,
             AdvisorAction::TimePrefContinue,
             "1回目は再アームする"
         );
 
-        let action2 = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action2 = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_ne!(
             action2,
@@ -1992,7 +2390,18 @@ mod tests {
         conv.awaiting_time_pref = true;
         let extraction = extraction_false("全然関係ない質問です");
 
-        let action = decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        let action = decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_ne!(action, AdvisorAction::LeadSolicit);
         assert_eq!(action, AdvisorAction::Answer);
@@ -2010,7 +2419,16 @@ mod tests {
         conv.awaiting_time_pref = true;
         conv.time_pref_extraction_error_count = 2;
 
-        let action = decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false);
+        let action = decide_time_pref_extraction_failed(
+            &u,
+            &mut conv,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_ne!(action, AdvisorAction::LeadSolicit);
         assert_eq!(action, AdvisorAction::Answer);
@@ -2030,7 +2448,18 @@ mod tests {
         conv.time_pref_extraction_error_count = 2;
         let extraction = extraction_false("別の話です");
 
-        decide_time_pref(&u, &extraction, &mut conv, &cfg, false, 3, false, false);
+        decide_time_pref(
+            &u,
+            &extraction,
+            &mut conv,
+            &cfg,
+            false,
+            3,
+            false,
+            false,
+            true,
+            "test-case",
+        );
 
         assert_eq!(conv.time_pref_extraction_error_count, 0);
     }
@@ -2044,7 +2473,16 @@ mod tests {
         conv.time_pref_extraction_error_count = 2;
 
         assert_eq!(
-            decide_time_pref_extraction_failed(&u, &mut conv, false, 3, false, false),
+            decide_time_pref_extraction_failed(
+                &u,
+                &mut conv,
+                false,
+                3,
+                false,
+                false,
+                true,
+                "test-case"
+            ),
             AdvisorAction::Safety
         );
         assert_eq!(

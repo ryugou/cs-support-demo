@@ -753,6 +753,11 @@ async fn advisor_reply_handler(
             understanding.conditions =
                 decide::merge_conditions(&accumulated_conditions, &understanding.conditions);
             let is_continuation = !history.is_empty() || req.case_id.is_some();
+            // Issue #49 / design doc 2026-10-06-advisor-lead-interest-design.md §3 手順5の保険:
+            // 「この case で、ボットがまだ一度も応答していない」かどうかを `decide` 系関数へ渡す。
+            // 新しい状態は増やさず、既存の `is_continuation`(継続会話かどうか)の否定として導出
+            // する(spec 上の絶対条件: 既存の会話状態以外の方法で求めない)。
+            let first_turn = !is_continuation;
 
             // Issue #50 バッチ2(design doc §13.2 rule 2(a)): CS 側(urtect schema)が継続状態
             // (聞き返し中・時間帯受付中)にあるかを、decide 系関数を呼ぶ前に確定させる
@@ -809,6 +814,8 @@ async fn advisor_reply_handler(
                         state.config.api.clarify_max_turns,
                         advisor_attrs.support_mode,
                         cs_continuing,
+                        first_turn,
+                        &case_id,
                     ),
                     Err(_) => decide::decide_time_pref_extraction_failed(
                         &understanding,
@@ -817,6 +824,8 @@ async fn advisor_reply_handler(
                         state.config.api.clarify_max_turns,
                         advisor_attrs.support_mode,
                         cs_continuing,
+                        first_turn,
+                        &case_id,
                     ),
                 }
             } else {
@@ -828,6 +837,8 @@ async fn advisor_reply_handler(
                     state.config.api.clarify_max_turns,
                     advisor_attrs.support_mode,
                     cs_continuing,
+                    first_turn,
+                    &case_id,
                 )
             };
 
@@ -1469,6 +1480,8 @@ mod tests {
             3,
             attrs.support_mode,
             false,
+            false, // first_turn: これは Safety 応答の直後の次ターンなので継続会話
+            "test-case",
         );
 
         assert_eq!(
@@ -1521,6 +1534,8 @@ mod tests {
             3,
             attrs.support_mode,
             true,
+            false, // first_turn: これは Safety 応答の直後の次ターンなので継続会話
+            "test-case",
         );
 
         assert_eq!(
