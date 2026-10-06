@@ -42,7 +42,7 @@
 手順5: !suppress_lead_solicit && u.lead_interest && !lead_requested && !(first_turn && u.product_intent) → LeadSolicit
 ```
 
-- `first_turn` は「この case で、ボットがまだ一度も応答していない」こと。既存の会話状態から決定論で求める（`turn_count` 等。既存の状態で判定できる値を使い、新しい状態は増やさない）。
+- `first_turn` は「この case で、ボットがまだ一度も応答していない」こと。永続 case の状態から純関数（`first_turn_from_case`、`server/src/advisor/api.rs`）で求める。`load_case` が返す support_case が存在し、かつ属性 `turn_count`（`record_conversation_turn` が応答のたびに進める）が 1 以上なら `false`、それ以外（case が無い、`turn_count` が欠落・0・パース不能）は `true`。リクエストの `history` / `case_id` の有無は使わない（未知の `case_id` や、`case_id` を失って履歴だけ送るクライアントでも、永続 case に応答履歴が無ければ最初のターンとして扱うため）。新しい状態は増やさない。ターン記録の書き込みに失敗した case は `true` のままになるが、保険が効く側（LeadSolicit を見送る側）への倒れ方なので許容する。
 - `first_turn && u.product_intent` で LeadSolicit を見送ったときは、手順 6（Clarify）以降へ進む。`lead_interest` の値は捨てず、次のターン以降は従来どおり手順 5 で判定する。
 - 見送ったことを `tracing::info!` で 1 行出す（`case_id`、理由）。発話本文は出さない。
 
@@ -68,6 +68,7 @@
 | --- | --- |
 | 理解プロンプト | `lead_interest` の定義と、`true` / `false` の例（Issue の実測発話を含む）がプロンプトに含まれる |
 | `decide` 手順 5 | 最初のターンで `lead_interest && product_intent` → LeadSolicit にならず、条件が不足なら Clarify、十分なら Answer。最初のターンで `lead_interest && !product_intent` → 従来どおり LeadSolicit。2 ターン目以降で `lead_interest && product_intent` → 従来どおり LeadSolicit。見送り時に `lead_interest` の値が状態として失われない |
+| `first_turn_from_case` | 未知の `case_id`（case なし）→ `true`。履歴のみで `case_id` なし（新規 case）→ `true`。既存 case で `turn_count` ≥ 1 → `false`（履歴が空でも）。既存 case で `turn_count` が 0・欠落・パース不能 → `true`。ハンドラ全体を通した配線テストは、応答生成に実 LLM と vegapunk が要り土台が無いため置かず、導出を純関数に切り出してその単体テストで固定する |
 | 既存 | `decide` の既存テスト（優先順位、`lead_requested`、`suppress_lead_solicit`、時間帯）が変更なしで通る |
 
 ## 6. 本番での確認（マージ後）

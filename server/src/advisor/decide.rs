@@ -94,8 +94,11 @@ pub enum AdvisorAction {
 ///
 /// `first_turn` / `case_id`: Issue #49 対応(design doc `2026-10-06-advisor-lead-interest-design.md`
 /// §3)で追加した。`first_turn` は「この case で、ボットがまだ一度も応答していない」こと
-/// (呼び出し元が既存の会話状態から決定論で求める。`api.rs` は `!is_continuation` をそのまま
-/// 渡す)。`case_id` は手順5の保険が発火して LeadSolicit を見送った際の `tracing::info!` ログに
+/// (呼び出し元が永続 case の状態から決定論で求める。`api.rs` は `load_case` の結果を
+/// `first_turn_from_case` に通し、「case が存在し、かつ `turn_count` が 1 以上」のときだけ
+/// `false` を渡す。リクエストの `history` / `case_id` の有無からは求めない。そこから求めると、
+/// 初回から `case_id` を指定するクライアントや履歴だけを送るクライアントで最初のターンを
+/// 継続と誤分類する)。`case_id` は手順5の保険が発火して LeadSolicit を見送った際の `tracing::info!` ログに
 /// 相関キーとして載せるためだけに使う(`decide_in_domain_flow` の doc comment 参照)。
 #[allow(clippy::too_many_arguments)]
 pub fn decide(
@@ -1790,7 +1793,7 @@ mod tests {
                 3,
                 false,
                 false,
-                true,
+                false,
                 "test-case"
             ),
             AdvisorAction::Safety
@@ -1819,7 +1822,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
         assert_eq!(
@@ -1840,7 +1843,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
         assert_eq!(
@@ -1877,7 +1880,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -1965,7 +1968,7 @@ mod tests {
                 3,
                 false,
                 false,
-                true,
+                false,
                 "test-case",
             );
             let AdvisorAction::LeadConfirmed { slot } = action else {
@@ -1999,7 +2002,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2039,7 +2042,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2076,7 +2079,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2111,7 +2114,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
         assert_eq!(
@@ -2131,7 +2134,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
         assert_eq!(
@@ -2173,7 +2176,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2187,7 +2190,7 @@ mod tests {
                 3,
                 false,
                 false,
-                true,
+                false,
                 "test-case",
             )
         });
@@ -2218,7 +2221,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2241,7 +2244,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2266,7 +2269,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2294,7 +2297,7 @@ mod tests {
                 3,
                 false,
                 false,
-                true,
+                false,
                 "test-case",
             )
         });
@@ -2338,7 +2341,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
         assert_eq!(
@@ -2356,7 +2359,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2399,7 +2402,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2426,7 +2429,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2457,7 +2460,7 @@ mod tests {
             3,
             false,
             false,
-            true,
+            false,
             "test-case",
         );
 
@@ -2480,7 +2483,7 @@ mod tests {
                 3,
                 false,
                 false,
-                true,
+                false,
                 "test-case"
             ),
             AdvisorAction::Safety
