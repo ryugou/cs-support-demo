@@ -27,6 +27,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -210,7 +211,11 @@ async fn main() -> Result<()> {
 
     let bind_addr: SocketAddr = config.bind_addr.parse()?;
 
-    let mut app = cs_support_mcp::health::health_router();
+    // 監視対象の監査ログ(Issue #62)。advisor 本体用と CS 連携用(support_harness)の
+    // 2 つを両方監視する。`/livez` `/healthz` はいずれかが poisoned なら 503 を返し、
+    // 下の起動処理はいずれかが poisoned になったら自分でプロセスを終了させる。
+    let worm_logs_for_shutdown = vec![harness.worm.clone(), support_harness.worm.clone()];
+    let mut app = cs_support_mcp::health::health_router(worm_logs_for_shutdown.clone());
 
     // admin-ui（Issue #34）は `apiBase` をビルド時に `/admin/api`(project 非依存)で
     // ハードコードしている。project が 2 件以上だと、この 1 パスがどの project を指すか
@@ -318,21 +323,59 @@ async fn main() -> Result<()> {
     // この修正は homesec_advisor.rs に閉じる。
     let app = app.layer(TraceLayer::new_for_http());
 
+    // 監査ログが poisoned になったときの graceful shutdown 上限(Issue #62、既定 30 秒)。
+    let poisoned_shutdown_grace_period =
+        Duration::from_secs(config.harness.poisoned_shutdown_grace_period_secs);
+
     if let (Some(cert), Some(key)) = (&config.tls_cert_path, &config.tls_key_path) {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let tls_config = RustlsConfig::from_pem_file(cert, key)
             .await
             .with_context(|| format!("load TLS cert={cert} key={key}"))?;
         tracing::info!(%bind_addr, cert, key, "starting homesec_advisor over HTTPS");
+        // Issue #62: `Handle` が無いと poisoned 検知後に graceful shutdown を発動する
+        // 手段が無い。`graceful_shutdown(Some(duration))` は axum-server 自身が
+        // 「接続終了を待ちつつ duration を超えたら強制終了する」を実装済み
+        // (design doc §3.2 の実装指定)。
+        let handle = axum_server::Handle::new();
+        tokio::spawn({
+            let handle = handle.clone();
+            let worm_logs = worm_logs_for_shutdown.clone();
+            async move {
+                cs_support_mcp::shutdown::wait_and_report_poisoned(
+                    worm_logs,
+                    poisoned_shutdown_grace_period,
+                )
+                .await;
+                handle.graceful_shutdown(Some(poisoned_shutdown_grace_period));
+            }
+        });
         axum_server::bind_rustls(bind_addr, tls_config)
+            .handle(handle)
             .serve(app.into_make_service())
             .await?;
+        // ここに到達するのは poisoned 検知による graceful shutdown が完了した場合のみ
+        // (通知を受け取るまでは待ち受けを止めない。design doc §3.2)。
+        std::process::exit(cs_support_mcp::shutdown::POISONED_EXIT_CODE);
     } else {
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         tracing::info!(%bind_addr, "starting homesec_advisor over HTTP");
-        axum::serve(listener, app).await?;
+        let worm_logs = worm_logs_for_shutdown.clone();
+        // 通知を受け取ったこの時点から grace period を計測し、超えたら強制終了する
+        // (プロセス起動時点から計測しない。design doc §3.2)。`std::process::exit` は
+        // バイナリ側に残す(design doc §2.2)。
+        let shutdown_signal = cs_support_mcp::shutdown::poisoned_shutdown_signal(
+            worm_logs,
+            poisoned_shutdown_grace_period,
+            || std::process::exit(cs_support_mcp::shutdown::POISONED_EXIT_CODE),
+        );
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal)
+            .await?;
+        // ここに到達するのは poisoned 検知による graceful shutdown が grace period 内に
+        // 完了した場合のみ。
+        std::process::exit(cs_support_mcp::shutdown::POISONED_EXIT_CODE);
     }
-    Ok(())
 }
 
 /// support_harness 用の `AppConfig` を組み立てる(Issue #50 design doc §13.1、レビュー指摘1)。

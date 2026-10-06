@@ -930,6 +930,10 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
 - **actor 突合表の DB 化（B6、旧: JWT 認証の本番化）**: AuthN は Google OAuth 2.1 に移行済み（上記「AuthN 現状」参照）。残る課題は認可側で、`Authenticator::lookup_by_identity` が突合なしに任意の検証済み email を supervisor へ無条件解決する現状を、DB ベースの actor 表（sub/email → role / allowed_schemas）に差し替えること。払い出し・失効運用も本番で確定する。
 - **デモ商材と signal 語彙のドメイン整合**: 現行サンプルマニュアルは `SVR-HB100`（スマートホームハブ＝電子機器）だが、signal 語彙初版は化粧品・健康食品向け。納品対象の商材を確定し、マニュアルと語彙のドメインを揃える（電子機器なら安全語彙を発熱・発火・感電系に作り直す）。
 
+## S1-12. 追記（2026-10-06、監査ログ poisoned インスタンスの切り離し、Issue #62）
+
+監査ログ（WORM、S1-8）が poisoned になったプロセスのヘルス応答（`/livez` `/healthz` を 503 にする）と自己終了、復旧手順の正本は `docs/superpowers/specs/2026-10-06-poisoned-audit-instance-design.md` とする。本書には状態遷移・振る舞いの表を複製しない。
+
 ---
 
 # フェーズロードマップ — Step 2（顧客直チャットボット）/ Step 3（音声対応）への前方互換

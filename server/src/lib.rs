@@ -16,6 +16,7 @@ pub mod project;
 pub mod proto;
 pub mod resolve;
 pub mod rmcp_server;
+pub mod shutdown;
 pub mod staticui;
 #[cfg(test)]
 pub(crate) mod test_support;

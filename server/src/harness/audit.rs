@@ -80,6 +80,19 @@ enum ChainState {
 pub struct WormAuditLog {
     path: PathBuf,
     state: Mutex<(File, ChainState)>, // (append-only file, chain state)
+    /// poisoned への遷移を1回だけ知らせる（Issue #62）。`append` の3つの耐久化失敗分岐
+    /// （`writeln!` / `flush` / `sync_all`）でのみ `notify_waiters()` を呼ぶ。「既に
+    /// Poisoned からの早期拒否」（`ChainState::Poisoned` にマッチする分岐）では呼ばない
+    /// ため、通知は遷移の瞬間に1回だけ発行される。起動処理（`main.rs` /
+    /// `homesec_advisor.rs`）は `wait_poisoned` 経由でこれを監視し、受け取ったら
+    /// プロセスを終了させる。`WormAuditLog` 自身は `std::process::exit` を呼ばない
+    /// （design doc §2.2: 終了を決めるのは呼び出し側）。
+    poisoned_notify: tokio::sync::Notify,
+    /// `state` の `ChainState::Poisoned` と同期して立てるフラグ。`is_poisoned` が
+    /// `state` のロックを取らずに済むようにするためのもの。`append` は `sync_all` の間
+    /// ロックを保持する（GCS FUSE では長時間かかりうる）ため、ヘルスハンドラ
+    /// （async ワーカー上）がロック待ちで tokio ワーカーを塞ぐのを避ける。
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl WormAuditLog {
@@ -107,7 +120,43 @@ impl WormAuditLog {
         Ok(Self {
             path: path.to_path_buf(),
             state: Mutex::new((file, ChainState::Verified(prev_hash))),
+            poisoned_notify: tokio::sync::Notify::new(),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// この監査ログのファイルパス。終了処理のログ出力（どの監査ログが poisoned に
+    /// なったか）に使う。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// ハッシュ連鎖の状態が poisoned かどうか。読み取り専用で状態を変えない。
+    ///
+    /// 状態を保護する `Mutex` 自体が Rust の意味で poisoned（panic を保持したまま
+    /// unlock された）場合も `true` を返す。`ChainState::Poisoned`（耐久化失敗）とは
+    /// 原因が異なるが、どちらも「このプロセスはこのログへ以降 append できない」という
+    /// 結果は同じため、呼び出し側（ヘルスチェック・終了処理）には同じ扱いで見せる。
+    pub fn is_poisoned(&self) -> bool {
+        // ロックを取らない（`append` が fsync 中にロックを保持するため）。
+        // `Mutex::is_poisoned` も非ブロッキング。
+        self.poisoned.load(std::sync::atomic::Ordering::Acquire) || self.state.is_poisoned()
+    }
+
+    /// poisoned への遷移を待つ。既に poisoned なら即座に返る。
+    ///
+    /// 複数の呼び出し元が同時に待ってよい（`Notify::notify_waiters` は呼び出し時点で
+    /// 待機中の全 waiter を起こす。例: ヘルスチェックの監視と終了処理の監視が同じ
+    /// `WormAuditLog` を別々に監視できる）。
+    ///
+    /// 実装上の race 回避: `notified()` で待機者として登録してから `is_poisoned()` を
+    /// 確認する（逆順だと、確認と登録の間に遷移が起きた場合に通知を取り逃す）。
+    pub async fn wait_poisoned(&self) {
+        let notified = self.poisoned_notify.notified();
+        if self.is_poisoned() {
+            return;
+        }
+        notified.await;
     }
 
     /// イベントを追記し event_id を返す。
@@ -186,12 +235,18 @@ impl WormAuditLog {
         if let Err(err) = writeln!(file, "{line}") {
             // 部分書き込みの可能性があり、ディスク上の状態を判別できないため poison する。
             *chain = ChainState::Poisoned;
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.poisoned_notify.notify_waiters();
             return Err(err)
                 .with_context(|| poisoning_now_error(&self.path))
                 .with_context(|| format!("append audit log {}", self.path.display()));
         }
         if let Err(err) = file.flush() {
             *chain = ChainState::Poisoned;
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.poisoned_notify.notify_waiters();
             return Err(err)
                 .with_context(|| poisoning_now_error(&self.path))
                 .context("flush audit log");
@@ -206,6 +261,9 @@ impl WormAuditLog {
         // ここも他の I/O と同様に Err を呼び出し元へ伝播する（fail closed）。
         if let Err(err) = file.sync_all() {
             *chain = ChainState::Poisoned;
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.poisoned_notify.notify_waiters();
             return Err(err)
                 .with_context(|| poisoning_now_error(&self.path))
                 .with_context(|| format!("fsync audit log {}", self.path.display()));
@@ -217,10 +275,21 @@ impl WormAuditLog {
     /// テスト専用: `flush`/`sync_all` の実失敗を環境非依存に再現するのが難しいため、
     /// poisoned 状態への遷移だけを直接起こす。`#[cfg(test)]` によりテストビルド以外の
     /// バイナリには存在せず、本番コードから呼び出す経路は無い。
+    ///
+    /// `pub(crate)`: `health.rs` / `shutdown.rs` のテストが、実際の I/O 失敗を起こさずに
+    /// 「poisoned になった `WormAuditLog`」を用意するために使う（Issue #62）。
+    /// 遷移そのもの（`append` の3分岐と同じ文言を使った通知の有無）を固定するテストは、
+    /// 既存の実際の書き込み失敗手法（`audit.rs` 内のテスト）を使う。ここは状態遷移と
+    /// 通知を実際の分岐と同じように起こす（呼び出し側が `wait_poisoned` ベースの
+    /// フィクスチャとして使えるようにするため）。
     #[cfg(test)]
-    fn poison_for_test(&self) {
+    pub(crate) fn poison_for_test(&self) {
         let mut guard = self.state.lock().expect("audit log mutex poisoned");
         guard.1 = ChainState::Poisoned;
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(guard);
+        self.poisoned_notify.notify_waiters();
     }
 }
 
@@ -546,6 +615,205 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ---- Issue #62: is_poisoned / poisoned 通知 ----
+
+    /// 健全なログは `is_poisoned` が false を返す。open 直後・append 後のどちらも。
+    #[test]
+    fn is_poisoned_is_false_when_healthy() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let log = WormAuditLog::open(&path).expect("open worm log");
+        assert!(
+            !log.is_poisoned(),
+            "a freshly opened log must not be poisoned"
+        );
+        log.append(draft("req-1", "allowed")).expect("append");
+        assert!(
+            !log.is_poisoned(),
+            "a successful append must not poison the log"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `append` が fsync 中に `state` のロックを保持していても、`is_poisoned` は
+    /// ブロックせずに返る（ヘルスハンドラが tokio ワーカーを塞がないため）。
+    #[test]
+    fn is_poisoned_does_not_block_while_another_thread_holds_the_state_lock() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let log = std::sync::Arc::new(WormAuditLog::open(&path).expect("open worm log"));
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder_log = log.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = holder_log.state.lock().expect("lock state");
+            locked_tx.send(()).expect("signal locked");
+            // テスト側が確認を終えるまでロックを保持する（上限つき）。
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder thread must take the lock");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<bool>();
+        let caller_log = log.clone();
+        let caller = std::thread::spawn(move || {
+            let _ = result_tx.send(caller_log.is_poisoned());
+        });
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(1));
+
+        // 結果に関わらず保持側を解放して、スレッドを残さない。
+        release_tx.send(()).ok();
+        holder.join().expect("holder thread");
+        caller.join().expect("caller thread");
+
+        assert_eq!(
+            result,
+            Ok(false),
+            "is_poisoned must return without waiting for the state lock"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 実際の耐久化失敗（読み取り専用 fd への書き込み、既存テストと同じ手法）で
+    /// poisoned に遷移した後は `is_poisoned` が true を返す。
+    #[test]
+    fn is_poisoned_is_true_after_a_real_durability_failure() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let prev_hash = {
+            let log = WormAuditLog::open(&path).expect("open worm log");
+            log.append(draft("req-1", "allowed")).expect("append 1");
+            let body = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+            v["hash"].as_str().unwrap().to_string()
+        };
+        let read_only_file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open read-only");
+        let log = WormAuditLog {
+            path: path.clone(),
+            state: Mutex::new((read_only_file, ChainState::Verified(prev_hash))),
+            poisoned_notify: tokio::sync::Notify::new(),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(!log.is_poisoned());
+        let _ = log.append(draft("req-2", "escalate"));
+        assert!(
+            log.is_poisoned(),
+            "a real durability failure must flip is_poisoned to true"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// poisoned への遷移（実際の耐久化失敗）で `wait_poisoned` の待機者が1回起こされる。
+    /// 複数の waiter を登録しても、全員が同じ単一の遷移で起こされる（health / shutdown の
+    /// 両方が同じ `WormAuditLog` を同時に監視できる設計の裏付け）。
+    #[tokio::test]
+    async fn poisoning_transition_notifies_all_current_waiters_exactly_once() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let prev_hash = {
+            let log = WormAuditLog::open(&path).expect("open worm log");
+            log.append(draft("req-1", "allowed")).expect("append 1");
+            let body = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+            v["hash"].as_str().unwrap().to_string()
+        };
+        let read_only_file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open read-only");
+        let log = WormAuditLog {
+            path: path.clone(),
+            state: Mutex::new((read_only_file, ChainState::Verified(prev_hash))),
+            poisoned_notify: tokio::sync::Notify::new(),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let waiter1 = log.wait_poisoned();
+        let waiter2 = log.wait_poisoned();
+
+        let _ = log.append(draft("req-2", "escalate"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter1)
+            .await
+            .expect("waiter 1 must be notified by the poisoning transition");
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter2)
+            .await
+            .expect("waiter 2 must be notified by the same poisoning transition");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 健全な追記は誰も起こさない（poisoned 専用の通知であり、通常の追記イベントではない）。
+    #[tokio::test(start_paused = true)]
+    async fn healthy_append_does_not_notify_poisoned_waiters() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let log = WormAuditLog::open(&path).expect("open worm log");
+        let waiter = log.wait_poisoned();
+        log.append(draft("req-1", "allowed")).expect("append");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), waiter).await;
+        assert!(
+            result.is_err(),
+            "a healthy append must not notify poisoned waiters"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 既に poisoned な状態からの追記拒否（I/O を一切行わない short-circuit）は、
+    /// 遷移時の通知を再発行しない。遷移が落ち着いた後に新規登録した waiter で確認する
+    /// （登録前の通知は `Notify::notify_waiters` が後続の waiter まで起こさないため、
+    /// この waiter が起きたら「2 回目の通知が実際に発行された」ことの直接証拠になる）。
+    #[tokio::test(start_paused = true)]
+    async fn short_circuited_reject_on_already_poisoned_log_does_not_notify_again() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let prev_hash = {
+            let log = WormAuditLog::open(&path).expect("open worm log");
+            log.append(draft("req-1", "allowed")).expect("append 1");
+            let body = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+            v["hash"].as_str().unwrap().to_string()
+        };
+        let read_only_file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open read-only");
+        let log = WormAuditLog {
+            path: path.clone(),
+            state: Mutex::new((read_only_file, ChainState::Verified(prev_hash))),
+            poisoned_notify: tokio::sync::Notify::new(),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        // 1 回目: 実際の耐久化失敗で遷移させる。
+        let _ = log.append(draft("req-2", "escalate"));
+        assert!(matches!(
+            log.state.lock().expect("lock").1,
+            ChainState::Poisoned
+        ));
+
+        // 遷移が落ち着いた後に新規登録する waiter。
+        let waiter_after_transition = log.poisoned_notify.notified();
+
+        // 2 回目: 既に Poisoned なので I/O 抜きで即座に拒否されるはず。
+        let _ = log.append(draft("req-3", "escalate"));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            waiter_after_transition,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a reject of an already-poisoned log must not re-fire notify_waiters"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// レビュー指摘1: `poison_for_test` は「既に Poisoned な状態からの拒否」だけを固定するテスト
     /// であり、`Verified` → `Poisoned` への**遷移そのもの**は 1 経路もテストしていなかった
     /// （`append` の `sync_all` 失敗分岐から `*chain = ChainState::Poisoned;` を削除しても
@@ -592,6 +860,8 @@ mod tests {
         let log = WormAuditLog {
             path: path.clone(),
             state: Mutex::new((read_only_file, ChainState::Verified(prev_hash))),
+            poisoned_notify: tokio::sync::Notify::new(),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         };
 
         // 1 回目: 実際の writeln! 失敗で Err になり、Poisoned へ遷移するはず。
