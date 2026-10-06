@@ -1729,10 +1729,11 @@ impl Harness {
         // resolution == Matched の matched_model を product_models（CSV、辞書順）へ加算する。
         // Foreign / Ambiguous は加えない（design doc §2.1。`product_models` は切り替えの検知
         // 入力にのみ使い、回答可否の判定には使わない — design doc §4 不変条件）。
-        // この `evaluate()` の呼び出し元は `api.rs`（/api/reply）と `rmcp_server.rs`
-        // （MCP evaluate_answerability）のみ（homesec アドバイザーは呼ばない）。MCP 経路でも
-        // `product_models` は書き戻されるが、切り替えの自動検知は `api.rs::reply_handler` にしか
-        // 無いため、MCP 経路の入出力・判定は変わらない（design doc §1 末尾）。
+        // この `evaluate()` の呼び出し元は `api.rs`（/api/reply）、`rmcp_server.rs`
+        // （MCP evaluate_answerability）、`advisor/cs_support.rs`（homesec アドバイザーの
+        // CS 連携モード。support schema に対して呼ぶ）の 3 つ。どの経路でも `product_models` は
+        // 書き戻されるが、切り替えの自動検知は `api.rs::reply_handler` にしか無いため、
+        // MCP 経路・アドバイザー経路の入出力・判定は変わらない（design doc §1 末尾）。
         let existing_product_models = case_attrs
             .get("product_models")
             .cloned()
