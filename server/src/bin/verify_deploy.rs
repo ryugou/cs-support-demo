@@ -24,7 +24,7 @@ use cs_support_mcp::{
     config::{AppConfig, ManualSchemaKind, ProjectConfig},
     harness::{
         authn,
-        rules::{match_layer1, EscalationRule},
+        rules::{match_layer1, EscalationRule, ProhibitedDomain},
         scope,
         signal::SignalNormalizer,
         Harness, RequestContext,
@@ -522,34 +522,79 @@ fn summarize_layer1_check(results: &[Layer1Result]) -> CheckResult {
     }
 }
 
+/// rules・domains を lexicon と突合し、通れば cases を評価する同期部分（spec §3.2 の 3./4.）。
+/// vegapunk 読み出し（`store.load_escalation_rules` 等）を含まないため、単体テストでは
+/// Harness が持つ lexicon だけで検証できる（spec §7「語彙の突合」）。突合はサービスの評価
+/// 経路と同じ関数（`Harness::validate_rule_vocabulary`）を呼び、判定ロジックを複製しない
+/// （spec §5）。語彙に無い signal を参照するものが 1 つでもあれば、cases を評価せずに
+/// `layer1` を `fail` にする（`detail` にルール id と signal 名を含むエラー文が入る。発話は
+/// 含まない）。すべて語彙内なら cases を評価する。
+fn layer1_check_from_rules_and_domains(
+    harness: &Harness,
+    rules: &[EscalationRule],
+    domains: &[ProhibitedDomain],
+    cases: &[Layer1Case],
+) -> (CheckResult, Vec<Layer1Result>) {
+    if let Err(err) = harness.validate_rule_vocabulary(rules, domains) {
+        return (
+            CheckResult::fail("layer1", json!({ "error": format!("{err:#}") })),
+            Vec::new(),
+        );
+    }
+    let results: Vec<Layer1Result> = cases
+        .iter()
+        .map(|case| evaluate_layer1_case(rules, harness.lexicon.as_ref(), case))
+        .collect();
+    (summarize_layer1_check(&results), results)
+}
+
+/// store 取得失敗・ルール/禁止領域の読み込み失敗を記録する共通の失敗経路。`detail` は空のまま
+/// にする（顧客の発話を含まない読み出しエラーであり、運用者はログの `error` で原因を追える）。
+fn layer1_load_failure(
+    project_id: &str,
+    schema: &str,
+    err: &anyhow::Error,
+) -> (CheckResult, Vec<Layer1Result>) {
+    tracing::error!(
+        project_id = %project_id,
+        schema = %schema,
+        error = %format!("{err:#}"),
+        "verify-deploy: layer1 check failed to load escalation rules"
+    );
+    (CheckResult::fail("layer1", json!({})), Vec::new())
+}
+
 async fn run_layer1_check(
     harness: &Harness,
     project_id: &str,
     schema: &str,
     cases: &[Layer1Case],
 ) -> (CheckResult, Vec<Layer1Result>) {
-    let rules = match harness.store() {
-        Ok(store) => store.load_escalation_rules(schema).await,
-        Err(err) => Err(err),
+    let store = match harness.store() {
+        Ok(store) => store,
+        Err(err) => return layer1_load_failure(project_id, schema, &err),
     };
-    match rules {
-        Ok(rules) => {
-            let results: Vec<Layer1Result> = cases
-                .iter()
-                .map(|case| evaluate_layer1_case(&rules, harness.lexicon.as_ref(), case))
-                .collect();
-            (summarize_layer1_check(&results), results)
-        }
-        Err(err) => {
-            tracing::error!(
-                project_id = %project_id,
-                schema = %schema,
-                error = %format!("{err:#}"),
-                "verify-deploy: layer1 check failed to load escalation rules"
-            );
-            (CheckResult::fail("layer1", json!({})), Vec::new())
-        }
+    // サービスの評価経路（`Harness::evaluate`）と同じ関数でルール・禁止領域を読む
+    // （spec §3.2 の 1.）。
+    let (rules, domains) = match tokio::try_join!(
+        store.load_escalation_rules(schema),
+        store.load_prohibited_domains(schema),
+    ) {
+        Ok(pair) => pair,
+        Err(err) => return layer1_load_failure(project_id, schema, &err),
+    };
+    let (check, results) = layer1_check_from_rules_and_domains(harness, &rules, &domains, cases);
+    // `cases` は呼び出し元で非空が保証されている（`parse_expectations_file` が空の `layer1`
+    // を拒否する）ため、`results` が空なのは語彙突合で早期 return したときだけ起きる。
+    if results.is_empty() {
+        tracing::error!(
+            project_id = %project_id,
+            schema = %schema,
+            detail = %check.detail,
+            "verify-deploy: layer1 check rejected rules/domains referencing a signal outside the vocabulary"
+        );
     }
+    (check, results)
 }
 
 // ---------------------------------------------------------------------------
@@ -737,16 +782,21 @@ async fn build_config_runtime(
         .with_context(|| format!("resolve --target projects in config {}", group.config_path))?;
     let projects: Vec<ProjectConfig> = selected.into_iter().cloned().collect();
 
-    // 即時接続（`connect_with_limits`）。接続後の認証拒否・断は preflight が拾う（spec §4）。
-    let vegapunk =
-        VegapunkClient::connect_with_limits(&config.vegapunk_endpoint, token, config.grpc_limits())
-            .await
-            .with_context(|| {
-                format!(
-                    "connect vegapunk {} (config {})",
-                    config.vegapunk_endpoint, group.config_path
-                )
-            })?;
+    // 遅延接続（`connect_lazy_with_limits`、サービスの main.rs / homesec_advisor.rs と同じ）。
+    // 実際の接続は疎通確認の 1 件読み出しで初めて起きる。即時接続（`connect_with_limits`）だと
+    // VPC や接続先の障害で疎通確認に到達する前にランタイムの組み立てで終了し、
+    // project・schema・確認先つきの診断が出ず、残りの対象の確認も行われない（spec §4 末尾）。
+    let vegapunk = VegapunkClient::connect_lazy_with_limits(
+        &config.vegapunk_endpoint,
+        token,
+        config.grpc_limits(),
+    )
+    .with_context(|| {
+        format!(
+            "connect vegapunk {} (config {})",
+            config.vegapunk_endpoint, group.config_path
+        )
+    })?;
     let config_dir = config_path
         .parent()
         .map(Path::to_path_buf)
@@ -1345,6 +1395,151 @@ mod tests {
         let check = summarize_layer1_check(&results);
         assert_eq!(check.status, CheckStatus::Fail);
         assert_eq!(check.detail, json!({ "total": 2, "failed": 1 }));
+    }
+
+    // ---- layer1_check_from_rules_and_domains（語彙の突合、spec §3.2 の 3./4., §7） ----
+
+    /// `validate_rule_vocabulary` は `Harness` の lexicon だけを読み、vegapunk を呼ばない。
+    /// `VegapunkClient::connect_lazy_with_limits` は実際には接続せずチャネルを組み立てる
+    /// だけなので（本番の起動シーケンスと同じ性質。`main.rs` も同じ関数で起動時に接続する）、
+    /// `Harness::build` をネットワーク無しで完走できる。テストごとに「語彙」を差し替えたい
+    /// ため、`config.cloudrun.toml` を読み取り専用化した上で `signal_lexicon_path` だけ
+    /// 一時ファイルへ上書きする。
+    fn harness_with_lexicon_for_test(lexicon_json: &str) -> Harness {
+        let config = cloudrun_config();
+        let test_dir =
+            std::env::temp_dir().join(format!("verify-deploy-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let lexicon_path = test_dir.join("lexicon.json");
+        std::fs::write(&lexicon_path, lexicon_json).unwrap();
+
+        let mut harness_config = read_only_harness_config(&config, &test_dir.join("scratch"));
+        harness_config.harness.signal_lexicon_path = lexicon_path.to_string_lossy().into_owned();
+
+        let vegapunk = VegapunkClient::connect_lazy_with_limits(
+            &config.vegapunk_endpoint,
+            "test-token",
+            config.grpc_limits(),
+        )
+        .expect("connect_lazy_with_limits must not require network access");
+        let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        Harness::build(&harness_config, Arc::new(vegapunk), config_dir)
+            .expect("harness must build from a test-only lexicon without network access")
+    }
+
+    /// `vocab_test_signal` だけを含む lexicon。このテスト群における「語彙内」の唯一の signal。
+    const VOCAB_TEST_LEXICON: &str = r#"{"signals":[{"signal":"vocab_test_signal","class":"context","surface_forms":["ごい"]}]}"#;
+
+    fn domain(id: &str, signals: &[&str], binding: Binding) -> ProhibitedDomain {
+        ProhibitedDomain {
+            id: id.to_string(),
+            domain_signals: signals.iter().map(|s| Signal::new(*s)).collect(),
+            text_patterns: Vec::new(),
+            route: "support_desk".to_string(),
+            binding,
+        }
+    }
+
+    // `harness_with_lexicon_for_test` が呼ぶ `VegapunkClient::connect_lazy_with_limits` は
+    // 実接続をしないが、channel の組み立てには Tokio reactor が必要（`main.rs` では
+    // `#[tokio::main]` の中から呼ばれているため気づかれない）。素の `#[test]` にはそれが無く
+    // panic するため、この 3 件は `#[tokio::test]` にする。
+    #[tokio::test]
+    async fn layer1_check_fails_closed_without_evaluating_cases_when_a_rule_references_an_unknown_signal(
+    ) {
+        let harness = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
+        let rules = vec![rule(
+            "rule-with-unknown-signal",
+            &["signal_not_in_vocabulary"],
+            Binding::Advisory,
+        )];
+        let domains: Vec<ProhibitedDomain> = Vec::new();
+        let cases = vec![Layer1Case {
+            utterance: "ごいですか".to_string(),
+            expect_rule: None,
+        }];
+
+        let (check, results) =
+            layer1_check_from_rules_and_domains(&harness, &rules, &domains, &cases);
+
+        assert_eq!(check.name, "layer1");
+        assert_eq!(check.status, CheckStatus::Fail);
+        let detail = check
+            .detail
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("detail.error must be a string");
+        assert!(
+            detail.contains("rule-with-unknown-signal"),
+            "detail must name the offending rule id, got {detail:?}"
+        );
+        assert!(
+            detail.contains("signal_not_in_vocabulary"),
+            "detail must name the offending signal, got {detail:?}"
+        );
+        assert!(
+            results.is_empty(),
+            "cases must not be evaluated when the vocabulary check fails, got {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn layer1_check_rejects_a_prohibited_domain_that_references_an_unknown_signal() {
+        let harness = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
+        let rules: Vec<EscalationRule> = Vec::new();
+        let domains = vec![domain(
+            "domain-with-unknown-signal",
+            &["signal_not_in_vocabulary"],
+            Binding::Mandatory,
+        )];
+        let cases = vec![Layer1Case {
+            utterance: "ごいですか".to_string(),
+            expect_rule: None,
+        }];
+
+        let (check, results) =
+            layer1_check_from_rules_and_domains(&harness, &rules, &domains, &cases);
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        let detail = check
+            .detail
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("detail.error must be a string");
+        assert!(detail.contains("domain-with-unknown-signal"));
+        assert!(detail.contains("signal_not_in_vocabulary"));
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn layer1_check_evaluates_cases_when_every_rule_and_domain_signal_is_in_the_vocabulary() {
+        let harness = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
+        let rules = vec![rule(
+            "rule-in-vocabulary",
+            &["vocab_test_signal"],
+            Binding::Advisory,
+        )];
+        let domains = vec![domain(
+            "domain-in-vocabulary",
+            &["vocab_test_signal"],
+            Binding::Mandatory,
+        )];
+        let cases = vec![Layer1Case {
+            utterance: "ごいですか".to_string(),
+            expect_rule: Some("rule-in-vocabulary".to_string()),
+        }];
+
+        let (check, results) =
+            layer1_check_from_rules_and_domains(&harness, &rules, &domains, &cases);
+
+        assert_eq!(check.name, "layer1");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, CheckStatus::Pass);
+        assert_eq!(
+            results[0].matched_rule.as_deref(),
+            Some("rule-in-vocabulary")
+        );
     }
 
     // ---- compute_passed（結果の集約） ----

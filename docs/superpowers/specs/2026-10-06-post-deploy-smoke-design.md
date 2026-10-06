@@ -80,7 +80,7 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 
 1 件ごとに、発話・立った signal・マッチしたルール・期待値・合否を記録する。
 
-`validate_rule_vocabulary` は `Harness` の非公開メソッドなので、crate 内から呼べる可視性（`pub(crate)`）に広げて再利用する。CLI に突合ロジックを複製しない（§5）。
+`validate_rule_vocabulary` は `Harness` の非公開メソッドなので、`pub` に広げて再利用する。`verify_deploy` は `cs_support_mcp` ライブラリクレートを外部クレートとして `use` する別バイナリクレート（`server/Cargo.toml` の `[[bin]]`）であり、`pub(crate)` は定義クレート内でのみ可視なため別クレートからは呼べない。CLI に突合ロジックを複製しない（§5）。
 
 期待値ファイルは 1 つの project に対するものである。対象は `--expectations-project` で 1 つに決める（§2.1）。
 
