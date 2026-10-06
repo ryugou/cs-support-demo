@@ -1737,9 +1737,15 @@ impl Harness {
             .get("product_models")
             .cloned()
             .unwrap_or_default();
+        // 解決（allowlist の一覧表記への正規化）は resolve_matched_models の1か所に集約する
+        // （design doc §2.1 末尾）。本関数の冒頭で取得済みの `allowlist` を
+        // 再利用する。未解決の警告は /api/reply と MCP の両経路で毎ターン通るここで 1 回だけ出す
+        // （api.rs::judge_product_switch はログを出さない側を使う）。
+        let resolved_matched_models =
+            case_switch::resolve_matched_models(&allowlist, &product_references);
         case_attrs.insert(
             "product_models".to_string(),
-            case_switch::merge_product_models(&existing_product_models, &product_references),
+            case_switch::merge_product_models(&existing_product_models, &resolved_matched_models),
         );
         knowledge
             .record(

@@ -835,14 +835,22 @@ fn judge_product_switch(
     previous_models: &[String],
     previous_end_user_id: Option<String>,
     extraction: TurnExtraction,
+    allowlist: &product_gate::ProductAllowlist,
 ) -> SwitchDetection {
     let (adopted_refs, _discarded) =
         adopt_product_references_for_extraction_mode(extraction.0.mode, extraction.1.clone());
-    let switch = if case_switch::is_product_switch(previous_models, &adopted_refs) {
+    // 解決（allowlist の一覧表記への正規化）は case_switch::partition_matched_models の1か所に集約する（resolve_matched_models はそれに warn を足したラッパー）。
+    // is_product_switch と matched_models（監査記録）が必ず同じ解決済みの値を見るようにする
+    // ため、ここで1回だけ計算する（design doc §2.1 末尾）。
+    // 未解決の警告は同じ入力を解決する Harness::evaluate() 側で 1 回だけ出すため、
+    // ここではログを出さない純関数を使う（1 ターンに同一の警告が 2 回出るのを避ける）。
+    let (resolved_matched_models, _unresolved) =
+        case_switch::partition_matched_models(allowlist, &adopted_refs);
+    let switch = if case_switch::is_product_switch(previous_models, &resolved_matched_models) {
         Some(DetectedProductSwitch {
             previous_case_id: case_id.to_string(),
             previous_product_models,
-            matched_models: case_switch::matched_model_strings(&adopted_refs),
+            matched_models: resolved_matched_models,
             previous_end_user_id: previous_end_user_id.filter(|id| !id.is_empty()),
         })
     } else {
@@ -930,6 +938,7 @@ async fn detect_product_switch(
         &previous_models,
         Some(previous.end_user_id),
         extraction,
+        allowlist,
     )
 }
 
@@ -4131,6 +4140,16 @@ mod tests {
         }
     }
 
+    /// `judge_product_switch` のテストが切り替え前後の両方の型番（ADC-V724 / ADC-V523）を
+    /// 解決できる allowlist（`response_gate_fixture_allowlist` は ADC-V724 のみのため、
+    /// 切り替え検知のテストには不足する）。
+    fn switch_test_allowlist() -> product_gate::ProductAllowlist {
+        product_gate::ProductAllowlist::from_models(vec![
+            "ADC-V724".to_string(),
+            "ADC-V523".to_string(),
+        ])
+    }
+
     fn turn_extraction(
         mode: crate::harness::extraction::ExtractionMode,
         refs: Vec<product_gate::ProductReference>,
@@ -4156,6 +4175,7 @@ mod tests {
             &["ADC-V724".to_string()],
             None,
             turn_extraction(ExtractionMode::Hybrid, refs.clone()),
+            &switch_test_allowlist(),
         );
         let switch = detection
             .switch
@@ -4184,6 +4204,7 @@ mod tests {
             &["ADC-V724".to_string()],
             None,
             turn_extraction(ExtractionMode::Hybrid, refs.clone()),
+            &switch_test_allowlist(),
         );
         assert!(detection.switch.is_none());
         assert_eq!(detection.extraction.map(|(_, r)| r), Some(refs));
@@ -4202,6 +4223,7 @@ mod tests {
             &["ADC-V724".to_string()],
             None,
             turn_extraction(ExtractionMode::LexiconFallback, refs.clone()),
+            &switch_test_allowlist(),
         );
         assert!(
             detection.switch.is_none(),
@@ -4221,6 +4243,7 @@ mod tests {
             &["ADC-V724".to_string()],
             None,
             turn_extraction(ExtractionMode::LexiconOnly, vec![matched_ref("ADC-V523")]),
+            &switch_test_allowlist(),
         );
         assert!(detection.switch.is_none());
     }
@@ -4235,6 +4258,7 @@ mod tests {
             &["ADC-V724".to_string()],
             previous_end_user_id.map(str::to_string),
             turn_extraction(ExtractionMode::Hybrid, vec![matched_ref("ADC-V523")]),
+            &switch_test_allowlist(),
         )
         .switch
         .expect("a different Matched model switches")
