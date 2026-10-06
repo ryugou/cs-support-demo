@@ -40,7 +40,7 @@ impl WormAuditLog {
 
 - `WormAuditLog` は `tokio::sync::watch::Sender<bool>`（初期値 `false`）を持ち、`subscribe_poisoned() -> watch::Receiver<bool>` で受信側を渡す。poisoned の正はロックを取らない既存のフラグで、`watch` は通知の手段である。遷移時はフラグを立ててから、フラグが `false` → `true` に変わった 1 回だけ `send_replace(true)` する。`watch` は状態を値として保持するため、受け手が遷移の後から待ち始めても取りこぼさない。遷移には 2 種類あり、「1 回だけ」は両者で共有する。
   - ハッシュ連鎖の poisoned: 耐久化の失敗を検出した `append` が遷移させ、送信する。
-  - 内部の状態を保護する Mutex の poisoning: panic の時点では観測できないため、次の `append` がロックの取得でこれを検出して拒否するときに送信する。送信済みの場合は再送しない。
+  - 内部の状態を保護する Mutex の poisoning: panic の時点では観測できないため、次の `append` がロックの取得でこれを検出して拒否するときに送信する。送信済みの場合は再送しない。この場合、ヘルス応答は `is_poisoned()` により直ちに 503 になるが、終了処理は次の監査対象リクエストが来るまで始まらない（受容した限界）。その間に来るリクエストは、最初の 1 件が `append` で拒否されると同時に通知を発行して終了処理を始めるため、失敗するリクエストの数はハッシュ連鎖の poisoned と同じ 1 件である。リクエストが来なければ終了しないが、追記も起きないので監査の完全性は損なわれない。
 - 通知の受け手は、プロセスの起動処理（`server/src/main.rs`、`server/src/bin/homesec_advisor.rs`）である。`Receiver` の `wait_for(|poisoned| *poisoned)` で待ち、複数の監査ログを持つ場合はいずれかが `true` になった時点で §3.2 の終了処理を始める。
 - `WormAuditLog` 自身はプロセスを終了させない（ライブラリの中で `std::process::exit` を呼ばない）。
 
