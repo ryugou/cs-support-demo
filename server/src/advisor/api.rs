@@ -2253,6 +2253,28 @@ mod tests {
         );
     }
 
+    /// Issue #61 design doc §1 末尾・§6「アドバイザー: 型番が変わっても case_reset が false の
+    /// まま」: `AdvisorReplyResponse` は CS 側の `crate::api::ReplyResponse` とは別の構造体で
+    /// あり、製品切り替えの自動検知フィールド `case_reset` を一切持たない（homesec 経路は
+    /// この自動検知の対象外。design doc §1「アドバイザーの経路では、1の自動検知を行わない」）。
+    /// `case_reset` キー自体が応答 JSON に出ないことを固定し、CS 側の加算フィールドが
+    /// homesec 側へ意図せず漏れていないことを回帰確認する。
+    #[test]
+    fn advisor_reply_response_never_includes_case_reset() {
+        let response = AdvisorReplyResponse {
+            reply_text: "ご提案です。".to_string(),
+            case_id: "case-1".to_string(),
+            product_cards: None,
+            quick_replies: None,
+        };
+        let json = serde_json::to_value(&response).expect("must serialize");
+        assert!(
+            json.get("case_reset").is_none(),
+            "AdvisorReplyResponse must never gain a case_reset key (CS-only field; homesec does \
+             not run the automatic product-switch detection), got: {json}"
+        );
+    }
+
     // ---- handler routing (認可・入力検証・ルーティング。LLM/vegapunk 呼び出しには到達しない) ----
 
     fn test_llm_client() -> AnthropicClient {

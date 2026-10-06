@@ -10,6 +10,7 @@
 //! main.rs 側で登録しない（design doc §3）。
 
 use crate::config::AppConfig;
+use crate::harness::case_switch;
 use crate::harness::decision::{self, AnswerDecision};
 use crate::harness::product_gate;
 use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
@@ -58,10 +59,16 @@ pub enum HistoryRole {
 }
 
 /// レスポンスボディ（200 のみ。design doc §2）。
+///
+/// `case_reset`: Issue #61 design doc §2.4 の加算フィールド。製品切り替えが検知され、新しい
+/// case を作ってこのターンを評価したときだけ `true`。それ以外は常に `false`（省略しない。
+/// 既存の呼び出し側は未知フィールドを無視する前提のため、応答の形の変更はこのフィールドの
+/// 追加だけで後方互換を保つ）。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ReplyResponse {
     pub reply_text: String,
     pub case_id: String,
+    pub case_reset: bool,
 }
 
 /// エラーレスポンスボディ（design doc §2）。
@@ -787,6 +794,92 @@ fn is_continuation(history: &[ReplyHistoryTurn], case_id: Option<&str>) -> bool 
     !history.is_empty() || case_id.is_some()
 }
 
+/// Issue #61 design doc §2.2〜§2.3: 製品切り替えが検知されたターンの付帯情報。
+/// `Harness::record_case_switch`（新 case への `previous_case_id` 書き込み + 監査記録）への
+/// 入力をそのまま保持する。
+struct DetectedProductSwitch {
+    previous_case_id: String,
+    /// 旧 case の `product_models`（CSV、design doc §2.3 手順4の監査内容）。
+    previous_product_models: String,
+    /// 今ターンの `Matched` 型番（design doc §2.3 手順4の監査内容）。
+    matched_models: Vec<String>,
+}
+
+/// Issue #61 design doc §2.2: 既存 case の `product_models` が非空のときだけ、今ターンの
+/// 製品参照抽出を単独で発行して切り替えを判定する（決定論の比較そのものは
+/// [`case_switch::is_product_switch`]）。
+///
+/// `product_models` が空（これまで型番が出ていない会話）のときは抽出すら発行せず `None` を
+/// 返す（design doc §2.2 の前提条件そのものであり、新規会話・型番に触れない継続会話で
+/// 無駄な LLM 呼び出しを発生させないため）。
+///
+/// `product_models` の読み込みに失敗した場合（vegapunk 不達等）も `None`
+/// （fail-back: 切り替え検知はこのターンの応答可否を左右しない付加判定であり、ここで
+/// エラーを伝播させて `/api/reply` 全体を失敗させるのは本末転倒。失敗は必ず warn に残す）。
+///
+/// **spec にない判断（実装報告に明記する前提の設計判断）**: design doc §2.2 は
+/// 「今ターンの product_references」を検知の入力として要求するが、`evaluate()` 内部でも
+/// 同じ製品参照抽出が独立して走る。旧 case の状態を一切変更せずに切り替えを判定するには
+/// `evaluate()` を旧 case_id で呼ぶ前に判定結果が要るため、既存 case に `product_models` が
+/// 記録されているターンに限り、この抽出をもう一度（evaluate() 内部の抽出とは別に）発行する。
+async fn detect_product_switch(
+    state: &ApiState,
+    ctx: &RequestContext,
+    case_id: &str,
+    message: &str,
+    allowlist: &product_gate::ProductAllowlist,
+    request_id: &str,
+) -> Option<DetectedProductSwitch> {
+    let previous_product_models = match state.harness.load_case_product_models(ctx, case_id).await {
+        Ok(csv) => csv,
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                request_id = %request_id,
+                case_id,
+                "answer api: failed to load product_models for case switch detection; \
+                 treating this turn as a non-switch (fail-back; case switch detection is an \
+                 additive decision and must not block the reply)"
+            );
+            return None;
+        }
+    };
+    let previous_models = crate::harness::knowledge::csv_list(&previous_product_models);
+    if previous_models.is_empty() {
+        return None;
+    }
+    let current_turn_refs = state
+        .harness
+        .product_reference_extractor
+        .extract(message, allowlist.display_list())
+        .await;
+    if !case_switch::is_product_switch(&previous_models, &current_turn_refs) {
+        return None;
+    }
+    Some(DetectedProductSwitch {
+        previous_case_id: case_id.to_string(),
+        previous_product_models,
+        matched_models: case_switch::matched_model_strings(&current_turn_refs),
+    })
+}
+
+/// Issue #61 design doc §2.3 手順2: 製品切り替えが検知されたターンは、`evaluate()` へ渡す
+/// `case_id` / `history` を差し替える純関数。切り替え時は `(None, &[])`
+/// （今ターンを新 case の最初のターンとして評価する。累積 signal も無い状態になる。
+/// `is_continuation` もこの戻り値から導出すれば自然に初回扱いになる）。切り替えでなければ
+/// 元の値をそのまま使う。
+fn evaluate_inputs_for_turn<'a>(
+    switched: bool,
+    case_id: Option<&'a str>,
+    history: &'a [ReplyHistoryTurn],
+) -> (Option<&'a str>, &'a [ReplyHistoryTurn]) {
+    if switched {
+        (None, &[])
+    } else {
+        (case_id, history)
+    }
+}
+
 /// 顧客発話 1 件を「把握済み事項」の 1 行として安全に埋め込むための正規化（Critical 2）。
 ///
 /// `<把握済み事項>` は `build_clarify_prompt` の system prompt が「サーバが機械的に組み立てた
@@ -1039,10 +1132,11 @@ const CONVERSATION_TURN_WRITE_TIMEOUT: std::time::Duration = std::time::Duration
 /// テキスト正規化を必ず通す」）。純粋関数として独立させているのは、`Response`（axum 型）の
 /// body を経由せずに正規化結果を直接 `assert_eq!` できるようにするため
 /// （[`ok_reply_response`] のテストが `ReplyResponse` を直接比較できる）。
-fn build_reply_response(reply_text: String, case_id: String) -> ReplyResponse {
+fn build_reply_response(reply_text: String, case_id: String, case_reset: bool) -> ReplyResponse {
     ReplyResponse {
         reply_text: crate::harness::prompt_input::to_plain_text(&reply_text),
         case_id,
+        case_reset,
     }
 }
 
@@ -1082,8 +1176,11 @@ async fn ok_reply_response(
     end_user_id: Option<&str>,
     reply_text: String,
     case_id: String,
+    // Issue #61 design doc §2.4: 製品切り替えが検知されたターンだけ true。呼び出し元
+    // （`reply_handler`）が渡す。
+    case_reset: bool,
 ) -> Response {
-    let response = build_reply_response(reply_text, case_id);
+    let response = build_reply_response(reply_text, case_id, case_reset);
     match tokio::time::timeout(
         CONVERSATION_TURN_WRITE_TIMEOUT,
         state.harness.record_conversation_turn(
@@ -1472,6 +1569,9 @@ async fn reply_handler(
             req.end_user_id.as_deref(),
             reply_text,
             case_id,
+            // Issue #61: この定型応答は evaluate() を一切呼ばない（§3.1 質問側ゲート一段目）
+            // ため、製品切り替えの検知対象外。常に false。
+            false,
         )
         .await;
     }
@@ -1549,6 +1649,10 @@ async fn reply_handler(
                             req.end_user_id.as_deref(),
                             text,
                             case_id.to_string(),
+                            // Issue #61: 希望時間帯の返信としてここで確定した場合は evaluate()
+                            // を呼ばない。製品切り替えの検知は evaluate() を呼ぶ経路でのみ行う
+                            // ため、常に false。
+                            false,
                         )
                         .await;
                     }
@@ -1565,11 +1669,35 @@ async fn reply_handler(
         }
     }
 
+    // Issue #61 design doc §2.2〜§2.3: 製品切り替えの検知。決定論の判定自体は
+    // `case_switch::is_product_switch`（LLM を使わない）だが、その入力である「今ターンの
+    // Matched 型番」を得るには製品参照抽出（LLM）が要る。切り替えが検知された場合、
+    // `evaluate()` を旧 case_id で一切呼ばずに新しい case を作る必要がある
+    // （evaluate() は呼ばれた時点で signal 累積・last_decision・WORM 監査を case へ
+    // 書き込むため、「呼んでから判定して駄目なら戻す」方式では design doc §4 不変条件
+    // 「旧 case の内容・状態は変更しない」を満たせない）。そのため検知は evaluate() を
+    // 呼ぶ**前**に完了させる。既存 case の `product_models` が空のとき（新規会話・まだ
+    // 型番が出ていない会話）は抽出すら発行しない（design doc §2.2 の前提条件）。
+    let case_switch = match req.case_id.as_deref() {
+        Some(case_id) => {
+            detect_product_switch(&state, &ctx, case_id, &req.message, &allowlist, &request_id)
+                .await
+        }
+        None => None,
+    };
+
     // 「初回か継続か」の判定は決定論（コード）。文面の出し分けは `clarify.rs` /
     // `escalation_reply.rs` / `reply.rs`（回答下書き）側に `is_continuation` として渡すだけ
     // （design doc §3）。`evaluate()` の内部で回答下書き生成（`draft_customer_reply`）まで
     // 完結するため、`evaluate()` を呼ぶ前に計算しておく必要がある。
-    let is_continuation = is_continuation(&history, req.case_id.as_deref());
+    //
+    // Issue #61 design doc §2.3 手順2: 切り替えが検知されたターンは、`history` を使わず
+    // `case_id` も渡さない（今ターンを新 case の最初のターンとして、履歴なし・累積 signal
+    // なしで判定する）。`is_continuation` もこの差し替え後の値から導出するので自然に
+    // 初回扱いになる。
+    let (eval_case_id, eval_history) =
+        evaluate_inputs_for_turn(case_switch.is_some(), req.case_id.as_deref(), &history);
+    let is_continuation = is_continuation(eval_history, eval_case_id);
 
     match state
         .harness
@@ -1577,9 +1705,9 @@ async fn reply_handler(
             &ctx,
             &req.message,
             None,
-            req.case_id.as_deref(),
+            eval_case_id,
             &state.tools,
-            &history,
+            eval_history,
             is_continuation,
             // /api/reply は design doc §2 の契約: 未知 case_id はエラーにせず新規 case
             // として処理する（クライアント保存漏れ・再起動由来の未知 id は通常運用）。
@@ -1597,6 +1725,23 @@ async fn reply_handler(
         .await
     {
         Ok(mut outcome) => {
+            // Issue #61 design doc §2.3 手順1・4: 切り替えが検知されたターンだけ、新しく
+            // 作られた case（`outcome.case_id`）へ `previous_case_id` 属性を書き戻し、
+            // 切り替えの監査イベントを 1 件記録する。書き込み・監査の失敗は応答自体を
+            // 失敗させない（`Harness::record_case_switch` の doc コメント参照）。
+            if let Some(switch) = &case_switch {
+                state
+                    .harness
+                    .record_case_switch(
+                        &ctx,
+                        &switch.previous_case_id,
+                        &outcome.case_id,
+                        &switch.previous_product_models,
+                        &switch.matched_models,
+                    )
+                    .await;
+            }
+            let case_reset = case_switch.is_some();
             // Issue #28 §3.1 二段目: evaluate()の結果より前に判定する。
             if let Some(short_circuit) =
                 second_stage_short_circuit(&outcome, &req.message, &allowlist, &request_id)
@@ -1634,6 +1779,7 @@ async fn reply_handler(
                     req.end_user_id.as_deref(),
                     short_circuit.reply_text,
                     case_id,
+                    case_reset,
                 )
                 .await;
             }
@@ -1665,11 +1811,15 @@ async fn reply_handler(
             // Jev には今ターンの発話だけでなく過去の顧客発話も渡す（`build_jev_state` の
             // doc コメント参照）。state の組み立ては対象ターンと判定した後に
             // `resolve_jev_has_enough_info` の中で行う（ここで先に作らない）。
+            // Issue #61 design doc §2.3 手順2: 切り替えが検知されたターンは `eval_history`
+            // （空）を使う。「Jev へ渡す履歴も空」という要件はこの変数を介して自然に満たされる
+            // （`resolve_jev_has_enough_info` は `history` を素通しで `build_jev_state` へ渡す
+            // だけなので、ここで空にしておけば過去の顧客発話は一切含まれない）。
             let jev_has_enough_info = resolve_jev_has_enough_info(
                 &state.harness,
                 &outcome,
                 &conv,
-                &history,
+                eval_history,
                 &req.message,
                 &request_id,
             )
@@ -1729,6 +1879,7 @@ async fn reply_handler(
                         req.end_user_id.as_deref(),
                         text,
                         outcome.case_id,
+                        case_reset,
                     )
                     .await
                 }
@@ -1765,7 +1916,7 @@ async fn reply_handler(
                     let known_facts = build_known_facts(
                         &state.harness.lexicon,
                         &outcome.accumulated_signals,
-                        &history,
+                        eval_history,
                     );
                     // B4: 残り確認回数の可視化（design doc §3 v1.2 追記）。この分岐に入る時点で
                     // `decide_reply_action` の前提により `conv.clarify_turns < clarify_max_turns`
@@ -1824,6 +1975,7 @@ async fn reply_handler(
                         req.end_user_id.as_deref(),
                         reply_text,
                         outcome.case_id,
+                        case_reset,
                     )
                     .await
                 }
@@ -1877,6 +2029,7 @@ async fn reply_handler(
                         req.end_user_id.as_deref(),
                         reply_text,
                         outcome.case_id,
+                        case_reset,
                     )
                     .await
                 }
@@ -3786,6 +3939,62 @@ mod tests {
         assert!(!is_continuation(&[], None));
     }
 
+    // ---- evaluate_inputs_for_turn（Issue #61 design doc §2.3 手順2） ----
+
+    #[test]
+    fn evaluate_inputs_for_turn_keeps_the_original_case_id_and_history_when_not_switched() {
+        let history = vec![ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: "前回の質問".to_string(),
+        }];
+        let (case_id, hist) = evaluate_inputs_for_turn(false, Some("case-1"), &history);
+        assert_eq!(case_id, Some("case-1"));
+        assert_eq!(hist.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_inputs_for_turn_drops_case_id_and_history_when_switched() {
+        // design doc §2.3 手順2: 切り替えが検知されたターンは履歴なし・case_id なしで
+        // evaluate() へ渡す（新 case の最初のターンとして、累積 signal なしで判定させる）。
+        let history = vec![ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: "前回の質問".to_string(),
+        }];
+        let (case_id, hist) = evaluate_inputs_for_turn(true, Some("case-1"), &history);
+        assert_eq!(case_id, None);
+        assert!(hist.is_empty());
+    }
+
+    // ---- detect_product_switch（Issue #61 design doc §2.2） ----
+
+    /// `test_harness()` は `knowledge: None` で構築されるため、`load_case_product_models` は
+    /// 必ず `Err` になる（実 vegapunk 無しで到達できる唯一の経路）。この場合は fail-back で
+    /// `None`（非切り替え）になり、製品参照抽出（LLM）を一切呼ばないことを固定する
+    /// （`product_reference_extractor` も `None` 構成なので呼ばれても空配列を返すだけだが、
+    /// ここで確認したいのは「`load_case_product_models` が失敗した時点で抽出を試さずに
+    /// 早期 return すること」そのもの。失敗時に抽出へ進んでも観測可能な違いが出ない構成なので、
+    /// この呼び出しが `panic!` しない・`None` を返すことで間接的に確認する）。
+    #[tokio::test]
+    async fn detect_product_switch_fails_back_to_none_when_loading_product_models_errors() {
+        let state = test_api_state("correct-key");
+        let ctx = test_request_context(&state);
+        let allowlist = product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()]);
+        let result = detect_product_switch(
+            &state,
+            &ctx,
+            "case-1",
+            "ADC-V523の電源が入りません",
+            &allowlist,
+            "req-1",
+        )
+        .await;
+        assert!(
+            result.is_none(),
+            "a knowledge lookup failure must fail back to a non-switch decision, not panic or \
+             propagate an error"
+        );
+    }
+
     // ---- missing_to_text ----
 
     #[test]
@@ -4795,12 +5004,17 @@ mod tests {
 
     #[test]
     fn build_reply_response_strips_markdown_from_reply_text() {
-        let out = build_reply_response("これは**重要**です".to_string(), "case-1".to_string());
+        let out = build_reply_response(
+            "これは**重要**です".to_string(),
+            "case-1".to_string(),
+            false,
+        );
         assert_eq!(
             out,
             ReplyResponse {
                 reply_text: "これは重要です".to_string(),
                 case_id: "case-1".to_string(),
+                case_reset: false,
             }
         );
     }
@@ -4808,8 +5022,23 @@ mod tests {
     #[test]
     fn build_reply_response_passes_through_case_id_unchanged() {
         // 正規化対象は reply_text のみ。case_id は素通しであることを固定する。
-        let out = build_reply_response("問題ありません。".to_string(), "case-abc123".to_string());
+        let out = build_reply_response(
+            "問題ありません。".to_string(),
+            "case-abc123".to_string(),
+            false,
+        );
         assert_eq!(out.case_id, "case-abc123");
+    }
+
+    /// Issue #61 design doc §2.4: `case_reset` も素通しであることを固定する。
+    #[test]
+    fn build_reply_response_passes_through_case_reset_unchanged() {
+        let out = build_reply_response(
+            "新しいご相談ですね。".to_string(),
+            "case-9".to_string(),
+            true,
+        );
+        assert!(out.case_reset);
     }
 
     #[tokio::test]
@@ -4829,6 +5058,7 @@ mod tests {
             None,
             "**重要**なお知らせ".to_string(),
             "case-2".to_string(),
+            false,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4840,6 +5070,40 @@ mod tests {
             serde_json::from_slice(&bytes).expect("response body is JSON");
         assert_eq!(body["reply_text"], "重要なお知らせ");
         assert_eq!(body["case_id"], "case-2");
+        assert_eq!(
+            body["case_reset"], false,
+            "case_reset が追加されたこと以外、既存の応答テストの前提が変わらないこと \
+             (Issue #61 design doc §6)"
+        );
+    }
+
+    /// Issue #61 design doc §2.4・§6: 切り替えターンだけ `case_reset: true` が応答に載ることの
+    /// 直接確認（`ok_reply_response` 自体はこの値を受け取って素通しするだけなので、呼び出し元
+    /// の判定とは独立に固定できる）。
+    #[tokio::test]
+    async fn ok_reply_response_sets_case_reset_true_when_the_caller_detected_a_switch() {
+        let state = test_api_state("correct-key");
+        let ctx = test_request_context(&state);
+        let response = ok_reply_response(
+            &state,
+            &ctx,
+            "answer",
+            "エアコンの件は解決したので、次はドアベルの相談です",
+            "audit-switch",
+            None,
+            "承知しました。".to_string(),
+            "case-new".to_string(),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response body is JSON");
+        assert_eq!(body["case_id"], "case-new");
+        assert_eq!(body["case_reset"], true);
     }
 
     /// 2026-08-16 admin dashboard design doc §2: 「書き込み失敗は応答を止めない」の直接確認。
@@ -4858,6 +5122,7 @@ mod tests {
             Some("end-user-abc"),
             "聞き返し文です。".to_string(),
             "case-3".to_string(),
+            false,
         )
         .await;
         assert_eq!(
@@ -4924,6 +5189,7 @@ mod tests {
             None,
             "回答文です。".to_string(),
             "case-slow".to_string(),
+            false,
         )
         .await;
         let elapsed = start.elapsed();

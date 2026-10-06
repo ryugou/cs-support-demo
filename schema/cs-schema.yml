@@ -110,6 +110,13 @@ nodes:
       question: { type: string }
       product_key: { type: string }
       created_at: { type: string }
+      # Issue #61 design doc §2.1: その case のターンで確定した取扱製品の型番の集合
+      # （CSV、辞書順。harness/mod.rs::evaluate が resolution == Matched の matched_model を
+      # 加算する）。製品切り替えの検知にのみ使い、回答可否の判定には使わない。
+      product_models: { type: string }
+      # Issue #61 design doc §2.3: 製品切り替えで新しい case を作ったとき、旧 case の
+      # case_id を指す（旧 case 自身にはこの属性は設定されない）。
+      previous_case_id: { type: string }
       # 最新の evaluate_answerability の判定記録（record_answer_attempt の lineage 検証用）
       last_request_id: { type: string }
       last_decision: { type: string }

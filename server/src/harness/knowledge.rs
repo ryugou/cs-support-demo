@@ -2295,6 +2295,12 @@ mod tests {
             // advisor/decide.rs::next_question_streak が更新する。3 schema ファイル全部が
             // 同じ written リストと突き合わされるため、上と同じ理由で 3 ファイルすべてに加算する。
             "question_streak",
+            // Issue #61 design doc §2.1: harness/mod.rs::evaluate がターンごとに書き戻す
+            // （resolution == Matched の matched_model の CSV、辞書順）。
+            "product_models",
+            // Issue #61 design doc §2.3: 製品切り替え検知時に harness/mod.rs::
+            // record_case_switch（try_record_case_switch）が新 case へ書き込む。
+            "previous_case_id",
         ]
         .into_iter()
         .map(str::to_string)

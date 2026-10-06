@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod authn;
+pub mod case_switch;
 pub mod clarify;
 pub mod correction;
 pub mod decision;
@@ -977,6 +978,114 @@ impl Harness {
         }
     }
 
+    /// Issue #61 design doc §2.1/§2.2: case の `product_models` 属性だけを読む（製品切り替え
+    /// 検知専用、read-only。書き込みは行わない）。case 未存在・属性未設定のいずれも空文字
+    /// （design doc §2.1「まだ確定した型番が無い」）として扱う。
+    pub async fn load_case_product_models(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+    ) -> Result<String> {
+        let attrs = self.knowledge()?.load_case(&ctx.schema, case_id).await?;
+        Ok(attrs
+            .and_then(|a| a.get("product_models").cloned())
+            .unwrap_or_default())
+    }
+
+    /// Issue #61 design doc §2.3 手順1・4: 製品切り替えが検知されたターンに、新しく作られた
+    /// case（`new_case_id`。`evaluate()` が `UnknownCaseIdPolicy` とは無関係に `case_id: None`
+    /// で呼ばれたときに作る新規 case）へ `previous_case_id` 属性を書き戻し（read-merge-write）、
+    /// 切り替えの監査イベントを 1 件記録する。呼び出し元（`api.rs::reply_handler`）は
+    /// `evaluate()` が新 case を作って返した**後**に呼ぶこと（`new_case_id` が存在することを
+    /// 前提にする）。
+    ///
+    /// 書き込み・監査のいずれかが失敗しても応答自体は失敗させない（`record_out_of_scope_case`
+    /// と同じ「ターン欠落より応答継続を優先する」設計判断）。失敗は握りつぶさず
+    /// `tracing::error!` に残す。
+    ///
+    /// 発話本文は記録しない（design doc §2.3 手順4）。監査には旧 case_id・新 case_id・理由
+    /// （`product_switch`）・旧 case の `product_models`・今ターンの `Matched` 型番だけを積む
+    /// （`message` / `question` はこのメソッドの引数に無く、渡す経路自体が存在しない）。
+    pub async fn record_case_switch(
+        &self,
+        ctx: &RequestContext,
+        previous_case_id: &str,
+        new_case_id: &str,
+        previous_product_models: &str,
+        matched_models: &[String],
+    ) {
+        if let Err(err) = self
+            .try_record_case_switch(
+                ctx,
+                previous_case_id,
+                new_case_id,
+                previous_product_models,
+                matched_models,
+            )
+            .await
+        {
+            tracing::error!(
+                error = ?err,
+                request_id = %ctx.request_id,
+                schema = %ctx.schema,
+                previous_case_id,
+                new_case_id,
+                "failed to record a case switch (previous_case_id attribute write and/or audit \
+                 event); the customer still received a response under the new case_id, but the \
+                 switch linkage/audit may be incomplete — investigate vegapunk/knowledge \
+                 connectivity. If this failure originated in the WORM audit write step (see \
+                 error field), the in-process WORM audit log is now poisoned and every \
+                 subsequent audit append will be refused until the process restarts"
+            );
+        }
+    }
+
+    async fn try_record_case_switch(
+        &self,
+        ctx: &RequestContext,
+        previous_case_id: &str,
+        new_case_id: &str,
+        previous_product_models: &str,
+        matched_models: &[String],
+    ) -> Result<()> {
+        let knowledge = self.knowledge()?;
+        let existing = knowledge
+            .load_case(&ctx.schema, new_case_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "record_case_switch: new case {new_case_id} not found in schema {}; \
+                     evaluate() must create the case before this method is called",
+                    ctx.schema
+                )
+            })?;
+        let merged = merge_case_switch_attributes(&existing, previous_case_id);
+        knowledge
+            .record(
+                &ctx.schema,
+                "support_case",
+                new_case_id,
+                merged.into_iter().collect(),
+            )
+            .await?;
+        self.audit_with_nodes(
+            ctx,
+            "case_switch:product_switch",
+            None,
+            vec![
+                format!("previous_product_models={previous_product_models}"),
+                format!("matched_models={}", matched_models.join(",")),
+            ],
+            vec![
+                knowledge::harness_node_id(&ctx.schema, "support_case", previous_case_id),
+                knowledge::harness_node_id(&ctx.schema, "support_case", new_case_id),
+            ],
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// record_answer_outcome の本体（遵守事項 3）。attempt の存在検証 → outcome の
     /// write-once 強制 → outcome 記録 → KR 紐づけ（サーバ記録）があれば grade 更新、を
     /// grade_lock の同一クリティカルセクションで行う（重複加算・TOCTOU を封鎖）。
@@ -1578,6 +1687,21 @@ impl Harness {
         case_attrs.insert("last_kr_id".to_string(), case_kr_id);
         case_attrs.insert("last_evidence_keys".to_string(), last_evidence_keys);
         case_attrs.insert("last_evidence_kind".to_string(), last_evidence_kind);
+        // Issue #61 design doc §2.1: ターンごとに、今ターンの product_references のうち
+        // resolution == Matched の matched_model を product_models（CSV、辞書順）へ加算する。
+        // Foreign / Ambiguous は加えない（design doc §2.1。`product_models` は切り替えの検知
+        // 入力にのみ使い、回答可否の判定には使わない — design doc §4 不変条件）。
+        // homesec（アドバイザー）経路もこの `evaluate()` を共有するが、切り替えの自動検知
+        // そのものは `api.rs::reply_handler` にしか無いため、ここで書き込んでも homesec の
+        // 挙動は変わらない（design doc §1 末尾）。
+        let existing_product_models = case_attrs
+            .get("product_models")
+            .cloned()
+            .unwrap_or_default();
+        case_attrs.insert(
+            "product_models".to_string(),
+            case_switch::merge_product_models(&existing_product_models, &product_references),
+        );
         knowledge
             .record(
                 &ctx.schema,
@@ -2232,6 +2356,20 @@ fn merge_out_of_scope_demotion_attributes(
         "excluded_signals".to_string(),
         knowledge::signals_to_csv(&excluded),
     );
+    merged
+}
+
+/// Issue #61 design doc §2.3 手順1: 新しく作られた case の既存属性（`existing`。`evaluate()`
+/// がこの直前に書き込んだ `product_models` / `last_decision` 等を含む）を土台に、
+/// `previous_case_id`（旧 case の case_id）だけを重ねる read-merge-write（
+/// `merge_conv_state_attributes` / `merge_out_of_scope_demotion_attributes` と同じ形。
+/// vegapunk の `UpsertNodes` は全置換のため、部分送信は既存属性を消す）。
+fn merge_case_switch_attributes(
+    existing: &std::collections::HashMap<String, String>,
+    previous_case_id: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = existing.clone();
+    merged.insert("previous_case_id".to_string(), previous_case_id.to_string());
     merged
 }
 
@@ -4209,6 +4347,49 @@ mod tests {
         assert_eq!(
             merged.get("excluded_signals").map(String::as_str),
             Some("mold")
+        );
+    }
+
+    // ---- merge_case_switch_attributes（Issue #61 design doc §2.3 手順1） ----
+
+    #[test]
+    fn merge_case_switch_attributes_preserves_unrelated_existing_attributes() {
+        let existing: std::collections::HashMap<String, String> = [
+            ("case_id".to_string(), "case-new".to_string()),
+            ("product_models".to_string(), "ADC-V523".to_string()),
+            ("question".to_string(), "エアコンの調子が悪い".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_case_switch_attributes(&existing, "case-old");
+        assert_eq!(
+            merged.get("previous_case_id").map(String::as_str),
+            Some("case-old")
+        );
+        assert_eq!(
+            merged.get("product_models").map(String::as_str),
+            Some("ADC-V523")
+        );
+        assert_eq!(merged.get("case_id").map(String::as_str), Some("case-new"));
+        assert_eq!(
+            merged.get("question").map(String::as_str),
+            Some("エアコンの調子が悪い")
+        );
+    }
+
+    #[test]
+    fn merge_case_switch_attributes_overwrites_an_existing_previous_case_id() {
+        // previous_case_id は「直前の旧 case」を指す加算属性。複数回切り替わった場合は
+        // 最新の切り替え元で上書きする(連鎖を1段だけ保つ設計。design doc は多段の連鎖を
+        // 要求していない)。
+        let existing: std::collections::HashMap<String, String> =
+            [("previous_case_id".to_string(), "case-older".to_string())]
+                .into_iter()
+                .collect();
+        let merged = merge_case_switch_attributes(&existing, "case-old");
+        assert_eq!(
+            merged.get("previous_case_id").map(String::as_str),
+            Some("case-old")
         );
     }
 
