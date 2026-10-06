@@ -73,11 +73,14 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 
 ### 3.2 第 1 層判定の検査（期待値ファイルを指定した project のみ）
 
-1. その project の schema から、サービスと同じ関数でエスカレーションルールを読む（`load_escalation_rules`）。
+1. その project の schema から、サービスと同じ関数でエスカレーションルールと禁止領域を読む（`load_escalation_rules`、`load_prohibited_domains`）。
 2. 設定ファイルが指す lexicon を、サービスと同じ方法で読む。
-3. 期待値ファイルの各発話を lexicon だけで signal に変換し（LLM を使わない）、`match_layer1` の結果を `expect_rule` と比べる。
+3. 読んだルールと禁止領域の signal を、サービスの評価経路と同じ関数（`Harness::validate_rule_vocabulary`）で lexicon と突合する。語彙に無い signal を参照するルールが 1 つでもあれば、発話を評価せずに `layer1` を `fail` にし、`detail` にエラー文（ルール id と signal 名。発話は含まない）を入れる。理由: サービスはこの突合で全評価を fail closed にするため、期待値の 6 発話がそのルールを踏まなくても、本番は全件失敗している。突合を省くと、この検査が最も検出したい lexicon とルールの不一致を見逃す。
+4. 期待値ファイルの各発話を lexicon だけで signal に変換し（LLM を使わない）、`match_layer1` の結果を `expect_rule` と比べる。
 
 1 件ごとに、発話・立った signal・マッチしたルール・期待値・合否を記録する。
+
+`validate_rule_vocabulary` は `Harness` の非公開メソッドなので、crate 内から呼べる可視性（`pub(crate)`）に広げて再利用する。CLI に突合ロジックを複製しない（§5）。
 
 期待値ファイルは 1 つの project に対するものである。対象は `--expectations-project` で 1 つに決める（§2.1）。
 
@@ -115,6 +118,7 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 - 引数や設定の誤りは、JSON を出さずにエラーで終了する（終了コード 1）。
 - 検査の前に、対象 project ごとに疎通確認（preflight）を行う。読み出しは `ConversationTurn` の 1 件取得（`threads` 検査が使う `load_conversation_turns_page` を `limit` 1 で呼ぶ。`Search` と書き込みは使わない）。1 つでも失敗したら、設定ファイル・project・schema・接続先・エラー・エラー種別に応じた確認先（認証情報の環境変数、接続先、VPC）を標準エラーへ `tracing::error!` で出し、JSON を出さずに終了する（終了コード 1）。基盤障害・認証設定の誤りを、スモークの不合格と区別するためである。
 - 疎通確認が全 project で成功した後に起きた個別の失敗は、検査の `fail` として JSON に記録する。
+- vegapunk への接続は、サービス（`main.rs` / `homesec_advisor.rs`）と同じ遅延接続（`connect_lazy_with_limits`）で組み立てる。実際の接続は疎通確認の 1 件読み出しで初めて起きる。即時接続（`connect_with_limits`）にすると、VPC や接続先の障害で疎通確認に到達する前にランタイムの組み立てで終了し、上記の project・schema・確認先つきの診断が出ず、残りの対象の確認も行われない。接続先の構文誤りや token のメタデータ化の失敗は、遅延接続でも組み立て時のエラーのままでよい。
 
 ## 5. 不変条件
 
@@ -171,6 +175,7 @@ gcloud run jobs execute verify-deploy --project sivira-cs-support --region asia-
 | 期待値ファイルの読み込み | 正しい形式を読める。未知のフィールド・空の `layer1` を拒否する |
 | 同梱の期待値ファイル | `server/data/urtect/smoke-expectations.json` を、同梱の lexicon と同梱の `rules.json` から復元したルールで判定すると、全件が期待どおりになる |
 | 第 1 層判定の検査 | 期待と一致する場合は `pass`、マッチするルールが違う場合・マッチしないはずがマッチした場合・マッチするはずがしない場合は `fail` |
+| 語彙の突合 | 語彙に無い signal を参照するルール（または禁止領域）が 1 つでもあれば、発話を評価せずに `layer1` が `fail` になり、`detail` にルール id と signal 名を含むエラー文が入る。全ルールが語彙内なら発話の評価へ進む。突合の関数はサービスの評価経路と同じもの（`Harness::validate_rule_vocabulary`）を呼ぶ |
 | 結果の集約 | `fail` が 1 件でもあれば `passed` が `false`。`skipped` は不合格にしない |
 | 出力 | JSON に顧客の発話本文・会話の内容を含むフィールドが無い |
 | 疎通確認 | 読み出しが成功したら到達可能と分類する。失敗したら、設定ファイル・project・schema・接続先・エラーをメッセージに含め、認証拒否・接続断・その他でそれぞれ確認先が変わる |
