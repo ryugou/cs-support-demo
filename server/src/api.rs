@@ -880,6 +880,17 @@ fn evaluate_inputs_for_turn<'a>(
     }
 }
 
+/// Issue #61 design doc §2.3 手順3・§4: 希望時間帯の受付（ステップ 5）を行う対象 case_id。
+/// 製品切り替えが検知されたターンは `None`（受付しない）。旧 case の `awaiting_time_pref` /
+/// `time_pref_false_count` を切り替えターンで変更しないため。
+fn time_pref_case_id_for_turn(case_id: Option<&str>, switched: bool) -> Option<&str> {
+    if switched {
+        None
+    } else {
+        case_id
+    }
+}
+
 /// 顧客発話 1 件を「把握済み事項」の 1 行として安全に埋め込むための正規化（Critical 2）。
 ///
 /// `<把握済み事項>` は `build_clarify_prompt` の system prompt が「サーバが機械的に組み立てた
@@ -1576,9 +1587,31 @@ async fn reply_handler(
         .await;
     }
 
+    // Issue #61 design doc §2.2〜§2.3: 製品切り替えの検知。決定論の判定自体は
+    // `case_switch::is_product_switch`（LLM を使わない）だが、その入力である「今ターンの
+    // Matched 型番」を得るには製品参照抽出（LLM）が要る。切り替えが検知された場合、
+    // `evaluate()` を旧 case_id で一切呼ばずに新しい case を作る必要がある
+    // （evaluate() は呼ばれた時点で signal 累積・last_decision・WORM 監査を case へ
+    // 書き込むため、「呼んでから判定して駄目なら戻す」方式では design doc §4 不変条件
+    // 「旧 case の内容・状態は変更しない」を満たせない）。既存 case の `product_models` が
+    // 空のとき（新規会話・まだ型番が出ていない会話）は抽出すら発行しない（§2.2 の前提条件）。
+    //
+    // 検知は下の希望時間帯の受付（ステップ 5）より**前**に置く。時間帯受付は旧 case の
+    // `awaiting_time_pref` / `time_pref_false_count` を読み書きするため、切り替えターンで
+    // 先に走ると旧 case の状態が変わってしまう（§2.3 手順3・§4）。
+    let case_switch = match req.case_id.as_deref() {
+        Some(case_id) => {
+            detect_product_switch(&state, &ctx, case_id, &req.message, &allowlist, &request_id)
+                .await
+        }
+        None => None,
+    };
+
     // ステップ 5: 希望時間帯の受付（会話フロー v1.1 design doc §5）。
     // `evaluate()` を呼ぶ前にすべての state 変更・保存を完了させる。
-    if let Some(case_id) = req.case_id.as_deref() {
+    // 切り替えターンは新 case の最初のターンなので、旧 case の時間帯待ち状態には触れない。
+    if let Some(case_id) = time_pref_case_id_for_turn(req.case_id.as_deref(), case_switch.is_some())
+    {
         let mut conv = match state.harness.load_conv_state(&ctx, case_id).await {
             Ok(conv) => conv,
             Err(err) => return conv_state_load_failed(&err, &request_id, case_id),
@@ -1668,23 +1701,6 @@ async fn reply_handler(
             }
         }
     }
-
-    // Issue #61 design doc §2.2〜§2.3: 製品切り替えの検知。決定論の判定自体は
-    // `case_switch::is_product_switch`（LLM を使わない）だが、その入力である「今ターンの
-    // Matched 型番」を得るには製品参照抽出（LLM）が要る。切り替えが検知された場合、
-    // `evaluate()` を旧 case_id で一切呼ばずに新しい case を作る必要がある
-    // （evaluate() は呼ばれた時点で signal 累積・last_decision・WORM 監査を case へ
-    // 書き込むため、「呼んでから判定して駄目なら戻す」方式では design doc §4 不変条件
-    // 「旧 case の内容・状態は変更しない」を満たせない）。そのため検知は evaluate() を
-    // 呼ぶ**前**に完了させる。既存 case の `product_models` が空のとき（新規会話・まだ
-    // 型番が出ていない会話）は抽出すら発行しない（design doc §2.2 の前提条件）。
-    let case_switch = match req.case_id.as_deref() {
-        Some(case_id) => {
-            detect_product_switch(&state, &ctx, case_id, &req.message, &allowlist, &request_id)
-                .await
-        }
-        None => None,
-    };
 
     // 「初回か継続か」の判定は決定論（コード）。文面の出し分けは `clarify.rs` /
     // `escalation_reply.rs` / `reply.rs`（回答下書き）側に `is_continuation` として渡すだけ
@@ -3963,6 +3979,28 @@ mod tests {
         let (case_id, hist) = evaluate_inputs_for_turn(true, Some("case-1"), &history);
         assert_eq!(case_id, None);
         assert!(hist.is_empty());
+    }
+
+    // ---- time_pref_case_id_for_turn（Issue #61 design doc §2.3 手順3・§4） ----
+
+    #[test]
+    fn time_pref_case_id_for_turn_returns_the_case_id_when_not_switched() {
+        assert_eq!(
+            time_pref_case_id_for_turn(Some("case-1"), false),
+            Some("case-1")
+        );
+    }
+
+    #[test]
+    fn time_pref_case_id_for_turn_skips_time_pref_handling_when_switched() {
+        // 切り替えターンは旧 case の希望時間帯状態（awaiting_time_pref / 連続失敗回数）に
+        // 触れてはならない。
+        assert_eq!(time_pref_case_id_for_turn(Some("case-1"), true), None);
+    }
+
+    #[test]
+    fn time_pref_case_id_for_turn_is_none_without_a_case_id() {
+        assert_eq!(time_pref_case_id_for_turn(None, false), None);
     }
 
     // ---- detect_product_switch（Issue #61 design doc §2.2） ----

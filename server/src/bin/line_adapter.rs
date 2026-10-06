@@ -1670,7 +1670,7 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             tracing::warn!(
                 event_type,
                 missing_field,
-                "line webhook: a message event is missing a required field; ignoring this \
+                "line webhook: a message/postback event is missing a required field; ignoring this \
                  event (the customer will see no reply)"
             );
             Ok(())
@@ -6224,6 +6224,54 @@ mod tests {
         );
         assert_eq!(history[0], (Role::Customer, "前回の質問".to_string()));
         assert_eq!(history[2], (Role::Customer, "続きの質問です".to_string()));
+    }
+
+    async fn answer_api_ok_handler_with_case_reset_false() -> impl axum::response::IntoResponse {
+        axum::Json(serde_json::json!({
+            "reply_text": "続きですね。",
+            "case_id": "case-abc",
+            "case_reset": false,
+        }))
+    }
+
+    #[tokio::test]
+    async fn handle_event_keeps_prior_history_when_case_reset_is_explicitly_false() {
+        let answer_api_base = spawn_http_mock(
+            Router::new().route("/reply", post(answer_api_ok_handler_with_case_reset_false)),
+        )
+        .await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+
+        {
+            let mut session = state.sessions.lock_session("u1").await;
+            session.case_id = Some("case-abc".to_string());
+            session
+                .history
+                .push_back((Role::Customer, "前回の質問".to_string()));
+            session
+                .history
+                .push_back((Role::Assistant, "前回の回答".to_string()));
+        }
+
+        let event = text_webhook_event("u1", "rt1", "続きの質問です");
+        handle_event(&state, &event)
+            .await
+            .expect("handle_event must succeed when the answer api and line reply both succeed");
+
+        let (case_id, history) = state.sessions.snapshot("u1").await;
+        assert_eq!(case_id, Some("case-abc".to_string()));
+        assert_eq!(
+            history.len(),
+            4,
+            "an explicit case_reset=false must keep the prior history and append this turn"
+        );
+        assert_eq!(history[0], (Role::Customer, "前回の質問".to_string()));
     }
 
     // ---- handle_event: postback（Issue #61 design doc §3.2） ----
