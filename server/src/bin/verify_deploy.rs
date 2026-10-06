@@ -548,18 +548,21 @@ fn layer1_check_from_rules_and_domains(
     (summarize_layer1_check(&results), results)
 }
 
-/// store 取得失敗・ルール/禁止領域の読み込み失敗を記録する共通の失敗経路。`detail` は空のまま
-/// にする（顧客の発話を含まない読み出しエラーであり、運用者はログの `error` で原因を追える）。
+/// ケース評価の前段（store 取得・ルール/禁止領域の読み込み）で失敗したときの共通の失敗経路。
+/// `stage` でどの段階かをログに残す。`detail` は空のままにする（顧客の発話を含まない読み出し
+/// エラーであり、運用者はログの `stage` / `error` で原因を追える）。
 fn layer1_load_failure(
     project_id: &str,
     schema: &str,
+    stage: &'static str,
     err: &anyhow::Error,
 ) -> (CheckResult, Vec<Layer1Result>) {
     tracing::error!(
         project_id = %project_id,
         schema = %schema,
+        stage = stage,
         error = %format!("{err:#}"),
-        "verify-deploy: layer1 check failed to load escalation rules"
+        "verify-deploy: layer1 check failed before evaluating cases"
     );
     (CheckResult::fail("layer1", json!({})), Vec::new())
 }
@@ -572,7 +575,9 @@ async fn run_layer1_check(
 ) -> (CheckResult, Vec<Layer1Result>) {
     let store = match harness.store() {
         Ok(store) => store,
-        Err(err) => return layer1_load_failure(project_id, schema, &err),
+        Err(err) => {
+            return layer1_load_failure(project_id, schema, "knowledge store unavailable", &err)
+        }
     };
     // サービスの評価経路（`Harness::evaluate`）と同じ関数でルール・禁止領域を読む
     // （spec §3.2 の 1.）。
@@ -581,7 +586,14 @@ async fn run_layer1_check(
         store.load_prohibited_domains(schema),
     ) {
         Ok(pair) => pair,
-        Err(err) => return layer1_load_failure(project_id, schema, &err),
+        Err(err) => {
+            return layer1_load_failure(
+                project_id,
+                schema,
+                "load escalation rules / prohibited domains",
+                &err,
+            )
+        }
     };
     let (check, results) = layer1_check_from_rules_and_domains(harness, &rules, &domains, cases);
     // `cases` は呼び出し元で非空が保証されている（`parse_expectations_file` が空の `layer1`
@@ -953,6 +965,7 @@ mod tests {
     fn read_bearer_token_falls_back_to_the_file_when_inline_is_absent() {
         let dir = std::env::temp_dir().join(format!("verify-deploy-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = ScratchDir::new(dir.clone());
         let path = dir.join("token");
         std::fs::write(&path, "file-token\n").unwrap();
         let args = Args {
@@ -969,6 +982,7 @@ mod tests {
     fn read_bearer_token_rejects_an_empty_file() {
         let dir = std::env::temp_dir().join(format!("verify-deploy-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = ScratchDir::new(dir.clone());
         let path = dir.join("token");
         std::fs::write(&path, "   \n").unwrap();
         let args = Args {
@@ -1405,11 +1419,16 @@ mod tests {
     /// `Harness::build` をネットワーク無しで完走できる。テストごとに「語彙」を差し替えたい
     /// ため、`config.cloudrun.toml` を読み取り専用化した上で `signal_lexicon_path` だけ
     /// 一時ファイルへ上書きする。
-    fn harness_with_lexicon_for_test(lexicon_json: &str) -> Harness {
+    ///
+    /// 一時ディレクトリは `ScratchDir` で返し、スコープを抜けると削除させる。ローカル変数は宣言の
+    /// 逆順に drop されるため、呼び出し側は `let (_scratch, harness) = ...;` の順で受ける
+    /// （`harness` が先に drop され、その後でディレクトリが消える）。`_` 単体で受けると即 drop される。
+    fn harness_with_lexicon_for_test(lexicon_json: &str) -> (ScratchDir, Harness) {
         let config = cloudrun_config();
         let test_dir =
             std::env::temp_dir().join(format!("verify-deploy-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).unwrap();
+        let scratch = ScratchDir::new(test_dir.clone());
         let lexicon_path = test_dir.join("lexicon.json");
         std::fs::write(&lexicon_path, lexicon_json).unwrap();
 
@@ -1423,8 +1442,9 @@ mod tests {
         )
         .expect("connect_lazy_with_limits must not require network access");
         let config_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        Harness::build(&harness_config, Arc::new(vegapunk), config_dir)
-            .expect("harness must build from a test-only lexicon without network access")
+        let harness = Harness::build(&harness_config, Arc::new(vegapunk), config_dir)
+            .expect("harness must build from a test-only lexicon without network access");
+        (scratch, harness)
     }
 
     /// `vocab_test_signal` だけを含む lexicon。このテスト群における「語彙内」の唯一の signal。
@@ -1447,7 +1467,7 @@ mod tests {
     #[tokio::test]
     async fn layer1_check_fails_closed_without_evaluating_cases_when_a_rule_references_an_unknown_signal(
     ) {
-        let harness = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
+        let (_scratch, harness) = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
         let rules = vec![rule(
             "rule-with-unknown-signal",
             &["signal_not_in_vocabulary"],
@@ -1485,7 +1505,7 @@ mod tests {
 
     #[tokio::test]
     async fn layer1_check_rejects_a_prohibited_domain_that_references_an_unknown_signal() {
-        let harness = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
+        let (_scratch, harness) = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
         let rules: Vec<EscalationRule> = Vec::new();
         let domains = vec![domain(
             "domain-with-unknown-signal",
@@ -1513,7 +1533,7 @@ mod tests {
 
     #[tokio::test]
     async fn layer1_check_evaluates_cases_when_every_rule_and_domain_signal_is_in_the_vocabulary() {
-        let harness = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
+        let (_scratch, harness) = harness_with_lexicon_for_test(VOCAB_TEST_LEXICON);
         let rules = vec![rule(
             "rule-in-vocabulary",
             &["vocab_test_signal"],
