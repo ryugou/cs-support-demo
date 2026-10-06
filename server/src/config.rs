@@ -352,6 +352,7 @@ pub struct HarnessConfig {
     /// 上限（秒）。新しい接続の受付を止めた後、受付済みのリクエストの完了を待つが、
     /// この秒数を超えたら残りを打ち切ってプロセスを終了する（Issue #62、design doc
     /// `docs/superpowers/specs/2026-10-06-poisoned-audit-instance-design.md` §3.2）。
+    /// `0` は「受付済みのリクエストの完了を待たず、直ちに終了する」の意味（下限は設けない）。
     #[serde(default = "default_poisoned_shutdown_grace_period_secs")]
     pub poisoned_shutdown_grace_period_secs: u64,
 }

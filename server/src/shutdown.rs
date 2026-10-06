@@ -30,8 +30,9 @@ pub const RECOVERY_RUNBOOK_PATH: &str = "docs/runbooks/audit-log-recovery.md";
 /// パスを返す。
 ///
 /// 複数の監査ログを同時に監視できる（`homesec_advisor` は advisor 本体用と CS 連携用の
-/// 2 つを持つ）。各ログの `wait_poisoned()` を個別タスクで待ち、最初に poisoned に
-/// なったログのパスを `mpsc` チャネルで受け取る。
+/// 2 つを持つ）。各ログの `subscribe_poisoned()` の受信側を個別タスクで待ち
+/// （`watch` は状態を値で持つため、待ち始める前に poisoned になっていても取りこぼさない）、
+/// 最初に poisoned になったログのパスを `mpsc` チャネルで受け取る。
 ///
 /// 呼び出し元が空の `Vec` を渡すと、どの監査ログも poisoned にならないため即座に
 /// panic する（`line_adapter` は監査ログを持たないため、この関数自体を呼ばない。
@@ -41,8 +42,18 @@ pub async fn wait_for_any_poisoned(worm_logs: Vec<Arc<WormAuditLog>>) -> PathBuf
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(1);
     for log in worm_logs {
         let tx = tx.clone();
+        let mut poisoned_rx = log.subscribe_poisoned();
         tokio::spawn(async move {
-            log.wait_poisoned().await;
+            // `log`（Arc）をタスク内で保持し続ける: 送信側が drop されると `wait_for` が
+            // エラーを返すため、待っている間は監査ログを生かしておく。
+            if poisoned_rx.wait_for(|poisoned| *poisoned).await.is_err() {
+                tracing::error!(
+                    audit_log_path = %log.path().display(),
+                    "poisoned watch channel closed before the audit log poisoned; \
+                     this log is no longer monitored for shutdown"
+                );
+                return;
+            }
             // 受信側が既に別の監査ログの通知を受け取って rx を drop していた場合、
             // send は失敗するが無視してよい(他のログが先に poisoned になり、
             // 既に終了処理へ入っている)。
@@ -65,6 +76,11 @@ pub async fn wait_for_any_poisoned(worm_logs: Vec<Arc<WormAuditLog>>) -> PathBuf
 /// 起動時点から計測すると、健全に稼働中のサーバが grace period 経過後に強制終了される
 /// 事故になる（design doc §3.2 の実装注意）。
 pub async fn grace_period_elapsed(grace_period: Duration) {
+    // 0 は「受付済みのリクエストの完了を待たず直ちに終了する」の意味（design doc §3.2）。
+    // タイマーを登録せず即座に返す。
+    if grace_period.is_zero() {
+        return;
+    }
     tokio::time::sleep(grace_period).await;
 }
 
@@ -189,7 +205,6 @@ mod tests {
             healthy.clone(),
             poisoned.clone(),
         ]));
-        // 内部で spawn された監視タスクが `wait_poisoned` の登録を終えるまで一度譲る。
         tokio::task::yield_now().await;
         poisoned.poison_for_test();
 
@@ -198,6 +213,25 @@ mod tests {
             .expect("wait_for_any_poisoned must resolve once a log poisons")
             .expect("the spawned task must not panic");
         assert_eq!(resolved, poisoned_path);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回帰: 待ち始める前（`wait_for_any_poisoned` を一度も poll する前）に poisoned に
+    /// なっていても、後から待ち始めた終了処理が解決する。`yield_now()` で待機登録を
+    /// 先に成立させない。
+    #[tokio::test]
+    async fn wait_for_any_poisoned_resolves_when_poisoned_before_the_wait_starts() {
+        let dir = temp_dir();
+        let path = dir.join("audit.jsonl");
+        let log = Arc::new(WormAuditLog::open(&path).expect("open worm log"));
+
+        let wait = wait_for_any_poisoned(vec![log.clone()]);
+        log.poison_for_test();
+
+        let resolved = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("must resolve even though the log poisoned before the wait started");
+        assert_eq!(resolved, path);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -244,6 +278,46 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "must resolve once the grace period elapses");
+    }
+
+    /// 待ち時間の上限 0 は、待たずに即座に解決する（時計を進めなくても）。
+    #[tokio::test(start_paused = true)]
+    async fn grace_period_elapsed_resolves_immediately_for_zero() {
+        let result = tokio::time::timeout(
+            Duration::from_nanos(1),
+            grace_period_elapsed(Duration::ZERO),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a zero grace period must not wait for in-flight requests"
+        );
+    }
+
+    /// 待ち時間の上限 0 では、poisoned 通知の直後（時計を進めずに）強制終了の
+    /// コールバックが呼ばれる。
+    #[tokio::test(start_paused = true)]
+    async fn poisoned_shutdown_signal_forces_exit_immediately_for_zero_grace_period() {
+        let dir = temp_dir();
+        let log = Arc::new(WormAuditLog::open(&dir.join("audit.jsonl")).expect("open worm log"));
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_callback = fired.clone();
+
+        let signal = tokio::spawn(poisoned_shutdown_signal(
+            vec![log.clone()],
+            Duration::ZERO,
+            move || fired_for_callback.store(true, Ordering::SeqCst),
+        ));
+        tokio::task::yield_now().await;
+        log.poison_for_test();
+        signal.await.expect("signal task must not panic");
+        tokio::task::yield_now().await;
+
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "zero grace period must force exit right after the notification, without advancing time"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- POISONED_EXIT_CODE ----
