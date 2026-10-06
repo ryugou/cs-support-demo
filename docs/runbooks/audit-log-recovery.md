@@ -36,6 +36,14 @@ audit log {path} failed integrity check
 | `line {line_no}: hash chain is broken (prev_hash mismatch)` | `prev_hash` が直前行の `hash` と一致しない |
 | `line {line_no}: hash mismatch (tampered or corrupted)` | 再計算した hash が記録された `hash` と一致しない（改竄・破損） |
 
+連鎖の検証が通った後に出る、別系統のエラー（`WormAuditLog::open` の末尾改行検証）:
+
+```
+audit log {path} does not end with a newline after line {line_no}
+```
+
+これは、最終行（`line_no`）が JSON として読めて連鎖も正しいが、末尾の `\n` だけが永続化されなかった状態である。復旧は §4 手順4b（改行だけを補う）で行い、行は取り除かない。
+
 ### 2.1 対象行の特定（最初に必ず行う）
 
 1. ログに出た `line_no` を控える。
@@ -52,7 +60,9 @@ audit log {path} failed integrity check
 - **最終行での失敗、かつ末尾が改行で終わっている**: この失敗経路からは生じない。`append` は JSON の本文を書いてから改行を書くので、途中で失敗して残るのは「改行で終わらない非空の断片」だけである。改行で終わっているのに読めない行や、空行（`empty line in append-only log`）は、改竄または破損の疑いとして扱い、**取り除いてはいけない**。調査へ回す。
 - **最終行での失敗、かつ `missing prev_hash` / `missing hash` / `hash chain is broken (prev_hash mismatch)` / `hash mismatch (tampered or corrupted)` / `not a json object`**: 行自体は JSON として読める（構造が壊れているのは連鎖側）。これは「不完全な行」ではなく改竄・破損の疑いであり、**最終行であっても取り除いてはいけない**。調査へ回す。
 
-要するに、**取り除いてよいのは「改行で終わらない、JSON として読めない非空の最終行」だけ**である。
+- **`does not end with a newline after line {line_no}`（連鎖の検証は通っている）**: 最終行は完全で連鎖に組み込まれているが、末尾の改行だけが無い。行を取り除いてはいけない。§4 手順4b で `\n` を 1 バイトだけ補う（本文のバイト列は一切変えない）。
+
+要するに、**取り除いてよいのは「改行で終わらない、JSON として読めない非空の最終行」だけ**であり、**改行だけを補ってよいのは「`does not end with a newline` で起動を拒否された、連鎖の正しいファイル」だけ**である。
 
 ## 3. 作業前の確認
 
@@ -166,6 +176,23 @@ gcloud storage cp --if-generation-match=0 'gs://<bucket>/audit/audit.jsonl#<gene
 head -n <wc> ./audit.jsonl > ./audit.jsonl.fixed
 ```
 
+### 手順4b: 改行だけを補う（起動エラーが `does not end with a newline` の場合）
+
+§2.2 の「改行だけが欠けた完全な最終行」に該当する場合は、手順4の代わりにこれを行う。手順1〜3（取得・末尾確認・別名保存）は同じく省略しない。手順2では、末尾が改行で終わっていないこと、`tail -n 1` の最終行が JSON として読めること（`tail -n 1 ./audit.jsonl | jq -e . > /dev/null`）を確認する。読めなければ手順4b ではなく §2.2 の判断に戻る。
+
+本文のバイト列は一切変えず、`\n` を 1 バイトだけ末尾に足す。
+
+```sh
+cp ./audit.jsonl ./audit.jsonl.fixed
+printf '\n' >> ./audit.jsonl.fixed
+```
+
+手順5では、行数が `line_no`（手順4の `line_no - 1` ではない）であること、元ファイルの全バイトが先頭から一致すること、末尾が改行で終わることを確認する。バイト一致の確認は、`wc -c ./audit.jsonl` の値を `<bytes>` として控え、次を実行して出力が無い（差異なし）ことで行う。
+
+```sh
+cmp -n <bytes> ./audit.jsonl ./audit.jsonl.fixed
+```手順6以降は同じ。手順7の記録には「取り除いたバイト列」の代わりに「`\n` を 1 バイト追記した」ことと `line_no` を書く。
+
 ### 手順5: 取り除き結果の確認
 
 確認は、取り除いた後に完全な行が残るかどうかで分かれる。
@@ -215,10 +242,10 @@ gcloud storage cp ./audit.jsonl.fixed gs://<bucket>/audit/audit.jsonl --if-gener
 Cloud Run は失敗したインスタンスを自動的に再試行する。`minScale` が 0 のサービスでは、次のリクエストでコールドスタートが走る。
 
 ```sh
-curl -sS https://cs-support-mcp-235108918288.asia-northeast1.run.app/livez
+curl -sS -o /dev/null -w '%{http_code}\n' https://cs-support-mcp-235108918288.asia-northeast1.run.app/livez
 ```
 
-`homesec-advisor` の場合は対応する service URL に置き換える。`200` が返り、§3.1 のログクエリで新しい `failed integrity check` エラーが出ていなければ復旧完了である。
+`homesec-advisor` の場合は対応する service URL に置き換える。出力が `200` であり（`503` は poisoned のインスタンスが返す値。`curl` は 503 でも終了コード 0 なので、本文ではなく状態コードで判定する）、§3.1 のログクエリで新しい `failed integrity check` エラーが出ていなければ復旧完了である。
 
 ## 5. 対象が複数あること
 
