@@ -286,11 +286,41 @@ pub async fn extract_signals_and_product_references(
     product_reference_extractor: &ProductReferenceExtractor,
     question: &str,
     catalog: &str,
-) -> (ExtractionResult, Vec<super::product_gate::ProductReference>) {
+) -> TurnExtraction {
     tokio::join!(
         signal_extractor.extract(question),
         product_reference_extractor.extract(question, catalog),
     )
+}
+
+/// 1 ターンの抽出結果（signal 抽出の結果と、独立に抽出した製品参照）。
+/// 製品参照は**生の値**で、採用の可否は `Harness::evaluate` が
+/// `adopt_product_references_for_extraction_mode` で決める。
+pub type TurnExtraction = (ExtractionResult, Vec<super::product_gate::ProductReference>);
+
+/// Issue #61: 呼び出し元（`/api/reply` の製品切り替え検知）が同じ発話・同じ catalog で
+/// 抽出済みの結果（signal + 製品参照）を渡してきた場合は、LLM 呼び出しを一切再発行せず
+/// そのまま使う（1 ターンの抽出を 1 回に保つ）。`None` なら
+/// [`extract_signals_and_product_references`] で抽出する。
+pub async fn resolve_turn_extraction(
+    supplied: Option<TurnExtraction>,
+    signal_extractor: &dyn AsyncSignalExtractor,
+    product_reference_extractor: &ProductReferenceExtractor,
+    question: &str,
+    catalog: &str,
+) -> TurnExtraction {
+    match supplied {
+        Some(extraction) => extraction,
+        None => {
+            extract_signals_and_product_references(
+                signal_extractor,
+                product_reference_extractor,
+                question,
+                catalog,
+            )
+            .await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +597,144 @@ mod tests {
         assert!(
             product_references.is_empty(),
             "product reference extraction must degrade to empty on its own failure"
+        );
+    }
+
+    /// 呼び出し回数を数える signals 抽出モック（Issue #61: 1 ターンの抽出は 1 回）。
+    struct CountingSignalLlm {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ClassifyLlm for CountingSignalLlm {
+        async fn classify(&self, _question: &str) -> anyhow::Result<Vec<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec!["discoloration".to_string()])
+        }
+    }
+
+    /// 呼び出し回数を数える製品参照抽出モック（Issue #61: 1 ターンの抽出は 1 回）。
+    struct CountingProductReferenceLlm {
+        calls: std::sync::atomic::AtomicUsize,
+        result: Vec<super::super::product_gate::ProductReference>,
+    }
+
+    #[async_trait::async_trait]
+    impl ClassifyProductReferences for CountingProductReferenceLlm {
+        async fn classify(
+            &self,
+            _question: &str,
+            _catalog: &str,
+        ) -> anyhow::Result<Vec<super::super::product_gate::ProductReference>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+    }
+
+    struct CountingExtractors {
+        signal_llm: Arc<CountingSignalLlm>,
+        product_llm: Arc<CountingProductReferenceLlm>,
+        signal_extractor: HybridExtractor,
+        product_reference_extractor: ProductReferenceExtractor,
+    }
+
+    fn counting_extractors() -> CountingExtractors {
+        let signal_llm = Arc::new(CountingSignalLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let product_llm = Arc::new(CountingProductReferenceLlm {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            result: vec![sample_reference()],
+        });
+        CountingExtractors {
+            signal_extractor: HybridExtractor::new(
+                lexicon(),
+                Some(signal_llm.clone() as Arc<dyn ClassifyLlm>),
+            ),
+            product_reference_extractor: ProductReferenceExtractor::new(Some(
+                product_llm.clone() as Arc<dyn ClassifyProductReferences>
+            )),
+            signal_llm,
+            product_llm,
+        }
+    }
+
+    #[tokio::test]
+    async fn supplied_turn_extraction_skips_both_llm_calls_and_is_returned_as_is() {
+        let ex = counting_extractors();
+        let supplied_refs = vec![super::super::product_gate::ProductReference {
+            surface: "supplied".to_string(),
+            resolution: super::super::product_gate::ProductReferenceResolution::Matched,
+            matched_model: Some("ADC-V724".to_string()),
+        }];
+        let supplied: TurnExtraction = (
+            ExtractionResult {
+                signals: SignalSet::new(),
+                mode: ExtractionMode::LexiconFallback,
+            },
+            supplied_refs.clone(),
+        );
+
+        let (result, refs) = resolve_turn_extraction(
+            Some(supplied),
+            &ex.signal_extractor,
+            &ex.product_reference_extractor,
+            "カビが生えた",
+            "ADC-V724",
+        )
+        .await;
+
+        assert_eq!(
+            refs, supplied_refs,
+            "supplied references must be used verbatim"
+        );
+        assert!(matches!(result.mode, ExtractionMode::LexiconFallback));
+        assert!(
+            result.signals.is_empty(),
+            "supplied signals must be used verbatim"
+        );
+        assert_eq!(
+            ex.signal_llm
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a supplied extraction must skip the signal llm call"
+        );
+        assert_eq!(
+            ex.product_llm
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a supplied extraction must skip the product reference llm call"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_supplied_turn_extraction_each_extraction_runs_exactly_once() {
+        let ex = counting_extractors();
+
+        let (result, refs) = resolve_turn_extraction(
+            None,
+            &ex.signal_extractor,
+            &ex.product_reference_extractor,
+            "カビが生えた",
+            "ADC-V724",
+        )
+        .await;
+
+        assert_eq!(refs, vec![sample_reference()]);
+        assert!(matches!(result.mode, ExtractionMode::Hybrid));
+        assert_eq!(
+            ex.signal_llm
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            ex.product_llm
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 

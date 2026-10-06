@@ -538,7 +538,10 @@ fn filter_out_of_scope_hits(
 /// `match` に `_ =>` のワイルドカードを使わない: `ExtractionMode` に将来バリアントが増えたとき、
 /// 網羅性検査でコンパイルエラーにして「新しいモードで product_references を採用してよいか」の
 /// 再検討をこの関数の変更者に強制するため。
-fn adopt_product_references_for_extraction_mode(
+///
+/// Issue #61: `/api/reply` の製品切り替え検知も、この関数を適用した後の参照で判定する
+/// （`evaluate()` が採用しない参照で case を切り替えないため）。そのため `pub(crate)`。
+pub(crate) fn adopt_product_references_for_extraction_mode(
     extraction_mode: extraction::ExtractionMode,
     product_references: Vec<product_gate::ProductReference>,
 ) -> (Vec<product_gate::ProductReference>, usize) {
@@ -549,6 +552,15 @@ fn adopt_product_references_for_extraction_mode(
             (Vec::new(), discarded)
         }
     }
+}
+
+/// 製品切り替え検知（Issue #61）が読む、旧 case の属性。空文字は「無い」を表す。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaseSwitchContext {
+    /// `product_models`（CSV）。
+    pub product_models: String,
+    /// `end_user_id`。切り替え時に新 case へ継承する（design doc §2.3 手順1）。
+    pub end_user_id: String,
 }
 
 /// `Harness::evaluate()` に渡された case_id が既存 case として解決できなかった場合の挙動。
@@ -978,18 +990,26 @@ impl Harness {
         }
     }
 
-    /// Issue #61 design doc §2.1/§2.2: case の `product_models` 属性だけを読む（製品切り替え
-    /// 検知専用、read-only。書き込みは行わない）。case 未存在・属性未設定のいずれも空文字
-    /// （design doc §2.1「まだ確定した型番が無い」）として扱う。
-    pub async fn load_case_product_models(
+    /// Issue #61 design doc §2.1〜§2.3: 製品切り替えの検知に必要な case の属性
+    /// （`product_models` と `end_user_id`）だけを 1 回の読み取りで得る（read-only。書き込みは
+    /// 行わない）。case 未存在・属性未設定のいずれも空文字として扱う
+    /// （`product_models` の空は design doc §2.1「まだ確定した型番が無い」）。
+    pub async fn load_case_switch_context(
         &self,
         ctx: &RequestContext,
         case_id: &str,
-    ) -> Result<String> {
+    ) -> Result<CaseSwitchContext> {
         let attrs = self.knowledge()?.load_case(&ctx.schema, case_id).await?;
-        Ok(attrs
-            .and_then(|a| a.get("product_models").cloned())
-            .unwrap_or_default())
+        let attr = |key: &str| {
+            attrs
+                .as_ref()
+                .and_then(|a| a.get(key).cloned())
+                .unwrap_or_default()
+        };
+        Ok(CaseSwitchContext {
+            product_models: attr("product_models"),
+            end_user_id: attr("end_user_id"),
+        })
     }
 
     /// Issue #61 design doc §2.3 手順1・4: 製品切り替えが検知されたターンに、新しく作られた
@@ -1346,6 +1366,13 @@ impl Harness {
         // 箇所が明示的に渡す（既定値は無い）。design doc
         // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2 の表を参照。
         policy: ReplyDraftPolicy<'_>,
+        // Issue #61: 呼び出し元が同じ発話・同じ取扱一覧で抽出済みの結果（signal + **生の**
+        // 製品参照）。`Some` なら内部の抽出（LLM 呼び出し）を一切行わずこの値を使う
+        // （1 ターンの抽出を 1 回に保つ）。`None` なら従来どおり内部で抽出する。`Some` でも
+        // 製品参照の採用可否（`adopt_product_references_for_extraction_mode`）は内部抽出と同じく
+        // ここで 1 度だけ適用する（呼び出し元の切り替え判定は同じ関数を別のコピーに適用するだけで、
+        // 渡す値は生のまま）。
+        supplied_extraction: Option<extraction::TurnExtraction>,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
@@ -1394,7 +1421,8 @@ impl Harness {
         // 波及することはない。
         let (resolutions, (extraction_outcome, product_references)) = tokio::join!(
             knowledge.load_known_resolutions_with(&ctx.schema, &live_snapshot),
-            extraction::extract_signals_and_product_references(
+            extraction::resolve_turn_extraction(
+                supplied_extraction,
                 self.extractor.as_ref(),
                 &self.product_reference_extractor,
                 question,

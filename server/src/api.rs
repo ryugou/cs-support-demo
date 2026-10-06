@@ -10,8 +10,10 @@
 //! main.rs 側で登録しない（design doc §3）。
 
 use crate::config::AppConfig;
+use crate::harness::adopt_product_references_for_extraction_mode;
 use crate::harness::case_switch;
 use crate::harness::decision::{self, AnswerDecision};
+use crate::harness::extraction::{self, TurnExtraction};
 use crate::harness::product_gate;
 use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
 use crate::harness::{
@@ -803,25 +805,88 @@ struct DetectedProductSwitch {
     previous_product_models: String,
     /// 今ターンの `Matched` 型番（design doc §2.3 手順4の監査内容）。
     matched_models: Vec<String>,
+    /// 旧 case の `end_user_id`（空は `None`）。新 case へ継承する
+    /// （design doc §2.3 手順1。[`end_user_id_for_turn`]）。
+    previous_end_user_id: Option<String>,
+}
+
+/// [`detect_product_switch`] の結果。切り替えの判定に加え、検知のために抽出した今ターンの
+/// 抽出結果（signal + 生の製品参照）を持ち回る（Issue #61: `evaluate()` へそのまま渡し、
+/// 1 ターンの抽出を 1 回に保つ）。
+struct SwitchDetection {
+    switch: Option<DetectedProductSwitch>,
+    /// 検知のために抽出を発行したときだけ `Some`。抽出を発行しなかった（`product_models` が
+    /// 空・読み込み失敗）ときは `None` で、`evaluate()` が内部で抽出する。
+    extraction: Option<TurnExtraction>,
+}
+
+/// 抽出済みの今ターンの抽出結果から切り替えを判定し、`SwitchDetection` に詰める純関数
+/// （切り替えの有無にかかわらず `extraction` は `Some` で返す。切り替えたターンの新 case 判定
+/// でも同じ発話なので抽出し直さない）。
+///
+/// 判定に使う製品参照は、`evaluate()` と同じ採用規則
+/// （`adopt_product_references_for_extraction_mode`）を適用した後のもの。signal 抽出が
+/// `Hybrid` でないターンでは `evaluate()` が参照を採用しないため、切り替えも起きない
+/// （design doc §2.2）。`extraction` に載せて返す値は採用規則を適用する前の生の値で、
+/// 採用規則は `evaluate()` が 1 度だけ適用する。
+fn judge_product_switch(
+    case_id: &str,
+    previous_product_models: String,
+    previous_models: &[String],
+    previous_end_user_id: Option<String>,
+    extraction: TurnExtraction,
+) -> SwitchDetection {
+    let (adopted_refs, _discarded) =
+        adopt_product_references_for_extraction_mode(extraction.0.mode, extraction.1.clone());
+    let switch = if case_switch::is_product_switch(previous_models, &adopted_refs) {
+        Some(DetectedProductSwitch {
+            previous_case_id: case_id.to_string(),
+            previous_product_models,
+            matched_models: case_switch::matched_model_strings(&adopted_refs),
+            previous_end_user_id: previous_end_user_id.filter(|id| !id.is_empty()),
+        })
+    } else {
+        None
+    };
+    SwitchDetection {
+        switch,
+        extraction: Some(extraction),
+    }
+}
+
+/// Issue #61 design doc §2.3 手順1: `evaluate()` に渡す `end_user_id` を選ぶ純関数。
+/// 切り替えターンは旧 case の値を継承する（リクエストの値が省略・相違でも旧 case の所有者を
+/// 保つ）。旧 case に値が無ければリクエストの値（従来の新規 case と同じ扱い）。切り替えで
+/// なければリクエストの値。
+fn end_user_id_for_turn<'a>(
+    switch: Option<&'a DetectedProductSwitch>,
+    request_end_user_id: Option<&'a str>,
+) -> Option<&'a str> {
+    switch
+        .and_then(|s| s.previous_end_user_id.as_deref())
+        .or(request_end_user_id)
 }
 
 /// Issue #61 design doc §2.2: 既存 case の `product_models` が非空のときだけ、今ターンの
-/// 製品参照抽出を単独で発行して切り替えを判定する（決定論の比較そのものは
-/// [`case_switch::is_product_switch`]）。
+/// 抽出（signal + 製品参照）を `evaluate()` より前に 1 回発行して切り替えを判定する
+/// （決定論の比較そのものは [`case_switch::is_product_switch`]）。
 ///
-/// `product_models` が空（これまで型番が出ていない会話）のときは抽出すら発行せず `None` を
-/// 返す（design doc §2.2 の前提条件そのものであり、新規会話・型番に触れない継続会話で
-/// 無駄な LLM 呼び出しを発生させないため）。
+/// `product_models` が空（これまで型番が出ていない会話）のときは抽出すら発行せず、
+/// 非切り替え・抽出結果なしを返す（design doc §2.2 の前提条件そのものであり、新規会話・
+/// 型番に触れない継続会話で無駄な LLM 呼び出しを発生させないため）。
 ///
-/// `product_models` の読み込みに失敗した場合（vegapunk 不達等）も `None`
-/// （fail-back: 切り替え検知はこのターンの応答可否を左右しない付加判定であり、ここで
+/// case の属性の読み込みに失敗した場合（vegapunk 不達等）も同じく非切り替え・抽出結果
+/// なし（fail-back: 切り替え検知はこのターンの応答可否を左右しない付加判定であり、ここで
 /// エラーを伝播させて `/api/reply` 全体を失敗させるのは本末転倒。失敗は必ず warn に残す）。
 ///
 /// **spec にない判断（実装報告に明記する前提の設計判断）**: design doc §2.2 は
-/// 「今ターンの product_references」を検知の入力として要求するが、`evaluate()` 内部でも
-/// 同じ製品参照抽出が独立して走る。旧 case の状態を一切変更せずに切り替えを判定するには
-/// `evaluate()` を旧 case_id で呼ぶ前に判定結果が要るため、既存 case に `product_models` が
-/// 記録されているターンに限り、この抽出をもう一度（evaluate() 内部の抽出とは別に）発行する。
+/// 「今ターンの product_references」を検知の入力として要求する。旧 case の状態を一切変更せずに
+/// 切り替えを判定するには `evaluate()` を旧 case_id で呼ぶ前に判定結果が要るため、既存 case に
+/// `product_models` が記録されているターンに限り、この関数が抽出を発行する。参照だけでなく
+/// signal 抽出も一体で発行するのは、`evaluate()` が signal 抽出モードで参照の採用可否を決める
+/// ため（採用規則を適用した後の参照で判定する）。抽出結果は `SwitchDetection::extraction` で
+/// 返し、呼び出し元が `evaluate()` へ渡すことで、`evaluate()` 内部では抽出を再発行しない
+/// （1 ターンの抽出は 1 回）。
 async fn detect_product_switch(
     state: &ApiState,
     ctx: &RequestContext,
@@ -829,38 +894,43 @@ async fn detect_product_switch(
     message: &str,
     allowlist: &product_gate::ProductAllowlist,
     request_id: &str,
-) -> Option<DetectedProductSwitch> {
-    let previous_product_models = match state.harness.load_case_product_models(ctx, case_id).await {
-        Ok(csv) => csv,
+) -> SwitchDetection {
+    let no_detection = SwitchDetection {
+        switch: None,
+        extraction: None,
+    };
+    let previous = match state.harness.load_case_switch_context(ctx, case_id).await {
+        Ok(context) => context,
         Err(err) => {
             tracing::warn!(
                 error = ?err,
                 request_id = %request_id,
                 case_id,
-                "answer api: failed to load product_models for case switch detection; \
+                "answer api: failed to load the case attributes for case switch detection; \
                  treating this turn as a non-switch (fail-back; case switch detection is an \
                  additive decision and must not block the reply)"
             );
-            return None;
+            return no_detection;
         }
     };
-    let previous_models = crate::harness::knowledge::csv_list(&previous_product_models);
+    let previous_models = crate::harness::knowledge::csv_list(&previous.product_models);
     if previous_models.is_empty() {
-        return None;
+        return no_detection;
     }
-    let current_turn_refs = state
-        .harness
-        .product_reference_extractor
-        .extract(message, allowlist.display_list())
-        .await;
-    if !case_switch::is_product_switch(&previous_models, &current_turn_refs) {
-        return None;
-    }
-    Some(DetectedProductSwitch {
-        previous_case_id: case_id.to_string(),
-        previous_product_models,
-        matched_models: case_switch::matched_model_strings(&current_turn_refs),
-    })
+    let extraction = extraction::extract_signals_and_product_references(
+        state.harness.extractor.as_ref(),
+        &state.harness.product_reference_extractor,
+        message,
+        allowlist.display_list(),
+    )
+    .await;
+    judge_product_switch(
+        case_id,
+        previous.product_models,
+        &previous_models,
+        Some(previous.end_user_id),
+        extraction,
+    )
 }
 
 /// Issue #61 design doc §2.3 手順2: 製品切り替えが検知されたターンは、`evaluate()` へ渡す
@@ -1599,13 +1669,25 @@ async fn reply_handler(
     // 検知は下の希望時間帯の受付（ステップ 5）より**前**に置く。時間帯受付は旧 case の
     // `awaiting_time_pref` / `time_pref_false_count` を読み書きするため、切り替えターンで
     // 先に走ると旧 case の状態が変わってしまう（§2.3 手順3・§4）。
-    let case_switch = match req.case_id.as_deref() {
+    let SwitchDetection {
+        switch: case_switch,
+        extraction: supplied_extraction,
+    } = match req.case_id.as_deref() {
         Some(case_id) => {
             detect_product_switch(&state, &ctx, case_id, &req.message, &allowlist, &request_id)
                 .await
         }
-        None => None,
+        None => SwitchDetection {
+            switch: None,
+            extraction: None,
+        },
     };
+
+    // Issue #61 design doc §2.3 手順1: 切り替えターンの新 case は旧 case の `end_user_id` を
+    // 継承する（リクエストの値が省略・相違でも所有者を変えない。旧 case に無ければ
+    // リクエストの値）。以降の `evaluate()` と応答の記録は、すべてこの値を使う。
+    let effective_end_user_id =
+        end_user_id_for_turn(case_switch.as_ref(), req.end_user_id.as_deref());
 
     // ステップ 5: 希望時間帯の受付（会話フロー v1.1 design doc §5）。
     // `evaluate()` を呼ぶ前にすべての state 変更・保存を完了させる。
@@ -1728,7 +1810,7 @@ async fn reply_handler(
             // /api/reply は design doc §2 の契約: 未知 case_id はエラーにせず新規 case
             // として処理する（クライアント保存漏れ・再起動由来の未知 id は通常運用）。
             crate::harness::UnknownCaseIdPolicy::StartNew,
-            req.end_user_id.as_deref(),
+            effective_end_user_id,
             // Issue #78, #83: 取次時・`LexiconFallback` のターン・二段目ゲートが打ち切るターンは、
             // 受け止め文と決定的ブロック、聞き返し、または取扱外の定型応答で応答を組み立て、
             // 下書きを使わない（design doc
@@ -1737,6 +1819,10 @@ async fn reply_handler(
             ReplyDraftPolicy::SkipWhenUnused {
                 response_allowlist: &allowlist,
             },
+            // Issue #61: 切り替え検知で抽出済みなら（切り替えターンの新 case 判定も含め）同じ
+            // 抽出結果（signal + 生の製品参照）を渡し、evaluate() 内部での再抽出を省く。採用規則
+            // は evaluate() が 1 度だけ適用する。検知を行わなかったターンは None（内部で抽出）。
+            supplied_extraction,
         )
         .await
     {
@@ -1792,7 +1878,7 @@ async fn reply_handler(
                     "out_of_scope",
                     &req.message,
                     &audit_event_id,
-                    req.end_user_id.as_deref(),
+                    effective_end_user_id,
                     short_circuit.reply_text,
                     case_id,
                     case_reset,
@@ -1892,7 +1978,7 @@ async fn reply_handler(
                         "answer",
                         &req.message,
                         &outcome.audit_event_id,
-                        req.end_user_id.as_deref(),
+                        effective_end_user_id,
                         text,
                         outcome.case_id,
                         case_reset,
@@ -1988,7 +2074,7 @@ async fn reply_handler(
                         "clarify",
                         &req.message,
                         &outcome.audit_event_id,
-                        req.end_user_id.as_deref(),
+                        effective_end_user_id,
                         reply_text,
                         outcome.case_id,
                         case_reset,
@@ -2042,7 +2128,7 @@ async fn reply_handler(
                         "escalation",
                         &req.message,
                         &outcome.audit_event_id,
-                        req.end_user_id.as_deref(),
+                        effective_end_user_id,
                         reply_text,
                         outcome.case_id,
                         case_reset,
@@ -4005,11 +4091,11 @@ mod tests {
 
     // ---- detect_product_switch（Issue #61 design doc §2.2） ----
 
-    /// `test_harness()` は `knowledge: None` で構築されるため、`load_case_product_models` は
+    /// `test_harness()` は `knowledge: None` で構築されるため、`load_case_switch_context` は
     /// 必ず `Err` になる（実 vegapunk 無しで到達できる唯一の経路）。この場合は fail-back で
     /// `None`（非切り替え）になり、製品参照抽出（LLM）を一切呼ばないことを固定する
     /// （`product_reference_extractor` も `None` 構成なので呼ばれても空配列を返すだけだが、
-    /// ここで確認したいのは「`load_case_product_models` が失敗した時点で抽出を試さずに
+    /// ここで確認したいのは「`load_case_switch_context` が失敗した時点で抽出を試さずに
     /// 早期 return すること」そのもの。失敗時に抽出へ進んでも観測可能な違いが出ない構成なので、
     /// この呼び出しが `panic!` しない・`None` を返すことで間接的に確認する）。
     #[tokio::test]
@@ -4027,10 +4113,173 @@ mod tests {
         )
         .await;
         assert!(
-            result.is_none(),
+            result.switch.is_none(),
             "a knowledge lookup failure must fail back to a non-switch decision, not panic or \
              propagate an error"
         );
+        assert!(
+            result.extraction.is_none(),
+            "no extraction was issued, so evaluate() must extract on its own (None)"
+        );
+    }
+
+    fn matched_ref(model: &str) -> product_gate::ProductReference {
+        product_gate::ProductReference {
+            surface: model.to_string(),
+            resolution: product_gate::ProductReferenceResolution::Matched,
+            matched_model: Some(model.to_string()),
+        }
+    }
+
+    fn turn_extraction(
+        mode: crate::harness::extraction::ExtractionMode,
+        refs: Vec<product_gate::ProductReference>,
+    ) -> crate::harness::extraction::TurnExtraction {
+        (
+            crate::harness::extraction::ExtractionResult {
+                signals: crate::harness::signal::SignalSet::new(),
+                mode,
+            },
+            refs,
+        )
+    }
+
+    /// Issue #61 差し戻し: 切り替えが起きたターンでも、検知で抽出した結果（signal と製品参照）を
+    /// 持ち回り、新 case の判定（evaluate()）に同じ結果を使う（抽出し直さない）。
+    #[test]
+    fn judge_product_switch_carries_the_extraction_when_switched_in_hybrid_mode() {
+        use crate::harness::extraction::ExtractionMode;
+        let refs = vec![matched_ref("ADC-V523")];
+        let detection = judge_product_switch(
+            "case-1",
+            "ADC-V724".to_string(),
+            &["ADC-V724".to_string()],
+            None,
+            turn_extraction(ExtractionMode::Hybrid, refs.clone()),
+        );
+        let switch = detection
+            .switch
+            .expect("a different Matched model switches in Hybrid mode");
+        assert_eq!(switch.previous_case_id, "case-1");
+        assert_eq!(switch.matched_models, vec!["ADC-V523".to_string()]);
+        let (result, carried_refs) = detection
+            .extraction
+            .expect("the extraction must be carried to evaluate()");
+        assert!(matches!(result.mode, ExtractionMode::Hybrid));
+        assert_eq!(
+            carried_refs, refs,
+            "raw references are carried; evaluate() applies the adoption rule itself"
+        );
+    }
+
+    /// Issue #61 差し戻し: 非切り替えのターンでも抽出結果は evaluate() へ渡す
+    /// （evaluate() 内部で 2 回目の抽出を走らせない）。
+    #[test]
+    fn judge_product_switch_carries_the_extraction_when_not_switched() {
+        use crate::harness::extraction::ExtractionMode;
+        let refs = vec![matched_ref("ADC-V724")];
+        let detection = judge_product_switch(
+            "case-1",
+            "ADC-V724".to_string(),
+            &["ADC-V724".to_string()],
+            None,
+            turn_extraction(ExtractionMode::Hybrid, refs.clone()),
+        );
+        assert!(detection.switch.is_none());
+        assert_eq!(detection.extraction.map(|(_, r)| r), Some(refs));
+    }
+
+    /// Issue #61 codex 指摘 2: signal 抽出が劣化したターン（LexiconFallback）は evaluate() が
+    /// 製品参照を採用しない。生の抽出で別の型番が出ていても、切り替えは起きない。
+    /// 抽出結果自体は（evaluate() が同じ採用規則を適用できるよう）そのまま持ち回る。
+    #[test]
+    fn judge_product_switch_does_not_switch_when_signal_extraction_fell_back_to_lexicon() {
+        use crate::harness::extraction::ExtractionMode;
+        let refs = vec![matched_ref("ADC-V523")];
+        let detection = judge_product_switch(
+            "case-1",
+            "ADC-V724".to_string(),
+            &["ADC-V724".to_string()],
+            None,
+            turn_extraction(ExtractionMode::LexiconFallback, refs.clone()),
+        );
+        assert!(
+            detection.switch.is_none(),
+            "references evaluate() will discard must not switch the case"
+        );
+        let (result, carried_refs) = detection.extraction.expect("extraction is carried");
+        assert!(matches!(result.mode, ExtractionMode::LexiconFallback));
+        assert_eq!(carried_refs, refs);
+    }
+
+    #[test]
+    fn judge_product_switch_does_not_switch_when_signal_extraction_is_lexicon_only() {
+        use crate::harness::extraction::ExtractionMode;
+        let detection = judge_product_switch(
+            "case-1",
+            "ADC-V724".to_string(),
+            &["ADC-V724".to_string()],
+            None,
+            turn_extraction(ExtractionMode::LexiconOnly, vec![matched_ref("ADC-V523")]),
+        );
+        assert!(detection.switch.is_none());
+    }
+
+    // ---- end_user_id の継承（Issue #61 codex 指摘 1、design doc §2.3 手順1） ----
+
+    fn switched_detection(previous_end_user_id: Option<&str>) -> DetectedProductSwitch {
+        use crate::harness::extraction::ExtractionMode;
+        judge_product_switch(
+            "case-1",
+            "ADC-V724".to_string(),
+            &["ADC-V724".to_string()],
+            previous_end_user_id.map(str::to_string),
+            turn_extraction(ExtractionMode::Hybrid, vec![matched_ref("ADC-V523")]),
+        )
+        .switch
+        .expect("a different Matched model switches")
+    }
+
+    #[test]
+    fn end_user_id_for_turn_inherits_the_old_case_value_when_the_request_omits_it() {
+        let switch = switched_detection(Some("user-old"));
+        assert_eq!(end_user_id_for_turn(Some(&switch), None), Some("user-old"));
+    }
+
+    #[test]
+    fn end_user_id_for_turn_inherits_the_old_case_value_when_the_request_differs() {
+        let switch = switched_detection(Some("user-old"));
+        assert_eq!(
+            end_user_id_for_turn(Some(&switch), Some("user-new")),
+            Some("user-old")
+        );
+    }
+
+    #[test]
+    fn end_user_id_for_turn_uses_the_request_value_when_the_old_case_has_none() {
+        let switch = switched_detection(None);
+        assert_eq!(
+            end_user_id_for_turn(Some(&switch), Some("user-req")),
+            Some("user-req")
+        );
+    }
+
+    #[test]
+    fn end_user_id_for_turn_treats_an_empty_old_value_as_absent() {
+        let switch = switched_detection(Some(""));
+        assert_eq!(
+            end_user_id_for_turn(Some(&switch), Some("user-req")),
+            Some("user-req")
+        );
+    }
+
+    #[test]
+    fn end_user_id_for_turn_uses_the_request_value_when_not_switched() {
+        assert_eq!(
+            end_user_id_for_turn(None, Some("user-req")),
+            Some("user-req")
+        );
+        assert_eq!(end_user_id_for_turn(None, None), None);
     }
 
     // ---- missing_to_text ----
