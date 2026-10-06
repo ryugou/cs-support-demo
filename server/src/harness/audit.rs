@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -70,7 +70,7 @@ struct AuditEvent<'a> {
 enum ChainState {
     /// 直近まで耐久化を確認できた行の hash。次の `append` はこれを prev_hash として使う。
     Verified(String),
-    /// 直近の `append` で `writeln!` / `flush` / `sync_all` のいずれかが失敗し、その行が
+    /// 直近の `append` で `write_all` / `flush` / `sync_all` のいずれかが失敗し、その行が
     /// ディスクに載ったかどうかをこのプロセスから判別できなくなった状態。
     Poisoned,
 }
@@ -109,8 +109,18 @@ impl WormAuditLog {
         // 破損・改ざん・切り詰めを黙って新チェーンで上書きしない。
         // ログは長期運用で巨大化し得るため、一括読み込みでなく 1 行ずつストリーム検証する。
         let prev_hash = match File::open(path) {
-            Ok(existing) => verify_chain(std::io::BufReader::new(existing))
-                .with_context(|| format!("audit log {} failed integrity check", path.display()))?,
+            Ok(existing) => {
+                let (hash, line_no) = verify_chain(std::io::BufReader::new(existing))
+                    .with_context(|| {
+                        format!("audit log {} failed integrity check", path.display())
+                    })?;
+                // verify_chain は BufRead::lines() で読むため、改行の無い連鎖的に正しい
+                // 最終行をそのまま受理してしまう。次の append がその直後に本文を連結すると
+                // 1 行に 2 イベントが入った壊れた JSONL になるため、連鎖検証が通った後に
+                // 改行の有無を別途検査する（design doc §3.1）。
+                verify_trailing_newline(path, line_no)?;
+                hash
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => genesis_hash(),
             Err(err) => {
                 return Err(err).with_context(|| format!("read audit log {}", path.display()))
@@ -174,7 +184,7 @@ impl WormAuditLog {
     /// イベントを追記し event_id を返す。
     ///
     /// **なぜ耐久化（`flush` / `sync_all`）に失敗したら以降の追記を拒否するか
-    /// （PR #60 Copilot 指摘の是正）**: `writeln!` 自体は成功していても OS バッファに
+    /// （PR #60 Copilot 指摘の是正）**: `write_all` 自体は成功していても OS バッファに
     /// 留まっているだけの可能性があり、後続の `flush` / `sync_all` が失敗した時点では
     /// 「この行が実際にディスク（Cloud Run の gcsfuse マウントなら GCS）まで届いたか」を
     /// このプロセスから判別できない。ここで「届いていない」と楽観して in-memory の
@@ -247,8 +257,14 @@ impl WormAuditLog {
             prev_hash: &prev_hash,
             hash: &hash,
         };
-        let line = serde_json::to_string(&event)?;
-        if let Err(err) = writeln!(file, "{line}") {
+        // 本文と改行を 1 つのバッファにまとめ、write_all で 1 回の書き込みにする
+        // （design doc §3.1）。writeln! は本文と改行を別々の書き込みとして発行し得るため、
+        // 本文だけが永続化されて改行が失敗する状態が生じ得た。1 回にまとめても短い書き込みや
+        // 途中のクラッシュによる窓は消えないため、起動時の末尾改行検証（verify_trailing_newline）
+        // で受け止める。
+        let mut line = serde_json::to_string(&event)?;
+        line.push('\n');
+        if let Err(err) = file.write_all(line.as_bytes()) {
             // 部分書き込みの可能性があり、ディスク上の状態を判別できないため poison する。
             *chain = ChainState::Poisoned;
             self.mark_poisoned();
@@ -348,10 +364,12 @@ fn genesis_hash() -> String {
     format!("{:x}", Sha256::digest(b"cs-support-mcp-worm-genesis"))
 }
 
-/// 既存ログ全行の hash chain をストリームで検証し、最後の hash を返す（空なら genesis）。
-/// 1 行でも JSON 不正・チェーン断絶・hash 不一致があれば Err（fail closed）。
-fn verify_chain(reader: impl std::io::BufRead) -> Result<String> {
+/// 既存ログ全行の hash chain をストリームで検証し、最後の hash と検証済みの行数を返す
+/// （空なら genesis hash と行数 0）。1 行でも JSON 不正・チェーン断絶・hash 不一致があれば
+/// Err（fail closed）。行数は呼び出し元（`open`）が末尾改行検証のエラー文に使う。
+fn verify_chain(reader: impl std::io::BufRead) -> Result<(String, usize)> {
     let mut prev = genesis_hash();
+    let mut verified_line_no = 0usize;
     for (index, line) in reader.lines().enumerate() {
         let line_no = index + 1;
         let line = line.with_context(|| format!("line {line_no}: read failed"))?;
@@ -386,8 +404,50 @@ fn verify_chain(reader: impl std::io::BufRead) -> Result<String> {
             anyhow::bail!("line {line_no}: hash mismatch (tampered or corrupted)");
         }
         prev = line_hash;
+        verified_line_no = line_no;
     }
-    Ok(prev)
+    Ok((prev, verified_line_no))
+}
+
+/// `verify_chain` が通った既存ファイルに対して、末尾が改行で終わっているかを検査する
+/// （design doc §3.1）。`verify_chain` は `BufRead::lines()` で読むため、改行の無い
+/// 連鎖的に正しい最終行をそのまま受理してしまう。次の `append` がその直後に本文を連結
+/// すると、1 行に 2 イベントが入った壊れた JSONL になるため、改行の有無を最終行が完全か
+/// どうかとは別に検査する必要がある。空ファイルは受理する（design doc §3.1 / §6）。
+fn verify_trailing_newline(path: &Path, line_no: usize) -> Result<()> {
+    let len = std::fs::metadata(path)
+        .with_context(|| {
+            format!(
+                "stat audit log {} for trailing newline check",
+                path.display()
+            )
+        })?
+        .len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut tail = File::open(path).with_context(|| {
+        format!(
+            "reopen audit log {} for trailing newline check",
+            path.display()
+        )
+    })?;
+    tail.seek(SeekFrom::End(-1)).with_context(|| {
+        format!(
+            "seek audit log {} for trailing newline check",
+            path.display()
+        )
+    })?;
+    let mut last_byte = [0u8; 1];
+    tail.read_exact(&mut last_byte)
+        .with_context(|| format!("read audit log {} tail byte", path.display()))?;
+    if last_byte[0] != b'\n' {
+        anyhow::bail!(
+            "audit log {} does not end with a newline after line {line_no}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -904,10 +964,10 @@ mod tests {
     /// `cargo test --lib` は全件 green のまま通ることを変異検証で確認済み）。
     ///
     /// このテストは `poison_for_test` を使わず、読み取り専用でオープンした `File` を使うことで
-    /// **実際の I/O 失敗**から `writeln!` 分岐の遷移を再現する（読み取り専用 fd への `write`
+    /// **実際の I/O 失敗**から `write_all` 分岐の遷移を再現する（読み取り専用 fd への `write`
     /// syscall は EBADF で失敗することを事前に最小のプローブで実測済み）。
     ///
-    /// カバーできるのはこの `writeln!` 分岐のみ。`std::fs::File` の `Write::flush` は no-op で
+    /// カバーできるのはこの `write_all` 分岐のみ。`std::fs::File` の `Write::flush` は no-op で
     /// 常に `Ok` を返すため到達不能であり、`sync_all` の失敗を移植性のある形で起こす手段が無い
     /// （実測でも読み取り専用 fd に対して `flush` / `sync_all` はどちらも `Ok` を返した）。
     /// 残り 2 分岐（`flush` / `sync_all` 失敗時の poison 遷移）は、3 分岐とも同一の
@@ -935,7 +995,7 @@ mod tests {
         let lines_before = std::fs::read_to_string(&path).unwrap().lines().count();
         assert_eq!(lines_before, 1);
 
-        // 読み取り専用で開いた File を使い、writeln! が実際に失敗する状況を作る
+        // 読み取り専用で開いた File を使い、write_all が実際に失敗する状況を作る
         // (書き込み用に開いていない fd への write syscall は EBADF で拒否される)。
         let read_only_file = OpenOptions::new()
             .read(true)
@@ -948,14 +1008,14 @@ mod tests {
             poisoned: std::sync::atomic::AtomicBool::new(false),
         };
 
-        // 1 回目: 実際の writeln! 失敗で Err になり、Poisoned へ遷移するはず。
+        // 1 回目: 実際の write_all 失敗で Err になり、Poisoned へ遷移するはず。
         let err1 = log
             .append(draft("req-2", "escalate"))
             .expect_err("append against a read-only fd must fail");
         let message1 = format!("{err1:#}");
         assert!(
             message1.contains("append audit log"),
-            "the failing append must carry the writeln! branch's own io context: {message1}"
+            "the failing append must carry the write_all branch's own io context: {message1}"
         );
         // 状態そのもの（ChainState::Poisoned への遷移）を直接確認する。文言に依存しない。
         assert!(
@@ -974,10 +1034,10 @@ mod tests {
             message2.contains("a previous append failed to durably persist"),
             "the short-circuited append must be rejected via poisoned_error()'s own wording: {message2}"
         );
-        // 補助的確認: writeln! 分岐固有の io context を持たない(=その分岐を再度踏んでいない)。
+        // 補助的確認: write_all 分岐固有の io context を持たない(=その分岐を再度踏んでいない)。
         assert!(
             !message2.contains("append audit log"),
-            "the short-circuited append must not carry the writeln! branch's io context \
+            "the short-circuited append must not carry the write_all branch's io context \
              (that would mean it attempted I/O again instead of refusing early): {message2}"
         );
 
@@ -1047,6 +1107,102 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
         assert_eq!(last["prev_hash"].as_str().unwrap(), first_hash);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Issue #62: 末尾の改行検証 (design doc §3.1) ----
+
+    /// spec (a): 連鎖的に正しい行だけで構成され、末尾に `\n` が無いファイルは `open` が
+    /// 拒否する。`verify_chain` は `BufRead::lines()` で読むため、改行の無い連鎖的に
+    /// 正しい最終行をそのまま受理してしまう。末尾の改行検証はこれを別に検査する。
+    #[test]
+    fn open_rejects_a_chain_valid_log_missing_its_trailing_newline() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        {
+            let log = WormAuditLog::open(&path).expect("open");
+            log.append(draft("req-1", "allowed")).expect("append 1");
+            log.append(draft("req-2", "escalate")).expect("append 2");
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes.pop(),
+            Some(b'\n'),
+            "the file written by append must end with a newline before this test removes it"
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        // `WormAuditLog` は `Debug` を実装していないため `expect_err` は使えない
+        // （`Result::err()` は `Ok` 側の型に `Debug` を要求しない）。
+        let err = WormAuditLog::open(&path)
+            .err()
+            .expect("a chain-valid log missing its trailing newline must not open");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("does not end with a newline after line 2"),
+            "unexpected error: {message}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// spec (b): (a) のファイルの末尾に `\n` を 1 バイトだけ追記すれば `open` できる
+    /// （本文のバイト列は変えず、欠けていた区切りだけを補う runbook の手順 §5.1-3a の裏付け）。
+    #[test]
+    fn open_accepts_the_log_once_the_missing_trailing_newline_byte_is_restored() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        {
+            let log = WormAuditLog::open(&path).expect("open");
+            log.append(draft("req-1", "allowed")).expect("append");
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            WormAuditLog::open(&path).is_err(),
+            "sanity: the file without its trailing newline must fail to open first"
+        );
+
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).unwrap();
+        WormAuditLog::open(&path)
+            .expect("restoring exactly the missing newline byte must allow open to succeed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// spec (c): 空ファイル（0 バイト）は末尾改行検証の対象外として受理される。
+    #[test]
+    fn open_accepts_an_empty_audit_log_file() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        WormAuditLog::open(&path).expect("an empty audit log file must be accepted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// spec (d): `append` が書く各行は改行で終わる。本文と改行を 1 回の書き込みにまとめた
+    /// 後も、1 回の `append` につきファイル上に増える `\n` は常に 1 個であることを確認する。
+    #[test]
+    fn append_terminates_each_written_line_with_a_newline() {
+        let dir = std::env::temp_dir().join(format!("worm-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("audit.jsonl");
+        let log = WormAuditLog::open(&path).expect("open");
+        log.append(draft("req-1", "allowed")).expect("append 1");
+        log.append(draft("req-2", "escalate")).expect("append 2");
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes.last(),
+            Some(&b'\n'),
+            "the file must end with a newline after the second append"
+        );
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            text.matches('\n').count(),
+            2,
+            "each of the 2 appended lines must be terminated by its own newline"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
