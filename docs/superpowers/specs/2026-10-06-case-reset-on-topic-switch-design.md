@@ -28,6 +28,10 @@
 
 ターンごとに、`evaluate` が得た `product_references` のうち `resolution == Matched` の `matched_model` を集合に加えて書き戻す（既存の case 属性の read-merge-write と同じ経路）。`Foreign`（取扱外）と `Ambiguous` は加えない。
 
+`matched_model` は LLM が添える文字列で、コードはこれまで検証していない（`product_gate.rs` の `ProductReference` の注記）。集合に加える値と、§2.2 の比較に使う値は、**取扱製品一覧（`ProductAllowlist`）の正規表記に解決した型番**に限る。解決は、型番トークンの正規化（`normalize_model_token`。大小文字・ハイフン・全半角の差を吸収する）が一覧の型番と一致するものを、一覧に書かれた表記で返す。解決できない `Matched`（`matched_model` が無い、空、一覧のどの型番にも正規化後に一致しない）は、集合に加えず、§2.2 の判定でも `Matched` として数えない（型番に触れない発話と同じ扱い）。理由: 大小文字や別表記の揺れが、同じ製品を別の型番として比較させ、切り替えでないターンで case をリセットするのを防ぐ。解決できなかった件数と値は `tracing::warn!` に出す（発話本文は出さない）。
+
+`ProductAllowlist` に `canonical_model(&str) -> Option<String>` を追加する。`from_models` で正規化形から一覧表記への対応を持つ。`is_product_switch` と `merge_product_models` は、呼び出し側が解決済みの型番を渡す形にするか、`ProductAllowlist` を引数に取る形にする（どちらでもよいが、解決は 1 か所で行い、2 つの関数が同じ入力を見ることを保証する）。
+
 ### 2.2 検知の規則
 
 次をすべて満たすとき、切り替えと判定する。
@@ -102,6 +106,7 @@
 | --- | --- |
 | 検知の規則（純関数） | 2.2 の条件を満たす組み合わせで切り替え、満たさない 4 つの場合で非切り替え |
 | `product_models` の更新 | `Matched` だけが加わり、`Foreign` / `Ambiguous` は加わらない。辞書順 CSV で書き戻される |
+| 型番の正規化（§2.1） | `canonical_model` は大小文字・ハイフン・全半角の揺れ（例: `adc-v724`、`ADC‐V724`、`ＡＤＣ-V724`）を一覧の表記 `ADC-V724` に解決し、一覧に無い値・空・空白のみは `None`。`matched_model` が `adc-v724` の `Matched` は、case の `product_models` に `ADC-V724` があれば切り替えにならず、集合にも `ADC-V724` として 1 件だけ入る。解決できない `Matched` は集合に加わらず、切り替え判定で `Matched` として数えない |
 | 切り替え時の処理 | 今ターンが履歴なし・累積 signal なしで判定される。旧 case の状態が変わらない。監査イベントが 1 件記録され、発話本文を含まない |
 | `end_user_id` の継承（純関数） | 切り替えターンは、リクエストで省略されても旧 case の値を使う。リクエストの値が旧 case と異なっても旧 case の値を使う。旧 case に値が無い（空を含む）ときはリクエストの値を使う。切り替えでないターンはリクエストの値のまま |
 | 採用規則と切り替え判定（純関数） | signal 抽出が `LexiconFallback` / `LexiconOnly` のターンは、生の抽出に別の型番が `Matched` で出ていても切り替えない。`Hybrid` のターンは従来どおり切り替える。どちらも抽出結果（抽出モード・生の参照）を `evaluate` へ持ち回る |
