@@ -98,8 +98,9 @@ pub async fn wait_and_report_poisoned(
         audit_log_path = %poisoned_path.display(),
         grace_period_secs = grace_period.as_secs(),
         runbook = RECOVERY_RUNBOOK_PATH,
-        "audit log hash chain is poisoned (a previous append failed to durably \
-         persist); shutting down this process so a restart re-runs verify_chain; \
+        "audit log is poisoned (either a previous append failed to durably persist, \
+         or the state mutex was poisoned by a panic; the preceding append error names \
+         the cause); shutting down this process so a restart re-runs verify_chain; \
          if verify_chain fails after restart, follow the runbook above"
     );
     poisoned_path
