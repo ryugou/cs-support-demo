@@ -121,6 +121,7 @@
 
 - `2026-08-11-answer-api-line-adapter-design.md` §2: `history` の入力契約に、切り替えはサーバが検知して `case_reset` で指示すること、アダプタの追従動作を追記する。§6 の環境変数に `CS_LINE_RESET_TEXT` / `CS_LINE_RESET_LABEL` を加える。応答の形に `case_reset` を加える。
 - `schema/cs-support.yml` と `schema/homesec.yml` の `support_case` に `product_models` と `previous_case_id` を加える（加算のみ）。homesec ではどちらも書き込まれない: 自動検知を行わないため `product_models` を書かず、手動のリセット（§3.2）はサーバを呼ばずに次のリクエストが `case_id` 無しで通常の新規作成になるため `previous_case_id` も付かない。3 つの schema ファイルで `support_case` の属性集合を一致させるテストを満たすために宣言だけ行う。
+- 本番 vegapunk への schema 登録は、`schema/cs-support.yml` は CI の `auto-ingest`（`ingest-rules`）が行うが、`schema/homesec.yml` は `ingest-homesec` job しか登録せず、CI はこの job を実行しない（`CLAUDE.md` のホームセキュリティアドバイザ節）。マージ・デプロイ後に `gcloud run jobs execute ingest-homesec --project sivira-cs-support --region asia-northeast1 --wait` を手動で 1 回実行し、`homesec` schema の宣言を本番と揃える。低レベル `UpsertNodes` は属性を検証しないため未実行でも応答は失敗しないが、宣言の不一致を残さない。
 - `specs/production-cs-mcp.md` の会話層の記述に、case の切り替えの規則（本書への参照）を追記する。
 - `CLAUDE.md` は変更しない（環境変数の正本は `2026-08-11-answer-api-line-adapter-design.md` §6）。
 
