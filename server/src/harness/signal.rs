@@ -151,6 +151,11 @@ pub struct LexiconNormalizer {
     /// 返す契約をこのマップの不在で表現するため。Suggestion: 空白のみの値を有効扱いしない）。
     customer_labels: std::collections::HashMap<String, String>,
     vocabulary: Vec<VocabularyEntry>,
+    /// シグナル名の lexicon 宣言順（ファイルの `signals` 配列順。`llm_only` も含む全件）。
+    /// `SignalSet`（`BTreeSet`）はアルファベット順になるため、宣言順を必要とする呼び出し側
+    /// （`handoff_items::derive_handoff_items`、design doc
+    /// `2026-10-07-partial-answer-with-handoff-design.md` §2）がこれを使って並べ替える。
+    declaration_order: Vec<String>,
 }
 
 impl LexiconNormalizer {
@@ -190,6 +195,11 @@ impl LexiconNormalizer {
                 class: entry.class,
                 description: entry.description.clone(),
             })
+            .collect();
+        let declaration_order: Vec<String> = file
+            .signals
+            .iter()
+            .map(|entry| entry.signal.clone())
             .collect();
         // suppress_forms の検証は llm_only でのフィルタ前、全エントリに対して行う
         // （llm_only エントリが suppress_forms を宣言すること自体を拒否する必要があるため）。
@@ -259,7 +269,14 @@ impl LexiconNormalizer {
             classes,
             customer_labels,
             vocabulary,
+            declaration_order,
         })
+    }
+
+    /// シグナル名の lexicon 宣言順（`llm_only` を含む全件）。`SignalSet` 自体はアルファベット順
+    /// （`BTreeSet`）になるため、宣言順で並べ替えたい呼び出し側がこれを使う。
+    pub(crate) fn declared_signal_order(&self) -> &[String] {
+        &self.declaration_order
     }
 
     pub fn class_of(&self, signal: &Signal) -> Option<SignalClass> {

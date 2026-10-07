@@ -49,6 +49,8 @@ pub enum ReplyDraftPolicy<'a> {
 | `server/src/api.rs`（`/{project_id}/api/reply`） | `SkipWhenUnused { response_allowlist }`。`response_allowlist` は質問側ゲートで取得し二段目ゲート（`second_stage_short_circuit`）にも渡す同じ変数の `&allowlist` | 取次時は受け止め文と決定的ブロック、または聞き返しで応答を組み立て、`LexiconFallback` 時は判定によらず取次応答へ倒し（`decide_reply_action`）、二段目ゲートが打ち切るときは判定によらず取扱外の定型応答を返す（`second_stage_out_of_scope_reply`）ため、いずれも下書きを使わない |
 | `server/src/advisor/cs_support.rs`（homesec 経由） | `SkipWhenUnused { response_allowlist }`。`response_allowlist` は同上（二段目ゲートに渡す同じ変数の `&allowlist`） | 同上 |
 
+**2026-10-07 改訂**: `docs/superpowers/specs/2026-10-07-partial-answer-with-handoff-design.md` により、`/{project_id}/api/reply` 経由の「判定が取次（`Escalate`）のときは生成しない」は、「`Escalate` でも同書 §3.1 の部分回答条件（取り次ぐ項目が1つ以上・関連十分・未取次・下書き有効）を満たすときは生成する」に緩和された（呼び出し側が `CaseConvState::is_already_escalated()` から渡す）。`ReplyDraftPolicy::SkipWhenUnused` には `already_escalated: bool` が加わった。homesec 経由（`advisor/cs_support.rs`）は同書 §8 により対象外で、`already_escalated: true` を固定で渡して従来どおり `Escalate` では生成しない。詳細・判定条件・応答合成への反映は同書を正本とする。
+
 ### 2.3 `evaluate` の挙動
 
 判定が確定し監査記録（`audit_with_nodes`）を終えた後、下書き生成の直前で次を判定する。

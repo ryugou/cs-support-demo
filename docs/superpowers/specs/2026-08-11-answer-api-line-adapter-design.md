@@ -91,6 +91,7 @@ MCP 経由で case_id を打ち間違えたときに黙って新規 case へ合�
 - truncated な下書きを捨てる理由: 生成上限で途中切断された下書きは、切れ目がたまたま「。」の直後に落ちると完成文に見え、日本語のビジネス文では末尾に来る安全上の但し書きだけが欠落しうる（`llm.rs` の `ReplyDraft` doc コメント）。MCP 経路は人間の CS 担当が下書きを検分してから送るため `truncated=true` を返すだけで足りるが、`/api/reply` は人間の検分が一切入らない自動送信経路のため同じ扱いにはできない
 - decision・evidence はレスポンスに含めない。判定内訳は既存の audit log（`audit_event_id`）で追跡する
 - フォールバックに落ちた場合は warn ログに `request_id` / 判定 / 理由 / `draft_truncated` を出す（truncation が原因か運用者が切り分けられるようにする）
+- **2026-10-07 改訂**: 判定が `escalate` でも、`docs/superpowers/specs/2026-10-07-partial-answer-with-handoff-design.md` §3.1 の部分回答条件を満たすときは、`reply_text` は定型の `[api] fallback_reply_text` ではなく、材料から答えられる部分の下書き（取り次ぐ項目には踏み込まない）+ 決定的ブロックになる。条件を満たさないときは本表のとおり変わらない。
 
 ## 5. 会話履歴の扱い
 

@@ -238,8 +238,14 @@ pub async fn run_support_turn(
             // 下書きを使わない（design doc
             // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。事前判定には、下の
             // 二段目ゲート（`second_stage_short_circuit`）に渡すのと同じ `allowlist` を使う。
+            //
+            // design doc `2026-10-07-partial-answer-with-handoff-design.md` §1「対象」:
+            // homesec アドバイザー（CS 連携モードを含む）は部分回答下書きの対象外で、現行の
+            // 挙動（Escalate では下書きを生成しない）を変えない。`already_escalated: true`
+            // 固定で `handoff_items::can_draft_partial_answer` を常に `false` にする。
             ReplyDraftPolicy::SkipWhenUnused {
                 response_allowlist: &allowlist,
+                already_escalated: true,
             },
             // Issue #61: アドバイザー経路は製品切り替え検知を行わないので抽出済みの値は無い
             // （内部で抽出する）。
