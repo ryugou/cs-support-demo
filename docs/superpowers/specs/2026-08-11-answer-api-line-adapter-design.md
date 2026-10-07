@@ -41,14 +41,17 @@ Content-Type: application/json
 
 **`history` の入力契約（呼び出し側の責務。サーバは検証できない）**: `history` は**同一 case・同一相談対象**の時系列履歴に限る。相談対象（製品・事象）が変わったら、呼び出し側は `history` を空にし `case_id` も渡さず、新しい相談として送ること。守られない場合、古い製品名 + 今ターンの症状の組み合わせで Jev の `has_enough_info` が不当に上がり、誤った製品文脈で即時エスカレーションしうる（`[jev] enabled = true` のときのみ。§5 の例外と `2026-09-21-jev-shadow-design.md` §7 を参照）。
 
+**Issue #61 追記（`/urtect/api/reply` のみ。advisor 経路は対象外）**: 製品の切り替え（これまでと異なる取扱製品の型番が確定したターン）は呼び出し側の責務ではなく**サーバが検知する**（決定論、`2026-10-06-case-reset-on-topic-switch-design.md` §2.2）。検知したターンはサーバが新しい case を作り、呼び出し側が渡した `history` / `case_id` を使わずに評価し、応答の `case_reset` を `true` にする。呼び出し側（LINE アダプタ）はこの指示に**追従するだけ**でよい: `case_reset: true` を受け取ったら、保持している `history` を空にし `case_id` を応答の値へ置き換えてから、今ターンの顧客発話と返信だけを新しい履歴として積み直す（詳細・アダプタの実装は同 design doc §3）。したがって上記の「呼び出し側が `history` を空にして送る」責務は、型番を一度も出していない相談どうしの切り替え（同design doc §5 既知の限界）等、サーバが検知できないケースにのみ残る。
+
 レスポンス（200 のみ）:
 
 ```json
-{ "reply_text": "string", "case_id": "string" }
+{ "reply_text": "string", "case_id": "string", "case_reset": false }
 ```
 
 - `reply_text`: 顧客向け最終応答文。呼び出し側は無加工で送信する。**必ずプレーンテキスト**（LINE は Markdown を描画しないため）。保証は二段構え: 生成プロンプトで Markdown 記法を禁止し、さらに `/api/reply` の応答確定点で**コードによるプレーンテキスト正規化**を必ず通す（太字/斜体マーカー `**`・`__`・`*`・`_` の対除去、行頭 `#` 見出し記号の除去、インラインコード・コードフェンスの除去、`[text](url)` → `text（url）`、行頭の `-`/`*` 箇条書きを「・」へ。改行は保持）。この正規化は生成物・フォールバック定型文を問わず全応答に適用する。MCP 経路（CS 担当が検分する下書き）には適用しない
 - `case_id`: 次リクエストで渡す値。サーバが発番し vegapunk に永続化する（既存の case 機構）
+- `case_reset`: Issue #61 加算フィールド。製品切り替えが検知され、新しい case でこのターンを評価したときだけ `true`。それ以外は常に `false`。欠落時（旧サーバ）はアダプタ側で `false` として扱う（詳細は `2026-10-06-case-reset-on-topic-switch-design.md` §2.4・§3.1）
 
 エラー（body は `{ "error": "<code>", "message": "<説明>" }`）:
 
@@ -112,14 +115,18 @@ env（`LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `CS_ANSWER_API_URL` 
 | `CS_ANSWER_API_KEY` | 応答生成 API の Bearer キー |
 | `CS_LINE_FALLBACK_TEXT` | 任意。API 失敗時の詫び文。既定「申し訳ありません。ただいま応答できません。時間をおいてもう一度お試しください。」 |
 | `CS_LINE_NONTEXT_TEXT` | 任意。非テキスト受信時の案内。既定「恐れ入りますが、テキストでお送りください。」 |
+| `CS_LINE_RESET_TEXT` | 任意（Issue #61）。`action=reset_case` ポストバック受信時に返す固定文。既定「新しいご相談として承ります。内容をお知らせください。」 |
+| `CS_LINE_RESET_LABEL` | 任意（Issue #61）。すべての返信に付けるクイックリプライのラベル。既定「別の相談を始める」。20 字超過時は起動時エラー（切り詰めない） |
 
 処理順（webhook 1 リクエストにつき）:
 
 1. `X-Line-Signature` を channel secret の HMAC-SHA256（base64）で定数時間比較する。不一致は 400
-2. イベントを順に処理する。`message` かつ `text` 以外のメッセージは `CS_LINE_NONTEXT_TEXT` を返信、`message` 以外のイベントは無視
+2. イベントを順に処理する。`message` かつ `text` 以外のメッセージは `CS_LINE_NONTEXT_TEXT` を返信、`message` 以外のイベントは無視（**Issue #61 追記**: `postback` イベントのうち `data=action=reset_case` はサーバを呼ばずセッションを空にして `CS_LINE_RESET_TEXT` を返信する。他の `data` は無視して warn する。詳細は `2026-10-06-case-reset-on-topic-switch-design.md` §3.2）
 3. テキストイベント: まず**同一ユーザーのセッションロックを取得**し、その直後に LINE の chat loading API（`POST https://api.line.me/v2/bot/chat/loading/start`、`chatId` = source.userId、`loadingSeconds` = 60）を呼んで処理中アニメーションを表示する（ロック取得後に呼ぶ理由は下記の直列化の項を参照。ロック取得前に呼ぶと、同一ユーザーの並行イベントの処理順が chat loading API の応答速度で決まってしまい、会話履歴・signal 累積・case_id 確定の順序が入れ替わりうる）。**この呼び出しの失敗は warn ログのみで処理を継続する**（表示は体験改善であり必須機能ではない）。続けてロック済みセッションから該当 user の履歴・case_id を取り、API を 1 回コール（タイムアウト 50 秒）
-4. API が 200 を返した時点で、`case_id` と顧客発話（customer ターン）を直ちにセッションへ保存する。サーバ側では 200 の時点で case が確定し signal が追記済みのため、以降の発話を同じ case に必ず合流させる（LINE 返信の成否でこの保存を左右させると、返信失敗時に次の発話が新規 case となり蓄積 signal が判定から脱落する）。その後 `reply_text` を Reply API で返信し、**返信成功時のみ** assistant ターンを履歴へ追記する（顧客が受信していない発話を履歴に残さない）。API が非 200・タイムアウトの場合は `CS_LINE_FALLBACK_TEXT` を返信し、セッションは変更しない
+4. API が 200 を返した時点で、`case_id` と顧客発話（customer ターン）を直ちにセッションへ保存する。サーバ側では 200 の時点で case が確定し signal が追記済みのため、以降の発話を同じ case に必ず合流させる（LINE 返信の成否でこの保存を左右させると、返信失敗時に次の発話が新規 case となり蓄積 signal が判定から脱落する）。その後 `reply_text` を Reply API で返信し、**返信成功時のみ** assistant ターンを履歴へ追記する（顧客が受信していない発話を履歴に残さない）。API が非 200・タイムアウトの場合は `CS_LINE_FALLBACK_TEXT` を返信し、セッションは変更しない。**Issue #61 追記**: 応答の `case_reset` が `true` の場合は、この保存の前にセッションの履歴を空にし、今ターンの顧客発話と返信だけを新しい履歴として積む（`2026-10-06-case-reset-on-topic-switch-design.md` §3.1）
 5. 全イベント処理後に 200 を返す
+
+**Issue #61 追記**: すべての返信（上記のどの経路でも）に、ポストバックアクション `data=action=reset_case` のクイックリプライ「別の相談を始める」（`CS_LINE_RESET_LABEL`）を 1 件付ける。既存の選択肢（advisor の `quick_replies`）がある場合は末尾に加え、LINE の上限（13 件）を超える場合は選択肢側を優先しこの項目を落とす。詳細は `2026-10-06-case-reset-on-topic-switch-design.md` §3.2・§3.3。
 
 イベントは 1 リクエスト内・同一ユーザーとも逐次処理する（並行処理しない）。そのため 1 イベントあたりのタイムアウトは最大で約 103 秒（chat loading API 呼び出し、per-request timeout 3 秒・失敗/タイムアウトしても継続 + 応答生成 API 呼び出し 50 秒 + LINE Reply API 呼び出し分）まで累積しうる。chat loading API は「失敗しても warn ログのみで継続する」設計（手順3）のため、ここに `state.http` の既定 timeout（50 秒）をそのまま使うと LINE reply token の実効予算（実測往復 10〜15 秒、第 8 節）を食い潰しうる。これを避けるため chat loading API 呼び出しだけ短い per-request timeout（3 秒、`server/src/bin/line_adapter.rs` の `DEFAULT_LINE_LOADING_TIMEOUT`）を明示的に掛けている。この累積は v1 の Accepted Risk として受容し、デプロイ後の E2E（第 8 節）で実測した往復時間をもとに妥当性を再評価する。
 

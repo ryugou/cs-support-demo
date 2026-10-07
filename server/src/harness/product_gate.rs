@@ -159,11 +159,15 @@ const MIN_FRAGMENT_VETO_CHARS: usize = 3;
 
 /// 取扱製品の allowlist（1 schema 分のスナップショット）。
 ///
-/// 正規化済み型番の集合（大文字比較用）と、顧客向け表示文字列（ソート済みで「、」連結）の
-/// 両方を持つ。生成は [`ProductAllowlist::from_models`] / [`ProductGate::allowlist`] 経由のみ。
+/// 正規化形（大文字比較用）から一覧の表記（`from_models` に渡された trim 済み元の値）への
+/// 対応と、顧客向け表示文字列（ソート済みで「、」連結）の両方を持つ。正規化形をキーにした
+/// `HashMap` にしているのは、[`canonical_model`](ProductAllowlist::canonical_model) が
+/// 大小文字・ハイフン種別・全半角の揺れを吸収したうえで一覧の表記を返す必要があるため
+/// （design doc §2.1）。生成は [`ProductAllowlist::from_models`] / [`ProductGate::allowlist`]
+/// 経由のみ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductAllowlist {
-    normalized: HashSet<String>,
+    canonical: HashMap<String, String>,
     display: String,
 }
 
@@ -193,18 +197,31 @@ impl ProductAllowlist {
             usable.push(trimmed.to_string());
         }
         usable.sort();
-        let normalized = usable.iter().map(|m| normalize_model_token(m)).collect();
+        let canonical = usable
+            .iter()
+            .map(|m| (normalize_model_token(m), m.clone()))
+            .collect();
         let display = usable.join("、");
-        Self {
-            normalized,
-            display,
-        }
+        Self { canonical, display }
     }
 
     /// allowlist に実際に使える型番が 1 件も無いか（`ProductGate::fetch` の fail-closed 判定
     /// [`validate_allowlist_not_empty`] に使う）。
     fn is_empty(&self) -> bool {
-        self.normalized.is_empty()
+        self.canonical.is_empty()
+    }
+
+    /// `raw` を正規化し、allowlist 内の型番であれば一覧の表記（`from_models` に渡された
+    /// 元の trim 済み値）を返す（design doc §2.1）。大小文字・ハイフン種別・全半角の揺れを
+    /// 吸収する。trim 後に空、または一覧のどの型番にも正規化後一致しない場合は `None`
+    /// （design doc §2.1: `matched_model` が LLM の自由記述で未検証であるため、ここで初めて
+    /// 一覧表記へ解決する）。
+    pub fn canonical_model(&self, raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        self.canonical.get(&normalize_model_token(trimmed)).cloned()
     }
 
     /// `query_nodes` の `NodeResult` 一覧から allowlist を組み立てる。`model` 属性が欠けた
@@ -236,7 +253,7 @@ impl ProductAllowlist {
 
     /// 正規化済みトークンが allowlist 内か。
     pub fn is_in_scope(&self, normalized_token: &str) -> bool {
-        self.normalized.contains(normalized_token)
+        self.canonical.contains_key(normalized_token)
     }
 
     /// `surface`（LLM が抽出した表層表記、型番形式とは限らない自由記述）が、決定論的に見て
@@ -319,15 +336,15 @@ impl ProductAllowlist {
         let normalized_surface = normalize_model_token(trimmed);
         if normalized_surface.chars().count() >= MIN_FRAGMENT_VETO_CHARS
             && self
-                .normalized
-                .iter()
+                .canonical
+                .keys()
                 .any(|model| model.ends_with(&normalized_surface))
         {
             return true;
         }
         extract_bare_fragments(trimmed).iter().any(|fragment| {
             let suffix = format!("-{fragment}");
-            self.normalized.iter().any(|model| model.ends_with(&suffix))
+            self.canonical.keys().any(|model| model.ends_with(&suffix))
         })
     }
 
@@ -1752,6 +1769,54 @@ mod tests {
         let allow = fixture_allowlist();
         assert!(allow.is_in_scope("ADC-V724"));
         assert!(!allow.is_in_scope("ADC-VDB101"));
+    }
+
+    // ---- canonical_model（Issue #61 design doc §2.1・§6「型番の正規化」） ----
+
+    fn single_model_allowlist() -> ProductAllowlist {
+        ProductAllowlist::from_models(vec!["ADC-V724".to_string()])
+    }
+
+    #[test]
+    fn canonical_model_resolves_a_lowercase_token_to_the_allowlist_display_form() {
+        assert_eq!(
+            single_model_allowlist().canonical_model("adc-v724"),
+            Some("ADC-V724".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_model_resolves_a_unicode_hyphen_variant_to_the_allowlist_display_form() {
+        // design doc §6 の例「ADC‐V724」。U+2010 HYPHEN は ASCII '-' とは異なるコードポイント
+        // で、NFKC でも半角化されない（normalize_hyphens が明示的に変換する対象）。
+        assert_eq!(
+            single_model_allowlist().canonical_model("ADC\u{2010}V724"),
+            Some("ADC-V724".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_model_resolves_a_fullwidth_alnum_token_to_the_allowlist_display_form() {
+        // 「ＡＤＣ-V724」の全角英数字部分は NFKC で半角化される。
+        assert_eq!(
+            single_model_allowlist().canonical_model("ＡＤＣ-V724"),
+            Some("ADC-V724".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_model_is_none_for_a_value_not_in_the_allowlist() {
+        assert_eq!(single_model_allowlist().canonical_model("ADC-V999"), None);
+    }
+
+    #[test]
+    fn canonical_model_is_none_for_an_empty_string() {
+        assert_eq!(single_model_allowlist().canonical_model(""), None);
+    }
+
+    #[test]
+    fn canonical_model_is_none_for_a_whitespace_only_string() {
+        assert_eq!(single_model_allowlist().canonical_model("   "), None);
     }
 
     // ---- matches_in_scope_model: ADC-無し型番断片の suffix veto（Issue #28 W1-b 是正） ----

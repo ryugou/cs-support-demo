@@ -412,6 +412,9 @@ struct WebhookBody {
 /// webhook イベント 1 件。`message` / `source` は message イベント以外では `None`
 /// （例: follow イベントには `message` が無い）。フィールドは permissive にパースする
 /// （`timestamp` / `mode` 等、使わない項目は無視する。`deny_unknown_fields` は付けない）。
+///
+/// `postback`（Issue #61 design doc §3.2）は postback イベントのときだけ `Some`
+/// （message イベント等には無い）。
 #[derive(Debug, Deserialize)]
 struct WebhookEvent {
     #[serde(rename = "type")]
@@ -420,6 +423,8 @@ struct WebhookEvent {
     reply_token: Option<String>,
     source: Option<EventSource>,
     message: Option<EventMessage>,
+    #[serde(default)]
+    postback: Option<EventPostback>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,6 +440,13 @@ struct EventMessage {
     #[serde(rename = "type")]
     message_type: String,
     text: Option<String>,
+}
+
+/// postback イベントの `postback` フィールド（Issue #61 design doc §3.2）。`data` は
+/// LINE のクイックリプライ item（`action.data`）で指定した値がそのまま返る。
+#[derive(Debug, Deserialize)]
+struct EventPostback {
+    data: Option<String>,
 }
 
 // ---- 応答生成 API（`POST /{project_id}/api/reply`）の呼び出し ----
@@ -621,6 +633,12 @@ struct AnswerApiResponse {
     /// `case_id` までカード同様に道連れにされていた。
     #[serde(default, deserialize_with = "deserialize_quick_replies")]
     quick_replies: Option<Vec<QuickReplyPayload>>,
+    /// Issue #61 design doc §2.4・§3.1: 製品切り替えが検知され、新しい case でこのターンを
+    /// 評価したときだけ `true`。`#[serde(default)]`（値は `bool` の既定 `false`）により、
+    /// `case_reset` を返さない古いサーバの応答・CS 側が省略した場合のいずれも `false` として
+    /// 扱う（design doc §3.1「`case_reset` が無い（古いサーバ）応答は `false` として扱う」）。
+    #[serde(default)]
+    case_reset: bool,
 }
 
 /// `quick_replies` 配列の 1 要素(design doc §3.3)。
@@ -812,26 +830,43 @@ enum RoutedEvent {
     },
     /// テキスト以外のメッセージ（画像・スタンプ等）。`CS_LINE_NONTEXT_TEXT` を返信する。
     NonText { reply_token: String },
+    /// Issue #61 design doc §3.2: ポストバック `data=action=reset_case`。サーバを呼ばず、
+    /// セッションを空にしたうえで固定の返信文（`CS_LINE_RESET_TEXT`）を返す。
+    ResetCase {
+        reply_token: String,
+        user_id: String,
+    },
+    /// Issue #61 design doc §3.2: `data` が `action=reset_case` 以外のポストバック。無視して
+    /// warn する（`data` の値自体はログに出さない。クライアントが自由に設定できる値のため）。
+    IgnoreUnknownPostback,
     /// message 以外のイベント（follow 等）。**想定内**の無視。LINE の webhook は
     /// message 以外のイベント種別を頻繁に送ってくるため、ログは出さない
     /// （呼び出し側で無言 `Ok(())` にする）。
     Ignore,
-    /// message イベントだが `replyToken` / `source.userId` / `message.text` を欠く。
-    /// LINE の実仕様では起こらない想定の契約違反であり、`unwrap` で panic させるより
-    /// 当該イベントだけ無視して他のイベント処理を継続する方が安全だが、これは
+    /// message / postback イベントだが `replyToken` / `source.userId` / `message.text` /
+    /// `postback.data` を欠く。LINE の実仕様では起こらない想定の契約違反であり、`unwrap` で
+    /// panic させるより当該イベントだけ無視して他のイベント処理を継続する方が安全だが、これは
     /// **想定外**の無視なので呼び出し側が `tracing::warn!` を出す（F3: グループ会話等で
     /// `source.userId` が欠けたテキストメッセージを無言で握りつぶすと、顧客には
     /// 「Bot が無反応」に見え、運用者にも気づく手段が無くなるため）。
     IgnoreMalformed {
         event_type: String,
         /// 欠けていたフィールド（`"replyToken"` / `"message"` / `"source.userId"` /
-        /// `"message.text"` / 両方欠落時は `"source.userId and message.text"`）。
+        /// `"message.text"` / `"postback.data"` / 両方欠落時は
+        /// `"source.userId and message.text"`）。
         missing_field: &'static str,
     },
 }
 
-/// `WebhookEvent` を [`RoutedEvent`] に振り分ける純関数（design doc §6 手順 2）。
+/// Issue #61 design doc §3.2: ポストバックアクション `data=action=reset_case`。
+const RESET_CASE_POSTBACK_DATA: &str = "action=reset_case";
+
+/// `WebhookEvent` を [`RoutedEvent`] に振り分ける純関数（design doc §6 手順 2、
+/// postback の振り分けは Issue #61 design doc §3.2）。
 fn route_event(event: &WebhookEvent) -> RoutedEvent {
+    if event.event_type == "postback" {
+        return route_postback_event(event);
+    }
     if event.event_type != "message" {
         return RoutedEvent::Ignore;
     }
@@ -871,6 +906,38 @@ fn route_event(event: &WebhookEvent) -> RoutedEvent {
         (None, None) => RoutedEvent::IgnoreMalformed {
             event_type: event.event_type.clone(),
             missing_field: "source.userId and message.text",
+        },
+    }
+}
+
+/// `event_type == "postback"` のイベントを振り分ける（`route_event` から分離。Issue #61
+/// design doc §3.2）。`data` が [`RESET_CASE_POSTBACK_DATA`] と完全一致するときだけ
+/// `ResetCase`、それ以外の非空 `data` は `IgnoreUnknownPostback`、`replyToken` /
+/// `source.userId` / `postback.data` の欠落は `IgnoreMalformed`（想定外の契約違反として
+/// 呼び出し側が warn する）。
+fn route_postback_event(event: &WebhookEvent) -> RoutedEvent {
+    let Some(reply_token) = &event.reply_token else {
+        return RoutedEvent::IgnoreMalformed {
+            event_type: event.event_type.clone(),
+            missing_field: "replyToken",
+        };
+    };
+    let Some(user_id) = event.source.as_ref().and_then(|s| s.user_id.clone()) else {
+        return RoutedEvent::IgnoreMalformed {
+            event_type: event.event_type.clone(),
+            missing_field: "source.userId",
+        };
+    };
+    let data = event.postback.as_ref().and_then(|p| p.data.as_deref());
+    match data {
+        Some(RESET_CASE_POSTBACK_DATA) => RoutedEvent::ResetCase {
+            reply_token: reply_token.clone(),
+            user_id,
+        },
+        Some(_) => RoutedEvent::IgnoreUnknownPostback,
+        None => RoutedEvent::IgnoreMalformed {
+            event_type: event.event_type.clone(),
+            missing_field: "postback.data",
         },
     }
 }
@@ -1487,6 +1554,12 @@ struct AppStateInner {
     answer_api_key: String,
     fallback_text: String,
     nontext_text: String,
+    /// Issue #61 design doc §3.2: `action=reset_case` ポストバック受信時に返す固定文
+    /// （env `CS_LINE_RESET_TEXT`）。
+    reset_text: String,
+    /// Issue #61 design doc §3.2・§3.3: すべての返信に付けるクイックリプライのラベル
+    /// （env `CS_LINE_RESET_LABEL`）。20 字以内（起動時に [`validate_reset_label`] で検証済み）。
+    reset_label: String,
     http: reqwest::Client,
     sessions: SessionStore,
     /// LINE Reply API の呼び出し先。本番は常に [`DEFAULT_LINE_REPLY_API_URL`]
@@ -1597,7 +1670,7 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             tracing::warn!(
                 event_type,
                 missing_field,
-                "line webhook: a message event is missing a required field; ignoring this \
+                "line webhook: a message/postback event is missing a required field; ignoring this \
                  event (the customer will see no reply)"
             );
             Ok(())
@@ -1651,6 +1724,16 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
                 .as_ref()
                 .and_then(|r| r.quick_replies.as_deref());
 
+            // Issue #61 design doc §3.1: `case_reset: true` の応答では、サーバ側で製品切り替え
+            // が検知され新しい case でこのターンが評価されている。アダプタは古い履歴を捨て、
+            // この後の `apply_customer_turn` が今ターンの顧客発話を新しい履歴の先頭として積む
+            // ようにする（リクエスト前にクローンした `history`（上の `call_answer_api` 呼び出し
+            // 引数）は既に送信済みで無関係。ここで捨てるのは `session.history` 本体）。
+            // `case_reset` が無い（古いサーバ）・`false` のいずれも何もしない（従来どおり）。
+            if api_response.as_ref().is_some_and(|r| r.case_reset) {
+                session.history.clear();
+            }
+
             // design doc §6 手順4 / handle_event の doc comment 参照: 応答生成 API が 200 を
             // 返した時点（= update が Some）で、LINE への返信を試みる前に case_id と
             // customer ターンを保存する。返信の成否に左右させない。
@@ -1681,6 +1764,36 @@ async fn handle_event(state: &AppState, event: &WebhookEvent) -> Result<()> {
             }
 
             reply_result
+        }
+        // Issue #61 design doc §3.2: 他のポストバックは無視する。`data` の値は warn に出さない
+        // （クライアントが自由に設定できる値のため、顧客由来のデータを含みうる）。
+        RoutedEvent::IgnoreUnknownPostback => {
+            tracing::warn!(
+                "line webhook: received a postback event whose data does not match the \
+                 reset_case action; ignoring it (design doc §3.2). the data value itself is \
+                 not logged"
+            );
+            Ok(())
+        }
+        // Issue #61 design doc §3.2: 明示的なリセット。サーバを呼ばず、セッションを空にして
+        // 固定文を返す。
+        RoutedEvent::ResetCase {
+            reply_token,
+            user_id,
+        } => {
+            // 同一ユーザーの他イベントとの直列化は `RoutedEvent::Text` と同じ規律
+            // （`SessionStore::lock_session` の doc comment 参照）: ロックを保持したまま
+            // セッションを空にし、LINE 返信まで完了させる。
+            let mut session = state.sessions.lock_session(&user_id).await;
+            *session = Session::fresh();
+            send_line_reply(state, &reply_token, &state.reset_text, None, None)
+                .await
+                .with_context(|| {
+                    format!(
+                        "send line reply (reset_case) user_id={user_id} {}",
+                        reply_token_log_fragment(&reply_token)
+                    )
+                })
         }
     }
 }
@@ -1801,8 +1914,12 @@ async fn call_answer_api(
 /// 不正がテキスト回答の送信を道連れにしない、という規律の継続）。
 ///
 /// `quick_replies` が `Some` で、かつ [`build_quick_reply`] が有効な item を 1 件以上生成
-/// できたときだけ、**送信する最後のメッセージ**（Flex を積んだ場合は Flex、積まなかった場合
-/// はテキスト）の `"quickReply"` キーへ付与する（design doc §3.3、Issue #34）。
+/// できたときは、その選択肢を使う。いずれにしても、Issue #61 design doc §3.2「ボットの
+/// すべての返信にクイックリプライ『別の相談を始める』を1件付ける」に従い、
+/// [`with_reset_case_quick_reply`] が選択肢の末尾にポストバック item を追加したものを
+/// **送信する最後のメッセージ**（Flex を積んだ場合は Flex、積まなかった場合はテキスト）の
+/// `"quickReply"` キーへ付与する（design doc §3.3、Issue #34 の既存契約に Issue #61 を
+/// 重ねる）。
 async fn send_line_reply(
     state: &AppState,
     reply_token: &str,
@@ -1821,12 +1938,10 @@ async fn send_line_reply(
             messages.push(flex);
         }
     }
-    if let Some(items) = quick_replies {
-        if let Some(quick_reply) = build_quick_reply(items) {
-            if let Some(last_message) = messages.last_mut() {
-                last_message["quickReply"] = quick_reply;
-            }
-        }
+    let existing_quick_reply = quick_replies.and_then(build_quick_reply);
+    let quick_reply = with_reset_case_quick_reply(existing_quick_reply, &state.reset_label);
+    if let Some(last_message) = messages.last_mut() {
+        last_message["quickReply"] = quick_reply;
     }
     let payload = serde_json::json!({
         "replyToken": reply_token,
@@ -1978,6 +2093,56 @@ fn build_quick_reply(items: &[QuickReplyPayload]) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "items": valid_items }))
 }
 
+/// LINE の quick reply 全体の上限（design doc §3.2「LINEの上限（13件）」）。アダプタ自身の
+/// 防御的な上限 [`QUICK_REPLY_MAX_ITEMS`]（4件、応答生成側の選択肢だけに課す上限）とは別物。
+const LINE_QUICK_REPLY_API_MAX_ITEMS: usize = 13;
+
+/// Issue #61 design doc §3.2: `action=reset_case` ポストバックの quick reply item を1件
+/// 組み立てる。テキストアクションにしない（label 押下時に利用者の発話として応答生成 API へ
+/// 送られてしまうため。design doc §3.2「テキストアクションにしない」）。
+fn build_reset_case_quick_reply_item(reset_label: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "action",
+        "action": {
+            "type": "postback",
+            "label": reset_label,
+            "data": RESET_CASE_POSTBACK_DATA,
+        },
+    })
+}
+
+/// Issue #61 design doc §3.2: ボットの**すべて**の返信に、既存の quickReply オブジェクト
+/// （`existing`。`build_quick_reply` が返す `{"items": [...]}` 形。`None` なら選択肢ゼロ）の
+/// 末尾へ `action=reset_case` のポストバック item を1件追加した quickReply オブジェクトを
+/// 返す。既存の選択肢と合わせて LINE の上限（[`LINE_QUICK_REPLY_API_MAX_ITEMS`]、13件）を
+/// 超える場合は、選択肢側を優先しこの項目を落とす（design doc §3.2）。
+///
+/// 常に `serde_json::Value`（`Option` ではない）を返す: 既存が `None`（items.len() == 0 <
+/// 13）でも必ずリセット item 1 件を含む `{"items": [...]}` になるため、「quickReply キー自体を
+/// 省略する」分岐が存在しない（design doc §3.2「ボットのすべての返信に...1件付ける」）。
+fn with_reset_case_quick_reply(
+    existing: Option<serde_json::Value>,
+    reset_label: &str,
+) -> serde_json::Value {
+    let mut items: Vec<serde_json::Value> = existing
+        .as_ref()
+        .and_then(|v| v.get("items"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if items.len() >= LINE_QUICK_REPLY_API_MAX_ITEMS {
+        tracing::warn!(
+            existing_items = items.len(),
+            "line webhook: dropping the reset_case quick reply item because the existing \
+             choices already reach line's quick reply limit (design doc §3.2: choices take \
+             priority over the reset_case item)"
+        );
+    } else {
+        items.push(build_reset_case_quick_reply_item(reset_label));
+    }
+    serde_json::json!({ "items": items })
+}
+
 /// [`start_loading_indicator`] の per-request timeout の既定値（Stage 1 レビュー指摘 Critical
 /// 1）。本番は常にこの定数を使う（`main()` が設定する）。テストは
 /// `AppStateInner::line_loading_timeout` を短く差し替える。
@@ -2105,6 +2270,31 @@ fn require_env(name: &str) -> Result<String> {
 const DEFAULT_FALLBACK_TEXT: &str =
     "申し訳ありません。ただいま応答できません。時間をおいてもう一度お試しください。";
 const DEFAULT_NONTEXT_TEXT: &str = "恐れ入りますが、テキストでお送りください。";
+/// Issue #61 design doc §3.2: `action=reset_case` ポストバック受信時に返す固定文の既定値。
+const DEFAULT_RESET_TEXT: &str = "新しいご相談として承ります。内容をお知らせください。";
+/// Issue #61 design doc §3.3: すべての返信に付けるクイックリプライのラベルの既定値
+/// （20 字以内。`validate_reset_label` の上限と同じ値を満たす）。
+const DEFAULT_RESET_LABEL: &str = "別の相談を始める";
+/// Issue #61 design doc §3.3: クイックリプライのラベルの上限文字数。
+const RESET_LABEL_MAX_CHARS: usize = 20;
+
+/// Issue #61 design doc §3.3: クイックリプライのラベル（`CS_LINE_RESET_LABEL`、既定
+/// [`DEFAULT_RESET_LABEL`]）が [`RESET_LABEL_MAX_CHARS`] 字以内であることを検証する。
+/// LINE の上限に合わせて切り詰めるのではなく、**起動時にエラーにする**
+/// （design doc §3.3「超過時は起動時にエラーにする」）。切り詰めだと「どこで切れるか」が
+/// 運用者の意図と食い違ったラベルのまま本番で動き続けてしまうため、設定ミスは起動不能で
+/// 気づけるようにする。
+fn validate_reset_label(label: &str) -> Result<()> {
+    let chars = label.chars().count();
+    if chars > RESET_LABEL_MAX_CHARS {
+        anyhow::bail!(
+            "CS_LINE_RESET_LABEL must be at most {RESET_LABEL_MAX_CHARS} characters, got \
+             {chars} (label={label:?}); line's quick reply label limit is {RESET_LABEL_MAX_CHARS} \
+             characters and this value is not truncated before sending"
+        );
+    }
+    Ok(())
+}
 
 /// 任意 env（`CS_LINE_FALLBACK_TEXT` / `CS_LINE_NONTEXT_TEXT`）の値を確定する。
 /// 未設定・空文字列・空白のみのいずれも既定文へ正規化する（fail closed にはしない —
@@ -2142,6 +2332,12 @@ async fn main() -> Result<()> {
     );
     let nontext_text =
         resolve_optional_text_env(env::var("CS_LINE_NONTEXT_TEXT").ok(), DEFAULT_NONTEXT_TEXT);
+    // Issue #61 design doc §3.2・§3.3。
+    let reset_text =
+        resolve_optional_text_env(env::var("CS_LINE_RESET_TEXT").ok(), DEFAULT_RESET_TEXT);
+    let reset_label =
+        resolve_optional_text_env(env::var("CS_LINE_RESET_LABEL").ok(), DEFAULT_RESET_LABEL);
+    validate_reset_label(&reset_label)?;
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(50))
@@ -2163,6 +2359,8 @@ async fn main() -> Result<()> {
         answer_api_key,
         fallback_text,
         nontext_text,
+        reset_text,
+        reset_label,
         http,
         sessions: SessionStore::new(),
         line_reply_api_url: DEFAULT_LINE_REPLY_API_URL.to_string(),
@@ -2750,6 +2948,7 @@ mod tests {
                 message_type: "text".to_string(),
                 text: Some("hi".to_string()),
             }),
+            postback: None,
         };
         assert_eq!(
             route_event(&event),
@@ -2769,6 +2968,7 @@ mod tests {
                 user_id: Some("U1".to_string()),
             }),
             message: None,
+            postback: None,
         };
         assert_eq!(
             route_event(&event),
@@ -2790,6 +2990,7 @@ mod tests {
                 message_type: "text".to_string(),
                 text: Some("hi".to_string()),
             }),
+            postback: None,
         };
         assert_eq!(
             route_event(&event),
@@ -2812,12 +3013,71 @@ mod tests {
                 message_type: "text".to_string(),
                 text: None,
             }),
+            postback: None,
         };
         assert_eq!(
             route_event(&event),
             RoutedEvent::IgnoreMalformed {
                 event_type: "message".to_string(),
                 missing_field: "message.text",
+            }
+        );
+    }
+
+    // ---- route_event: postback（Issue #61 design doc §3.2） ----
+
+    #[test]
+    fn route_event_classifies_a_reset_case_postback() {
+        let event = postback_webhook_event("U1", "rt1", Some(RESET_CASE_POSTBACK_DATA));
+        assert_eq!(
+            route_event(&event),
+            RoutedEvent::ResetCase {
+                reply_token: "rt1".to_string(),
+                user_id: "U1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn route_event_ignores_a_postback_whose_data_does_not_match_reset_case() {
+        let event = postback_webhook_event("U1", "rt1", Some("action=something_else"));
+        assert_eq!(route_event(&event), RoutedEvent::IgnoreUnknownPostback);
+    }
+
+    #[test]
+    fn route_event_flags_a_postback_missing_reply_token_as_malformed() {
+        let mut event = postback_webhook_event("U1", "rt1", Some(RESET_CASE_POSTBACK_DATA));
+        event.reply_token = None;
+        assert_eq!(
+            route_event(&event),
+            RoutedEvent::IgnoreMalformed {
+                event_type: "postback".to_string(),
+                missing_field: "replyToken",
+            }
+        );
+    }
+
+    #[test]
+    fn route_event_flags_a_postback_missing_source_user_id_as_malformed() {
+        let mut event = postback_webhook_event("U1", "rt1", Some(RESET_CASE_POSTBACK_DATA));
+        event.source = Some(EventSource { user_id: None });
+        assert_eq!(
+            route_event(&event),
+            RoutedEvent::IgnoreMalformed {
+                event_type: "postback".to_string(),
+                missing_field: "source.userId",
+            }
+        );
+    }
+
+    #[test]
+    fn route_event_flags_a_postback_missing_data_as_malformed() {
+        let event = postback_webhook_event("U1", "rt1", None);
+        assert_eq!(
+            route_event(&event),
+            RoutedEvent::IgnoreMalformed {
+                event_type: "postback".to_string(),
+                missing_field: "postback.data",
             }
         );
     }
@@ -2831,6 +3091,7 @@ mod tests {
             case_id: "case-99".to_string(),
             product_cards: None,
             quick_replies: None,
+            case_reset: false,
         };
         let (text, update) = assemble_reply(Some(&resp), "質問です", "フォールバック文");
         assert_eq!(text, "こちらが回答です");
@@ -4260,10 +4521,15 @@ mod tests {
              change (CS route backward compatibility)"
         );
         assert_eq!(messages[0]["type"], "text");
-        assert!(
-            messages[0].get("quickReply").is_none(),
-            "quick_replies=None must not attach a quickReply key"
-        );
+        // Issue #61 design doc §3.2: ボットのすべての返信にリセット用クイックリプライが付く。
+        // quick_replies=None でも quickReply キー自体は必ず付き、リセット item 1 件だけを
+        // 含む。
+        let items = messages[0]["quickReply"]["items"]
+            .as_array()
+            .expect("quickReply.items must always be present (design doc §3.2)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["action"]["type"], "postback");
+        assert_eq!(items[0]["action"]["data"], RESET_CASE_POSTBACK_DATA);
     }
 
     #[tokio::test]
@@ -4435,11 +4701,15 @@ mod tests {
         let items = messages[0]["quickReply"]["items"]
             .as_array()
             .expect("quickReply.items must be a JSON array on the text message");
-        assert_eq!(items.len(), 2);
+        // Issue #61 design doc §3.2: 既存の選択肢(2件)の末尾にリセット item が1件追加され、
+        // 合計3件になる。
+        assert_eq!(items.len(), 3);
         assert_eq!(items[0]["type"], "action");
         assert_eq!(items[0]["action"]["type"], "message");
         assert_eq!(items[0]["action"]["label"], "侵入・空き巣が心配");
         assert_eq!(items[0]["action"]["text"], "侵入や空き巣が心配です");
+        assert_eq!(items[2]["action"]["type"], "postback");
+        assert_eq!(items[2]["action"]["data"], RESET_CASE_POSTBACK_DATA);
     }
 
     #[tokio::test]
@@ -4483,9 +4753,12 @@ mod tests {
         let items = messages[1]["quickReply"]["items"]
             .as_array()
             .expect("quickReply.items must be a JSON array on the flex (last) message");
-        assert_eq!(items.len(), 1);
+        // Issue #61 design doc §3.2: 既存の選択肢(1件)の末尾にリセット item が1件追加され、
+        // 合計2件になる。
+        assert_eq!(items.len(), 2);
         assert_eq!(items[0]["action"]["label"], "平日10-12時");
         assert_eq!(items[0]["action"]["text"], "平日10時から12時にお願いします");
+        assert_eq!(items[1]["action"]["type"], "postback");
     }
 
     #[tokio::test]
@@ -4517,14 +4790,18 @@ mod tests {
             .clone();
         assert_eq!(
             items.len(),
-            1,
-            "only the item with both a non-empty label and message must survive"
+            // Issue #61 design doc §3.2: 有効な選択肢(1件)の末尾にリセット item が1件
+            // 追加され、合計2件になる。
+            2,
+            "only the item with both a non-empty label and message must survive, plus the \
+             reset_case item that is always appended"
         );
         assert_eq!(items[0]["action"]["label"], "有効");
+        assert_eq!(items[1]["action"]["type"], "postback");
     }
 
     #[tokio::test]
-    async fn send_line_reply_omits_quick_reply_key_when_every_item_is_invalid() {
+    async fn send_line_reply_still_attaches_the_reset_case_item_when_every_other_item_is_invalid() {
         let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
         let router = Router::new()
             .route("/reply", post(line_reply_capture_handler))
@@ -4542,12 +4819,16 @@ mod tests {
             .expect("send_line_reply must succeed against a 200 mock");
 
         let captured = captured.lock().unwrap().clone();
-        assert!(
-            captured.body.as_ref().unwrap()["messages"][0]
-                .get("quickReply")
-                .is_none(),
-            "no valid item must mean no quickReply key at all"
-        );
+        // Issue #61 design doc §3.2: 「ボットのすべての返信にクイックリプライを1件付ける」ため、
+        // quick_replies の全要素が無効でも quickReply キー自体は必ず付く(以前は「有効な item
+        // が0件ならキー自体を省略する」挙動だったが、この変更で意図的に変わった)。
+        let items = captured.body.as_ref().unwrap()["messages"][0]["quickReply"]["items"]
+            .as_array()
+            .expect("quickReply.items must always be present (design doc §3.2)")
+            .clone();
+        assert_eq!(items.len(), 1, "only the reset_case item must remain");
+        assert_eq!(items[0]["action"]["type"], "postback");
+        assert_eq!(items[0]["action"]["data"], RESET_CASE_POSTBACK_DATA);
     }
 
     #[tokio::test]
@@ -4577,9 +4858,17 @@ mod tests {
             .expect("quickReply.items must be a JSON array")
             .clone();
         assert_eq!(
+            // Issue #61 design doc §3.2: 防御的に切り詰められた選択肢(QUICK_REPLY_MAX_ITEMS
+            // 件)の末尾にリセット item が1件追加され、+1 件になる(4+1=5 は LINE の上限13件に
+            // 対して余裕があるため、リセット item は落ちない)。
             items.len(),
-            QUICK_REPLY_MAX_ITEMS,
-            "the adapter must defensively cap quick_replies even if the answer api returns more"
+            QUICK_REPLY_MAX_ITEMS + 1,
+            "the adapter must defensively cap quick_replies even if the answer api returns \
+             more, then still append the reset_case item"
+        );
+        assert_eq!(
+            items[QUICK_REPLY_MAX_ITEMS]["action"]["type"], "postback",
+            "the reset_case item must be appended after the capped choices"
         );
         let label = items[0]["action"]["label"]
             .as_str()
@@ -4729,6 +5018,8 @@ mod tests {
             answer_api_key: "test-answer-api-key".to_string(),
             fallback_text: DEFAULT_FALLBACK_TEXT.to_string(),
             nontext_text: DEFAULT_NONTEXT_TEXT.to_string(),
+            reset_text: DEFAULT_RESET_TEXT.to_string(),
+            reset_label: DEFAULT_RESET_LABEL.to_string(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -4750,6 +5041,27 @@ mod tests {
             message: Some(EventMessage {
                 message_type: "text".to_string(),
                 text: Some(text.to_string()),
+            }),
+            postback: None,
+        }
+    }
+
+    /// Issue #61 design doc §3.2: postback イベントのテストフィクスチャ。`data` が `None`
+    /// の場合も表現できるよう `Option<&str>` を受ける。
+    fn postback_webhook_event(
+        user_id: &str,
+        reply_token: &str,
+        data: Option<&str>,
+    ) -> WebhookEvent {
+        WebhookEvent {
+            event_type: "postback".to_string(),
+            reply_token: Some(reply_token.to_string()),
+            source: Some(EventSource {
+                user_id: Some(user_id.to_string()),
+            }),
+            message: None,
+            postback: Some(EventPostback {
+                data: data.map(str::to_string),
             }),
         }
     }
@@ -5701,5 +6013,338 @@ mod tests {
             resolve_optional_text_env(Some("  カスタム文言  ".to_string()), "default"),
             "カスタム文言"
         );
+    }
+
+    // ---- validate_reset_label（Issue #61 design doc §3.3） ----
+
+    #[test]
+    fn validate_reset_label_accepts_the_default_label() {
+        assert!(validate_reset_label(DEFAULT_RESET_LABEL).is_ok());
+    }
+
+    #[test]
+    fn validate_reset_label_accepts_exactly_20_chars() {
+        let label = "あ".repeat(RESET_LABEL_MAX_CHARS);
+        assert!(validate_reset_label(&label).is_ok());
+    }
+
+    #[test]
+    fn validate_reset_label_rejects_21_chars() {
+        let label = "あ".repeat(RESET_LABEL_MAX_CHARS + 1);
+        let err = validate_reset_label(&label).expect_err("21 chars must be rejected");
+        assert!(
+            err.to_string().contains("CS_LINE_RESET_LABEL"),
+            "error must name the offending env var: {err}"
+        );
+    }
+
+    // ---- with_reset_case_quick_reply（Issue #61 design doc §3.2） ----
+
+    #[test]
+    fn with_reset_case_quick_reply_appends_to_an_empty_existing_quick_reply() {
+        let quick_reply = with_reset_case_quick_reply(None, "別の相談を始める");
+        let items = quick_reply["items"]
+            .as_array()
+            .expect("items must be a JSON array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "action");
+        assert_eq!(items[0]["action"]["type"], "postback");
+        assert_eq!(items[0]["action"]["label"], "別の相談を始める");
+        assert_eq!(items[0]["action"]["data"], RESET_CASE_POSTBACK_DATA);
+    }
+
+    #[test]
+    fn with_reset_case_quick_reply_appends_after_existing_choices() {
+        let existing = serde_json::json!({
+            "items": [
+                {"type": "action", "action": {"type": "message", "label": "A", "text": "a"}},
+            ]
+        });
+        let quick_reply = with_reset_case_quick_reply(Some(existing), "別の相談を始める");
+        let items = quick_reply["items"]
+            .as_array()
+            .expect("items must be a JSON array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["action"]["label"], "A");
+        assert_eq!(items[1]["action"]["type"], "postback");
+    }
+
+    #[test]
+    fn with_reset_case_quick_reply_drops_the_item_when_already_at_the_line_limit() {
+        // design doc §3.2: LINE の上限(13件)を超える場合は選択肢側を優先し、この項目を落とす。
+        let existing_items: Vec<serde_json::Value> = (0..LINE_QUICK_REPLY_API_MAX_ITEMS)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "action",
+                    "action": {"type": "message", "label": format!("item{i}"), "text": "x"}
+                })
+            })
+            .collect();
+        let existing = serde_json::json!({ "items": existing_items });
+        let quick_reply = with_reset_case_quick_reply(Some(existing), "別の相談を始める");
+        let items = quick_reply["items"]
+            .as_array()
+            .expect("items must be a JSON array");
+        assert_eq!(
+            items.len(),
+            LINE_QUICK_REPLY_API_MAX_ITEMS,
+            "the reset_case item must be dropped; existing choices must be unchanged and not \
+             truncated to make room for it"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| item["action"]["type"] != "postback"),
+            "no postback item must have been added when already at the limit"
+        );
+    }
+
+    #[test]
+    fn with_reset_case_quick_reply_still_appends_at_one_below_the_line_limit() {
+        let existing_items: Vec<serde_json::Value> = (0..LINE_QUICK_REPLY_API_MAX_ITEMS - 1)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "action",
+                    "action": {"type": "message", "label": format!("item{i}"), "text": "x"}
+                })
+            })
+            .collect();
+        let existing = serde_json::json!({ "items": existing_items });
+        let quick_reply = with_reset_case_quick_reply(Some(existing), "別の相談を始める");
+        let items = quick_reply["items"]
+            .as_array()
+            .expect("items must be a JSON array");
+        assert_eq!(items.len(), LINE_QUICK_REPLY_API_MAX_ITEMS);
+        assert_eq!(
+            items[LINE_QUICK_REPLY_API_MAX_ITEMS - 1]["action"]["type"],
+            "postback"
+        );
+    }
+
+    // ---- handle_event: case_reset（Issue #61 design doc §3.1） ----
+
+    /// 応答生成 API のモック: `case_reset: true` を含む 200 を返す。
+    async fn answer_api_ok_handler_with_case_reset() -> impl axum::response::IntoResponse {
+        axum::Json(serde_json::json!({
+            "reply_text": "新しいご相談ですね。",
+            "case_id": "case-new",
+            "case_reset": true,
+        }))
+    }
+
+    #[tokio::test]
+    async fn handle_event_clears_history_and_replaces_case_id_when_case_reset_is_true() {
+        let answer_api_base = spawn_http_mock(
+            Router::new().route("/reply", post(answer_api_ok_handler_with_case_reset)),
+        )
+        .await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+
+        // 事前に、切り替え前の相談の履歴と case_id を持つセッションを用意する。
+        {
+            let mut session = state.sessions.lock_session("u1").await;
+            session.case_id = Some("case-old".to_string());
+            session
+                .history
+                .push_back((Role::Customer, "エアコンの件です".to_string()));
+            session
+                .history
+                .push_back((Role::Assistant, "承知しました".to_string()));
+        }
+
+        let event = text_webhook_event("u1", "rt1", "ドアベルの件に変わります");
+        handle_event(&state, &event)
+            .await
+            .expect("handle_event must succeed when the answer api and line reply both succeed");
+
+        let (case_id, history) = state.sessions.snapshot("u1").await;
+        assert_eq!(
+            case_id,
+            Some("case-new".to_string()),
+            "case_id must be replaced with the new case from the case_reset response"
+        );
+        assert_eq!(
+            history.len(),
+            2,
+            "only this turn's customer+assistant turns must remain; the pre-switch history \
+             (2 turns) must be discarded, not appended to"
+        );
+        assert_eq!(
+            history[0],
+            (Role::Customer, "ドアベルの件に変わります".to_string()),
+            "the first remaining turn must be this turn's customer message, not a turn from \
+             the discarded pre-switch history"
+        );
+        assert_eq!(
+            history[1],
+            (Role::Assistant, "新しいご相談ですね。".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_event_keeps_prior_history_when_case_reset_is_absent() {
+        // `answer_api_ok_handler`（既存のモック）は case_reset フィールドを一切返さない。
+        // design doc §3.1: 「case_reset が無い(古いサーバ)応答は false として扱う」。
+        let answer_api_base =
+            spawn_http_mock(Router::new().route("/reply", post(answer_api_ok_handler))).await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+
+        {
+            let mut session = state.sessions.lock_session("u1").await;
+            session.case_id = Some("case-abc".to_string());
+            session
+                .history
+                .push_back((Role::Customer, "前回の質問".to_string()));
+            session
+                .history
+                .push_back((Role::Assistant, "前回の回答".to_string()));
+        }
+
+        let event = text_webhook_event("u1", "rt1", "続きの質問です");
+        handle_event(&state, &event)
+            .await
+            .expect("handle_event must succeed when the answer api and line reply both succeed");
+
+        let (_, history) = state.sessions.snapshot("u1").await;
+        assert_eq!(
+            history.len(),
+            4,
+            "without case_reset, the prior history (2 turns) must be kept and this turn's \
+             2 turns appended to it, not replaced"
+        );
+        assert_eq!(history[0], (Role::Customer, "前回の質問".to_string()));
+        assert_eq!(history[2], (Role::Customer, "続きの質問です".to_string()));
+    }
+
+    async fn answer_api_ok_handler_with_case_reset_false() -> impl axum::response::IntoResponse {
+        axum::Json(serde_json::json!({
+            "reply_text": "続きですね。",
+            "case_id": "case-abc",
+            "case_reset": false,
+        }))
+    }
+
+    #[tokio::test]
+    async fn handle_event_keeps_prior_history_when_case_reset_is_explicitly_false() {
+        let answer_api_base = spawn_http_mock(
+            Router::new().route("/reply", post(answer_api_ok_handler_with_case_reset_false)),
+        )
+        .await;
+        let line_ok_base =
+            spawn_http_mock(Router::new().route("/reply", post(|| async { StatusCode::OK }))).await;
+        let state = test_app_state(
+            format!("{answer_api_base}/reply"),
+            format!("{line_ok_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+
+        {
+            let mut session = state.sessions.lock_session("u1").await;
+            session.case_id = Some("case-abc".to_string());
+            session
+                .history
+                .push_back((Role::Customer, "前回の質問".to_string()));
+            session
+                .history
+                .push_back((Role::Assistant, "前回の回答".to_string()));
+        }
+
+        let event = text_webhook_event("u1", "rt1", "続きの質問です");
+        handle_event(&state, &event)
+            .await
+            .expect("handle_event must succeed when the answer api and line reply both succeed");
+
+        let (case_id, history) = state.sessions.snapshot("u1").await;
+        assert_eq!(case_id, Some("case-abc".to_string()));
+        assert_eq!(
+            history.len(),
+            4,
+            "an explicit case_reset=false must keep the prior history and append this turn"
+        );
+        assert_eq!(history[0], (Role::Customer, "前回の質問".to_string()));
+    }
+
+    // ---- handle_event: postback（Issue #61 design doc §3.2） ----
+
+    #[tokio::test]
+    async fn handle_event_resets_the_session_and_replies_with_the_fixed_text_on_reset_case_postback(
+    ) {
+        // 応答生成 API を到達不能なアドレスに向け、呼ばれたら必ず失敗することを保証する
+        // (design doc §3.2「ポストバックはサーバを呼ばない」の直接確認)。
+        let captured = Arc::new(Mutex::new(CapturedLineReplyBody::default()));
+        let line_router = Router::new()
+            .route("/reply", post(line_reply_capture_handler))
+            .with_state(captured.clone());
+        let line_base = spawn_http_mock(line_router).await;
+        let state = test_app_state(
+            "http://127.0.0.1:1/unreachable-answer-api".to_string(),
+            format!("{line_base}/reply"),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+
+        {
+            let mut session = state.sessions.lock_session("u1").await;
+            session.case_id = Some("case-old".to_string());
+            session
+                .history
+                .push_back((Role::Customer, "前回の質問".to_string()));
+        }
+
+        let event = postback_webhook_event("u1", "rt1", Some(RESET_CASE_POSTBACK_DATA));
+        handle_event(&state, &event)
+            .await
+            .expect("handle_event must succeed: resetting a session never calls the answer api");
+
+        let (case_id, history) = state.sessions.snapshot("u1").await;
+        assert_eq!(case_id, None, "the session's case_id must be cleared");
+        assert!(history.is_empty(), "the session's history must be cleared");
+
+        let captured = captured.lock().unwrap().clone();
+        let body = captured.body.as_ref().unwrap();
+        assert_eq!(body["messages"][0]["text"], DEFAULT_RESET_TEXT);
+    }
+
+    #[tokio::test]
+    async fn handle_event_ignores_an_unrecognized_postback_without_touching_the_session() {
+        let state = test_app_state(
+            "http://127.0.0.1:1/unreachable-answer-api".to_string(),
+            "http://127.0.0.1:1/unreachable-line-reply-api".to_string(),
+            UNREACHABLE_LOADING_API_URL.to_string(),
+        );
+
+        {
+            let mut session = state.sessions.lock_session("u1").await;
+            session.case_id = Some("case-old".to_string());
+            session
+                .history
+                .push_back((Role::Customer, "前回の質問".to_string()));
+        }
+
+        let event = postback_webhook_event("u1", "rt1", Some("action=unknown_thing"));
+        let result = handle_event(&state, &event).await;
+        assert!(
+            result.is_ok(),
+            "an unrecognized postback must be ignored (no line reply attempt, so no error path)"
+        );
+
+        let (case_id, history) = state.sessions.snapshot("u1").await;
+        assert_eq!(
+            case_id,
+            Some("case-old".to_string()),
+            "the session must be untouched by an unrecognized postback"
+        );
+        assert_eq!(history.len(), 1);
     }
 }

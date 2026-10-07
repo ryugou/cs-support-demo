@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod authn;
+pub mod case_switch;
 pub mod clarify;
 pub mod correction;
 pub mod decision;
@@ -537,7 +538,10 @@ fn filter_out_of_scope_hits(
 /// `match` に `_ =>` のワイルドカードを使わない: `ExtractionMode` に将来バリアントが増えたとき、
 /// 網羅性検査でコンパイルエラーにして「新しいモードで product_references を採用してよいか」の
 /// 再検討をこの関数の変更者に強制するため。
-fn adopt_product_references_for_extraction_mode(
+///
+/// Issue #61: `/api/reply` の製品切り替え検知も、この関数を適用した後の参照で判定する
+/// （`evaluate()` が採用しない参照で case を切り替えないため）。そのため `pub(crate)`。
+pub(crate) fn adopt_product_references_for_extraction_mode(
     extraction_mode: extraction::ExtractionMode,
     product_references: Vec<product_gate::ProductReference>,
 ) -> (Vec<product_gate::ProductReference>, usize) {
@@ -548,6 +552,15 @@ fn adopt_product_references_for_extraction_mode(
             (Vec::new(), discarded)
         }
     }
+}
+
+/// 製品切り替え検知（Issue #61）が読む、旧 case の属性。空文字は「無い」を表す。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaseSwitchContext {
+    /// `product_models`（CSV）。
+    pub product_models: String,
+    /// `end_user_id`。切り替え時に新 case へ継承する（design doc §2.3 手順1）。
+    pub end_user_id: String,
 }
 
 /// `Harness::evaluate()` に渡された case_id が既存 case として解決できなかった場合の挙動。
@@ -977,6 +990,132 @@ impl Harness {
         }
     }
 
+    /// Issue #61 design doc §2.1〜§2.3: 製品切り替えの検知に必要な case の属性
+    /// （`product_models` と `end_user_id`）だけを 1 回の読み取りで得る（read-only。書き込みは
+    /// 行わない）。case 未存在・属性未設定のいずれも空文字として扱う
+    /// （`product_models` の空は design doc §2.1「まだ確定した型番が無い」）。
+    pub async fn load_case_switch_context(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+    ) -> Result<CaseSwitchContext> {
+        let attrs = self.knowledge()?.load_case(&ctx.schema, case_id).await?;
+        let attr = |key: &str| {
+            attrs
+                .as_ref()
+                .and_then(|a| a.get(key).cloned())
+                .unwrap_or_default()
+        };
+        Ok(CaseSwitchContext {
+            product_models: attr("product_models"),
+            end_user_id: attr("end_user_id"),
+        })
+    }
+
+    /// Issue #61 design doc §2.3 手順1・4: 製品切り替えが検知されたターンに、新しく作られた
+    /// case（`new_case_id`。`evaluate()` が `UnknownCaseIdPolicy` とは無関係に `case_id: None`
+    /// で呼ばれたときに作る新規 case）へ `previous_case_id` 属性を書き戻し（read-merge-write）、
+    /// 切り替えの監査イベントを 1 件記録する。呼び出し元（`api.rs::reply_handler`）は
+    /// `evaluate()` が新 case を作って返した**後**に呼ぶこと（`new_case_id` が存在することを
+    /// 前提にする）。
+    ///
+    /// 書き込み・監査のいずれかが失敗しても応答自体は失敗させない（`record_out_of_scope_case`
+    /// と同じ「ターン欠落より応答継続を優先する」設計判断）。失敗は握りつぶさず
+    /// `tracing::error!` に残す。
+    ///
+    /// 発話本文は記録しない（design doc §2.3 手順4）。監査には旧 case_id・新 case_id・理由
+    /// （`product_switch`）・旧 case の `product_models`・今ターンの `Matched` 型番だけを積む
+    /// （`message` / `question` はこのメソッドの引数に無く、渡す経路自体が存在しない）。
+    pub async fn record_case_switch(
+        &self,
+        ctx: &RequestContext,
+        previous_case_id: &str,
+        new_case_id: &str,
+        previous_product_models: &str,
+        matched_models: &[String],
+    ) {
+        // 属性書き込みと監査は独立に試行する（片方の失敗でもう片方を飛ばさない）。
+        // 書き込み失敗時も「切り替えが起きた」事実は監査に残す必要がある。
+        if let Err(err) = self
+            .write_previous_case_id(ctx, previous_case_id, new_case_id)
+            .await
+        {
+            tracing::error!(
+                error = ?err,
+                request_id = %ctx.request_id,
+                schema = %ctx.schema,
+                previous_case_id,
+                new_case_id,
+                "failed to write the previous_case_id attribute for a case switch; the customer \
+                 still received a response under the new case_id, but the new case has no link \
+                 to the old one — investigate vegapunk/knowledge connectivity (the audit event \
+                 is attempted independently)"
+            );
+        }
+        let fields = case_switch_audit_fields(
+            &ctx.schema,
+            previous_case_id,
+            new_case_id,
+            previous_product_models,
+            matched_models,
+        );
+        if let Err(err) = self
+            .audit_with_nodes(
+                ctx,
+                fields.decision,
+                None,
+                fields.governing_norm_ids,
+                fields.retrieved_node_ids,
+                None,
+            )
+            .await
+        {
+            tracing::error!(
+                error = ?err,
+                request_id = %ctx.request_id,
+                schema = %ctx.schema,
+                previous_case_id,
+                new_case_id,
+                "failed to append the case switch audit event; the customer still received a \
+                 response, but this switch has NO audit record. If this failure originated in \
+                 the WORM audit write step (see error field), the in-process WORM audit log is \
+                 now poisoned and every subsequent audit append will be refused until the \
+                 process restarts"
+            );
+        }
+    }
+
+    /// 新 case（`new_case_id`）のみへ `previous_case_id` を read-merge-write する。旧 case には
+    /// 一切書き込まない（design doc §4）。
+    async fn write_previous_case_id(
+        &self,
+        ctx: &RequestContext,
+        previous_case_id: &str,
+        new_case_id: &str,
+    ) -> Result<()> {
+        let knowledge = self.knowledge()?;
+        let existing = knowledge
+            .load_case(&ctx.schema, new_case_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "record_case_switch: new case {new_case_id} not found in schema {}; \
+                     evaluate() must create the case before this method is called",
+                    ctx.schema
+                )
+            })?;
+        let merged = merge_case_switch_attributes(&existing, previous_case_id);
+        knowledge
+            .record(
+                &ctx.schema,
+                "support_case",
+                new_case_id,
+                merged.into_iter().collect(),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// record_answer_outcome の本体（遵守事項 3）。attempt の存在検証 → outcome の
     /// write-once 強制 → outcome 記録 → KR 紐づけ（サーバ記録）があれば grade 更新、を
     /// grade_lock の同一クリティカルセクションで行う（重複加算・TOCTOU を封鎖）。
@@ -1232,6 +1371,13 @@ impl Harness {
         // 箇所が明示的に渡す（既定値は無い）。design doc
         // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2 の表を参照。
         policy: ReplyDraftPolicy<'_>,
+        // Issue #61: 呼び出し元が同じ発話・同じ取扱一覧で抽出済みの結果（signal + **生の**
+        // 製品参照）。`Some` なら内部の抽出（LLM 呼び出し）を一切行わずこの値を使う
+        // （1 ターンの抽出を 1 回に保つ）。`None` なら従来どおり内部で抽出する。`Some` でも
+        // 製品参照の採用可否（`adopt_product_references_for_extraction_mode`）は内部抽出と同じく
+        // ここで 1 度だけ適用する（呼び出し元の切り替え判定は同じ関数を別のコピーに適用するだけで、
+        // 渡す値は生のまま）。
+        supplied_extraction: Option<extraction::TurnExtraction>,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
@@ -1280,7 +1426,8 @@ impl Harness {
         // 波及することはない。
         let (resolutions, (extraction_outcome, product_references)) = tokio::join!(
             knowledge.load_known_resolutions_with(&ctx.schema, &live_snapshot),
-            extraction::extract_signals_and_product_references(
+            extraction::resolve_turn_extraction(
+                supplied_extraction,
                 self.extractor.as_ref(),
                 &self.product_reference_extractor,
                 question,
@@ -1583,6 +1730,29 @@ impl Harness {
         case_attrs.insert("last_kr_id".to_string(), case_kr_id);
         case_attrs.insert("last_evidence_keys".to_string(), last_evidence_keys);
         case_attrs.insert("last_evidence_kind".to_string(), last_evidence_kind);
+        // Issue #61 design doc §2.1: ターンごとに、今ターンの product_references のうち
+        // resolution == Matched の matched_model を product_models（CSV、辞書順）へ加算する。
+        // Foreign / Ambiguous は加えない（design doc §2.1。`product_models` は切り替えの検知
+        // 入力にのみ使い、回答可否の判定には使わない — design doc §4 不変条件）。
+        // この `evaluate()` の呼び出し元は `api.rs`（/api/reply）、`rmcp_server.rs`
+        // （MCP evaluate_answerability）、`advisor/cs_support.rs`（homesec アドバイザーの
+        // CS 連携モード。support schema に対して呼ぶ）の 3 つ。どの経路でも `product_models` は
+        // 書き戻されるが、切り替えの自動検知は `api.rs::reply_handler` にしか無いため、
+        // MCP 経路・アドバイザー経路の入出力・判定は変わらない（design doc §1 末尾）。
+        let existing_product_models = case_attrs
+            .get("product_models")
+            .cloned()
+            .unwrap_or_default();
+        // 解決（allowlist の一覧表記への正規化）は resolve_matched_models の1か所に集約する
+        // （design doc §2.1 末尾）。本関数の冒頭で取得済みの `allowlist` を
+        // 再利用する。未解決の警告は /api/reply と MCP の両経路で毎ターン通るここで 1 回だけ出す
+        // （api.rs::judge_product_switch はログを出さない側を使う）。
+        let resolved_matched_models =
+            case_switch::resolve_matched_models(&allowlist, &product_references);
+        case_attrs.insert(
+            "product_models".to_string(),
+            case_switch::merge_product_models(&existing_product_models, &resolved_matched_models),
+        );
         knowledge
             .record(
                 &ctx.schema,
@@ -2238,6 +2408,50 @@ fn merge_out_of_scope_demotion_attributes(
         knowledge::signals_to_csv(&excluded),
     );
     merged
+}
+
+/// Issue #61 design doc §2.3 手順1: 新しく作られた case の既存属性（`existing`。`evaluate()`
+/// がこの直前に書き込んだ `product_models` / `last_decision` 等を含む）を土台に、
+/// `previous_case_id`（旧 case の case_id）だけを重ねる read-merge-write（
+/// `merge_conv_state_attributes` / `merge_out_of_scope_demotion_attributes` と同じ形。
+/// vegapunk の `UpsertNodes` は全置換のため、部分送信は既存属性を消す）。
+fn merge_case_switch_attributes(
+    existing: &std::collections::HashMap<String, String>,
+    previous_case_id: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = existing.clone();
+    merged.insert("previous_case_id".to_string(), previous_case_id.to_string());
+    merged
+}
+
+/// case 切り替え監査（Issue #61 design doc §2.3 手順4）に積む内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaseSwitchAuditFields {
+    decision: String,
+    governing_norm_ids: Vec<String>,
+    retrieved_node_ids: Vec<String>,
+}
+
+/// 監査内容の組み立て。引数に発話本文（message / question）が存在しないことが「発話を
+/// 記録しない」ことの構造的保証になる。
+fn case_switch_audit_fields(
+    schema: &str,
+    previous_case_id: &str,
+    new_case_id: &str,
+    previous_product_models: &str,
+    matched_models: &[String],
+) -> CaseSwitchAuditFields {
+    CaseSwitchAuditFields {
+        decision: "case_switch:product_switch".to_string(),
+        governing_norm_ids: vec![
+            format!("previous_product_models={previous_product_models}"),
+            format!("matched_models={}", matched_models.join(",")),
+        ],
+        retrieved_node_ids: vec![
+            knowledge::harness_node_id(schema, "support_case", previous_case_id),
+            knowledge::harness_node_id(schema, "support_case", new_case_id),
+        ],
+    }
 }
 
 #[cfg(test)]
@@ -4215,6 +4429,140 @@ mod tests {
             merged.get("excluded_signals").map(String::as_str),
             Some("mold")
         );
+    }
+
+    // ---- merge_case_switch_attributes（Issue #61 design doc §2.3 手順1） ----
+
+    #[test]
+    fn merge_case_switch_attributes_preserves_unrelated_existing_attributes() {
+        let existing: std::collections::HashMap<String, String> = [
+            ("case_id".to_string(), "case-new".to_string()),
+            ("product_models".to_string(), "ADC-V523".to_string()),
+            ("question".to_string(), "エアコンの調子が悪い".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_case_switch_attributes(&existing, "case-old");
+        assert_eq!(
+            merged.get("previous_case_id").map(String::as_str),
+            Some("case-old")
+        );
+        assert_eq!(
+            merged.get("product_models").map(String::as_str),
+            Some("ADC-V523")
+        );
+        assert_eq!(merged.get("case_id").map(String::as_str), Some("case-new"));
+        assert_eq!(
+            merged.get("question").map(String::as_str),
+            Some("エアコンの調子が悪い")
+        );
+    }
+
+    #[test]
+    fn merge_case_switch_attributes_overwrites_an_existing_previous_case_id() {
+        // previous_case_id は「直前の旧 case」を指す加算属性。複数回切り替わった場合は
+        // 最新の切り替え元で上書きする(連鎖を1段だけ保つ設計。design doc は多段の連鎖を
+        // 要求していない)。
+        let existing: std::collections::HashMap<String, String> =
+            [("previous_case_id".to_string(), "case-older".to_string())]
+                .into_iter()
+                .collect();
+        let merged = merge_case_switch_attributes(&existing, "case-old");
+        assert_eq!(
+            merged.get("previous_case_id").map(String::as_str),
+            Some("case-old")
+        );
+    }
+
+    // ---- case_switch_audit_fields / record_case_switch（Issue #61 design doc §2.3 手順4） ----
+
+    const SWITCH_UTTERANCE: &str = "ADC-V523の電源が入りません";
+
+    fn switch_fields() -> CaseSwitchAuditFields {
+        case_switch_audit_fields(
+            "urtect",
+            "case-old",
+            "case-new",
+            "ADC-V724",
+            &["ADC-V523".to_string(), "ADC-V525".to_string()],
+        )
+    }
+
+    #[test]
+    fn case_switch_audit_fields_label_carries_the_product_switch_reason() {
+        assert_eq!(switch_fields().decision, "case_switch:product_switch");
+    }
+
+    #[test]
+    fn case_switch_audit_fields_reference_both_old_and_new_case_nodes() {
+        let fields = switch_fields();
+        assert_eq!(
+            fields.retrieved_node_ids,
+            vec![
+                knowledge::harness_node_id("urtect", "support_case", "case-old"),
+                knowledge::harness_node_id("urtect", "support_case", "case-new"),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_switch_audit_fields_record_previous_and_matched_models() {
+        let fields = switch_fields();
+        assert!(fields
+            .governing_norm_ids
+            .contains(&"previous_product_models=ADC-V724".to_string()));
+        assert!(fields
+            .governing_norm_ids
+            .contains(&"matched_models=ADC-V523,ADC-V525".to_string()));
+    }
+
+    #[test]
+    fn case_switch_audit_fields_never_contain_the_customer_utterance() {
+        // 発話は関数の引数に存在しない（構造的保証）。出力のどこにも現れないことの回帰。
+        let fields = switch_fields();
+        let all = format!(
+            "{} {:?} {:?}",
+            fields.decision, fields.governing_norm_ids, fields.retrieved_node_ids
+        );
+        assert!(!all.contains(SWITCH_UTTERANCE));
+        assert!(!all.contains("電源"));
+    }
+
+    /// knowledge が None（vegapunk 無し）で `previous_case_id` 書き込みが失敗しても、
+    /// 監査は独立に 1 件だけ追記され、発話本文は含まれない。
+    #[tokio::test]
+    async fn record_case_switch_appends_exactly_one_audit_even_when_attribute_write_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("harness-switch-audit-{}", uuid::Uuid::new_v4()));
+        let harness = Harness {
+            worm: Arc::new(audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap()),
+            ..harness_for_test()
+        };
+        assert!(harness.knowledge.is_none());
+        let ctx = harness
+            .begin(
+                &test_identity(),
+                "sivira-cs-demo",
+                crate::config::ManualSchemaKind::LegacySection,
+            )
+            .expect("begin");
+
+        harness
+            .record_case_switch(
+                &ctx,
+                "case-old",
+                "case-new",
+                "ADC-V724",
+                &["ADC-V523".to_string()],
+            )
+            .await;
+
+        let body = std::fs::read_to_string(dir.join("audit.jsonl")).expect("read worm log");
+        assert_eq!(body.lines().count(), 1);
+        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+        assert_eq!(line["decision"], "case_switch:product_switch");
+        assert!(!body.contains(SWITCH_UTTERANCE));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- require_existing_case_attrs（Warning 2 の回帰防止） ----

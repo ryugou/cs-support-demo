@@ -695,6 +695,8 @@ impl CsSupportRmcpServer {
                 // 取次時も含め常に生成する（design doc
                 // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。
                 ReplyDraftPolicy::Always,
+                // Issue #61: MCP 経路は製品切り替え検知を行わないので抽出済みの値は無い（内部で抽出）。
+                None,
             )
             .await
             .map_err(to_error)?;

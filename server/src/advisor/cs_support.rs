@@ -241,6 +241,9 @@ pub async fn run_support_turn(
             ReplyDraftPolicy::SkipWhenUnused {
                 response_allowlist: &allowlist,
             },
+            // Issue #61: アドバイザー経路は製品切り替え検知を行わないので抽出済みの値は無い
+            // （内部で抽出する）。
+            None,
         )
         .await?;
 
