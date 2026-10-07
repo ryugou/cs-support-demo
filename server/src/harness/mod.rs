@@ -8,6 +8,7 @@ pub mod egress;
 pub mod escalation_reply;
 pub mod extraction;
 pub mod grading;
+pub mod handoff_items;
 pub mod hours;
 pub mod knowledge;
 pub mod product_gate;
@@ -597,8 +598,15 @@ pub enum ReplyDraftPolicy<'a> {
     /// `response_allowlist` は、応答側が二段目ゲート（取扱外製品の打ち切り）に渡すのと同じ
     /// allowlist。事前判定を応答側と同じ入力で行い、両者の判定を必ず一致させるために呼び出し側が
     /// 渡す（`evaluate` 内で取得した allowlist は事前判定に使わない）。
+    ///
+    /// `already_escalated` は、この case が既に取次済み（`CaseConvState::is_already_escalated()`）
+    /// かどうか（design doc `2026-10-07-partial-answer-with-handoff-design.md` §3.1・§3.6）。
+    /// 取次済みの case では部分回答の下書き（`handoff_items::can_draft_partial_answer`）を
+    /// 試みない。呼び出し側（`api.rs`）は `evaluate()` を呼ぶ前に、同じ case の会話状態から
+    /// 計算して渡す。
     SkipWhenUnused {
         response_allowlist: &'a product_gate::ProductAllowlist,
+        already_escalated: bool,
     },
 }
 
@@ -614,7 +622,9 @@ fn second_stage_short_circuits(
 ) -> bool {
     match policy {
         ReplyDraftPolicy::Always => false,
-        ReplyDraftPolicy::SkipWhenUnused { response_allowlist } => {
+        ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist, ..
+        } => {
             // ログを出さない版を使う。veto の警告は応答側の判定で 1 回だけ出す。
             product_gate::find_confirmed_foreign_reference(
                 product_references,
@@ -629,7 +639,8 @@ fn second_stage_short_circuits(
 
 /// `policy` と確定した `decision`・抽出モード・二段目ゲートが打ち切るかどうか
 /// （`second_stage_short_circuits`）から、`Harness::draft_customer_reply` を呼ぶかどうかを決める
-/// 純関数（Issue #78, #83）。`evaluate` 本体から切り出してあるのは、`harness_for_test()` が
+/// 純関数（Issue #78, #83）。`partial_answer_ok`（部分回答の可否）は Escalate の省略だけを緩める。
+/// `evaluate` 本体から切り出してあるのは、`harness_for_test()` が
 /// `knowledge: None` で構築されており `evaluate()` 自体を通すテストの土台が無いため
 /// （design doc §4）。
 pub fn should_draft_reply(
@@ -637,17 +648,67 @@ pub fn should_draft_reply(
     decision: &decision::AnswerDecision,
     extraction_mode: extraction::ExtractionMode,
     second_stage_short_circuits: bool,
+    partial_answer_ok: bool,
 ) -> bool {
     match policy {
         ReplyDraftPolicy::Always => true,
         ReplyDraftPolicy::SkipWhenUnused { .. } => {
-            let is_escalate = matches!(decision, decision::AnswerDecision::Escalate { .. });
+            let is_allowed = matches!(decision, decision::AnswerDecision::Allowed { .. });
             let is_forced_escalation_by_extraction_failure =
                 extraction_mode == extraction::ExtractionMode::LexiconFallback;
-            !(is_escalate
-                || is_forced_escalation_by_extraction_failure
-                || second_stage_short_circuits)
+            // 部分回答（`partial_answer_ok`）が緩めるのは「Escalate のときは生成しない」だけ。
+            // LexiconFallback（api.rs が判定によらず取次へ倒す）と二段目ゲートの打ち切り
+            // （応答側が evaluate 結果を捨てる）による省略は、部分回答でも残す。
+            !(is_forced_escalation_by_extraction_failure || second_stage_short_circuits)
+                && (is_allowed || partial_answer_ok)
         }
+    }
+}
+
+/// 下書きを生成するか・部分回答モードか、をまとめて決めた結果（design doc §3.1・§3.6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplyDraftPlan {
+    generate: bool,
+    partial_answer_ok: bool,
+}
+
+/// `evaluate()` の下書き計画（`already_escalated` の取り出し → 部分回答の可否 →
+/// `should_draft_reply`）を 1 か所にまとめた純関数。テストも同じ関数を呼ぶことで、本番側の
+/// 合成が退行（`already_escalated` の取り損ね、`draft_generation_enabled` の固定値化等）
+/// したときにテストが落ちるようにする。
+/// `Always`（MCP）は取次済みという概念が無いので `already_escalated` を `false` として扱う。
+fn plan_reply_draft(
+    policy: &ReplyDraftPolicy<'_>,
+    decision: &decision::AnswerDecision,
+    extraction_mode: extraction::ExtractionMode,
+    second_stage_short_circuits: bool,
+    best_manual_score: Option<f32>,
+    thresholds: &decision::Thresholds,
+    draft_generation_enabled: bool,
+) -> ReplyDraftPlan {
+    let already_escalated = match policy {
+        ReplyDraftPolicy::Always => false,
+        ReplyDraftPolicy::SkipWhenUnused {
+            already_escalated, ..
+        } => *already_escalated,
+    };
+    let partial_answer_ok = handoff_items::can_draft_partial_answer(
+        decision,
+        best_manual_score,
+        thresholds,
+        already_escalated,
+        draft_generation_enabled,
+    );
+    let generate = should_draft_reply(
+        policy,
+        decision,
+        extraction_mode,
+        second_stage_short_circuits,
+        partial_answer_ok,
+    );
+    ReplyDraftPlan {
+        generate,
+        partial_answer_ok,
     }
 }
 
@@ -1671,6 +1732,20 @@ impl Harness {
             thresholds: &self.thresholds,
             default_route: &self.default_route,
         });
+        // design doc `2026-10-07-partial-answer-with-handoff-design.md` §2・§3.1: 取り次ぐ項目
+        // （customer_label の列）を、マッチした第1層ルールの `condition` / 第2層禁止領域の
+        // `domain_signals` から導出する。**`decide()` 自体は変更しない。** `decide()` が内部で
+        // 使ったのと同一の入力（`rules`/`domains`, `accumulated`, `question`）で照合し直すだけ。
+        // layer=1 はマッチした**全**ルールの和集合（`match_layer1` は 1 件しか返さず、他ルールの
+        // 話題が材料から答えられてしまうため）。layer=3 と Allowed は空。
+        let handoff_items = handoff_items::handoff_items_for_decision(
+            &decision_result,
+            &rules,
+            &domains,
+            &accumulated,
+            question,
+            &self.lexicon,
+        );
         // [観測] Issue #79: 第1層の取次で、宣言された customer_ack が複数ルールのマッチにより
         // 使われなかったことを観測できるようにする。下書き生成方針（policy）とは独立に出す。
         // 発話本文・signal の値・宣言文の本文は出力しない
@@ -1840,21 +1915,63 @@ impl Harness {
         // `allowlist` は使わない（キャッシュ更新をまたいで別スナップショットになると、事前判定と
         // 応答側の判定がずれるため）。
         let short_circuits = second_stage_short_circuits(&policy, &product_references, question);
-        let reply_draft =
-            if should_draft_reply(&policy, &decision_result, extraction_mode, short_circuits) {
-                self.draft_customer_reply(
-                    question,
-                    &decision_result,
-                    &section_hits,
-                    &resolutions,
-                    history,
-                    is_continuation,
-                    &allowlist,
-                )
-                .await
-            } else {
-                None
-            };
+        // design doc `2026-10-07-partial-answer-with-handoff-design.md` §3.1・§3.6: 取次
+        // （Escalate）のターンでも、§3.1 の条件をすべて満たすときは部分回答の下書きを試みる。
+        // `Always`（MCP）は取次済みという概念が無いので第3条件（`already_escalated`）を無視する
+        // （`false` 固定）。
+        let ReplyDraftPlan {
+            generate,
+            partial_answer_ok,
+        } = plan_reply_draft(
+            &policy,
+            &decision_result,
+            extraction_mode,
+            short_circuits,
+            best_manual_score,
+            &self.thresholds,
+            self.reply_drafter.is_some(),
+        );
+        let reply_draft = if generate {
+            self.draft_customer_reply(
+                question,
+                &decision_result,
+                &section_hits,
+                &resolutions,
+                history,
+                is_continuation,
+                &allowlist,
+                &handoff_items,
+                partial_answer_ok,
+            )
+            .await
+        } else {
+            None
+        };
+        // 採否は `handoff_items::accept_draft`: NO_ANSWER トークンは全下書きで不採用、design doc
+        // §3.5(2〜4) の歯止めは部分回答の下書き（`partial_answer_ok`。常に Escalate のときだけ
+        // true）にだけ適用する。1番（egress gate / 取扱外型番ゲート）は
+        // `draft_customer_reply` 内部（egress_gate）・呼び出し側（`api.rs` /
+        // `advisor/cs_support.rs` の `gate_customer_reply_draft`）で既に適用済みなので対象外。
+        let reply_draft = match reply_draft {
+            Some(draft) => {
+                match handoff_items::accept_draft(&draft.text, partial_answer_ok, &handoff_items) {
+                    Ok(()) => Some(draft),
+                    Err(reason) => {
+                        tracing::warn!(
+                            request_id = %ctx.request_id,
+                            case_id = %case_id,
+                            partial_answer = partial_answer_ok,
+                            reason = %reason,
+                            "draft rejected (NO_ANSWER token, or a partial answer handoff \
+                             safeguard); discarding the draft (customer_reply_draft = null). \
+                             The customer utterance and draft text are not logged"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
         let customer_reply_draft = reply_draft.map(|d| d.text);
 
@@ -1892,6 +2009,15 @@ impl Harness {
     ///
     /// `is_continuation` は `evaluate()` から素通しされる会話段階フラグ（判定はサーバ側が
     /// コードで行う。`reply::build_reply_system_prompt` の doc を参照）。
+    ///
+    /// `handoff_items` は取り次ぐ項目のラベル列（design doc
+    /// `2026-10-07-partial-answer-with-handoff-design.md` §2・§3.2）。`decision` が `Allowed`
+    /// のときは呼び出し側（`evaluate()`）が常に空配列を渡す。
+    ///
+    /// `partial_answer_ok` は design doc 同 §3.1 の部分回答の条件
+    /// （`handoff_items::can_draft_partial_answer`）の判定結果。`evaluate()` が判定済みの値を
+    /// そのまま渡す（ここでは再計算しない）。`decision` が `Allowed` のときは
+    /// `reply::build_reply_brief_with_resolution` 側で無視される。
     #[allow(clippy::too_many_arguments)]
     async fn draft_customer_reply(
         &self,
@@ -1902,6 +2028,8 @@ impl Harness {
         history: &[reply::ReplyHistoryTurn],
         is_continuation: bool,
         allowlist: &product_gate::ProductAllowlist,
+        handoff_items: &[String],
+        partial_answer_ok: bool,
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
         // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
@@ -1917,9 +2045,11 @@ impl Harness {
                 .map(|kr| kr.answer.as_str()),
             _ => None,
         };
-        let brief = reply::build_reply_brief_with_resolution(decision, hits, kr_answer);
-        let system = reply::build_reply_system_prompt(&brief, is_continuation, allowlist);
-        let user = reply::build_reply_user_message(question, &brief, history);
+        let brief =
+            reply::build_reply_brief_with_resolution(decision, hits, kr_answer, partial_answer_ok);
+        let system =
+            reply::build_reply_system_prompt(&brief, is_continuation, allowlist, handoff_items);
+        let user = reply::build_reply_user_message(question, &brief, history, handoff_items);
         let draft = match drafter
             .draft_reply(
                 &system,
@@ -2554,7 +2684,8 @@ mod tests {
         let refs = vec![foreign_reference("ADC-VDB101")];
         assert!(second_stage_short_circuits(
             &ReplyDraftPolicy::SkipWhenUnused {
-                response_allowlist: &allow
+                response_allowlist: &allow,
+                already_escalated: false,
             },
             &refs,
             "ADC-VDB101について教えてください"
@@ -2572,7 +2703,8 @@ mod tests {
         let refs = vec![foreign_reference("ADC-VDB101")];
         assert!(!second_stage_short_circuits(
             &ReplyDraftPolicy::SkipWhenUnused {
-                response_allowlist: &allow_with_it
+                response_allowlist: &allow_with_it,
+                already_escalated: false,
             },
             &refs,
             "ADC-VDB101について教えてください"
@@ -2593,6 +2725,7 @@ mod tests {
             second_stage_short_circuits(
                 &ReplyDraftPolicy::SkipWhenUnused {
                     response_allowlist: &allow,
+                    already_escalated: false,
                 },
                 &refs,
                 "ADC-VDB101について教えてください",
@@ -2634,13 +2767,14 @@ mod tests {
         let allow = response_allowlist_fixture();
         let skip = ReplyDraftPolicy::SkipWhenUnused {
             response_allowlist: &allow,
+            already_escalated: false,
         };
         let decision =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
         for mode in all_extraction_modes() {
             for short_circuits in [false, true] {
                 assert!(
-                    !should_draft_reply(&skip, &decision, mode, short_circuits),
+                    !should_draft_reply(&skip, &decision, mode, short_circuits, false),
                     "Escalate must not draft under SkipWhenUnused \
                      (mode={mode:?}, second_stage={short_circuits})"
                 );
@@ -2653,6 +2787,7 @@ mod tests {
         let allow = response_allowlist_fixture();
         let skip = ReplyDraftPolicy::SkipWhenUnused {
             response_allowlist: &allow,
+            already_escalated: false,
         };
         for short_circuits in [false, true] {
             assert!(
@@ -2660,7 +2795,8 @@ mod tests {
                     &skip,
                     &allowed_decision(),
                     extraction::ExtractionMode::LexiconFallback,
-                    short_circuits
+                    short_circuits,
+                    false
                 ),
                 "second_stage={short_circuits}"
             );
@@ -2673,10 +2809,11 @@ mod tests {
         let allow = response_allowlist_fixture();
         let skip = ReplyDraftPolicy::SkipWhenUnused {
             response_allowlist: &allow,
+            already_escalated: false,
         };
         for mode in all_extraction_modes() {
             assert!(
-                !should_draft_reply(&skip, &allowed_decision(), mode, true),
+                !should_draft_reply(&skip, &allowed_decision(), mode, true, false),
                 "second-stage gate discards the evaluate() outcome, so no draft (mode={mode:?})"
             );
         }
@@ -2688,13 +2825,14 @@ mod tests {
         let allow = response_allowlist_fixture();
         let skip = ReplyDraftPolicy::SkipWhenUnused {
             response_allowlist: &allow,
+            already_escalated: false,
         };
         for mode in all_extraction_modes()
             .into_iter()
             .filter(|m| *m != extraction::ExtractionMode::LexiconFallback)
         {
             assert!(
-                should_draft_reply(&skip, &allowed_decision(), mode, false),
+                should_draft_reply(&skip, &allowed_decision(), mode, false, false),
                 "Allowed must draft under SkipWhenUnused (mode={mode:?})"
             );
         }
@@ -2707,7 +2845,13 @@ mod tests {
         for mode in all_extraction_modes() {
             for short_circuits in [false, true] {
                 assert!(
-                    should_draft_reply(&ReplyDraftPolicy::Always, &escalate, mode, short_circuits),
+                    should_draft_reply(
+                        &ReplyDraftPolicy::Always,
+                        &escalate,
+                        mode,
+                        short_circuits,
+                        false
+                    ),
                     "Always must draft on Escalate (mode={mode:?}, second_stage={short_circuits})"
                 );
                 assert!(
@@ -2715,12 +2859,229 @@ mod tests {
                         &ReplyDraftPolicy::Always,
                         &allowed_decision(),
                         mode,
-                        short_circuits
+                        short_circuits,
+                        false
                     ),
                     "Always must draft on Allowed (mode={mode:?}, second_stage={short_circuits})"
                 );
             }
         }
+    }
+
+    fn skip_policy_gate(
+        decision: &decision::AnswerDecision,
+        mode: extraction::ExtractionMode,
+        short_circuits: bool,
+        partial_answer_ok: bool,
+    ) -> bool {
+        let allow = response_allowlist_fixture();
+        let skip = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+            already_escalated: false,
+        };
+        should_draft_reply(&skip, decision, mode, short_circuits, partial_answer_ok)
+    }
+
+    #[test]
+    fn should_draft_reply_is_true_for_escalate_with_partial_answer_ok_in_hybrid_mode() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        assert!(skip_policy_gate(
+            &decision,
+            extraction::ExtractionMode::Hybrid,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_draft_reply_is_false_for_partial_answer_ok_when_lexicon_fallback() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        assert!(!skip_policy_gate(
+            &decision,
+            extraction::ExtractionMode::LexiconFallback,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_draft_reply_is_false_for_partial_answer_ok_when_second_stage_short_circuits() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        assert!(!skip_policy_gate(
+            &decision,
+            extraction::ExtractionMode::Hybrid,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_draft_reply_is_false_for_escalate_without_partial_answer_ok() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        assert!(!skip_policy_gate(
+            &decision,
+            extraction::ExtractionMode::Hybrid,
+            false,
+            false
+        ));
+    }
+
+    // ---- plan_reply_draft（design doc 2026-10-07-partial-answer-with-handoff §3.1・§3.6） ----
+
+    fn plan_for(
+        policy: &ReplyDraftPolicy<'_>,
+        decision: &decision::AnswerDecision,
+        mode: extraction::ExtractionMode,
+        best_manual_score: Option<f32>,
+    ) -> ReplyDraftPlan {
+        plan_reply_draft(
+            policy,
+            decision,
+            mode,
+            false,
+            best_manual_score,
+            &harness_for_test().thresholds,
+            true,
+        )
+    }
+
+    fn escalate_hearing_none() -> decision::AnswerDecision {
+        escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new())
+    }
+
+    #[test]
+    fn plan_reply_draft_generates_a_partial_answer_for_an_unescalated_eligible_escalate() {
+        let allow = response_allowlist_fixture();
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+            already_escalated: false,
+        };
+        let plan = plan_for(
+            &policy,
+            &escalate_hearing_none(),
+            extraction::ExtractionMode::Hybrid,
+            Some(0.9),
+        );
+        assert_eq!(
+            plan,
+            ReplyDraftPlan {
+                generate: true,
+                partial_answer_ok: true
+            }
+        );
+    }
+
+    #[test]
+    fn plan_reply_draft_does_not_generate_when_the_case_is_already_escalated() {
+        let allow = response_allowlist_fixture();
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+            already_escalated: true,
+        };
+        let plan = plan_for(
+            &policy,
+            &escalate_hearing_none(),
+            extraction::ExtractionMode::Hybrid,
+            Some(0.9),
+        );
+        assert_eq!(
+            plan,
+            ReplyDraftPlan {
+                generate: false,
+                partial_answer_ok: false
+            }
+        );
+    }
+
+    #[test]
+    fn plan_reply_draft_always_generates_but_is_not_partial_when_relevance_is_insufficient() {
+        let plan = plan_for(
+            &ReplyDraftPolicy::Always,
+            &escalate_hearing_none(),
+            extraction::ExtractionMode::Hybrid,
+            Some(0.1),
+        );
+        assert_eq!(
+            plan,
+            ReplyDraftPlan {
+                generate: true,
+                partial_answer_ok: false
+            }
+        );
+    }
+
+    #[test]
+    fn plan_reply_draft_always_ignores_already_escalated_for_partial_eligibility() {
+        let plan = plan_for(
+            &ReplyDraftPolicy::Always,
+            &escalate_hearing_none(),
+            extraction::ExtractionMode::Hybrid,
+            Some(0.9),
+        );
+        assert!(plan.generate);
+        assert!(plan.partial_answer_ok);
+    }
+
+    #[test]
+    fn plan_reply_draft_generates_without_partial_for_skip_when_unused_allowed() {
+        let allow = response_allowlist_fixture();
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+            already_escalated: false,
+        };
+        let plan = plan_for(
+            &policy,
+            &allowed_decision(),
+            extraction::ExtractionMode::Hybrid,
+            Some(0.9),
+        );
+        assert_eq!(
+            plan,
+            ReplyDraftPlan {
+                generate: true,
+                partial_answer_ok: false
+            }
+        );
+    }
+
+    #[test]
+    fn plan_reply_draft_does_not_generate_a_partial_answer_under_lexicon_fallback() {
+        let allow = response_allowlist_fixture();
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+            already_escalated: false,
+        };
+        let plan = plan_for(
+            &policy,
+            &escalate_hearing_none(),
+            extraction::ExtractionMode::LexiconFallback,
+            Some(0.9),
+        );
+        assert!(!plan.generate);
+    }
+
+    #[test]
+    fn plan_reply_draft_does_not_generate_when_draft_generation_is_disabled() {
+        let allow = response_allowlist_fixture();
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+            already_escalated: false,
+        };
+        let plan = plan_reply_draft(
+            &policy,
+            &escalate_hearing_none(),
+            extraction::ExtractionMode::Hybrid,
+            false,
+            Some(0.9),
+            &harness_for_test().thresholds,
+            false,
+        );
+        assert!(!plan.partial_answer_ok);
+        assert!(!plan.generate);
     }
 
     // ---- suppressed_ack_rule_ids（Issue #79） ----
@@ -3194,9 +3555,240 @@ mod tests {
                 &[],
                 is_continuation,
                 &allowlist,
+                &[],
+                false,
             )
             .await;
         (draft, log)
+    }
+
+    // ---- design doc 2026-10-07-partial-answer-with-handoff-design.md §3.1/§3.5: evaluate() の
+    // 下書き生成ゲート（should_draft_reply(...) || can_draft_partial_answer(...)）----
+    //
+    // `evaluate()` 自体は vegapunk への実接続を要求するため（`harness_for_test()` は
+    // `knowledge: None`）、ここでは `evaluate()` が実際に行う合成判断
+    // （`can_draft_partial_answer` の結果を渡した `should_draft_reply`）を同じ純関数で計算した
+    // うえで `draft_customer_reply` を直接呼ぶ（`draft_customer_reply_via_stub` と同じパターン）。
+
+    /// `decision` と `already_escalated` から `evaluate()` と同じゲートを計算し、ゲートが
+    /// 開いているときだけ stub LLM 付きの `draft_customer_reply` を呼ぶ。stub への到達回数
+    /// （`log`）で呼ばれたか否かを確認できるようにする。
+    async fn evaluate_style_draft_gate(
+        draft_text: &str,
+        decision: &decision::AnswerDecision,
+        best_manual_score: Option<f32>,
+        already_escalated: bool,
+        handoff_items: &[String],
+    ) -> (
+        Option<crate::llm::ReplyDraft>,
+        crate::llm::test_support::RequestLog,
+    ) {
+        let body = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": draft_text}],
+        })
+        .to_string();
+        let (endpoint, log) = crate::llm::test_support::spawn_messages_stub(body).await;
+
+        let dir = std::env::temp_dir().join(format!("harness-reply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let key_path = dir.join("llm-api-key");
+        std::fs::write(&key_path, "test-key\n").expect("write api key file");
+        let drafter = crate::llm::AnthropicClient::from_config(&crate::config::LlmConfig {
+            enabled: true,
+            endpoint,
+            api_key_file: Some(key_path.to_string_lossy().to_string()),
+            ..Default::default()
+        })
+        .expect("llm client must build from the stub config")
+        .expect("enabled = true with a readable key file must yield a client");
+
+        let harness = Harness {
+            reply_drafter: Some(drafter),
+            ng: production_ng_dictionary(),
+            ..harness_for_test()
+        };
+
+        let allow = response_allowlist_fixture();
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+            already_escalated,
+        };
+        // `evaluate()` 本体と同じ純関数を呼ぶ（合成をテスト内で再実装しない。本体が退行したら
+        // このテストが落ちる）。short_circuits はこの合成テストの対象外なので常に false。
+        let plan = plan_reply_draft(
+            &policy,
+            decision,
+            extraction::ExtractionMode::Hybrid,
+            false,
+            best_manual_score,
+            &harness.thresholds,
+            harness.reply_drafter.is_some(),
+        );
+
+        let hits = vec![SectionHit {
+            section_key: "sec-a".to_string(),
+            title_ja: "料金ページ".to_string(),
+            body_ja: Some("月額利用料金は1台1,540円（税込）です。".to_string()),
+            body_en: None,
+            translation_status: None,
+            breadcrumb: Vec::new(),
+            score: 0.9,
+            source_url: None,
+        }];
+
+        let draft = if plan.generate {
+            harness
+                .draft_customer_reply(
+                    "導入にどれくらいの費用がかかるの？",
+                    decision,
+                    &hits,
+                    &[],
+                    &[],
+                    false,
+                    &allow,
+                    handoff_items,
+                    plan.partial_answer_ok,
+                )
+                .await
+        } else {
+            None
+        };
+        // evaluate() と同じく採否ゲートを通す（導出された項目が歯止めまで繋がっていること
+        // を固定するため）。
+        let draft = draft.filter(|d| {
+            handoff_items::accept_draft(&d.text, plan.partial_answer_ok, handoff_items).is_ok()
+        });
+        (draft, log)
+    }
+
+    #[tokio::test]
+    async fn evaluate_gate_calls_the_drafter_once_for_escalate_meeting_partial_answer_conditions() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        const CLEAN: &str =
+            "お問い合わせありがとうございます。担当部署より改めてご連絡いたします。";
+        let (draft, log) = evaluate_style_draft_gate(
+            CLEAN,
+            &decision,
+            Some(0.9), // thresholds().low (0.6) 以上 = 関連十分
+            false,     // 未取次
+            &[],
+        )
+        .await;
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "Escalate で §3.1 を満たすときは下書き LLM が1回呼ばれること"
+        );
+        assert!(draft.is_some(), "NG に触れない下書きは採用されること");
+    }
+
+    /// design doc `2026-10-07-partial-answer-with-handoff-design.md` §3.2 配線テスト:
+    /// `can_draft_partial_answer` が true の Escalate で、`draft_customer_reply` が実際に
+    /// `hits` の本文を stub への生リクエストへ渡すことを確認する。純関数の単体テスト
+    /// （`reply.rs` の `escalation_brief_includes_manual_material_when_partial_answer_is_
+    /// eligible`）だけでは、`draft_customer_reply` 自体が `partial_answer_ok` を握り潰しても
+    /// （例: 固定値 `false` を渡す退行）全テストが緑のままになる。
+    #[tokio::test]
+    async fn evaluate_gate_passes_manual_material_to_the_drafter_for_an_eligible_partial_answer() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        const CLEAN: &str =
+            "お問い合わせありがとうございます。担当部署より改めてご連絡いたします。";
+        let (draft, log) = evaluate_style_draft_gate(
+            CLEAN,
+            &decision,
+            Some(0.9), // thresholds().low (0.6) 以上 = 関連十分
+            false,     // 未取次
+            &[],
+        )
+        .await;
+        assert!(draft.is_some());
+        let requests = log.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "stub に実際にリクエストが届いていること（配線を主張する前提）"
+        );
+        assert!(
+            requests[0].contains("月額利用料金は1台1,540円（税込）です。"),
+            "the drafter's request must include the manual material from hits, got: {}",
+            requests[0]
+        );
+    }
+
+    /// 導出された handoff 項目が歯止め（`accept_draft`）まで繋がっていること: ラベルを含む
+    /// 正常な下書きは採用される。
+    #[tokio::test]
+    async fn evaluate_gate_accepts_a_partial_draft_that_mentions_the_derived_handoff_label() {
+        let decision = escalate_hearing_none();
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        let (draft, log) = evaluate_style_draft_gate(
+            "月額利用料金は1台1,540円（税込）です。初期費用・設置工事費に関するご質問は担当者がご案内します。",
+            &decision,
+            Some(0.9),
+            false,
+            &items,
+        )
+        .await;
+        assert_eq!(log.lock().unwrap().len(), 1, "stub に到達していること");
+        assert!(draft.is_some(), "ラベルを含む下書きは採用されること");
+    }
+
+    /// 同上: ラベルを欠いた部分回答の下書きは不採用（None）になる。
+    #[tokio::test]
+    async fn evaluate_gate_rejects_a_partial_draft_missing_the_derived_handoff_label() {
+        let decision = escalate_hearing_none();
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        let (draft, log) = evaluate_style_draft_gate(
+            "月額利用料金は1台1,540円（税込）です。担当部署より改めてご連絡いたします。",
+            &decision,
+            Some(0.9),
+            false,
+            &items,
+        )
+        .await;
+        assert_eq!(log.lock().unwrap().len(), 1, "stub に到達していること");
+        assert!(draft.is_none(), "ラベルを欠く下書きは不採用であること");
+    }
+
+    #[tokio::test]
+    async fn evaluate_gate_does_not_call_the_drafter_when_the_case_is_already_escalated() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        let (draft, log) = evaluate_style_draft_gate(
+            "呼ばれないはずの下書き",
+            &decision,
+            Some(0.9),
+            true, // 取次済み → §3.1 を満たさない
+            &[],
+        )
+        .await;
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "取次済み case では下書き LLM を呼ばないこと"
+        );
+        assert!(draft.is_none());
+    }
+
+    #[tokio::test]
+    async fn evaluate_gate_does_not_call_the_drafter_when_relevance_is_insufficient() {
+        let decision =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        let (draft, log) = evaluate_style_draft_gate(
+            "呼ばれないはずの下書き",
+            &decision,
+            Some(0.1), // thresholds().low (0.6) 未満 = 関連不十分
+            false,
+            &[],
+        )
+        .await;
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "関連不十分な Escalate では下書き LLM を呼ばないこと"
+        );
+        assert!(draft.is_none());
     }
 
     /// 「NG 表現を含まない下書きなら通る」ことは、**下記 2 件の偽陽性を潰すために必須**。

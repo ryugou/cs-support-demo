@@ -1806,6 +1806,32 @@ async fn reply_handler(
         evaluate_inputs_for_turn(case_switch.is_some(), req.case_id.as_deref(), &history);
     let is_continuation = is_continuation(eval_history, eval_case_id);
 
+    // design doc `2026-10-07-partial-answer-with-handoff-design.md` §3.1・§3.6: 部分回答の
+    // 可否判定に使う「この case は既に取次済みか」を、evaluate() を呼ぶ前に確定済みの
+    // `eval_case_id` から読む（`outcome.case_id` は evaluate() が確定した**後**にしか無いため、
+    // ここでは使えない）。
+    // - `eval_case_id` が既存 case を指すとき: その会話状態の `is_already_escalated()`。
+    // - 会話状態の読み取り自体が失敗したとき: `true`（安全側。部分回答を試みず現行動作に倒す。
+    //   ターン欠落より応答継続を優先する既存の設計思想に合わせる）。
+    // - 新規会話（`eval_case_id` が `None`）のとき: `false`。
+    let already_escalated = match eval_case_id {
+        Some(case_id) => match state.harness.load_conv_state(&ctx, case_id).await {
+            Ok(conv) => conv.is_already_escalated(),
+            Err(err) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    case_id = %case_id,
+                    error = %err,
+                    "answer api: failed to load conv state before evaluate(); treating this \
+                     turn as already escalated (safe side) so the partial-answer draft path is \
+                     skipped (the main evaluate() call below still proceeds)"
+                );
+                true
+            }
+        },
+        None => false,
+    };
+
     match state
         .harness
         .evaluate(
@@ -1825,8 +1851,11 @@ async fn reply_handler(
             // 下書きを使わない（design doc
             // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。事前判定には、下の
             // 二段目ゲート（`second_stage_short_circuit`）に渡すのと同じ `allowlist` を使う。
+            // `already_escalated` は部分回答の可否（§3.1・§3.6）専用で、上記の省略規則とは
+            // 独立に `handoff_items::can_draft_partial_answer` が見る。
             ReplyDraftPolicy::SkipWhenUnused {
                 response_allowlist: &allowlist,
+                already_escalated,
             },
             // Issue #61: 切り替え検知で抽出済みなら（切り替えターンの新 case 判定も含め）同じ
             // 抽出結果（signal + 生の製品参照）を渡し、evaluate() 内部での再抽出を省く。採用規則
