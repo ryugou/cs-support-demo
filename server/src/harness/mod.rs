@@ -677,9 +677,11 @@ struct ReplyDraftPlan {
 /// 合成が退行（`already_escalated` の取り損ね、`draft_generation_enabled` の固定値化等）
 /// したときにテストが落ちるようにする。
 /// `Always`（MCP）は取次済みという概念が無いので `already_escalated` を `false` として扱う。
+#[allow(clippy::too_many_arguments)]
 fn plan_reply_draft(
     policy: &ReplyDraftPolicy<'_>,
     decision: &decision::AnswerDecision,
+    handoff_items: &[String],
     extraction_mode: extraction::ExtractionMode,
     second_stage_short_circuits: bool,
     best_manual_score: Option<f32>,
@@ -694,6 +696,7 @@ fn plan_reply_draft(
     };
     let partial_answer_ok = handoff_items::can_draft_partial_answer(
         decision,
+        handoff_items,
         best_manual_score,
         thresholds,
         already_escalated,
@@ -1925,6 +1928,7 @@ impl Harness {
         } = plan_reply_draft(
             &policy,
             &decision_result,
+            &handoff_items,
             extraction_mode,
             short_circuits,
             best_manual_score,
@@ -2932,15 +2936,24 @@ mod tests {
 
     // ---- plan_reply_draft（design doc 2026-10-07-partial-answer-with-handoff §3.1・§3.6） ----
 
+    /// design doc §3.1 の取り次ぐ項目の非空フィクスチャ。`plan_for` を使うテストの大半は
+    /// 「取り次ぐ項目が1つ以上ある」以外の条件を見るためのものなので、これを渡して空判定の
+    /// 分岐（タスク1で追加）と混同しないようにする。
+    fn handoff_items_fixture() -> Vec<String> {
+        vec!["初期費用・設置工事費に関するご質問".to_string()]
+    }
+
     fn plan_for(
         policy: &ReplyDraftPolicy<'_>,
         decision: &decision::AnswerDecision,
         mode: extraction::ExtractionMode,
         best_manual_score: Option<f32>,
+        handoff_items: &[String],
     ) -> ReplyDraftPlan {
         plan_reply_draft(
             policy,
             decision,
+            handoff_items,
             mode,
             false,
             best_manual_score,
@@ -2965,6 +2978,7 @@ mod tests {
             &escalate_hearing_none(),
             extraction::ExtractionMode::Hybrid,
             Some(0.9),
+            &handoff_items_fixture(),
         );
         assert_eq!(
             plan,
@@ -2987,6 +3001,7 @@ mod tests {
             &escalate_hearing_none(),
             extraction::ExtractionMode::Hybrid,
             Some(0.9),
+            &handoff_items_fixture(),
         );
         assert_eq!(
             plan,
@@ -3004,6 +3019,7 @@ mod tests {
             &escalate_hearing_none(),
             extraction::ExtractionMode::Hybrid,
             Some(0.1),
+            &handoff_items_fixture(),
         );
         assert_eq!(
             plan,
@@ -3021,6 +3037,7 @@ mod tests {
             &escalate_hearing_none(),
             extraction::ExtractionMode::Hybrid,
             Some(0.9),
+            &handoff_items_fixture(),
         );
         assert!(plan.generate);
         assert!(plan.partial_answer_ok);
@@ -3033,11 +3050,13 @@ mod tests {
             response_allowlist: &allow,
             already_escalated: false,
         };
+        // Allowed は handoff_items の値に関わらず partial_answer_ok が false になるので、空で構わない。
         let plan = plan_for(
             &policy,
             &allowed_decision(),
             extraction::ExtractionMode::Hybrid,
             Some(0.9),
+            &[],
         );
         assert_eq!(
             plan,
@@ -3060,6 +3079,7 @@ mod tests {
             &escalate_hearing_none(),
             extraction::ExtractionMode::LexiconFallback,
             Some(0.9),
+            &handoff_items_fixture(),
         );
         assert!(!plan.generate);
     }
@@ -3074,6 +3094,7 @@ mod tests {
         let plan = plan_reply_draft(
             &policy,
             &escalate_hearing_none(),
+            &handoff_items_fixture(),
             extraction::ExtractionMode::Hybrid,
             false,
             Some(0.9),
@@ -3619,6 +3640,7 @@ mod tests {
         let plan = plan_reply_draft(
             &policy,
             decision,
+            handoff_items,
             extraction::ExtractionMode::Hybrid,
             false,
             best_manual_score,
@@ -3666,14 +3688,18 @@ mod tests {
     async fn evaluate_gate_calls_the_drafter_once_for_escalate_meeting_partial_answer_conditions() {
         let decision =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
-        const CLEAN: &str =
-            "お問い合わせありがとうございます。担当部署より改めてご連絡いたします。";
+        // §3.1 は「取り次ぐ項目が1つ以上ある」ことを要求するため、空の handoff_items では
+        // partial_answer_ok が false になり生成自体が起きない。非空のラベルを渡し、スタブが
+        // 返す下書きにそのラベルを含めて歯止め（accept_draft）も通す。
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        const CLEAN: &str = "お問い合わせありがとうございます。\
+                              初期費用・設置工事費に関するご質問は担当者がご案内します。";
         let (draft, log) = evaluate_style_draft_gate(
             CLEAN,
             &decision,
             Some(0.9), // thresholds().low (0.6) 以上 = 関連十分
             false,     // 未取次
-            &[],
+            &items,
         )
         .await;
         assert_eq!(
@@ -3694,14 +3720,17 @@ mod tests {
     async fn evaluate_gate_passes_manual_material_to_the_drafter_for_an_eligible_partial_answer() {
         let decision =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
-        const CLEAN: &str =
-            "お問い合わせありがとうございます。担当部署より改めてご連絡いたします。";
+        // §3.1 は「取り次ぐ項目が1つ以上ある」ことを要求するため、空の handoff_items では
+        // partial_answer_ok が false になり生成自体が起きない（上記テストと同じ理由）。
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        const CLEAN: &str = "お問い合わせありがとうございます。\
+                              初期費用・設置工事費に関するご質問は担当者がご案内します。";
         let (draft, log) = evaluate_style_draft_gate(
             CLEAN,
             &decision,
             Some(0.9), // thresholds().low (0.6) 以上 = 関連十分
             false,     // 未取次
-            &[],
+            &items,
         )
         .await;
         assert!(draft.is_some());
@@ -3757,12 +3786,15 @@ mod tests {
     async fn evaluate_gate_does_not_call_the_drafter_when_the_case_is_already_escalated() {
         let decision =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        // handoff_items を非空にして、false になる理由が already_escalated 単独であることを
+        // 保つ（空のままだと「取り次ぐ項目が無い」判定と混同される）。
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
         let (draft, log) = evaluate_style_draft_gate(
             "呼ばれないはずの下書き",
             &decision,
             Some(0.9),
             true, // 取次済み → §3.1 を満たさない
-            &[],
+            &items,
         )
         .await;
         assert!(
@@ -3776,12 +3808,15 @@ mod tests {
     async fn evaluate_gate_does_not_call_the_drafter_when_relevance_is_insufficient() {
         let decision =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        // handoff_items を非空にして、false になる理由が関連不十分単独であることを保つ
+        // （空のままだと「取り次ぐ項目が無い」判定と混同される）。
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
         let (draft, log) = evaluate_style_draft_gate(
             "呼ばれないはずの下書き",
             &decision,
             Some(0.1), // thresholds().low (0.6) 未満 = 関連不十分
             false,
-            &[],
+            &items,
         )
         .await;
         assert!(

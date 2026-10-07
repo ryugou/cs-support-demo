@@ -62,6 +62,10 @@ pub fn derive_handoff_items(normalizer: &LexiconNormalizer, signals: &SignalSet)
 ///   帰結として、Jev が「情報十分」と判定して `Clarify` ではなく取次（EscalationReply）になる
 ///   ターン（例: rules.json の `warranty-failure`）でも部分回答は生成されない。Jev 判定の後で
 ///   部分回答を計画するよう制御フローを変えるかどうかは spec の明確化待ち（オーケストレーター判断）。
+/// - 判定が第1層または第2層の取次である。第3層（根拠不足・確信度不足）は `handoff_items` の
+///   中身に依存せず、`layer` で明示的に除外する（`handoff_items_for_decision` が将来第3層で
+///   非空を返しても、spec 変更なしに部分回答が有効化されないようにするため）。
+/// - 取り次ぐ項目（`handoff_items`）が1つ以上ある（上の layer 条件とは独立に両方必要）。
 /// - その case が既に取次済みではない（`already_escalated == false`）。
 /// - 下書き生成が有効（`draft_generation_enabled == true`。`customer_reply_draft_enabled =
 ///   true` かつ `[llm] enabled = true` と同値）。
@@ -70,15 +74,22 @@ pub fn derive_handoff_items(normalizer: &LexiconNormalizer, signals: &SignalSet)
 /// `decision` が `Allowed` のときは常に `false`（部分回答という概念自体が `Escalate` 専用）。
 pub fn can_draft_partial_answer(
     decision: &AnswerDecision,
+    handoff_items: &[String],
     best_manual_score: Option<f32>,
     thresholds: &Thresholds,
     already_escalated: bool,
     draft_generation_enabled: bool,
 ) -> bool {
-    let AnswerDecision::Escalate { hearing, .. } = decision else {
+    let AnswerDecision::Escalate { hearing, layer, .. } = decision else {
         return false;
     };
     if hearing.is_some() {
+        return false;
+    }
+    if !matches!(*layer, 1 | 2) {
+        return false;
+    }
+    if handoff_items.is_empty() {
         return false;
     }
     if already_escalated || !draft_generation_enabled {
@@ -306,10 +317,15 @@ mod tests {
         }
     }
 
+    fn handoff_items_fixture() -> Vec<String> {
+        vec!["初期費用・設置工事費に関するご質問".to_string()]
+    }
+
     #[test]
     fn can_draft_partial_answer_is_true_when_every_condition_is_met() {
         assert!(can_draft_partial_answer(
             &escalate(None),
+            &handoff_items_fixture(),
             Some(0.6),
             &thresholds(),
             false,
@@ -317,6 +333,7 @@ mod tests {
         ));
         assert!(can_draft_partial_answer(
             &escalate(None),
+            &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
             false,
@@ -326,8 +343,10 @@ mod tests {
 
     #[test]
     fn can_draft_partial_answer_is_false_for_an_allowed_decision() {
+        // Allowed は `handoff_items` の値に関わらず早期 false になるため、空配列で構わない。
         assert!(!can_draft_partial_answer(
             &allowed(),
+            &[],
             Some(0.9),
             &thresholds(),
             false,
@@ -342,6 +361,7 @@ mod tests {
         // spec が改訂されたら見直す対象（spec が明示した決定ではない）。
         assert!(!can_draft_partial_answer(
             &escalate(Some(HearingContract::ProductAndSymptom)),
+            &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
             false,
@@ -350,9 +370,73 @@ mod tests {
     }
 
     #[test]
+    fn can_draft_partial_answer_is_false_when_there_are_no_handoff_items() {
+        // design doc §3.1: 取り次ぐ項目が1つも無いとき（第3層の取次を含む）は部分回答の対象に
+        // しない。他の条件（関連十分・未取次・下書き有効・hearing なし）をすべて満たしていても
+        // false になることを固定する。
+        assert!(!can_draft_partial_answer(
+            &escalate(None),
+            &[],
+            Some(0.9),
+            &thresholds(),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn can_draft_partial_answer_is_false_for_a_layer3_escalate_even_with_sufficient_relevance() {
+        // 第3層の取次は `handoff_items_for_decision` が常に空配列を返すため、実際に起きるのは
+        // この組み合わせ（layer=3 かつ handoff_items が空）。根拠不足・確信度不足は「答えてはいけ
+        // ない部分」ではなく「答える根拠が足りない」ので、材料の関連度が下限を超えていても部分
+        // 回答を試みてはならない（design doc §3.1）。
+        assert!(!can_draft_partial_answer(
+            &escalate_at(3),
+            &[],
+            Some(0.9),
+            &thresholds(),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn can_draft_partial_answer_is_false_for_a_layer3_escalate_even_with_handoff_items() {
+        // handoff_items が非空でも第3層は対象外（design doc §3.1）。`handoff_items_for_decision` の
+        // 将来の変更で暗黙に有効化されないよう、layer での明示的な除外を固定する。
+        assert!(!can_draft_partial_answer(
+            &escalate_at(3),
+            &handoff_items_fixture(),
+            Some(0.9),
+            &thresholds(),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn can_draft_partial_answer_is_true_for_layer1_and_layer2_escalates_with_handoff_items() {
+        // design doc §3.1: 第1層・第2層のマッチによる取次は部分回答の対象。
+        for layer in [1, 2] {
+            assert!(
+                can_draft_partial_answer(
+                    &escalate_at(layer),
+                    &handoff_items_fixture(),
+                    Some(0.9),
+                    &thresholds(),
+                    false,
+                    true
+                ),
+                "layer {layer} must be eligible"
+            );
+        }
+    }
+
+    #[test]
     fn can_draft_partial_answer_is_false_when_relevance_is_insufficient() {
         assert!(!can_draft_partial_answer(
             &escalate(None),
+            &handoff_items_fixture(),
             Some(0.59),
             &thresholds(),
             false,
@@ -360,6 +444,7 @@ mod tests {
         ));
         assert!(!can_draft_partial_answer(
             &escalate(None),
+            &handoff_items_fixture(),
             None,
             &thresholds(),
             false,
@@ -371,6 +456,7 @@ mod tests {
     fn can_draft_partial_answer_is_false_when_the_case_is_already_escalated() {
         assert!(!can_draft_partial_answer(
             &escalate(None),
+            &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
             true,
@@ -382,6 +468,7 @@ mod tests {
     fn can_draft_partial_answer_is_false_when_draft_generation_is_disabled() {
         assert!(!can_draft_partial_answer(
             &escalate(None),
+            &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
             false,
