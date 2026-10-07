@@ -348,6 +348,13 @@ pub struct HarnessConfig {
     /// 返信文は数百字必要で、抽出用の上限では途中で切れる。
     #[serde(default = "default_reply_draft_max_tokens")]
     pub customer_reply_draft_max_tokens: u32,
+    /// 監査ログ（`WormAuditLog`）が poisoned になったときの graceful shutdown の待ち時間
+    /// 上限（秒）。新しい接続の受付を止めた後、受付済みのリクエストの完了を待つが、
+    /// この秒数を超えたら残りを打ち切ってプロセスを終了する（Issue #62、design doc
+    /// `docs/superpowers/specs/2026-10-06-poisoned-audit-instance-design.md` §3.2）。
+    /// `0` は「受付済みのリクエストの完了を待たず、直ちに終了する」の意味（下限は設けない）。
+    #[serde(default = "default_poisoned_shutdown_grace_period_secs")]
+    pub poisoned_shutdown_grace_period_secs: u64,
 }
 
 fn default_reply_draft_max_tokens() -> u32 {
@@ -372,6 +379,9 @@ fn default_policy() -> String {
 fn default_escalation_route() -> String {
     "triage".to_string()
 }
+fn default_poisoned_shutdown_grace_period_secs() -> u64 {
+    30
+}
 
 impl Default for HarnessConfig {
     fn default() -> Self {
@@ -388,6 +398,7 @@ impl Default for HarnessConfig {
             default_escalation_route: default_escalation_route(),
             vector_route_enabled: false,
             manual_scoring_v2_enabled: false,
+            poisoned_shutdown_grace_period_secs: default_poisoned_shutdown_grace_period_secs(),
         }
     }
 }
@@ -976,6 +987,27 @@ support_search_improvement_queue_path = "/data/audit/search-improvement-queue-su
     #[test]
     fn default_escalation_route_defaults_to_triage() {
         assert_eq!(HarnessConfig::default().default_escalation_route, "triage");
+    }
+
+    /// Issue #62: 監査ログが poisoned になったときの graceful shutdown 上限。
+    /// config ファイルに記述しなくても既定 30 秒で動くこと（CLAUDE.md により
+    /// `server/config*.toml` 自体は変更しない）。
+    #[test]
+    fn poisoned_shutdown_grace_period_secs_defaults_to_30() {
+        assert_eq!(
+            HarnessConfig::default().poisoned_shutdown_grace_period_secs,
+            30
+        );
+    }
+
+    /// `#[serde(default = ...)]` が効いていること（既存 config に新フィールドが無くても
+    /// パースが壊れないことの回帰防止。`HarnessConfig` は `#[serde(default)]` 付きで
+    /// `AppConfig` に埋め込まれているため、`[harness]` セクション自体が省略された
+    /// config でも既定値が使われる）。
+    #[test]
+    fn poisoned_shutdown_grace_period_secs_is_omittable_from_toml() {
+        let parsed: HarnessConfig = toml::from_str("").expect("empty [harness] must parse");
+        assert_eq!(parsed.poisoned_shutdown_grace_period_secs, 30);
     }
 
     #[test]

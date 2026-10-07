@@ -2190,7 +2190,9 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/line/webhook", post(webhook_handler))
         .with_state(state)
-        .merge(cs_support_mcp::health::health_router())
+        // line_adapter は WormAuditLog を持たない。0 個を渡すと常に 200 を返す
+        // (health_router の既定動作、Issue #62)。
+        .merge(cs_support_mcp::health::health_router(vec![]))
         // F5: 正常系のリクエストが 1 行もログに残らないと、webhook が届いているか自体を
         // 運用時に確認できない。main.rs のトップレベル app と同じパターン。
         .layer(TraceLayer::new_for_http());
