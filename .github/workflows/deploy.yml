@@ -46,7 +46,7 @@ env:
   # CI が同一イメージ tag へ更新する対象。ここが唯一の正本で、CLAUDE.md の記述は
   # この 2 行に追従させる。リソースを増やしたらここに足す。
   RUN_SERVICES: "cs-support-mcp cs-support-line homesec-advisor homesec-line"
-  RUN_JOBS: "ingest-products ingest-rules ingest-urtect ingest-alarmcom merge-schema verify-alarmcom backfill-concept-keys ingest-homesec"
+  RUN_JOBS: "ingest-products ingest-rules ingest-urtect ingest-alarmcom merge-schema verify-alarmcom backfill-concept-keys ingest-homesec verify-deploy"
 
 jobs:
   build-deploy:
@@ -114,7 +114,8 @@ jobs:
 
       - name: Update Cloud Run job images
         # 対象は ingest-products / ingest-rules / ingest-urtect / ingest-alarmcom /
-        # merge-schema / verify-alarmcom / backfill-concept-keys の 7 job。
+        # merge-schema / verify-alarmcom / backfill-concept-keys / ingest-homesec /
+        # verify-deploy の 9 job（正本は env.RUN_JOBS）。
         # いずれも cs-support-mcp と同一イメージを別バイナリ・別引数で起動する
         # （バイナリ選択は各 job のエントリポイント定義側の責務で、ここでは image tag
         # のみを更新する）。ループ内で `gcloud` が非 0 終了すると `run:` ステップの

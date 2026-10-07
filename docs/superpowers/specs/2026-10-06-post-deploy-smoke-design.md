@@ -148,8 +148,8 @@ lexicon、NG 辞書、project の定義、vegapunk の接続設定は上書き�
 
 ## 6. 実行と運用
 
-- Cloud Run job `verify-deploy` は、`merge-schema` と同じ VPC connector・service account・Secret Manager 注入で作成する。作成はリポジトリ管理者が `gcloud run jobs create` で行う。
-- `.github/workflows/deploy.yml` の `RUN_JOBS` への追加は、job の実体を作成した後に別の変更として行う（未作成のまま追加するとデプロイ経路全体が止まるため）。本変更では `deploy.yml` を変更しない。
+- Cloud Run job `verify-deploy` は、`merge-schema` と同じ Direct VPC egress（`cs-support-vpc` / `cs-support-subnet`）・service account・Secret Manager 注入で作成する。作成はリポジトリ管理者が `gcloud run jobs create` で行う（2026-10-07 に作成済み。初回実行は `"passed": true`）。
+- `.github/workflows/deploy.yml` の `RUN_JOBS` への追加は、job の実体を作成した後に別の変更として行う（未作成のまま追加するとデプロイ経路全体が止まるため）。本体の変更（PR #84）では `deploy.yml` を変更せず、job 作成後の追従変更で `RUN_JOBS` に追加した。
 - 実行はデプロイ後に手動で行う。
 
 ```sh
