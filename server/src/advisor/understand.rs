@@ -270,8 +270,12 @@ fn build_understand_prompt(
          一般的な不安・過去の被害の相談は false。\n\
          - urtect_support: 既に URTECT 製品を所有しており、その操作・不具合の個別サポートを\
          求めている場合のみ true とする。導入検討・比較は false。\n\
-         - lead_interest: 担当者からの連絡・案内を望む意思が読み取れる場合のみ true とする\
-         (「お願いします」「話を聞きたい」等)。単なる製品への興味は false。\n\
+         - lead_interest: 人間の担当者からの連絡・案内・相談を明示的に望む場合のみ true と\
+         する(「担当者から話を聞きたい」「連絡をください」「導入を相談したい」「(担当者連絡の\
+         提案に対して)お願いします」等)。ボットに対する提案・回答・比較の要求(「提案して」\
+         「おすすめを教えて」「どれが合うか選んで」「比較して」等)は false とする。例えば\
+         「屋外カメラを本気で選びたい。うちに合うものを提案して。一戸建てで玄関と駐車場を映したい」\
+         は、ボットへの提案要求なので false。迷う場合は false とする。\n\
          - product_intent: 具体的な機器・製品(カメラ・センサー等)の導入について尋ねている、\
          またはそれらの物品に言及している場合のみ true とする。悩み・状況の相談のみで物品に\
          触れていない場合は false。\n\
@@ -660,6 +664,47 @@ mod tests {
         assert!(
             system.contains("担当者からの連絡"),
             "system prompt: {system}"
+        );
+        // design doc 2026-10-06-advisor-lead-interest-design.md §2: true にするのは、人間の
+        // 担当者からの連絡・案内・相談を明示的に望む場合だけ。
+        for true_example in [
+            "担当者から話を聞きたい",
+            "連絡をください",
+            "導入を相談したい",
+            "お願いします",
+        ] {
+            assert!(
+                system.contains(true_example),
+                "lead_interest=true の例として「{true_example}」を含めること: {system}"
+            );
+        }
+        // 同 §2: ボットに対する提案・回答・比較の要求は false(Issue #49: 「提案して」を
+        // 担当者連絡の希望と取り違えていた問題の修正)。
+        for false_example in [
+            "提案して",
+            "おすすめを教えて",
+            "どれが合うか選んで",
+            "比較して",
+        ] {
+            assert!(
+                system.contains(false_example),
+                "lead_interest=false の例として「{false_example}」を含めること: {system}"
+            );
+        }
+    }
+
+    /// Issue #49 の実測発話「屋外カメラを本気で選びたい。うちに合うものを提案して。一戸建てで
+    /// 玄関と駐車場を映したい」は、ボットへの提案要求(「提案して」)にもかかわらず
+    /// lead_interest=true に誤判定され、提案を返さず LeadSolicit(担当者連絡の案内)へ進んで
+    /// いた。この実測発話の全文が false の例としてプロンプトに含まれることを固定する
+    /// (design doc 2026-10-06-advisor-lead-interest-design.md §2・§5)。
+    #[test]
+    fn prompt_includes_issue_49_propose_to_bot_phrase_as_a_lead_interest_false_example() {
+        const ISSUE_49_UTTERANCE: &str = "屋外カメラを本気で選びたい。うちに合うものを提案して。一戸建てで玄関と駐車場を映したい";
+        let (system, _) = build_understand_prompt("発話", "履歴", "累積");
+        assert!(
+            system.contains(ISSUE_49_UTTERANCE),
+            "Issue #49 の実測発話の全文を false の例として含めること: {system}"
         );
     }
 

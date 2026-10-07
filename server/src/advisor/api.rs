@@ -625,6 +625,24 @@ async fn draft_with_materials(
     (text, meta, composed)
 }
 
+/// Issue #49 / design doc `2026-10-06-advisor-lead-interest-design.md` §3: 「この case で、
+/// ボットがまだ一度も応答していない」ことを、永続 case の状態から導出する純関数。
+///
+/// `existing_case` は `store.load_case` の結果(case が無ければ `None`)。ボットが応答した
+/// ターンは `record_conversation_turn` が support_case の `turn_count` を 1 以上へ進めるため、
+/// 「case が存在し、かつ `turn_count >= 1`」なら 2 ターン目以降(`false`)、それ以外は最初の
+/// ターン(`true`)とする。リクエストの `history` / `case_id` の有無は使わない: 未知の
+/// `case_id` や、`case_id` を失って履歴だけ送るクライアントでも、永続 case に応答履歴が
+/// 無ければ最初のターンとして扱うため。`turn_count` が欠落・パース不能な case(旧データ、
+/// ターン記録の書き込み失敗)も最初のターン扱いになる(保険が効く側に倒す)。
+fn first_turn_from_case(existing_case: Option<&HashMap<String, String>>) -> bool {
+    let recorded_turns = existing_case
+        .and_then(|attrs| attrs.get("turn_count"))
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(0);
+    recorded_turns == 0
+}
+
 /// `POST /{project_id}/api/reply`（design doc §6 の 11 手順そのもの）。
 async fn advisor_reply_handler(
     State(state): State<AdvisorApiState>,
@@ -695,10 +713,13 @@ async fn advisor_reply_handler(
         Ok(store) => store,
         Err(err) => return internal_error_response(&err, &ctx.request_id, "store"),
     };
-    let existing_attrs = match store.load_case(&project.schema, &case_id).await {
-        Ok(attrs) => attrs.unwrap_or_default(),
+    let existing_case = match store.load_case(&project.schema, &case_id).await {
+        Ok(attrs) => attrs,
         Err(err) => return internal_error_response(&err, &ctx.request_id, "load_case"),
     };
+    // Issue #49: first_turn は永続 case の状態(存在 + turn_count)から導く。
+    let first_turn = first_turn_from_case(existing_case.as_ref());
+    let existing_attrs = existing_case.unwrap_or_default();
 
     // 手順3: 会話状態と advisor 固有の case 属性を復元する。
     let mut conv = match state.harness.load_conv_state(&ctx, &case_id).await {
@@ -809,6 +830,8 @@ async fn advisor_reply_handler(
                         state.config.api.clarify_max_turns,
                         advisor_attrs.support_mode,
                         cs_continuing,
+                        first_turn,
+                        &case_id,
                     ),
                     Err(_) => decide::decide_time_pref_extraction_failed(
                         &understanding,
@@ -817,6 +840,8 @@ async fn advisor_reply_handler(
                         state.config.api.clarify_max_turns,
                         advisor_attrs.support_mode,
                         cs_continuing,
+                        first_turn,
+                        &case_id,
                     ),
                 }
             } else {
@@ -828,6 +853,8 @@ async fn advisor_reply_handler(
                     state.config.api.clarify_max_turns,
                     advisor_attrs.support_mode,
                     cs_continuing,
+                    first_turn,
+                    &case_id,
                 )
             };
 
@@ -1154,6 +1181,44 @@ mod tests {
     use super::*;
     use crate::config::{LlmConfig, ManualSchemaKind};
 
+    // ---- first_turn_from_case ----
+
+    fn case_with_turn_count(turn_count: &str) -> HashMap<String, String> {
+        let mut attrs = HashMap::new();
+        attrs.insert("turn_count".to_string(), turn_count.to_string());
+        attrs
+    }
+
+    #[test]
+    fn first_turn_is_true_for_an_unknown_case_id_that_has_no_persisted_case() {
+        // 未知・新規の case_id を初回リクエストから指定した場合: load_case は None。
+        assert!(first_turn_from_case(None));
+    }
+
+    #[test]
+    fn first_turn_is_true_when_only_history_is_sent_and_a_fresh_case_is_created() {
+        // case_id を失ったクライアントが履歴だけ送る場合: 新しい uuid の case が作られ、
+        // load_case は None になる(履歴の有無は導出に影響しない)。
+        assert!(first_turn_from_case(None));
+    }
+
+    #[test]
+    fn first_turn_is_false_for_an_existing_case_with_recorded_turns_even_with_empty_history() {
+        assert!(!first_turn_from_case(Some(&case_with_turn_count("1"))));
+        assert!(!first_turn_from_case(Some(&case_with_turn_count("5"))));
+    }
+
+    #[test]
+    fn first_turn_is_true_for_an_existing_case_whose_turn_count_is_zero() {
+        assert!(first_turn_from_case(Some(&case_with_turn_count("0"))));
+    }
+
+    #[test]
+    fn first_turn_is_true_for_an_existing_case_without_a_parseable_turn_count() {
+        assert!(first_turn_from_case(Some(&HashMap::new())));
+        assert!(first_turn_from_case(Some(&case_with_turn_count("abc"))));
+    }
+
     // ---- build_history_digest ----
 
     #[test]
@@ -1469,6 +1534,8 @@ mod tests {
             3,
             attrs.support_mode,
             false,
+            false, // first_turn: これは Safety 応答の直後の次ターンなので継続会話
+            "test-case",
         );
 
         assert_eq!(
@@ -1521,6 +1588,8 @@ mod tests {
             3,
             attrs.support_mode,
             true,
+            false, // first_turn: これは Safety 応答の直後の次ターンなので継続会話
+            "test-case",
         );
 
         assert_eq!(
