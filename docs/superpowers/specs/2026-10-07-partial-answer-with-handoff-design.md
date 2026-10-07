@@ -34,6 +34,7 @@
 取次（`Escalate`）のターンで、次をすべて満たすときだけ部分回答の下書きを生成する。
 
 - 判定が `Escalate` で、`hearing`（聞き返し契約）による `Clarify` ではない。
+- 取り次ぐ項目が 1 つ以上ある（第 1 層または第 2 層のマッチによる取次）。第 3 層の取次（根拠不足・確信度不足）は「答えてはいけない部分」ではなく「答える根拠が足りない」なので、部分回答の対象にしない（材料の関連度が下限を超えていても試みない）。
 - `best_manual_score` が関連十分である。
 - その case が既に取次済みではない（`CaseConvState::is_already_escalated()` が `false`。取次済みなら現行の `build_already_escalated_reply` のまま）。
 - 下書き生成が有効（`customer_reply_draft_enabled = true` かつ LLM 有効）。
