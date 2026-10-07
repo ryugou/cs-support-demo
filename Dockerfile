@@ -65,7 +65,8 @@ RUN cargo build --release --locked \
     --bin line_adapter \
     --bin homesec_advisor \
     --bin ingest_homesec \
-    --bin ingest_urtect_lp
+    --bin ingest_urtect_lp \
+    --bin verify_deploy
 
 FROM debian:bookworm-slim
 
@@ -84,6 +85,7 @@ COPY --from=builder /app/server/target/release/line_adapter /usr/local/bin/line_
 COPY --from=builder /app/server/target/release/homesec_advisor /usr/local/bin/homesec_advisor
 COPY --from=builder /app/server/target/release/ingest_homesec /usr/local/bin/ingest_homesec
 COPY --from=builder /app/server/target/release/ingest_urtect_lp /usr/local/bin/ingest_urtect_lp
+COPY --from=builder /app/server/target/release/verify_deploy /usr/local/bin/verify_deploy
 COPY server/config.gce.toml ./config.gce.toml
 COPY server/config.cloudrun.toml ./config.cloudrun.toml
 COPY server/config.homesec.toml ./config.homesec.toml

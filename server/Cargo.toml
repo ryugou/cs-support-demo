@@ -110,3 +110,7 @@ path = "src/bin/ingest_homesec.rs"
 [[bin]]
 name = "ingest_urtect_lp"
 path = "src/bin/ingest_urtect_lp.rs"
+
+[[bin]]
+name = "verify_deploy"
+path = "src/bin/verify_deploy.rs"

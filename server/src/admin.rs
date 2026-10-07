@@ -13,7 +13,9 @@
 
 use crate::api::error_response;
 use crate::config::ManualSchemaKind;
-use crate::harness::{escalation_reply, prompt_input, Harness, RegisterKnownResolutionError};
+use crate::harness::{
+    escalation_reply, prompt_input, Harness, RegisterKnownResolutionError, RequestContext,
+};
 use crate::oauth::VerifiedIdentity;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, Query, State};
@@ -34,16 +36,18 @@ pub struct AdminState {
     pub harness: Arc<Harness>,
 }
 
-/// スレッド一覧・ユーザー別一覧の既定 limit（design doc §4）。
-const THREADS_DEFAULT_LIMIT: usize = 20;
+/// スレッド一覧・ユーザー別一覧の既定 limit（design doc §4）。`pub` なのは `verify_deploy`
+/// （Issue #40）が管理 API と同じ引数で一覧を読むため（値の複製による乖離を防ぐ）。
+pub const THREADS_DEFAULT_LIMIT: usize = 20;
 /// 1 回の内部フェッチで取得する `ConversationTurn` の件数。distinct case 数がまだ `limit` に
 /// 満たない場合、このページ幅で追加取得を繰り返す。
 const THREADS_FETCH_PAGE_SIZE: i32 = 200;
 /// 内部フェッチの繰り返し上限（design doc §4: 「多くとも数回程度のリトライで十分」）。
 /// 過度なループガードとして 10 回で打ち切り、それでも `limit` に届かなければ届いた分だけ返す。
 const MAX_INTERNAL_FETCH_ROUNDS: usize = 10;
-/// 利用状況サマリの既定期間（日数）。
-const STATS_DEFAULT_DAYS: u32 = 7;
+/// 利用状況サマリの既定期間（日数）。`pub` なのは `verify_deploy`（Issue #40）が管理 API と
+/// 同じ期間で統計を読むため。
+pub const STATS_DEFAULT_DAYS: u32 = 7;
 /// `?days=` の受理上限（日数）。10 年分（365 * 10 = 3650 日）あれば運用上の利用状況分析に
 /// 十分で、それ以上を要求する業務要件は design doc に無い。上限を設ける本質的な理由は
 /// `chrono::DateTime - chrono::Duration` が表現可能範囲（西暦 262000 年ごろ）を超えると
@@ -116,8 +120,11 @@ pub fn mount_admin_api(
 
 /// `ConversationTurn` ノードの属性 map から取り出した最小ビュー。スレッド一覧の集約・
 /// スレッド詳細・利用状況サマリの 3 用途で共有する。
+/// `verify_deploy`（Issue #40）が `summarize_turns` を直接呼ぶために `pub` にしてある
+/// （フィールドは非公開のまま: 呼び出し元は `from_attrs` で変換した `Vec<TurnRow>` を
+/// 中身を見ずに `summarize_turns` へ渡すだけで、顧客発話本文のフィールドへはアクセスできない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TurnRow {
+pub struct TurnRow {
     case_id: String,
     turn_id: String,
     seq: u32,
@@ -133,7 +140,11 @@ impl TurnRow {
     /// `attrs.get("case_id")` / `attrs.get("turn_id")` / `attrs.get("created_at")` のいずれかが
     /// 欠けている行は不完全な ConversationTurn とみなして `None`（スキップ）。他の属性は
     /// 欠落を既定値として許容する（旧行・書き込み途中の行を握りつぶさずに読み進めるため）。
-    fn from_attrs(attrs: &HashMap<String, String>) -> Option<Self> {
+    ///
+    /// `pub`（Issue #40）: `verify_deploy` が `load_conversation_turns_since` の戻り値から
+    /// `summarize_turns` 向けの `Vec<TurnRow>` を、ハンドラ（`stats_summary`）と同じ経路で
+    /// 組み立てるために必要。
+    pub fn from_attrs(attrs: &HashMap<String, String>) -> Option<Self> {
         Some(Self {
             case_id: attrs.get("case_id")?.clone(),
             turn_id: attrs.get("turn_id")?.clone(),
@@ -362,7 +373,10 @@ pub struct StatsSummary {
 }
 
 /// `TurnRow` の集合から [`StatsSummary`] を組み立てる純関数。
-fn summarize_turns(days: u32, rows: &[TurnRow]) -> StatsSummary {
+///
+/// `pub`（Issue #40）: `verify_deploy` が `stats_summary` ハンドラと同じ集約関数を
+/// HTTP を介さず直接呼ぶために必要。
+pub fn summarize_turns(days: u32, rows: &[TurnRow]) -> StatsSummary {
     let mut reply_kind_counts: BTreeMap<String, u32> = BTreeMap::new();
     let mut case_ids: HashSet<&str> = HashSet::new();
     let mut end_user_ids: HashSet<&str> = HashSet::new();
@@ -417,6 +431,9 @@ type PageFuture<'a> = std::pin::Pin<
 /// `initial_offset` から連番で内部フェッチを繰り返し、集約・ページング境界の決定を行う。
 /// `fetch_thread_page` は実 vegapunk 呼び出し（`KnowledgeStore::load_conversation_turns_page`）
 /// を渡す薄いラッパー。テストはネットワーク無しの決定論的フェイクを渡せる。
+///
+/// `pub`（Issue #40）: `verify_deploy` が `list_threads` ハンドラと同じ読み出しを
+/// HTTP を介さず直接呼ぶために必要。シグネチャは変更しない。
 ///
 /// ループを抜けた理由（`source_exhausted`: 最後の内部フェッチで backend が返した raw 行数
 /// （フィルタ前）が `THREADS_FETCH_PAGE_SIZE` 未満だったか）を `paginate_summaries` へ引き渡し、
@@ -522,7 +539,7 @@ async fn build_threads_page<'a>(
 /// スレッド一覧・ユーザー別一覧の共通取得ロジック。`base_filter` が `Some` ならその条件
 /// （`end_user_id eq` 等）を全内部クエリへ重ねる。`initial_offset` は外部 cursor を decode した
 /// raw offset（cursor 無しなら 0）。
-async fn fetch_thread_page(
+pub async fn fetch_thread_page(
     state: &AdminState,
     base_filter: Option<(&str, &str, &str)>,
     limit: usize,
@@ -667,14 +684,107 @@ impl From<TurnRow> for TurnView {
     }
 }
 
+/// `pub`（Issue #40）: `verify_deploy` が `fetch_thread_detail` の戻り値を受けるために型だけ
+/// 公開する。フィールドは全て非公開で、外部へ出すのは件数アクセサ `turn_count` のみ
+/// （`Serialize` は派生しているため、発話本文を出さないことは型ではなく CLI 側の
+/// 方針で守る）。
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct ThreadDetail {
+pub struct ThreadDetail {
     case_id: String,
     case_ref: String,
     turns: Vec<TurnView>,
     clarify_turns: u32,
     preferred_contact_time: Option<String>,
     accumulated_signals: Vec<String>,
+}
+
+impl ThreadDetail {
+    pub fn turn_count(&self) -> usize {
+        self.turns.len()
+    }
+}
+
+/// `GET /admin/api/threads/{case_id}`（design doc §4）の読み出し本体。HTTP extractor に
+/// 依存しない（Issue #40: `verify_deploy` CLI が `get_thread` ハンドラと同じ読み出しを
+/// HTTP を介さず直接呼ぶための分離）。
+///
+/// `get_thread` から抽出しただけで、ロジック・`tracing::error!` の文言・分岐の条件は
+/// 元の実装と同一（挙動を変えない）。戻り値:
+/// - `Ok(Some(detail))`: 正常に取得できた。
+/// - `Ok(None)`: 指定した `case_id` の ConversationTurn が1件も無い
+///   （呼び出し元のハンドラはこれを 404 へ変換する）。
+/// - `Err(_)`: インフラ側の失敗（呼び出し元のハンドラは 500 へ変換する）。ここで
+///   `tracing::error!` 済みなので、呼び出し元は同じメッセージへ変換するだけでよい。
+pub async fn fetch_thread_detail(
+    state: &AdminState,
+    ctx: &RequestContext,
+    case_id: &str,
+) -> anyhow::Result<Option<ThreadDetail>> {
+    let store = match state.harness.store() {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::error!(error = %format!("{err:#}"), "admin api: get_thread knowledge store unavailable");
+            return Err(err);
+        }
+    };
+    let attrs_list = match store
+        .load_conversation_turns_for_case(&state.schema, case_id)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                error = %format!("{err:#}"),
+                schema = %state.schema,
+                case_id,
+                "admin api: get_thread load_conversation_turns_for_case failed"
+            );
+            return Err(err);
+        }
+    };
+    let mut turns: Vec<TurnView> = attrs_list
+        .iter()
+        .filter_map(TurnRow::from_attrs)
+        .map(TurnView::from)
+        .collect();
+    if turns.is_empty() {
+        return Ok(None);
+    }
+    turns.sort_by_key(|t| t.seq);
+
+    let conv = match state.harness.load_conv_state(ctx, case_id).await {
+        Ok(conv) => conv,
+        Err(err) => {
+            tracing::error!(
+                error = %format!("{err:#}"),
+                schema = %state.schema,
+                case_id,
+                "admin api: get_thread load_conv_state failed"
+            );
+            return Err(err);
+        }
+    };
+    let signals = match state.harness.load_case_signals(ctx, case_id).await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(
+                error = %format!("{err:#}"),
+                schema = %state.schema,
+                case_id,
+                "admin api: get_thread load_case_signals failed"
+            );
+            return Err(err);
+        }
+    };
+
+    Ok(Some(ThreadDetail {
+        case_id: case_id.to_string(),
+        case_ref: escalation_reply::case_ref(case_id),
+        turns,
+        clarify_turns: conv.clarify_turns,
+        preferred_contact_time: conv.preferred_contact_time,
+        accumulated_signals: signals.iter().map(|s| s.as_str().to_string()).collect(),
+    }))
 }
 
 /// `GET /admin/api/threads/{case_id}`（design doc §4）。ターン列は `seq` 昇順、case メタ
@@ -700,92 +810,19 @@ async fn get_thread(
         }
     };
 
-    let store = match state.harness.store() {
-        Ok(store) => store,
-        Err(err) => {
-            tracing::error!(error = %format!("{err:#}"), "admin api: get_thread knowledge store unavailable");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "failed to load the thread; see server logs",
-            );
-        }
-    };
-    let attrs_list = match store
-        .load_conversation_turns_for_case(&state.schema, &case_id)
-        .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::error!(
-                error = %format!("{err:#}"),
-                schema = %state.schema,
-                case_id,
-                "admin api: get_thread load_conversation_turns_for_case failed"
-            );
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "failed to load the thread; see server logs",
-            );
-        }
-    };
-    let mut turns: Vec<TurnView> = attrs_list
-        .iter()
-        .filter_map(TurnRow::from_attrs)
-        .map(TurnView::from)
-        .collect();
-    if turns.is_empty() {
-        return error_response(
+    match fetch_thread_detail(&state, &ctx, &case_id).await {
+        Ok(Some(detail)) => (StatusCode::OK, Json(detail)).into_response(),
+        Ok(None) => error_response(
             StatusCode::NOT_FOUND,
             "not_found",
             format!("no conversation turns found for case_id={case_id}"),
-        );
+        ),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "failed to load the thread; see server logs",
+        ),
     }
-    turns.sort_by_key(|t| t.seq);
-
-    let conv = match state.harness.load_conv_state(&ctx, &case_id).await {
-        Ok(conv) => conv,
-        Err(err) => {
-            tracing::error!(
-                error = %format!("{err:#}"),
-                schema = %state.schema,
-                case_id,
-                "admin api: get_thread load_conv_state failed"
-            );
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "failed to load the thread; see server logs",
-            );
-        }
-    };
-    let signals = match state.harness.load_case_signals(&ctx, &case_id).await {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::error!(
-                error = %format!("{err:#}"),
-                schema = %state.schema,
-                case_id,
-                "admin api: get_thread load_case_signals failed"
-            );
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "failed to load the thread; see server logs",
-            );
-        }
-    };
-
-    let detail = ThreadDetail {
-        case_id: case_id.clone(),
-        case_ref: escalation_reply::case_ref(&case_id),
-        turns,
-        clarify_turns: conv.clarify_turns,
-        preferred_contact_time: conv.preferred_contact_time,
-        accumulated_signals: signals.iter().map(|s| s.as_str().to_string()).collect(),
-    };
-    (StatusCode::OK, Json(detail)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1668,6 +1705,41 @@ mod tests {
     async fn fetch_thread_page_fails_when_knowledge_is_unavailable() {
         let state = test_admin_state();
         let err = fetch_thread_page(&state, None, 20, 0)
+            .await
+            .expect_err("knowledge: None must fail");
+        assert!(err.to_string().contains("knowledge"));
+    }
+
+    /// `supervisor_ctx`（`harness/mod.rs` のテストヘルパー）と同じパターンで組み立てた
+    /// 最小限の `RequestContext`。`fetch_thread_detail` は `ctx.schema` しか参照しないため、
+    /// actor/scope はプレースホルダでよい。
+    fn test_request_context(schema: &str) -> RequestContext {
+        RequestContext {
+            actor: crate::harness::authn::Actor {
+                sub: "google-sub:admin-test".to_string(),
+                email: "admin-test@sivira.co".to_string(),
+                role: crate::harness::authn::Role::Supervisor,
+                allowed_schemas: vec![schema.to_string()],
+            },
+            scope: crate::harness::scope::AccessScope {
+                allowed_schemas: vec![schema.to_string()],
+                max_sensitivity: None,
+                label_allowlist: None,
+            },
+            schema: schema.to_string(),
+            request_id: "req-admin-test".to_string(),
+            manual_schema: ManualSchemaKind::ManualV1,
+        }
+    }
+
+    /// `get_thread` から抽出した後も、`knowledge: None` では元のハンドラと同じ経路
+    /// （`state.harness.store()` の失敗）で `Err` になることを固定する
+    /// （Issue #40: 抽出が `get_thread` の 500 経路を壊していないことの証拠）。
+    #[tokio::test]
+    async fn fetch_thread_detail_fails_when_knowledge_is_unavailable() {
+        let state = test_admin_state();
+        let ctx = test_request_context(&state.schema);
+        let err = fetch_thread_detail(&state, &ctx, "case-1")
             .await
             .expect_err("knowledge: None must fail");
         assert!(err.to_string().contains("knowledge"));

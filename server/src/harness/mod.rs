@@ -1154,7 +1154,12 @@ impl Harness {
     }
 
     /// 第1・2層ルールが参照する signal が語彙に存在することを検証する（fail closed）。
-    fn validate_rule_vocabulary(
+    ///
+    /// `verify_deploy` バイナリ（Issue #40 のデプロイ後スモーク CLI）は `cs_support_mcp` を
+    /// 外部クレートとして `use` する別クレート（`server/Cargo.toml` の `[[bin]]`）であり、
+    /// `pub(crate)` は定義クレート内でのみ可視なため別クレートからは呼べない。crate 境界を
+    /// 越えて再利用するため `pub` にする。
+    pub fn validate_rule_vocabulary(
         &self,
         rules: &[rules::EscalationRule],
         domains: &[rules::ProhibitedDomain],
