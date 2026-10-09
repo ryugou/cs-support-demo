@@ -1037,6 +1037,7 @@ mod tests {
             customer_reply_draft_truncated: false,
             product_references: Vec::new(),
             new_signals: SignalSet::new(),
+            handoff_items: Vec::new(),
         }
     }
 

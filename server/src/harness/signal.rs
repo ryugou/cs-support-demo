@@ -279,6 +279,17 @@ impl LexiconNormalizer {
         &self.declaration_order
     }
 
+    /// signal の正規化済み（NFKC + 小文字化 + 英数字以外除去）surface_forms を返す
+    /// （`handoff_items::passes_handoff_safeguards` が取り次ぐ項目の表層形照合に使う。design doc
+    /// `2026-10-07-partial-answer-with-handoff-design.md` §3.5(3)）。lexicon に signal 自体が
+    /// 未登録、または `llm_only`（文字列照合の対象外で `entries` に積まない）の場合は `None`。
+    pub(crate) fn normalized_surface_forms_of(&self, signal: &Signal) -> Option<&[String]> {
+        self.entries
+            .iter()
+            .find(|entry| entry.signal == signal.as_str())
+            .map(|entry| entry.normalized_forms.as_slice())
+    }
+
     pub fn class_of(&self, signal: &Signal) -> Option<SignalClass> {
         self.classes.get(signal.as_str()).copied()
     }
@@ -672,6 +683,41 @@ mod tests {
     fn customer_label_of_returns_none_for_an_unregistered_signal() {
         let lex = lexicon();
         assert_eq!(lex.customer_label_of(&Signal::new("totally_unknown")), None);
+    }
+
+    #[test]
+    fn normalized_surface_forms_of_returns_the_normalized_forms_for_a_registered_signal() {
+        let lex = lexicon();
+        assert_eq!(
+            lex.normalized_surface_forms_of(&Signal::new("mold")),
+            Some(["カビ".to_string(), "かび".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn normalized_surface_forms_of_returns_none_for_an_unregistered_signal() {
+        let lex = lexicon();
+        assert_eq!(
+            lex.normalized_surface_forms_of(&Signal::new("totally_unknown")),
+            None
+        );
+    }
+
+    #[test]
+    fn normalized_surface_forms_of_returns_none_for_an_llm_only_signal() {
+        // llm_only の signal は文字列照合の対象外で `entries` に積まれないため、surface_forms
+        // 自体が空でも登録されていても None を返す（`contains_signal` は true のままでよい）。
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "unclassified_risk", "class": "hazard", "surface_forms": [], "llm_only": true }
+            ] }"#,
+        )
+        .unwrap();
+        assert!(lex.contains_signal("unclassified_risk"));
+        assert_eq!(
+            lex.normalized_surface_forms_of(&Signal::new("unclassified_risk")),
+            None
+        );
     }
 
     #[test]

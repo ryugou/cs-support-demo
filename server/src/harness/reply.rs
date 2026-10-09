@@ -494,9 +494,10 @@ pub fn build_reply_system_prompt(
             .collect::<Vec<_>>()
             .join("、");
         p.push_str(&format!(
-            "- 次の項目については、金額・可否・条件を一切書かず、「〈項目〉は担当者がご案内し\
-             ます」の趣旨だけを書く。各項目を必ず1回は挙げる。受付番号や対応時間は書かない\
-             （別途決定論的な案内が付くため）: {items}\n"
+            "- 次の項目について、金額・可否・条件は一切書かない。材料に「別途かかる」等の存在の\
+             記述があれば、それだけは金額を伴わない独立した文として書いてよい。「担当者がご案内\
+             します」等の取次の文言、受付番号、対応時間は書かない（別途決定論的な案内が付くため）\
+             : {items}\n"
         ));
     }
     p.push_str(&format!(
@@ -1751,13 +1752,31 @@ mod tests {
                 p.contains("条件で変わるもの"),
                 "cost categorization instruction missing: {p}"
             );
+            // design doc §3.2（2026-10-09 改訂）: 取次の文言・受付番号・対応時間は書かせない
+            // （§3.3 の決定論の一文・ブロックが別途付くため）。「担当者がご案内します」という
+            // 文字列自体は「書かない」という禁止の文の中に残る。
             assert!(
-                p.contains("担当者がご案内します"),
+                p.contains("「担当者がご案内します」等の取次の文言、受付番号、対応時間は書かない"),
                 "handoff item instruction missing: {p}"
+            );
+            assert!(
+                p.contains("存在の記述"),
+                "the instruction to still allow a non-monetary existence statement is missing: {p}"
             );
             assert!(p.contains("初期費用・設置工事費に関するご質問"), "{p}");
             assert!(p.contains(NO_ANSWER_TOKEN), "{p}");
         }
+    }
+
+    /// §3.5(2) 廃止（2026-10-09）と整合: ラベル網羅を促す指示自体を削除した
+    /// （旧文言「各項目を必ず1回は挙げる」。言い換えに追従する表層形照合へ移行したため、
+    /// 下書き側にラベルの完全一致を要求する指示を残す意味が無くなった）。
+    #[test]
+    fn system_prompt_no_longer_demands_every_handoff_item_be_mentioned_verbatim() {
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        let brief = build_reply_brief(&escalate(DisclosureScope::ConfirmingWithTeam), &[], false);
+        let p = super::build_reply_system_prompt(&brief, false, &test_allowlist(), &items);
+        assert!(!p.contains("各項目を必ず1回は挙げる"));
     }
 
     #[test]
