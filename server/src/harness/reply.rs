@@ -167,6 +167,10 @@ pub struct ReplyBrief {
     /// 分岐）はこの一文をそのまま含めるよう指示する（design doc
     /// `2026-10-05-initial-cost-handoff-design.md` §4.2）。
     pub handoff_ack: Option<String>,
+    /// design doc `2026-10-07-partial-answer-with-handoff-design.md` §3.1 の部分回答の条件
+    /// （`handoff_items::can_draft_partial_answer`）の判定結果。`kind == ReplyKind::Escalation`
+    /// のときだけ意味を持ち、`ReplyKind::Answer` では常に無視される。
+    pub partial_answer_ok: bool,
 }
 
 /// LLM へ渡す資料 1 件。**本文と出典ラベルを分けて持つ。**
@@ -311,6 +315,7 @@ pub fn build_reply_brief_with_resolution(
                 disclosure: None,
                 excerpts,
                 handoff_ack: None,
+                partial_answer_ok,
             }
         }
         AnswerDecision::Allowed {
@@ -340,6 +345,7 @@ pub fn build_reply_brief_with_resolution(
                 disclosure: None,
                 excerpts: excerpts_from_hits(hits, Some(evidence_section_keys.as_slice())),
                 handoff_ack: None,
+                partial_answer_ok,
             }
         }
         AnswerDecision::Escalate {
@@ -360,6 +366,7 @@ pub fn build_reply_brief_with_resolution(
                 Vec::new()
             },
             handoff_ack: customer_ack.clone(),
+            partial_answer_ok,
         },
     }
 }
@@ -440,7 +447,7 @@ pub fn build_reply_system_prompt(
     // CONTINUATION_OPENER_RULE（挨拶・感謝・謝罪の定型オープナー禁止）と同じ「共通ルール」
     // ブロック内で自己矛盾する（Issue #17 レビュー指摘）。字数指定と文体は継続時も維持し、
     // 「挨拶を含む」の要求だけを外す。
-    let partial_answer_mode = brief.kind == ReplyKind::Escalation && !brief.excerpts.is_empty();
+    let partial_answer_mode = brief.kind == ReplyKind::Escalation && brief.partial_answer_ok;
     let tone_rule = if partial_answer_mode {
         "- 日本語（です・ます調）で、120〜300 字程度。挨拶・お礼・結びの定型は書かず、回答本文だけにする。\n"
     } else if is_continuation {
@@ -524,8 +531,10 @@ pub fn build_reply_system_prompt(
             ));
         }
         ReplyKind::Escalation => {
-            // 部分回答モード（design doc §3.1・§3.2）: `build_reply_brief_with_resolution` は
-            // `partial_answer_ok` のときだけ Escalation に材料を載せるため、材料の有無で判別できる。
+            // 部分回答モード（design doc §3.1・§3.2）: `brief.partial_answer_ok` を直接読む
+            // （PR #99 Copilot レビュー指摘是正。旧実装は `!brief.excerpts.is_empty()` で推定して
+            // いたため、本文が空の hit しか無いとき `partial_answer_ok == true` でも誤って
+            // 取次のみモードに落ちていた。材料の有無では判別しない）。
             // このモードでは「答えるな・資料は無い」指示を出すと材料を渡しているのと自己矛盾する。
             // 受け止め文・受付番号・取次の定型案内は別途決定論的に付く（§3.3）ので書かせない。
             if partial_answer_mode {
@@ -1796,6 +1805,73 @@ mod tests {
         assert!(
             p.contains("金額を含む文と「、」で繋がない"),
             "existence-statement independence instruction missing: {p}"
+        );
+    }
+
+    // ---- Copilot レビュー指摘（PR #99）: 部分回答モードの判別を `brief.partial_answer_ok` で
+    // 行う（`!brief.excerpts.is_empty()` からの推定をやめる） ----
+
+    /// `hits` が本文の無い（trim 後に空の）セクションしか持たないとき、
+    /// `excerpts_from_hits` は空配列を返すため `brief.excerpts.is_empty()` が `true` になる。
+    /// 旧実装はこれで部分回答モードを**推定**していたため、`partial_answer_ok == true`
+    /// （evaluate 側は部分回答と判定済み）でも取次のみモードの指示に落ち、下書きに取次の
+    /// 文言が混じって呼び出し側が付ける取次の一文と二重になっていた。`partial_answer_ok` を
+    /// 直接読むことで、材料の有無に関わらず判定結果どおりのモードになることを固定する。
+    #[test]
+    fn system_prompt_uses_partial_answer_ok_not_excerpts_emptiness_to_detect_partial_answer_mode() {
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        let brief = build_reply_brief(
+            &escalate(DisclosureScope::ConfirmingWithTeam),
+            &[hit("sec-a", "")],
+            true,
+        );
+        assert!(
+            brief.excerpts.is_empty(),
+            "precondition: a hit with no usable body must yield no excerpts"
+        );
+        let p = super::build_reply_system_prompt(&brief, false, &test_allowlist(), &items);
+        assert!(
+            p.contains("下書きは回答本文だけで構成する"),
+            "partial answer mode instruction missing even though partial_answer_ok is true: {p}"
+        );
+        assert!(
+            !p.contains("担当部署へ取り次ぐ旨だけを書きます"),
+            "handoff-only instruction must not appear when partial_answer_ok is true: {p}"
+        );
+    }
+
+    /// 対称のケース: `partial_answer_ok == false` の `Escalate` で `excerpts` が非空でも、
+    /// 取次のみモードの指示になることを固定する。`build_reply_brief_with_resolution` 経由では
+    /// `partial_answer_ok == false` のとき必ず `excerpts` が空になる構造的な保証があるため
+    /// （この保証自体は上の `escalation_brief_without_partial_answer_eligibility_carries_no_manual_excerpts`
+    /// が固定している）、ここでは `ReplyBrief` を直接構築し、`build_reply_system_prompt` が
+    /// `excerpts` の中身ではなく `partial_answer_ok` だけを見て分岐することを検証する。
+    #[test]
+    fn system_prompt_uses_partial_answer_ok_not_excerpts_presence_to_detect_non_partial_mode() {
+        let brief = ReplyBrief {
+            kind: ReplyKind::Escalation,
+            disclosure: Some(DisclosureScope::ConfirmingWithTeam),
+            excerpts: vec![ReplyExcerpt {
+                source: "マニュアル「タイトル」".to_string(),
+                body: "本文".to_string(),
+            }],
+            handoff_ack: None,
+            partial_answer_ok: false,
+        };
+        let p = super::build_reply_system_prompt(&brief, false, &test_allowlist(), &[]);
+        assert!(
+            p.contains("担当部署へ取り次ぐ旨だけを書きます"),
+            "handoff-only instruction missing even though partial_answer_ok is false: {p}"
+        );
+        assert!(
+            p.contains(
+                "解決方法・手順・原因の推測は、いかなる場合も一切書かない。資料は与えられていない。"
+            ),
+            "{p}"
+        );
+        assert!(
+            !p.contains("下書きは回答本文だけで構成する"),
+            "partial answer mode instruction must not appear when partial_answer_ok is false: {p}"
         );
     }
 
