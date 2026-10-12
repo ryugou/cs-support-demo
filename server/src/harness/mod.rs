@@ -13,6 +13,8 @@ pub mod hours;
 pub mod knowledge;
 pub mod product_gate;
 pub(crate) mod prompt_input;
+#[cfg(test)]
+mod real_llm_smoke;
 pub mod reply;
 pub mod rules;
 pub mod scope;

@@ -24,7 +24,7 @@
 //! `#[tokio::test]` は既定で current-thread ランタイムなので、`.await` をまたいでも同一
 //! スレッド上で実行される限り成立する。
 
-use crate::harness::rules::{Binding, EscalationRule, HearingContract};
+use crate::harness::rules::{Binding, EscalationRule, HearingContract, ProhibitedDomain};
 use crate::harness::signal::Signal;
 use std::cell::RefCell;
 use std::sync::Once;
@@ -97,6 +97,59 @@ pub(crate) fn load_bundled_escalation_rules() -> Vec<EscalationRule> {
                 condition: r.condition.into_iter().map(Signal::new).collect(),
                 route: r.route,
                 owner: r.owner,
+            }
+        })
+        .collect()
+}
+
+/// `ingest_rules.rs` の `DomainInput` と同形のテスト専用パース struct（[`BundledRuleInput`]
+/// と同じ理由で複製している）。
+#[derive(Debug, serde::Deserialize)]
+struct BundledDomainInput {
+    domain_id: String,
+    #[serde(default)]
+    domain_signals: Vec<String>,
+    #[serde(default)]
+    pattern: Vec<String>,
+    route: String,
+    binding: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BundledDomainsFile {
+    prohibited_domains: Vec<BundledDomainInput>,
+}
+
+/// 実際に配布される `data/urtect/rules.json` の第2層禁止領域を実行時の型で返す
+/// （[`load_bundled_escalation_rules`] の第2層版）。
+pub(crate) fn load_bundled_prohibited_domains() -> Vec<ProhibitedDomain> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/urtect/rules.json");
+    let body = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read bundled urtect rules.json {path:?}: {e}"));
+    let parsed: BundledDomainsFile = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("parse bundled urtect rules.json {path:?}: {e}"));
+    parsed
+        .prohibited_domains
+        .into_iter()
+        .map(|d| {
+            // `d.domain_id` is moved into `id` below; bind it first so the binding panic
+            // message can still refer to it.
+            let domain_id = d.domain_id;
+            ProhibitedDomain {
+                // 正本パーサ `Binding::parse`（`harness::rules`、完全一致のみ受理）を使う。
+                // `load_bundled_escalation_rules` と同じく、実データを本番と同じ解釈で通す
+                // ため文字列対応表をここで複製しない。
+                binding: Binding::parse(&d.binding).unwrap_or_else(|| {
+                    panic!(
+                        "unknown binding {:?} on domain {domain_id} in bundled urtect \
+                         rules.json",
+                        d.binding
+                    )
+                }),
+                id: domain_id,
+                domain_signals: d.domain_signals.into_iter().map(Signal::new).collect(),
+                text_patterns: d.pattern,
+                route: d.route,
             }
         })
         .collect()
