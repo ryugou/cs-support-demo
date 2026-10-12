@@ -2,7 +2,9 @@
 //!
 //! 正本: `docs/superpowers/specs/2026-10-07-partial-answer-with-handoff-design.md` §2, §3.1,
 //! §3.5（2026-10-09 改訂: §3.5(2) のラベル網羅検査を廃止し、§3.5(3) をラベル文字列照合から
-//! signal の surface_forms 照合へ変更）。**`decision::decide` 自体は変更しない。** ここは
+//! signal の surface_forms 照合へ変更。2026-10-12 改訂: §3.5(3) の文の区切りを「。！？」のみに
+//! 変更し改行を区切りから除外、金額の断定を桁区切り・小数点・漢数字まで拾う正規表現に拡張）。
+//! **`decision::decide` 自体は変更しない。** ここは
 //! `decide` が確定した `AnswerDecision`・マッチしたルール/禁止領域から「顧客に見せてよい取次
 //! 項目」を導出し、下書き生成の可否と、生成された下書きが歯止めを通るかを判定する純関数の集まり。
 
@@ -199,15 +201,18 @@ pub fn partial_answer_skip_reason(
     }
 }
 
-/// 半角・全角数字の後に、任意の空白と任意の漢数字単位（万・千・百・億）を挟んで `円` / `%` / `％`
-/// が続く断定表現を検出する（design doc §3.5 の3、§5「既知の限界」: 単位を伴わない断定
-/// 「無料です」は対象外。egress gate の NG 辞書側で補う）。「3万円」「１，５４０円」
-/// 「5,000 円」「1万5千円（末尾の「5千円」で検出）」を拾う。
+/// 数字（半角・全角、桁区切り「,」「，」、小数点、「万」「億」を含む）または漢数字
+/// （〇一二三四五六七八九十百千万億）の並びの直後に、任意の空白を挟んで `円` / `￥` / `%` /
+/// `％` が続く断定表現を検出する（design doc §3.5 の3、2026-10-12 改訂。§5「既知の限界」:
+/// 単位を伴わない断定「無料です」は対象外。egress gate の NG 辞書側で補う）。「3万円」
+/// 「１，５４０円」「5,000 円」「1万5千円（末尾の「5千円」で検出）」「三万円」「百万円」を拾う。
 fn monetary_assertion_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"[0-9０-９][\s　]*[万千百億]?[\s　]*(円|%|％)")
-            .expect("monetary assertion regex must compile")
+        regex::Regex::new(
+            r"(?:[0-9０-９][0-9０-９,，.]*[\s　]*[万千百億]?[\s　]*|[〇一二三四五六七八九十百千万億]+[\s　]*)(円|￥|%|％)",
+        )
+        .expect("monetary assertion regex must compile")
     })
 }
 
@@ -278,9 +283,9 @@ pub fn handoff_items_for_decision(
 /// 1 つでも失敗すれば `Err`。返す理由の文字列には**顧客発話・下書き本文は含めない**。
 ///
 /// 既知の限界（design doc §3.5(3) の定義どおりで、ここでは塞がない）: 金額検査は「取り次ぐ項目の
-/// 表層形を含む文（「。」「\n」区切り）」だけを見る。表層形を含まない別の文での金額断定、
-/// 可否・条件の断定（数字+単位を伴わないもの）は検出しない。これらはプロンプト指示と
-/// egress gate に委ねている（design doc §3.2・§5）。
+/// 表層形を含む文（「。」「！」「？」区切り。改行は区切りにしない）」だけを見る。表層形を含まない
+/// 別の文での金額断定、可否・条件の断定（数字+単位を伴わないもの）は検出しない。これらは
+/// プロンプト指示と egress gate に委ねている（design doc §3.2・§5）。
 pub fn passes_handoff_safeguards(
     draft: &str,
     handoff_items: &[HandoffItem],
@@ -304,12 +309,14 @@ pub fn passes_handoff_safeguards(
         );
     }
     // 3. 取り次ぐ項目の signal の surface_forms（lexicon 正規化済み）を含む文
-    //    （「。」「\n」区切り）に、金額・数量の断定が含まれない。ラベル文字列ではなく表層形で
-    //    照合するのは、LLM の言い換えに追従するため（2026-10-09 改訂）。本番で、LLM が
+    //    （「。」「！」「？」区切り。改行は区切りにしない。2026-10-12 改訂: 「・設置工事費\n
+    //    30,000円」のような箇条書きで表層形と金額が別の文に分かれて素通りするのを防ぐため、
+    //    改行を区切りから外した）に、金額・数量の断定が含まれない。ラベル文字列ではなく
+    //    表層形で照合するのは、LLM の言い換えに追従するため（2026-10-09 改訂）。本番で、LLM が
     //    「設置工事費は担当者がご案内します」と自然に言い換えた下書きが、ラベル
     //    「初期費用・設置工事費に関するご質問」の完全一致を要求する旧検査に落ちて全件
     //    不採用になった事故が実際の契機。
-    for sentence in draft.split(['。', '\n']) {
+    for sentence in draft.split(['。', '！', '!', '？', '?']) {
         let normalized_sentence = normalize_key(sentence);
         let mentions_handoff_item = handoff_items.iter().any(|item| {
             item.signals.iter().any(|signal| {
@@ -872,23 +879,59 @@ mod tests {
     }
 
     #[test]
-    fn passes_handoff_safeguards_treats_a_newline_as_a_sentence_boundary() {
-        // 旧仕様（`split('。')` のみ）は改行をまたいで同一文とみなしていたため、表層形と金額が
-        // 別の行にあってもまとめて不採用にしていた。改行も区切りに加えたことで、別の行にある
-        // 金額は取り次ぐ項目の表層形を含む文の一部とはみなされなくなる。
+    fn passes_handoff_safeguards_no_longer_treats_a_newline_as_a_sentence_boundary() {
         let lex = lexicon_with_surface_forms();
         let items = items_fixture();
         let drafted = "工事費は担当者がご案内します\n月額は1,540円です。";
-        assert!(passes_handoff_safeguards(drafted, &items, &lex).is_ok());
+        assert!(passes_handoff_safeguards(drafted, &items, &lex).is_err());
     }
 
     #[test]
-    fn passes_handoff_safeguards_rejects_a_monetary_assertion_on_the_same_line_across_a_newline() {
-        // 改行で区切られても、表層形と金額が**同じ行**にあれば引き続き不採用になる。
+    fn passes_handoff_safeguards_rejects_a_monetary_assertion_following_a_newline_in_the_same_sentence(
+    ) {
         let lex = lexicon_with_surface_forms();
         let items = items_fixture();
         let drafted = format!("{LABEL}は担当者がご案内します\n工事費は3万円です。");
         assert!(passes_handoff_safeguards(&drafted, &items, &lex).is_err());
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_rejects_kanji_numeral_amounts_and_bulleted_or_wrapped_amounts() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in [
+            "工事費は三万円です。",
+            "初期費用は百万円です。",
+            "・設置工事費\n30,000円",
+            "工事費は\n3万円です。",
+            "工事費は1.5万円です。",
+            "工事費は３０，０００円です。",
+            "工事費は5,000￥です。",
+        ] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_err(),
+                "{drafted:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_accepts_amount_sentences_separated_by_a_terminator_other_than_a_period(
+    ) {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in [
+            "設置工事費用は別途かかります。月額は1,540円です。",
+            "月額1,540円です！設置工事費は別途です。",
+            "月額1,540円ですか？設置工事費は別途です。",
+            "月額1,540円です?設置工事費は別途です。",
+            "月額1,540円です!設置工事費は別途です。",
+        ] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_ok(),
+                "{drafted:?} must be accepted"
+            );
+        }
     }
 
     #[test]

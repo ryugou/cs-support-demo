@@ -348,7 +348,8 @@ async fn decide_and_assert_layer1(
     (extracted, decision)
 }
 
-/// 下書きを生成し、本番と同じ採否判定（`accept_draft` と取扱外型番ゲート）を通して本文を返す。
+/// 下書きを生成し、本番と同じ採否判定（`accept_draft`、truncated 判定、取扱外型番ゲート）を
+/// 通して本文を返す。
 async fn draft_accepted_text(
     fx: &Fixture,
     decision: &AnswerDecision,
@@ -403,6 +404,13 @@ async fn draft_accepted_text(
     {
         panic!("run {run}/{runs}: draft was not accepted: {reason}");
     }
+    assert!(
+        !draft.truncated,
+        "run {run}/{runs}: draft was truncated at the generation limit; production's \
+         partial_answer_draft_for_escalation discards it and falls back to the \
+         acknowledgement text instead of using it:\n{}",
+        draft.text
+    );
     // api.rs の `gate_customer_reply_draft`（private）§3.5(1) と同じ判定。
     // 本番ならこの下書きは捨てられる。
     let out_of_scope = fx.allowlist.out_of_scope_mentions(&draft.text);

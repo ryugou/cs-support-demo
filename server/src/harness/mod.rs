@@ -715,14 +715,29 @@ fn record_partial_answer_skip(
         already_escalated_for_policy(policy),
         draft_generation_enabled,
     ) {
+        let message = match reason {
+            handoff_items::PartialAnswerSkipReason::HearingDeclared => {
+                "partial-answer draft was not attempted for a layer-1/2 escalate because the \
+                 matched rule declares a hearing contract; whether this turn becomes a \
+                 Clarify or stays an Escalate is decided afterward by api.rs via Jev's \
+                 has_enough_info judgment, so it cannot be assumed to end up on the \
+                 acknowledgement-text path. The customer utterance is not logged"
+            }
+            handoff_items::PartialAnswerSkipReason::NoHandoffItems
+            | handoff_items::PartialAnswerSkipReason::InsufficientRelevance
+            | handoff_items::PartialAnswerSkipReason::AlreadyEscalated
+            | handoff_items::PartialAnswerSkipReason::DraftGenerationDisabled => {
+                "partial-answer draft was not attempted for a layer-1/2 escalate; falling back \
+                 to the acknowledgement-text path. The customer utterance is not logged"
+            }
+        };
         tracing::info!(
             request_id = %request_id,
             case_id = %case_id,
             best_manual_score = ?best_manual_score,
             low_threshold = thresholds.low,
             reason = ?reason,
-            "partial-answer draft was not attempted for a layer-1/2 escalate; falling back \
-             to the acknowledgement-text path. The customer utterance is not logged"
+            "{message}"
         );
     }
 }
@@ -3047,6 +3062,19 @@ mod tests {
         escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new())
     }
 
+    fn escalate_hearing_declared() -> decision::AnswerDecision {
+        decision::AnswerDecision::Escalate {
+            reason: decision::EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "triage".to_string(),
+            disclosure_scope: decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            hearing: Some(rules::HearingContract::ProductAndSymptom),
+            customer_ack: None,
+        }
+    }
+
     #[test]
     fn plan_reply_draft_generates_a_partial_answer_for_an_unescalated_eligible_escalate() {
         let allow = response_allowlist_fixture();
@@ -3322,6 +3350,29 @@ mod tests {
             true,
         );
         assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn record_partial_answer_skip_logs_hearing_declared_without_claiming_the_acknowledgement_fallback(
+    ) {
+        let lines = skip_log_lines(
+            &escalate_hearing_declared(),
+            &handoff_items_fixture(),
+            Some(0.9),
+            false,
+            true,
+        );
+        assert_single_skip_line(&lines, "HearingDeclared");
+        assert!(
+            !lines[0].contains("falling back to the acknowledgement-text path"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("has_enough_info"),
+            "expected the log to name the later Jev has_enough_info judgment: {}",
+            lines[0]
+        );
     }
 
     // ---- suppressed_ack_rule_ids（Issue #79） ----
