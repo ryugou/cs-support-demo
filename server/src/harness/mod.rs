@@ -728,8 +728,9 @@ fn record_partial_answer_skip(
             | handoff_items::PartialAnswerSkipReason::InsufficientRelevance
             | handoff_items::PartialAnswerSkipReason::AlreadyEscalated
             | handoff_items::PartialAnswerSkipReason::DraftGenerationDisabled => {
-                "partial-answer draft was not attempted for a layer-1/2 escalate; falling back \
-                 to the acknowledgement-text path. The customer utterance is not logged"
+                "partial-answer draft was not attempted for a layer-1/2 escalate; the reply \
+                 uses the acknowledgement text (/api/reply) or a handoff-only draft (MCP \
+                 Always policy). The customer utterance is not logged"
             }
         };
         tracing::info!(
