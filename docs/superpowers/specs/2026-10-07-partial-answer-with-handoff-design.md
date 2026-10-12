@@ -129,3 +129,15 @@ user message には現行の材料（上位 3 件・各 2,500 字まで）と質
 - 判定ロジック（`decide`）の変更、ルールや lexicon の変更。
 - 費用項目の名前や金額をコード・設定に持つこと（料金ページの更新に追従させるため、材料からのみ得る）。
 - homesec アドバイザーへの適用。
+
+## 9. 実出力の検証（2026-10-12 追加。マージ前に必須）
+
+単体テストと reviewer の判定だけでは、顧客に返る最終文面を確認したことにならない（2026-10-09 の本番で下書きが全件捨てられていた）。本変更および以後の応答文面に関わる変更は、次の検証を通し、出力文面を PR とチャットに貼ってからマージを依頼する。
+
+- `#[ignore]` の統合テスト `real_llm_partial_answer_smoke`（`server/src/harness/` 配下のテストモジュール。crate 内部 API を使うため）を置く。`cargo test --manifest-path server/Cargo.toml --lib real_llm_partial_answer_smoke -- --ignored --nocapture` で実行する。
+- 入力は env で受ける: `CS_SUPPORT_LLM_API_KEY`（必須。無ければテストを失敗させる）、`CS_VERIFY_SECTIONS_JSON`（`ingest_urtect_lp --dry-run` の出力ファイルのパス。必須）、`CS_VERIFY_QUESTION`（既定「導入にどれくらいの費用がかかるの？」）、`CS_VERIFY_RUNS`（既定 5）。
+- 本番と同じ部品を使う: `server/data/urtect/signal-lexicon.json`、`server/data/urtect/rules.json`（`ingest_rules` と同じ読み方で `EscalationRule` / `ProhibitedDomain` に変換）、`config.cloudrun.toml` の `[llm]` と `[harness]` の値（モデル・max_tokens・閾値）、実 LLM による signal 抽出（`HybridExtractor`）と製品言及抽出、`decide`、`derive_handoff_items`、`plan_reply_draft`、`draft_customer_reply`、`accept_draft`、`build_handoff_sentence`、`build_deterministic_block`、`assemble_escalation_reply`。
+- 材料は sections JSON の `price` / `faq` / `flow` を `SectionHit` にする（この順でスコア 0.9 / 0.7 / 0.6、`breadcrumb` は `["URTECT", title_ja]`）。本番の上位 3 件を厳密に再現するものではないが、料金ページの本文は同一である。
+- 各 run で、判定（layer / rule）、立った signal、取り次ぐ項目、下書きの採否と理由、**最終応答文の全文**を標準出力に出す。
+- 合否: 全 run で判定が第 1 層 `initial-cost-quote`、下書きが採用され、最終応答文に「1,540」が含まれ、取次の一文（`build_handoff_sentence` の出力）と受付番号の行が含まれること。1 run でも外れたら失敗。
+- このテストは CI では走らせない（`#[ignore]`）。API キーをファイルに書かない。
