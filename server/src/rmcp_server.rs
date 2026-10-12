@@ -137,9 +137,15 @@ pub struct EvaluateAnswerabilityResponse {
     /// ターンは常に空になる（質問側ゲート二段目が signals 劣化時の fail-closed 判定を
     /// 破棄しないための措置）。MCP側ではこの判定（foreign→取扱外）は行わない。
     pub product_references: Vec<ProductReferenceJson>,
-    /// 取り次ぐ項目の顧客提示用ラベル。顧客への案内では、下書きの後にこの項目を
-    /// 担当者が確認して案内する旨を付けること。
+    /// 取り次ぐ項目の顧客提示用ラベル。`partial_answer` が `true` のときに限り、顧客への
+    /// 案内で下書きの後にこの項目を担当者が確認して案内する旨を付けること（`false` の取次
+    /// 下書きは既に取次の旨を含むので足さない）。
     pub handoff_items: Vec<String>,
+    /// 下書きの種別。`true` は部分回答の下書き（材料から答えた本文。取次の文言を含まない）、
+    /// `false` はそれ以外（`Allowed` の通常回答、取次の旨だけの下書き、または下書きが無い
+    /// 場合）。**`true` のときだけ、下書きの後に `handoff_items` を担当者が確認して案内する
+    /// 旨を付けること。`false` の取次下書きは既に取次の旨を含むので足さない。**
+    pub partial_answer: bool,
 }
 
 /// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
@@ -194,6 +200,7 @@ impl EvaluateAnswerabilityResponse {
                 .map(ProductReferenceJson::from)
                 .collect(),
             handoff_items: outcome.handoff_items,
+            partial_answer: outcome.partial_answer,
         }
     }
 }
@@ -1310,6 +1317,7 @@ mod tests {
     fn evaluation_outcome_with_handoff_items(
         decision: crate::harness::decision::AnswerDecision,
         handoff_items: Vec<String>,
+        partial_answer: bool,
     ) -> crate::harness::EvaluationOutcome {
         crate::harness::EvaluationOutcome {
             decision,
@@ -1326,6 +1334,7 @@ mod tests {
             product_references: Vec::new(),
             new_signals: crate::harness::signal::SignalSet::new(),
             handoff_items,
+            partial_answer,
         }
     }
 
@@ -1341,8 +1350,11 @@ mod tests {
             hearing: None,
             customer_ack: None,
         };
-        let outcome =
-            evaluation_outcome_with_handoff_items(decision, vec!["初期費用の見積もり".to_string()]);
+        let outcome = evaluation_outcome_with_handoff_items(
+            decision,
+            vec!["初期費用の見積もり".to_string()],
+            false,
+        );
         let response = EvaluateAnswerabilityResponse::from_outcome(outcome, "req-1".to_string());
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(
@@ -1360,9 +1372,47 @@ mod tests {
             stakes: crate::harness::decision::Stakes::Low,
             threshold: 0.8,
         };
-        let outcome = evaluation_outcome_with_handoff_items(decision, Vec::new());
+        let outcome = evaluation_outcome_with_handoff_items(decision, Vec::new(), false);
         let response = EvaluateAnswerabilityResponse::from_outcome(outcome, "req-2".to_string());
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["handoff_items"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn evaluate_answerability_response_serializes_partial_answer_from_the_outcome() {
+        let escalate = || crate::harness::decision::AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: vec![],
+            hearing: None,
+            customer_ack: None,
+        };
+        let allowed = || crate::harness::decision::AnswerDecision::Allowed {
+            source: crate::harness::decision::AnswerSource::Manual,
+            evidence_section_keys: vec!["doc#sec1".to_string()],
+            known_resolution_id: None,
+            stakes: crate::harness::decision::Stakes::Low,
+            threshold: 0.8,
+        };
+        let items = || vec!["初期費用の見積もり".to_string()];
+        let cases = [
+            ("partial answer escalation", escalate(), items(), true),
+            ("handoff only escalation", escalate(), items(), false),
+            ("allowed", allowed(), Vec::new(), false),
+        ];
+        for (name, decision, handoff_items, partial_answer) in cases {
+            let outcome =
+                evaluation_outcome_with_handoff_items(decision, handoff_items, partial_answer);
+            let response = EvaluateAnswerabilityResponse::from_outcome(outcome, "req".to_string());
+            let value = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                value["partial_answer"],
+                serde_json::json!(partial_answer),
+                "{name}"
+            );
+        }
     }
 }

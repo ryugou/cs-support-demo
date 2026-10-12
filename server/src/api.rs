@@ -2736,6 +2736,7 @@ mod tests {
             product_references: Vec::new(),
             new_signals: crate::harness::signal::SignalSet::new(),
             handoff_items: Vec::new(),
+            partial_answer: false,
         }
     }
 

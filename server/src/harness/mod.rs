@@ -154,6 +154,7 @@ pub struct EvaluationOutcome {
     /// 下書きに続ける取次の一文（`escalation_reply::build_handoff_sentence`）を組み立てるために
     /// 使う。
     pub handoff_items: Vec<String>,
+    pub partial_answer: bool,
 }
 
 /// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
@@ -740,6 +741,10 @@ fn record_partial_answer_skip(
             "{message}"
         );
     }
+}
+
+fn is_partial_answer_draft(partial_answer_ok: bool, customer_reply_draft: Option<&str>) -> bool {
+    partial_answer_ok && customer_reply_draft.is_some()
 }
 
 /// `evaluate()` の下書き計画（`already_escalated` の取り出し → 部分回答の可否 →
@@ -2070,6 +2075,8 @@ impl Harness {
         };
         let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
         let customer_reply_draft = reply_draft.map(|d| d.text);
+        let partial_answer =
+            is_partial_answer_draft(partial_answer_ok, customer_reply_draft.as_deref());
 
         Ok(EvaluationOutcome {
             decision: decision_result,
@@ -2086,6 +2093,7 @@ impl Harness {
             product_references,
             new_signals,
             handoff_items: handoff_item_labels,
+            partial_answer,
         })
     }
 
@@ -3072,6 +3080,23 @@ mod tests {
             missing: Vec::new(),
             hearing: Some(rules::HearingContract::ProductAndSymptom),
             customer_ack: None,
+        }
+    }
+
+    #[test]
+    fn is_partial_answer_draft_requires_both_partial_answer_ok_and_a_generated_draft() {
+        let cases = [
+            (true, Some("下書き"), true),
+            (true, None, false),
+            (false, Some("下書き"), false),
+            (false, None, false),
+        ];
+        for (partial_answer_ok, draft, expected) in cases {
+            assert_eq!(
+                is_partial_answer_draft(partial_answer_ok, draft),
+                expected,
+                "partial_answer_ok={partial_answer_ok} draft={draft:?}"
+            );
         }
     }
 
