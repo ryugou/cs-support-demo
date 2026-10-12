@@ -440,7 +440,10 @@ pub fn build_reply_system_prompt(
     // CONTINUATION_OPENER_RULE（挨拶・感謝・謝罪の定型オープナー禁止）と同じ「共通ルール」
     // ブロック内で自己矛盾する（Issue #17 レビュー指摘）。字数指定と文体は継続時も維持し、
     // 「挨拶を含む」の要求だけを外す。
-    let tone_rule = if is_continuation {
+    let partial_answer_mode = brief.kind == ReplyKind::Escalation && !brief.excerpts.is_empty();
+    let tone_rule = if partial_answer_mode {
+        "- 日本語（です・ます調）で、120〜300 字程度。挨拶・お礼・結びの定型は書かず、回答本文だけにする。\n"
+    } else if is_continuation {
         "- 日本語（です・ます調）で、120〜300 字程度。冒頭の挨拶は書かず、結びは自然に整えた返信文にする。\n"
     } else {
         "- 日本語（です・ます調）で、120〜300 字程度。挨拶と結びを含む自然な返信文にする。\n"
@@ -495,9 +498,9 @@ pub fn build_reply_system_prompt(
             .join("、");
         p.push_str(&format!(
             "- 次の項目について、金額・可否・条件は一切書かない。材料に「別途かかる」等の存在の\
-             記述があれば、それだけは金額を伴わない独立した文として書いてよい。「担当者がご案内\
-             します」等の取次の文言、受付番号、対応時間は書かない（別途決定論的な案内が付くため）\
-             : {items}\n"
+             記述があれば、それだけは書いてよい。ただし金額を伴わない独立した文にし、金額を含む\
+             文と「、」で繋がない。「担当者がご案内します」等の取次の文言、受付番号、対応時間は\
+             書かない（別途決定論的な案内が付くため）: {items}\n"
         ));
     }
     p.push_str(&format!(
@@ -525,15 +528,23 @@ pub fn build_reply_system_prompt(
             // `partial_answer_ok` のときだけ Escalation に材料を載せるため、材料の有無で判別できる。
             // このモードでは「答えるな・資料は無い」指示を出すと材料を渡しているのと自己矛盾する。
             // 受け止め文・受付番号・取次の定型案内は別途決定論的に付く（§3.3）ので書かせない。
-            let partial_answer_mode = !brief.excerpts.is_empty();
             if partial_answer_mode {
                 p.push_str(
                     "\n今回は、資料で答えられる部分だけを答え、取り次ぐ項目は担当者に引き継ぐ問い合わせです。\n",
                 );
                 p.push_str(EVIDENCE_DISCIPLINE_RULES);
                 p.push_str(
-                    "- 受付番号・対応時間・取次の定型案内（「担当より改めて連絡する」等）や謝意の定型文は\
+                    "- 受付番号・対応時間・取次の定型案内（「担当より改めて連絡する」等）は\
                      書かない（別途決定論的な案内が付くため）。\n",
+                );
+                p.push_str(
+                    "- 「担当部署に確認させていただきます」「詳しくは担当者へ」など担当者・担当部署への\
+                     確認や問い合わせへの誘導は書かない（取次の一文と重複する）。\n",
+                );
+                p.push_str(
+                    "- 「お問い合わせいただきありがとうございます」「お気軽にお問い合わせください」など\
+                     冒頭の挨拶・お礼・締めの定型や、「〜についてご説明いたします」の前置きは書かない。\
+                     下書きは回答本文だけで構成する。\n",
                 );
             } else {
                 p.push_str(
@@ -552,9 +563,10 @@ pub fn build_reply_system_prompt(
                 }
             }
             match brief.disclosure {
-                Some(DisclosureScope::ConfirmingWithTeam) => {
+                Some(DisclosureScope::ConfirmingWithTeam) if !partial_answer_mode => {
                     p.push_str("- 開示範囲: 「担当部署に確認する」旨までは書いてよい。\n");
                 }
+                Some(DisclosureScope::ConfirmingWithTeam) => {}
                 Some(DisclosureScope::NoInternalDetails) => {
                     p.push_str(
                         "- 開示範囲: 社内の事情（権限が無い・根拠が不足している等の理由）は一切書かない。\
@@ -1186,7 +1198,7 @@ mod tests {
             !p.contains("こちらで解決しそうでしょうか"),
             "the answer-branch closer must not leak into the partial answer prompt"
         );
-        assert!(p.contains("謝意の定型文は書かない"));
+        assert!(p.contains("挨拶・お礼・締めの定型や"));
     }
 
     #[test]
@@ -1765,7 +1777,77 @@ mod tests {
             );
             assert!(p.contains("初期費用・設置工事費に関するご質問"), "{p}");
             assert!(p.contains(NO_ANSWER_TOKEN), "{p}");
+            assert!(
+                p.contains("金額を含む文と「、」で繋がない"),
+                "existence-statement independence instruction missing: {p}"
+            );
         }
+    }
+
+    #[test]
+    fn partial_answer_mode_prompt_bans_filler_and_drops_greeting_and_team_confirmation_allowance() {
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        let brief = build_reply_brief(
+            &escalate(DisclosureScope::ConfirmingWithTeam),
+            &[hit("sec-a", "本文")],
+            true,
+        );
+        let p = super::build_reply_system_prompt(&brief, false, &test_allowlist(), &items);
+        for banned_filler in [
+            "担当部署に確認させていただきます",
+            "詳しくは担当者へ",
+            "お問い合わせいただきありがとうございます",
+            "お気軽にお問い合わせください",
+            "についてご説明いたします",
+            "下書きは回答本文だけで構成する",
+        ] {
+            assert!(p.contains(banned_filler), "{banned_filler} missing: {p}");
+        }
+        for contradicting in [
+            "挨拶と結びを含む",
+            "「担当部署に確認する」旨までは書いてよい",
+        ] {
+            assert!(!p.contains(contradicting), "{contradicting} present: {p}");
+        }
+        assert!(
+            p.contains("120〜300 字程度") && p.contains("です・ます調"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn partial_answer_mode_prompt_still_applies_no_internal_details_disclosure() {
+        let brief = build_reply_brief(
+            &escalate(DisclosureScope::NoInternalDetails),
+            &[hit("sec-a", "本文")],
+            true,
+        );
+        let p = super::build_reply_system_prompt(&brief, false, &test_allowlist(), &[]);
+        assert!(p.contains("社内の事情"), "{p}");
+    }
+
+    #[test]
+    fn non_partial_prompts_keep_greeting_and_disclosure_instructions_without_body_only_rule() {
+        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        let allowed_brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")], false);
+        let escalation_without_material =
+            build_reply_brief(&escalate(DisclosureScope::ConfirmingWithTeam), &[], false);
+        for brief in [allowed_brief, escalation_without_material] {
+            let p = super::build_reply_system_prompt(&brief, false, &test_allowlist(), &items);
+            assert!(!p.contains("下書きは回答本文だけで構成する"), "{p}");
+            assert!(!p.contains("お気軽にお問い合わせください"), "{p}");
+            assert!(p.contains("挨拶と結びを含む"), "{p}");
+        }
+        let p = super::build_reply_system_prompt(
+            &build_reply_brief(&escalate(DisclosureScope::ConfirmingWithTeam), &[], false),
+            false,
+            &test_allowlist(),
+            &items,
+        );
+        assert!(
+            p.contains("「担当部署に確認する」旨までは書いてよい"),
+            "{p}"
+        );
     }
 
     /// §3.5(2) 廃止（2026-10-09）と整合: ラベル網羅を促す指示自体を削除した
