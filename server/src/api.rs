@@ -796,12 +796,10 @@ async fn build_escalation_reply_text(
         );
     }
     if let Some(draft) = customer_reply_draft {
-        let handoff_sentence = escalation_reply::build_handoff_sentence(handoff_items);
-        let draft_with_handoff_sentence = format!("{draft}\n\n{handoff_sentence}");
         let block =
             escalation_reply::build_deterministic_block(case_id, hours_label, out_of_hours_now);
         let reply_text =
-            escalation_reply::assemble_escalation_reply(&draft_with_handoff_sentence, &block);
+            escalation_reply::assemble_partial_answer_reply(draft, handoff_items, &block);
         arm_time_pref_solicitation(conv);
         return (reply_text, true);
     }
@@ -4210,11 +4208,9 @@ mod tests {
 
         assert_eq!(
             reply_text,
-            escalation_reply::assemble_escalation_reply(
-                &format!(
-                    "{draft}\n\n{}",
-                    escalation_reply::build_handoff_sentence(&handoff_items)
-                ),
+            escalation_reply::assemble_partial_answer_reply(
+                draft,
+                &handoff_items,
                 &escalation_reply::build_deterministic_block(
                     "case-12345678-abcd",
                     "平日 10:00〜18:00",
@@ -4276,11 +4272,9 @@ mod tests {
 
         assert_eq!(
             reply_text,
-            escalation_reply::assemble_escalation_reply(
-                &format!(
-                    "{draft}\n\n{}",
-                    escalation_reply::build_handoff_sentence(&handoff_items)
-                ),
+            escalation_reply::assemble_partial_answer_reply(
+                draft,
+                &handoff_items,
                 &escalation_reply::build_deterministic_block(
                     "case-12345678-abcd",
                     "平日 10:00〜18:00",
@@ -4323,11 +4317,9 @@ mod tests {
 
         assert_eq!(
             reply_text,
-            escalation_reply::assemble_escalation_reply(
-                &format!(
-                    "{draft}\n\n{}",
-                    escalation_reply::build_handoff_sentence(&handoff_items)
-                ),
+            escalation_reply::assemble_partial_answer_reply(
+                draft,
+                &handoff_items,
                 &escalation_reply::build_deterministic_block(
                     "case-12345678-abcd",
                     "平日 10:00〜18:00",

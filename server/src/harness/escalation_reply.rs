@@ -285,6 +285,18 @@ pub fn build_handoff_sentence(labels: &[String]) -> String {
     }
 }
 
+pub fn assemble_partial_answer_reply(
+    draft: &str,
+    handoff_labels: &[String],
+    deterministic_block: &str,
+) -> String {
+    let handoff_sentence = build_handoff_sentence(handoff_labels);
+    assemble_escalation_reply(
+        &format!("{draft}\n\n{handoff_sentence}"),
+        deterministic_block,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +516,19 @@ mod tests {
     #[test]
     fn build_handoff_sentence_returns_an_empty_string_for_no_labels() {
         assert_eq!(build_handoff_sentence(&[]), "");
+    }
+
+    #[test]
+    fn assemble_partial_answer_reply_orders_draft_handoff_sentence_and_block_with_blank_lines() {
+        let reply = assemble_partial_answer_reply(
+            "下書きです。",
+            &["設置日程に関するご質問".to_string()],
+            "受付番号: 12345678",
+        );
+        assert_eq!(
+            reply,
+            "下書きです。\n\n設置日程に関するご質問は、担当者が確認してご案内します。\n\n受付番号: 12345678"
+        );
     }
 
     /// stub LLM に `draft_text` / `stop_reason` を返させ、`draft_ack_text` の結果を返す。

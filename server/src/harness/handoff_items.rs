@@ -292,6 +292,17 @@ pub fn passes_handoff_safeguards(
             "the draft is exactly the {NO_ANSWER_TOKEN:?} token (no answerable part found)"
         ));
     }
+    for item in handoff_items.iter().filter(|item| {
+        item.signals
+            .iter()
+            .all(|signal| normalizer.normalized_surface_forms_of(signal).is_none())
+    }) {
+        let names: Vec<&str> = item.signals.iter().map(Signal::as_str).collect();
+        tracing::warn!(
+            signals = ?names,
+            "handoff item has no surface forms to check (llm_only or unregistered signal); the monetary-assertion safeguard cannot cover it"
+        );
+    }
     // 3. 取り次ぐ項目の signal の surface_forms（lexicon 正規化済み）を含む文
     //    （「。」「\n」区切り）に、金額・数量の断定が含まれない。ラベル文字列ではなく表層形で
     //    照合するのは、LLM の言い換えに追従するため（2026-10-09 改訂）。本番で、LLM が
@@ -315,8 +326,9 @@ pub fn passes_handoff_safeguards(
         // `normalize_key` は英数字以外を除去するため、正規化後の文字列には規則表現が機能しない。
         if mentions_handoff_item && monetary_assertion_regex().is_match(sentence) {
             return Err(
-                "a sentence mentioning a handoff item's surface form contains a monetary/\
-                 quantity assertion (the sentence text itself is not included in this message)"
+                "invalid draft: a sentence mentioning a handoff item's surface form contains a \
+                 monetary or quantity assertion (the sentence text itself is not included in \
+                 this message)"
                     .to_string(),
             );
         }
@@ -745,6 +757,44 @@ mod tests {
         let lex = lexicon_with_surface_forms();
         let drafted = "工事費は1,540円です。";
         assert!(passes_handoff_safeguards(drafted, &items_fixture(), &lex).is_err());
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_warns_but_accepts_an_item_whose_signals_have_no_surface_forms() {
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "unclassified_risk", "class": "hazard", "surface_forms": [],
+                  "llm_only": true, "customer_label": "その他のご懸念" }
+            ] }"#,
+        )
+        .expect("lexicon parses");
+        let items = vec![HandoffItem {
+            label: "その他のご懸念".to_string(),
+            signals: vec![Signal::new("unclassified_risk")],
+        }];
+        let (result, logs) = crate::test_support::capture_logs(|| {
+            passes_handoff_safeguards("月額利用料金は1台1,540円です。", &items, &lex)
+        });
+        assert!(result.is_ok());
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("unclassified_risk"),
+            "expected a warning naming the unchecked signal, got: {warnings}"
+        );
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_does_not_warn_for_an_item_with_surface_forms() {
+        let lex = lexicon_with_surface_forms();
+        let (result, logs) = crate::test_support::capture_logs(|| {
+            passes_handoff_safeguards("月額利用料金は1台1,540円です。", &items_fixture(), &lex)
+        });
+        assert!(result.is_ok());
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            !warnings.contains("no surface forms"),
+            "unexpected warning for a checkable item: {warnings}"
+        );
     }
 
     #[test]

@@ -139,16 +139,34 @@ fn runs_from_env() -> usize {
     runs
 }
 
-/// design doc §9 の実出力検証。本番と同じ部品（signal-lexicon.json、rules.json、
-/// config.cloudrun.toml の `[llm]`/`[harness]`、実 LLM 抽出・下書き生成）を使い、
-/// 「導入にどれくらいの費用がかかるの？」が第1層 `initial-cost-quote` にマッチし、
-/// 下書きが採用され、最終応答文に月額料金・取次の一文・受付番号が含まれることを
-/// `CS_VERIFY_RUNS` 回連続で確認する。1 run でも外れたら即座に失敗させる。
-#[tokio::test]
-#[ignore = "requires CS_SUPPORT_LLM_API_KEY, network access to the Anthropic API, and \
-            CS_VERIFY_SECTIONS_JSON (ingest_urtect_lp --dry-run output); see design doc \
-            2026-10-07-partial-answer-with-handoff-design.md §9"]
-async fn real_llm_partial_answer_smoke() {
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_dir_all(&self.0) {
+            eprintln!(
+                "failed to remove temp dir {} of the harness worm audit log/queue: {err}",
+                self.0.display()
+            );
+        }
+    }
+}
+
+struct Fixture {
+    config: AppConfig,
+    harness: Harness,
+    lexicon: Arc<signal::LexiconNormalizer>,
+    escalation_rules: Vec<rules::EscalationRule>,
+    prohibited_domains: Vec<rules::ProhibitedDomain>,
+    mandatory_domains: Vec<rules::ProhibitedDomain>,
+    thresholds: Thresholds,
+    allowlist: ProductAllowlist,
+    hours_label: String,
+    hits: Vec<SectionHit>,
+    question: String,
+}
+
+fn load_config_and_client() -> (AppConfig, AnthropicClient) {
     let config = AppConfig::load(&server_path("config.cloudrun.toml"))
         .expect("load server/config.cloudrun.toml");
     // 下書きが無効なら本番は下書きを作らず、§9 の合否は成立しない（`Harness::build` と同じ前提）。
@@ -179,38 +197,15 @@ async fn real_llm_partial_answer_smoke() {
                  real_llm_partial_answer_smoke to exercise the real LLM"
             )
         });
+    (config, client)
+}
 
-    let sections_json_path = std::env::var(SECTIONS_ENV).unwrap_or_else(|_| {
-        panic!(
-            "{SECTIONS_ENV} is not set; point it at the output file of \
-             `ingest_urtect_lp --dry-run` (the price/faq/flow sections of the URTECT landing \
-             page)"
-        )
-    });
-    let question = std::env::var(QUESTION_ENV).unwrap_or_else(|_| DEFAULT_QUESTION.to_string());
-    let runs = runs_from_env();
-
-    let hits = material_hits(&sections_json_path);
-    let price_section_key = hits[0].section_key.clone();
-    let price_score = hits[0].score;
-
-    let lexicon = Arc::new(
-        signal::LexiconNormalizer::from_path(&resolve_server_path(
-            &config.harness.signal_lexicon_path,
-        ))
-        .expect("production signal lexicon must load and parse"),
-    );
-    let escalation_rules = load_bundled_escalation_rules();
-    let prohibited_domains = load_bundled_prohibited_domains();
-    let mandatory_domains: Vec<rules::ProhibitedDomain> = prohibited_domains
-        .iter()
-        .filter(|d| d.binding == rules::Binding::Mandatory)
-        .cloned()
-        .collect();
-    let thresholds: Thresholds = (&config.harness.thresholds).into();
-    let allowlist = ProductAllowlist::from_models(seed_product_models());
-    let hours_label = hours::business_hours_label(&config.api.business_hours);
-
+fn build_harness(
+    config: &AppConfig,
+    client: AnthropicClient,
+    lexicon: &Arc<signal::LexiconNormalizer>,
+    dir: &Path,
+) -> Harness {
     // signal 抽出・製品言及抽出の配線は `Harness::build` と同一（別々の LLM 呼び出しに
     // 分離済みの 2 コンポーネントを、同じ AnthropicClient を使い回して組む）。
     let signal_classifier: Arc<dyn ClassifyLlm> = Arc::new(AnthropicSignalClassifier::new(
@@ -220,10 +215,7 @@ async fn real_llm_partial_answer_smoke() {
     let product_reference_classifier: Arc<dyn ClassifyProductReferences> =
         Arc::new(AnthropicProductReferenceClassifier::new(client.clone()));
 
-    let dir = std::env::temp_dir().join(format!("real-llm-smoke-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("create temp dir for the harness worm audit log/queue");
-
-    let harness = Harness {
+    Harness {
         authenticator: authn::Authenticator::new(
             config.projects.iter().map(|p| p.schema.clone()).collect(),
         ),
@@ -244,7 +236,7 @@ async fn real_llm_partial_answer_smoke() {
             audit::WormAuditLog::open(&dir.join("audit.jsonl")).expect("open temp worm audit log"),
         ),
         knowledge: None,
-        thresholds: thresholds.clone(),
+        thresholds: (&config.harness.thresholds).into(),
         grading: (&config.harness.grading).into(),
         queue_path: dir.join("queue.jsonl"),
         grade_lock: tokio::sync::Mutex::new(()),
@@ -256,168 +248,248 @@ async fn real_llm_partial_answer_smoke() {
         reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
         product_gate: None,
         jev_client: None,
+    }
+}
+
+fn build_fixture(
+    config: AppConfig,
+    harness: Harness,
+    lexicon: Arc<signal::LexiconNormalizer>,
+    hits: Vec<SectionHit>,
+    question: String,
+) -> Fixture {
+    let prohibited_domains = load_bundled_prohibited_domains();
+    let mandatory_domains: Vec<rules::ProhibitedDomain> = prohibited_domains
+        .iter()
+        .filter(|d| d.binding == rules::Binding::Mandatory)
+        .cloned()
+        .collect();
+    let thresholds: Thresholds = (&config.harness.thresholds).into();
+    let hours_label = hours::business_hours_label(&config.api.business_hours);
+    Fixture {
+        harness,
+        lexicon,
+        escalation_rules: load_bundled_escalation_rules(),
+        prohibited_domains,
+        mandatory_domains,
+        thresholds,
+        allowlist: ProductAllowlist::from_models(seed_product_models()),
+        hours_label,
+        hits,
+        question,
+        config,
+    }
+}
+
+/// signal 抽出から `decide` までを実行し、第1層 `initial-cost-quote` の取次であることを確かめる。
+async fn decide_and_assert_layer1(
+    fx: &Fixture,
+    run: usize,
+    runs: usize,
+) -> (extraction::ExtractionResult, AnswerDecision) {
+    let question = &fx.question;
+    let extracted = fx.harness.extractor.extract(question).await;
+    let (signals, mode) = (&extracted.signals, extracted.mode);
+    // 製品言及抽出は signal 抽出と完全に独立したコンポーネント（Issue #52）。この質問は
+    // 型番言及を含まないため判定には使わないが、本番と同じ配線を実際に動かして確認する
+    // （design doc §9「実 LLM による...製品言及抽出」）。
+    let product_references = fx
+        .harness
+        .product_reference_extractor
+        .extract(question, fx.allowlist.display_list())
+        .await;
+    println!("signals: {signals:?} (extraction_mode={mode:?})");
+    println!("product_references: {product_references:?}");
+
+    // `Harness::evaluate` と同じ式（単ターンなので accumulated = signals）。
+    let stakes_input = StakesInput {
+        mandatory_domain_near: rules::match_layer2(&fx.mandatory_domains, signals, question)
+            .is_some(),
+        ng_near_hit: fx.harness.ng.near_hit(question),
+        hazard_signal_count: signals
+            .iter()
+            .filter(|s| fx.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
+            .count(),
+    };
+    let price_section_key = fx.hits[0].section_key.clone();
+    let decision = decision::decide(&DecisionInput {
+        question_signals: signals,
+        question_raw: question,
+        rules: &fx.escalation_rules,
+        domains: &fx.prohibited_domains,
+        resolutions: &[],
+        best_manual_score: Some(fx.hits[0].score),
+        best_manual_sections: std::slice::from_ref(&price_section_key),
+        stakes_input,
+        thresholds: &fx.thresholds,
+        default_route: &fx.config.harness.default_escalation_route,
+    });
+    let matched_layer1_rule_ids: Vec<String> = matching_layer1_rules(&fx.escalation_rules, signals)
+        .into_iter()
+        .map(|rule| rule.id.clone())
+        .collect();
+    println!("decision: {decision:?}");
+    println!("matched layer-1 rule ids: {matched_layer1_rule_ids:?}");
+
+    // 判定の合否は下書き生成より先に見る（判定が外れたまま下書き失敗で panic すると
+    // 失敗理由が誤誘導になる）。併発ルールがあっても `decide` が選ぶルールが
+    // initial-cost-quote なら §9 は満たされる。
+    assert!(
+        matches!(&decision, AnswerDecision::Escalate { layer: 1, .. }),
+        "run {run}/{runs}: expected a layer-1 escalate decision, got {decision:?}"
+    );
+    let selected_rule_id = match_layer1(&fx.escalation_rules, signals).map(|r| r.id.as_str());
+    assert_eq!(
+        selected_rule_id,
+        Some("initial-cost-quote"),
+        "run {run}/{runs}: expected initial-cost-quote to be the selected layer-1 rule \
+         (matched: {matched_layer1_rule_ids:?})"
+    );
+    (extracted, decision)
+}
+
+/// 下書きを生成し、本番と同じ採否判定（`accept_draft` と取扱外型番ゲート）を通して本文を返す。
+async fn draft_accepted_text(
+    fx: &Fixture,
+    decision: &AnswerDecision,
+    mode: extraction::ExtractionMode,
+    items: &[handoff_items::HandoffItem],
+    run: usize,
+    runs: usize,
+) -> String {
+    let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
+    let policy = ReplyDraftPolicy::SkipWhenUnused {
+        response_allowlist: &fx.allowlist,
+        already_escalated: false,
+    };
+    let plan = super::plan_reply_draft(
+        &policy,
+        decision,
+        items,
+        mode,
+        false,
+        Some(fx.hits[0].score),
+        &fx.thresholds,
+        fx.config.harness.customer_reply_draft_enabled,
+    );
+
+    let draft = if plan.generate {
+        fx.harness
+            .draft_customer_reply(
+                &fx.question,
+                decision,
+                &fx.hits,
+                &[],
+                &[],
+                false,
+                &fx.allowlist,
+                &labels,
+                plan.partial_answer_ok,
+            )
+            .await
+    } else {
+        None
     };
 
-    for run in 1..=runs {
-        println!("==== real_llm_partial_answer_smoke run {run}/{runs} ====");
-
-        let extraction::ExtractionResult { signals, mode } =
-            harness.extractor.extract(&question).await;
-        // 製品言及抽出は signal 抽出と完全に独立したコンポーネント（Issue #52）。この質問は
-        // 型番言及を含まないため判定には使わないが、本番と同じ配線を実際に動かして確認する
-        // （design doc §9「実 LLM による...製品言及抽出」）。
-        let product_references = harness
-            .product_reference_extractor
-            .extract(&question, allowlist.display_list())
-            .await;
-        println!("signals: {signals:?} (extraction_mode={mode:?})");
-        println!("product_references: {product_references:?}");
-
-        // `Harness::evaluate` と同じ式（単ターンなので accumulated = signals）。
-        let stakes_input = StakesInput {
-            mandatory_domain_near: rules::match_layer2(&mandatory_domains, &signals, &question)
-                .is_some(),
-            ng_near_hit: harness.ng.near_hit(&question),
-            hazard_signal_count: signals
-                .iter()
-                .filter(|s| harness.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
-                .count(),
-        };
-
-        let decision = decision::decide(&DecisionInput {
-            question_signals: &signals,
-            question_raw: &question,
-            rules: &escalation_rules,
-            domains: &prohibited_domains,
-            resolutions: &[],
-            best_manual_score: Some(price_score),
-            best_manual_sections: std::slice::from_ref(&price_section_key),
-            stakes_input,
-            thresholds: &thresholds,
-            default_route: &config.harness.default_escalation_route,
-        });
-        let matched_layer1_rule_ids: Vec<String> =
-            matching_layer1_rules(&escalation_rules, &signals)
-                .into_iter()
-                .map(|rule| rule.id.clone())
-                .collect();
-        println!("decision: {decision:?}");
-        println!("matched layer-1 rule ids: {matched_layer1_rule_ids:?}");
-
-        // 判定の合否は下書き生成より先に見る（判定が外れたまま下書き失敗で panic すると
-        // 失敗理由が誤誘導になる）。併発ルールがあっても `decide` が選ぶルールが
-        // initial-cost-quote なら §9 は満たされる。
-        assert!(
-            matches!(&decision, AnswerDecision::Escalate { layer: 1, .. }),
-            "run {run}/{runs}: expected a layer-1 escalate decision, got {decision:?}"
-        );
-        let selected_rule_id = match_layer1(&escalation_rules, &signals).map(|r| r.id.as_str());
-        assert_eq!(
-            selected_rule_id,
-            Some("initial-cost-quote"),
-            "run {run}/{runs}: expected initial-cost-quote to be the selected layer-1 rule \
-             (matched: {matched_layer1_rule_ids:?})"
-        );
-
-        let items = handoff_items::handoff_items_for_decision(
-            &decision,
-            &escalation_rules,
-            &prohibited_domains,
-            &signals,
-            &question,
-            &lexicon,
-        );
-        let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
-        println!("handoff items: {labels:?}");
-
-        let policy = ReplyDraftPolicy::SkipWhenUnused {
-            response_allowlist: &allowlist,
-            already_escalated: false,
-        };
-        let plan = super::plan_reply_draft(
-            &policy,
-            &decision,
-            &items,
-            mode,
-            false,
-            Some(price_score),
-            &thresholds,
-            config.harness.customer_reply_draft_enabled,
-        );
-
-        let draft = if plan.generate {
-            harness
-                .draft_customer_reply(
-                    &question,
-                    &decision,
-                    &hits,
-                    &[],
-                    &[],
-                    false,
-                    &allowlist,
-                    &labels,
-                    plan.partial_answer_ok,
-                )
-                .await
-        } else {
-            None
-        };
-
-        let draft_text = match draft {
-            None => panic!(
-                "run {run}/{runs}: draft_customer_reply did not generate a draft \
-                 (plan.generate={}, plan.partial_answer_ok={})",
-                plan.generate, plan.partial_answer_ok
-            ),
-            Some(draft) => {
-                match handoff_items::accept_draft(
-                    &draft.text,
-                    plan.partial_answer_ok,
-                    &items,
-                    &lexicon,
-                ) {
-                    Ok(()) => {
-                        // api.rs の `gate_customer_reply_draft`（private）§3.5(1) と同じ判定。
-                        // 本番ならこの下書きは捨てられる。
-                        let out_of_scope = allowlist.out_of_scope_mentions(&draft.text);
-                        assert!(
-                            out_of_scope.is_empty(),
-                            "run {run}/{runs}: draft mentions out-of-scope models \
-                             {out_of_scope:?} (production would discard it):\n{}",
-                            draft.text
-                        );
-                        println!("draft: accepted");
-                        draft.text
-                    }
-                    Err(reason) => panic!("run {run}/{runs}: draft was not accepted: {reason}"),
-                }
-            }
-        };
-
-        let handoff_sentence = escalation_reply::build_handoff_sentence(&labels);
-        let case_id = format!("case-smoketest{run:020}");
-        let deterministic_block =
-            escalation_reply::build_deterministic_block(&case_id, &hours_label, false);
-        let final_reply = escalation_reply::assemble_escalation_reply(
-            &format!("{draft_text}\n\n{handoff_sentence}"),
-            &deterministic_block,
-        );
-        println!("final reply:\n{final_reply}");
-
-        assert!(
-            final_reply.contains("1,540"),
-            "run {run}/{runs}: final reply does not mention the monthly fee (1,540):\n{final_reply}"
-        );
-        assert!(
-            final_reply.contains(&handoff_sentence),
-            "run {run}/{runs}: final reply does not contain the handoff sentence \
-             ({handoff_sentence:?}):\n{final_reply}"
-        );
-        assert!(
-            final_reply.contains("受付番号: "),
-            "run {run}/{runs}: final reply does not contain the case reference line:\n{final_reply}"
-        );
+    let Some(draft) = draft else {
+        panic!(
+            "run {run}/{runs}: draft_customer_reply did not generate a draft \
+             (plan.generate={}, plan.partial_answer_ok={})",
+            plan.generate, plan.partial_answer_ok
+        )
+    };
+    if let Err(reason) =
+        handoff_items::accept_draft(&draft.text, plan.partial_answer_ok, items, &fx.lexicon)
+    {
+        panic!("run {run}/{runs}: draft was not accepted: {reason}");
     }
+    // api.rs の `gate_customer_reply_draft`（private）§3.5(1) と同じ判定。
+    // 本番ならこの下書きは捨てられる。
+    let out_of_scope = fx.allowlist.out_of_scope_mentions(&draft.text);
+    assert!(
+        out_of_scope.is_empty(),
+        "run {run}/{runs}: draft mentions out-of-scope models \
+         {out_of_scope:?} (production would discard it):\n{}",
+        draft.text
+    );
+    println!("draft: accepted");
+    draft.text
+}
 
-    std::fs::remove_dir_all(&dir).expect("remove temp dir of the harness worm audit log/queue");
+async fn run_once(fx: &Fixture, run: usize, runs: usize) {
+    println!("==== real_llm_partial_answer_smoke run {run}/{runs} ====");
+    let (extracted, decision) = decide_and_assert_layer1(fx, run, runs).await;
+    let items = handoff_items::handoff_items_for_decision(
+        &decision,
+        &fx.escalation_rules,
+        &fx.prohibited_domains,
+        &extracted.signals,
+        &fx.question,
+        &fx.lexicon,
+    );
+    let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
+    println!("handoff items: {labels:?}");
+
+    let draft_text = draft_accepted_text(fx, &decision, extracted.mode, &items, run, runs).await;
+
+    let case_id = format!("case-smoketest{run:020}");
+    let deterministic_block =
+        escalation_reply::build_deterministic_block(&case_id, &fx.hours_label, false);
+    let final_reply =
+        escalation_reply::assemble_partial_answer_reply(&draft_text, &labels, &deterministic_block);
+    println!("final reply:\n{final_reply}");
+
+    let handoff_sentence = escalation_reply::build_handoff_sentence(&labels);
+    assert!(
+        final_reply.contains("1,540"),
+        "run {run}/{runs}: final reply does not mention the monthly fee (1,540):\n{final_reply}"
+    );
+    assert!(
+        final_reply.contains(&handoff_sentence),
+        "run {run}/{runs}: final reply does not contain the handoff sentence \
+         ({handoff_sentence:?}):\n{final_reply}"
+    );
+    assert!(
+        final_reply.contains("受付番号: "),
+        "run {run}/{runs}: final reply does not contain the case reference line:\n{final_reply}"
+    );
+}
+
+/// design doc §9 の実出力検証。本番と同じ部品（signal-lexicon.json、rules.json、
+/// config.cloudrun.toml の `[llm]`/`[harness]`、実 LLM 抽出・下書き生成）を使い、
+/// 「導入にどれくらいの費用がかかるの？」が第1層 `initial-cost-quote` にマッチし、
+/// 下書きが採用され、最終応答文に月額料金・取次の一文・受付番号が含まれることを
+/// `CS_VERIFY_RUNS` 回連続で確認する。1 run でも外れたら即座に失敗させる。
+#[tokio::test]
+#[ignore = "requires CS_SUPPORT_LLM_API_KEY, network access to the Anthropic API, and \
+            CS_VERIFY_SECTIONS_JSON (ingest_urtect_lp --dry-run output); see design doc \
+            2026-10-07-partial-answer-with-handoff-design.md §9"]
+async fn real_llm_partial_answer_smoke() {
+    let (config, client) = load_config_and_client();
+    let sections_json_path = std::env::var(SECTIONS_ENV).unwrap_or_else(|_| {
+        panic!(
+            "{SECTIONS_ENV} is not set; point it at the output file of \
+             `ingest_urtect_lp --dry-run` (the price/faq/flow sections of the URTECT landing \
+             page)"
+        )
+    });
+    let question = std::env::var(QUESTION_ENV).unwrap_or_else(|_| DEFAULT_QUESTION.to_string());
+    let runs = runs_from_env();
+    let hits = material_hits(&sections_json_path);
+
+    let lexicon = Arc::new(
+        signal::LexiconNormalizer::from_path(&resolve_server_path(
+            &config.harness.signal_lexicon_path,
+        ))
+        .expect("production signal lexicon must load and parse"),
+    );
+    let dir =
+        TempDir(std::env::temp_dir().join(format!("real-llm-smoke-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&dir.0).expect("create temp dir for the harness worm audit log/queue");
+
+    let harness = build_harness(&config, client, &lexicon, &dir.0);
+    let fx = build_fixture(config, harness, lexicon, hits, question);
+    for run in 1..=runs {
+        run_once(&fx, run, runs).await;
+    }
 }
