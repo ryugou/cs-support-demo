@@ -3,7 +3,8 @@
 //! 正本: `docs/superpowers/specs/2026-10-07-partial-answer-with-handoff-design.md` §2, §3.1,
 //! §3.5（2026-10-09 改訂: §3.5(2) のラベル網羅検査を廃止し、§3.5(3) をラベル文字列照合から
 //! signal の surface_forms 照合へ変更。2026-10-12 改訂: §3.5(3) の文の区切りを「。！？」のみに
-//! 変更し改行を区切りから除外、金額の断定を桁区切り・小数点・漢数字まで拾う正規表現に拡張）。
+//! 変更し改行を区切りから除外、金額の断定を桁区切り・小数点・漢数字まで拾う正規表現に拡張。
+//! 同日の追加改訂で、`￥` / `¥` の検出を後置から、数字の並びの直前に付く前置き記法だけに変更）。
 //! **`decision::decide` 自体は変更しない。** ここは
 //! `decide` が確定した `AnswerDecision`・マッチしたルール/禁止領域から「顧客に見せてよい取次
 //! 項目」を導出し、下書き生成の可否と、生成された下書きが歯止めを通るかを判定する純関数の集まり。
@@ -202,15 +203,16 @@ pub fn partial_answer_skip_reason(
 }
 
 /// 数字（半角・全角、桁区切り「,」「，」、小数点、「万」「億」を含む）または漢数字
-/// （〇一二三四五六七八九十百千万億）の並びの直後に、任意の空白を挟んで `円` / `￥` / `%` /
-/// `％` が続く断定表現を検出する（design doc §3.5 の3、2026-10-12 改訂。§5「既知の限界」:
-/// 単位を伴わない断定「無料です」は対象外。egress gate の NG 辞書側で補う）。「3万円」
-/// 「１，５４０円」「5,000 円」「1万5千円（末尾の「5千円」で検出）」「三万円」「百万円」を拾う。
+/// （〇一二三四五六七八九十百千万億）の並びの直後に、任意の空白を挟んで `円` / `%` / `％` が
+/// 続く断定表現、または数字の並びの直前に `￥` / `¥` が付く前置き記法を検出する（design doc
+/// §3.5 の3、2026-10-12 改訂。§5「既知の限界」: 単位を伴わない断定「無料です」は対象外。egress
+/// gate の NG 辞書側で補う）。「3万円」「１，５４０円」「5,000 円」「1万5千円（末尾の「5千円」で
+/// 検出）」「三万円」「百万円」「￥30,000」「¥30,000」を拾う。
 fn monetary_assertion_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(
-            r"(?:[0-9０-９][0-9０-９,，.]*[\s　]*[万千百億]?[\s　]*|[〇一二三四五六七八九十百千万億]+[\s　]*)(円|￥|%|％)",
+            r"(?:[0-9０-９][0-9０-９,，.]*[\s　]*[万千百億]?[\s　]*|[〇一二三四五六七八九十百千万億]+[\s　]*)(?:円|%|％)|[￥¥][\s　]*[0-9０-９][0-9０-９,，.]*",
         )
         .expect("monetary assertion regex must compile")
     })
@@ -906,13 +908,53 @@ mod tests {
             "工事費は\n3万円です。",
             "工事費は1.5万円です。",
             "工事費は３０，０００円です。",
-            "工事費は5,000￥です。",
         ] {
             assert!(
                 passes_handoff_safeguards(drafted, &items, &lex).is_err(),
                 "{drafted:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_rejects_yen_prefixed_amounts_across_widths_separators_and_spaces()
+    {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in [
+            "工事費は￥30,000です。",
+            "工事費は¥30,000です。",
+            "工事費は￥３０，０００です。",
+            "工事費は¥1.5万です。",
+            "工事費は￥ 30,000です。",
+            "工事費は¥　30,000です。",
+        ] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_err(),
+                "{drafted:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_known_limit_does_not_detect_a_postfixed_yen_sign() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in ["工事費は5,000￥です。", "工事費は5,000¥です。"] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_ok(),
+                "{drafted:?} is a known limit and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_accepts_a_yen_prefixed_amount_in_a_sentence_without_the_surface_form(
+    ) {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        let drafted = "月額は￥1,540です。設置工事費は別途です。";
+        assert!(passes_handoff_safeguards(drafted, &items, &lex).is_ok());
     }
 
     #[test]
