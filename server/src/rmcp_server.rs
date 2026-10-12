@@ -103,7 +103,7 @@ pub struct EvaluateAnswerabilityResponse {
     /// `2026-10-07-partial-answer-with-handoff-design.md` §3.1）。部分回答の条件（第 1・2 層の
     /// 取次で取り次ぐ項目が 1 つ以上あり、材料の関連度が十分）を満たす場合に限り、サーバは
     /// マニュアル抜粋を生成に渡し、下書きは**材料で答えられる部分のみ**を含む。取り次ぐ項目に
-    /// 踏み込まないことは、プロンプトの指示と決定論の歯止め（ラベル網羅・金額断定の検出・
+    /// 踏み込まないことは、プロンプトの指示と決定論の歯止め（金額断定の検出・
     /// `NO_ANSWER`）で担保しており、**構造的な保証ではない**。条件を満たさない escalate では
     /// 従来どおり本文を渡さず、下書きは「取り次ぐ旨」のみを含む。いずれの場合も**文面に解決
     /// 方法が現れないことは保証しない** — モデルの事前知識や、顧客が問い合わせ本文に書いた
@@ -137,6 +137,9 @@ pub struct EvaluateAnswerabilityResponse {
     /// ターンは常に空になる（質問側ゲート二段目が signals 劣化時の fail-closed 判定を
     /// 破棄しないための措置）。MCP側ではこの判定（foreign→取扱外）は行わない。
     pub product_references: Vec<ProductReferenceJson>,
+    /// 取り次ぐ項目の顧客提示用ラベル。顧客への案内では、下書きの後にこの項目を
+    /// 担当者が確認して案内する旨を付けること。
+    pub handoff_items: Vec<String>,
 }
 
 /// `EvaluationOutcome::related_cases` の JSON ミラー（S1-1 取得段の参考情報）。
@@ -154,6 +157,43 @@ impl From<crate::harness::RelatedCase> for RelatedCaseJson {
             case_id: c.case_id,
             question: c.question,
             last_decision: c.last_decision,
+        }
+    }
+}
+
+impl EvaluateAnswerabilityResponse {
+    fn from_outcome(outcome: crate::harness::EvaluationOutcome, request_id: String) -> Self {
+        Self {
+            decision: outcome.decision,
+            signals: outcome
+                .signals
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
+            accumulated_signals: outcome
+                .accumulated_signals
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
+            case_id: outcome.case_id,
+            clarification_allowed: outcome.clarification_allowed,
+            hits: outcome.hits,
+            audit_event_id: outcome.audit_event_id,
+            request_id,
+            related_cases: outcome
+                .related_cases
+                .into_iter()
+                .map(RelatedCaseJson::from)
+                .collect(),
+            extraction_mode: outcome.extraction_mode.as_str().to_string(),
+            customer_reply_draft: outcome.customer_reply_draft,
+            customer_reply_draft_truncated: outcome.customer_reply_draft_truncated,
+            product_references: outcome
+                .product_references
+                .into_iter()
+                .map(ProductReferenceJson::from)
+                .collect(),
+            handoff_items: outcome.handoff_items,
         }
     }
 }
@@ -662,7 +702,7 @@ impl CsSupportRmcpServer {
         //
         // 分節のラベル（【…】）は、呼び出し方の要件（case_id）と返却物の処理を
         // モデルが取り違えないために置いている。
-        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。【返却された customer_reply_draft の扱い】customer_reply_draft は検証前の下書きであり、承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れているため、そのまま顧客へ送らないこと。decision.decision が allowed の場合に限り、hits と突き合わせて補完してよい。decision.decision が escalate の場合、customer_reply_draft は 2 種類ある。部分回答の条件（第 1・2 層の取次で取り次ぐ項目があり、材料の関連度が十分）を満たすときは材料で答えられる部分のみを含む下書きで、取り次ぐ項目（取次が必要な話題）には金額・可否・条件を含め一切踏み込まない。満たさないときは取り次ぐ旨のみを含む下書きで、回答部分は含まない。受付番号や対応時間などの取次案内文は含まれないため、エスカレーションを実施する際はそれらを別途補うこと。取り次ぐ項目について、解決方法・手順・金額・可否を自分で補ってはならない（判定を無効化するため）。"
+        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。【返却された customer_reply_draft の扱い】customer_reply_draft は検証前の下書きであり、承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れているため、そのまま顧客へ送らないこと。decision.decision が allowed の場合に限り、hits と突き合わせて補完してよい。decision.decision が escalate の場合、customer_reply_draft は 2 種類ある。部分回答の条件（第 1・2 層の取次で取り次ぐ項目があり、材料の関連度が十分）を満たすときは材料で答えられる部分のみを含む下書きで、取り次ぐ項目（取次が必要な話題）には金額・可否・条件を含め一切踏み込まない。満たさないときは取り次ぐ旨のみを含む下書きで、回答部分は含まない。受付番号や対応時間などの取次案内文は含まれないため、エスカレーションを実施する際はそれらを別途補うこと。取り次ぐ項目について、解決方法・手順・金額・可否を自分で補ってはならない（判定を無効化するため）。部分回答の下書きには取次の文言が含まれないため、顧客への案内では handoff_items（取り次ぐ項目の顧客提示用ラベル列）を使い、下書きの後にこれらの項目を担当者が確認して案内する旨を付けること。"
     )]
     async fn evaluate_answerability(
         &self,
@@ -704,37 +744,10 @@ impl CsSupportRmcpServer {
             )
             .await
             .map_err(to_error)?;
-        Ok(Json(EvaluateAnswerabilityResponse {
-            decision: outcome.decision,
-            signals: outcome
-                .signals
-                .iter()
-                .map(|s| s.as_str().to_string())
-                .collect(),
-            accumulated_signals: outcome
-                .accumulated_signals
-                .iter()
-                .map(|s| s.as_str().to_string())
-                .collect(),
-            case_id: outcome.case_id,
-            clarification_allowed: outcome.clarification_allowed,
-            hits: outcome.hits,
-            audit_event_id: outcome.audit_event_id,
-            request_id: ctx.request_id,
-            related_cases: outcome
-                .related_cases
-                .into_iter()
-                .map(RelatedCaseJson::from)
-                .collect(),
-            extraction_mode: outcome.extraction_mode.as_str().to_string(),
-            customer_reply_draft: outcome.customer_reply_draft,
-            customer_reply_draft_truncated: outcome.customer_reply_draft_truncated,
-            product_references: outcome
-                .product_references
-                .into_iter()
-                .map(ProductReferenceJson::from)
-                .collect(),
-        }))
+        Ok(Json(EvaluateAnswerabilityResponse::from_outcome(
+            outcome,
+            ctx.request_id,
+        )))
     }
 
     #[tool(
@@ -1290,5 +1303,66 @@ mod tests {
                  clients, got: {rendered}"
             );
         }
+    }
+
+    // ---- EvaluateAnswerabilityResponse::from_outcome の handoff_items 加算（2026-10-12） ----
+
+    fn evaluation_outcome_with_handoff_items(
+        decision: crate::harness::decision::AnswerDecision,
+        handoff_items: Vec<String>,
+    ) -> crate::harness::EvaluationOutcome {
+        crate::harness::EvaluationOutcome {
+            decision,
+            signals: crate::harness::signal::SignalSet::new(),
+            accumulated_signals: crate::harness::signal::SignalSet::new(),
+            case_id: "case-1".to_string(),
+            clarification_allowed: false,
+            hits: Vec::new(),
+            audit_event_id: "audit-1".to_string(),
+            related_cases: Vec::new(),
+            extraction_mode: crate::harness::extraction::ExtractionMode::LexiconOnly,
+            customer_reply_draft: None,
+            customer_reply_draft_truncated: false,
+            product_references: Vec::new(),
+            new_signals: crate::harness::signal::SignalSet::new(),
+            handoff_items,
+        }
+    }
+
+    #[test]
+    fn evaluate_answerability_response_surfaces_handoff_items_for_an_escalation_with_items() {
+        let decision = crate::harness::decision::AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "support_desk".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: vec![],
+            hearing: None,
+            customer_ack: None,
+        };
+        let outcome =
+            evaluation_outcome_with_handoff_items(decision, vec!["初期費用の見積もり".to_string()]);
+        let response = EvaluateAnswerabilityResponse::from_outcome(outcome, "req-1".to_string());
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value["handoff_items"],
+            serde_json::json!(["初期費用の見積もり"])
+        );
+    }
+
+    #[test]
+    fn evaluate_answerability_response_serializes_handoff_items_as_an_empty_array_when_allowed() {
+        let decision = crate::harness::decision::AnswerDecision::Allowed {
+            source: crate::harness::decision::AnswerSource::Manual,
+            evidence_section_keys: vec!["doc#sec1".to_string()],
+            known_resolution_id: None,
+            stakes: crate::harness::decision::Stakes::Low,
+            threshold: 0.8,
+        };
+        let outcome = evaluation_outcome_with_handoff_items(decision, Vec::new());
+        let response = EvaluateAnswerabilityResponse::from_outcome(outcome, "req-2".to_string());
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["handoff_items"], serde_json::json!([]));
     }
 }
