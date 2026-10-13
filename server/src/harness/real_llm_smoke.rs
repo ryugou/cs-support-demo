@@ -116,6 +116,17 @@ fn load_verify_cases() -> Vec<(String, Vec<SectionHit>, Vec<SectionHit>)> {
          the pricing question, design doc §10.3), got {}",
         cases.len()
     );
+    // design doc §10.3: 同じ通りやすい言い回しを複製しても合格しないよう、言い回しは相異なる
+    // ことを要求する（codex レビュー RH-8）。
+    let distinct: std::collections::BTreeSet<&str> =
+        cases.iter().map(|case| case.question.trim()).collect();
+    assert!(
+        distinct.len() >= MIN_VERIFY_CASES,
+        "{CASES_ENV} ({cases_path:?}) must list at least {MIN_VERIFY_CASES} distinct paraphrases \
+         (design doc §10.3), got {} distinct of {}",
+        distinct.len(),
+        cases.len()
+    );
     cases
         .into_iter()
         .map(|case| {
