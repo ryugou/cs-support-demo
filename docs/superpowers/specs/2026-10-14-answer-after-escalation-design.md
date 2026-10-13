@@ -73,3 +73,11 @@
 
 - KnownResolution の照合順序の変更（別途、ナレッジ優先の設計で扱う）。
 - 累積 signal の仕様自体の変更（未取次の case のヒアリングには累積が必要）。
+
+## 9. `ReplyDraftPolicy` の目的分離（実装時の判断、2026-10-14）
+
+`advisor/cs_support.rs`（homesec の CS 連携モード）は `SkipWhenUnused { already_escalated: true }` を固定で渡し、「homesec では部分回答を出さない」（`2026-10-07-partial-answer-with-handoff-design.md` §8）を `already_escalated` の不適格条件で実現していた。本書 §2 が同じフィールドを「今ターンのみで判定する」の切替に使うと、homesec の累積判定が壊れる。
+
+- `ReplyDraftPolicy::SkipWhenUnused` に `partial_answer_enabled: bool` を追加する。部分回答の下書きを生成するのはこれが `true` のときだけ（§3 の条件に加える）。`/api/reply` は `true`、homesec の CS 連携モードは `false` を渡す。`Always`（MCP）は従来どおり部分回答あり。
+- `already_escalated` は本来の意味（その会話が取次済みか）だけに使う。homesec の CS 連携モードは会話の取次状態を持たないため `false` を渡す（判定は従来どおり累積集合で行う）。
+- これにより homesec の挙動は本変更の前後で変わらない（部分回答なし・累積判定）。テストで固定する（homesec の policy で部分回答の下書きが生成されないこと、`decide` に累積集合が渡ること）。
