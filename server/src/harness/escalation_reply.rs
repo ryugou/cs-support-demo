@@ -261,6 +261,42 @@ pub fn assemble_escalation_reply(ack_text: &str, deterministic_block: &str) -> S
     format!("{ack_text}\n\n{deterministic_block}")
 }
 
+/// 取次の一文を決定論で組み立てる（design doc
+/// `2026-10-07-partial-answer-with-handoff-design.md` §3.3）。何を担当者に回したかを LLM の
+/// 出力に依存させないため、ラベルの列挙はコードが行う。`labels` は `handoff_items`（lexicon の
+/// `customer_label`）をそのまま使い、新しい文言・ラベルをここで作らない。
+///
+/// - 項目が1つ: `"〈ラベル〉は、担当者が確認してご案内します。"`
+/// - 項目が複数: 見出し文に続けて各ラベルを `"・〈ラベル〉"` で改行区切りに並べる。
+/// - `labels` が空のときは呼ばれない前提（§3.3 はこの合成を部分回答の下書きがあるときにしか
+///   使わず、その下書きは §3.1 により取り次ぐ項目が1つ以上あるときにしか作られない）が、
+///   空文字列を返すだけで落ちない。
+pub fn build_handoff_sentence(labels: &[String]) -> String {
+    match labels {
+        [] => String::new(),
+        [single] => format!("{single}は、担当者が確認してご案内します。"),
+        multiple => {
+            let mut sentence = "次の内容は、担当者が確認してご案内します。".to_string();
+            for label in multiple {
+                sentence.push_str(&format!("\n・{label}"));
+            }
+            sentence
+        }
+    }
+}
+
+pub fn assemble_partial_answer_reply(
+    draft: &str,
+    handoff_labels: &[String],
+    deterministic_block: &str,
+) -> String {
+    let handoff_sentence = build_handoff_sentence(handoff_labels);
+    assemble_escalation_reply(
+        &format!("{draft}\n\n{handoff_sentence}"),
+        deterministic_block,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +487,48 @@ mod tests {
     fn assemble_escalation_reply_joins_with_blank_line() {
         let joined = assemble_escalation_reply("受け止め文です。", "受付番号: 12345678");
         assert_eq!(joined, "受け止め文です。\n\n受付番号: 12345678");
+    }
+
+    // ---- build_handoff_sentence（design doc
+    // 2026-10-07-partial-answer-with-handoff-design.md §3.3）----
+
+    #[test]
+    fn build_handoff_sentence_uses_the_single_item_form_for_one_label() {
+        let sentence = build_handoff_sentence(&["初期費用・設置工事費に関するご質問".to_string()]);
+        assert_eq!(
+            sentence,
+            "初期費用・設置工事費に関するご質問は、担当者が確認してご案内します。"
+        );
+    }
+
+    #[test]
+    fn build_handoff_sentence_uses_a_heading_and_bulleted_list_for_multiple_labels() {
+        let sentence = build_handoff_sentence(&[
+            "初期費用・設置工事費に関するご質問".to_string(),
+            "設置日程に関するご質問".to_string(),
+        ]);
+        assert_eq!(
+            sentence,
+            "次の内容は、担当者が確認してご案内します。\n・初期費用・設置工事費に関するご質問\n・設置日程に関するご質問"
+        );
+    }
+
+    #[test]
+    fn build_handoff_sentence_returns_an_empty_string_for_no_labels() {
+        assert_eq!(build_handoff_sentence(&[]), "");
+    }
+
+    #[test]
+    fn assemble_partial_answer_reply_orders_draft_handoff_sentence_and_block_with_blank_lines() {
+        let reply = assemble_partial_answer_reply(
+            "下書きです。",
+            &["設置日程に関するご質問".to_string()],
+            "受付番号: 12345678",
+        );
+        assert_eq!(
+            reply,
+            "下書きです。\n\n設置日程に関するご質問は、担当者が確認してご案内します。\n\n受付番号: 12345678"
+        );
     }
 
     /// stub LLM に `draft_text` / `stop_reason` を返させ、`draft_ack_text` の結果を返す。

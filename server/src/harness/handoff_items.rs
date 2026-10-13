@@ -1,42 +1,70 @@
 //! 取り次ぐ項目（handoff items）の導出と、部分回答下書きの可否判定・安全側の歯止め。
 //!
 //! 正本: `docs/superpowers/specs/2026-10-07-partial-answer-with-handoff-design.md` §2, §3.1,
-//! §3.5。**`decision::decide` 自体は変更しない。** ここは `decide` が確定した
-//! `AnswerDecision`・マッチしたルール/禁止領域から「顧客に見せてよい取次項目のラベル」を導出し、
-//! 下書き生成の可否と、生成された下書きが歯止めを通るかを判定する純関数の集まり。
+//! §3.5（2026-10-09 改訂: §3.5(2) のラベル網羅検査を廃止し、§3.5(3) をラベル文字列照合から
+//! signal の surface_forms 照合へ変更。2026-10-12 改訂: §3.5(3) の文の区切りを「。！？」のみに
+//! 変更し改行を区切りから除外、金額の断定を桁区切り・小数点・漢数字まで拾う正規表現に拡張。
+//! 同日の追加改訂で、`￥` / `¥` の検出を後置から、数字の並びの直前に付く前置き記法だけに変更）。
+//! **`decision::decide` 自体は変更しない。** ここは
+//! `decide` が確定した `AnswerDecision`・マッチしたルール/禁止領域から「顧客に見せてよい取次
+//! 項目」を導出し、下書き生成の可否と、生成された下書きが歯止めを通るかを判定する純関数の集まり。
 
 use crate::harness::decision::{AnswerDecision, Thresholds};
 use crate::harness::reply::NO_ANSWER_TOKEN;
 use crate::harness::rules::{
     match_layer2, matching_layer1_rules, EscalationRule, ProhibitedDomain,
 };
-use crate::harness::signal::{LexiconNormalizer, SignalSet};
-use std::collections::HashSet;
+use crate::harness::signal::{LexiconNormalizer, Signal, SignalSet};
+use crate::resolve::normalize_key;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
+/// 取り次ぐ項目 1 件（design doc §2）。顧客提示用の `label`（lexicon の `customer_label`）と、
+/// そのラベルを導いた signal の列を持つ。同じラベルを宣言する signal が複数あれば、全て同じ
+/// `HandoffItem` の `signals` に束ねる（`derive_handoff_items` の重複除去はラベル単位）。
+///
+/// `signals` は `passes_handoff_safeguards` が表層形照合に使う。ラベル文字列ではなく signal の
+/// `surface_forms` で照合するため、どの signal がこのラベルを導いたかをここで保持しておく
+/// 必要がある（2026-10-09 改訂）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandoffItem {
+    pub label: String,
+    pub signals: Vec<Signal>,
+}
+
 /// マッチした第1層ルールの `condition`、または第2層禁止領域の `domain_signals` から、
-/// 顧客提示用ラベル（`customer_label`）の列を導出する（design doc §2「取り次ぐ項目」）。
+/// 取り次ぐ項目（design doc §2）を導出する。
 ///
 /// - 順序は lexicon の宣言順（`SignalSet` は `BTreeSet` でアルファベット順になるため、
 ///   そのまま列挙すると lexicon が意図した提示順が失われる）。
-/// - 重複するラベルは除く（同じ文言を2回案内しない）。
+/// - 同じ `customer_label` を宣言する signal は 1 件の `HandoffItem` にまとめ、その `signals`
+///   に両方を積む（重複除去はラベル単位）。
 /// - `customer_label_of` が `None` を返す signal（lexicon 未登録、または `customer_label` が
 ///   未設定）は結果に含めず、`tracing::warn!` で signal 名（内部識別子）だけを出す。質問本文・
 ///   顧客発話はここでは一切扱っていないので出す対象にもならない。
-pub fn derive_handoff_items(normalizer: &LexiconNormalizer, signals: &SignalSet) -> Vec<String> {
+pub fn derive_handoff_items(
+    normalizer: &LexiconNormalizer,
+    signals: &SignalSet,
+) -> Vec<HandoffItem> {
     let order = normalizer.declared_signal_order();
     let position_of = |name: &str| order.iter().position(|s| s == name).unwrap_or(usize::MAX);
 
     let mut ordered: Vec<_> = signals.iter().collect();
     ordered.sort_by_key(|signal| position_of(signal.as_str()));
 
-    let mut items = Vec::new();
-    let mut seen_labels: HashSet<String> = HashSet::new();
+    let mut items: Vec<HandoffItem> = Vec::new();
+    let mut index_of_label: HashMap<String, usize> = HashMap::new();
     for signal in ordered {
         match normalizer.customer_label_of(signal) {
             Some(label) => {
-                if seen_labels.insert(label.to_string()) {
-                    items.push(label.to_string());
+                if let Some(&idx) = index_of_label.get(label) {
+                    items[idx].signals.push(signal.clone());
+                } else {
+                    index_of_label.insert(label.to_string(), items.len());
+                    items.push(HandoffItem {
+                        label: label.to_string(),
+                        signals: vec![signal.clone()],
+                    });
                 }
             }
             None => {
@@ -52,61 +80,141 @@ pub fn derive_handoff_items(normalizer: &LexiconNormalizer, signals: &SignalSet)
     items
 }
 
-/// 部分回答の可否（決定論、design doc §3.1）。
+/// 部分回答の下書きを見送った理由（design doc §3.1「見送りの記録」）。`tracing::info!` に
+/// そのまま載せる値で、発話本文・signal の値は含まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialAnswerSkipReason {
+    /// hearing（聞き返し契約）を宣言したルールにマッチしたターン。
+    HearingDeclared,
+    /// 取り次ぐ項目が1つも無い。
+    NoHandoffItems,
+    /// 材料の関連度が `thresholds.low` 未満（または取得不可）。
+    InsufficientRelevance,
+    /// その case が既に取次済み。
+    AlreadyEscalated,
+    /// 下書き生成そのものが無効（`customer_reply_draft_enabled = false`、または LLM 未設定）。
+    DraftGenerationDisabled,
+}
+
+/// [`partial_answer_eligibility`] の内部結果。公開 API（[`can_draft_partial_answer`] /
+/// [`partial_answer_skip_reason`]）はこれを bool / `Option<PartialAnswerSkipReason>` へ
+/// それぞれ写す。
+enum PartialAnswerEligibility {
+    Eligible,
+    /// `Escalate` 以外（`Allowed`）、または第3層の取次。design doc §3.1 がそもそも部分回答の
+    /// 対象外と定めている区分であり、「見送り」としての記録対象にもしない。
+    NotApplicable,
+    Ineligible(PartialAnswerSkipReason),
+}
+
+/// [`can_draft_partial_answer`] と [`partial_answer_skip_reason`] が共有する判定本体
+/// （design doc §3.1）。
 ///
-/// `Escalate` のターンで、次をすべて満たすときだけ `true`:
-/// - `hearing.is_none()`。spec §3.1 の条件は「hearing による `Clarify` ではない」だが、
-///   `Clarify` になるかどうかは `evaluate()` の後に `api.rs` の Jev（`has_enough_info`）判定で
-///   決まり、この関数の呼び出し時点では分からない。そのため hearing 契約を宣言したルールに
-///   マッチしたターンは一律 `false` とする（安全側の近似であり、**spec が明示した決定ではない**）。
-///   帰結として、Jev が「情報十分」と判定して `Clarify` ではなく取次（EscalationReply）になる
-///   ターン（例: rules.json の `warranty-failure`）でも部分回答は生成されない。Jev 判定の後で
-///   部分回答を計画するよう制御フローを変えるかどうかは spec の明確化待ち（オーケストレーター判断）。
+/// - `hearing` を宣言したルールにマッチしたターンは一律不可とする。spec §3.1 の条件は
+///   「hearing による `Clarify` ではない」だが、`Clarify` になるかどうかは `evaluate()` の後に
+///   `api.rs` の Jev（`has_enough_info`）判定で決まり、この関数の呼び出し時点では分からない。
+///   そのため hearing 契約を宣言したルールにマッチしたターンは一律 `false` とする（安全側の
+///   近似であり、**spec が明示した決定ではない**）。
 /// - 判定が第1層または第2層の取次である。第3層（根拠不足・確信度不足）は `handoff_items` の
 ///   中身に依存せず、`layer` で明示的に除外する（`handoff_items_for_decision` が将来第3層で
 ///   非空を返しても、spec 変更なしに部分回答が有効化されないようにするため）。
-/// - 取り次ぐ項目（`handoff_items`）が1つ以上ある（上の layer 条件とは独立に両方必要）。
-/// - その case が既に取次済みではない（`already_escalated == false`）。
-/// - 下書き生成が有効（`draft_generation_enabled == true`。`customer_reply_draft_enabled =
-///   true` かつ `[llm] enabled = true` と同値）。
-/// - `best_manual_score` が関連十分（`>= thresholds.low`。`None`、または `low` 未満は不十分）。
-///
-/// `decision` が `Allowed` のときは常に `false`（部分回答という概念自体が `Escalate` 専用）。
+fn partial_answer_eligibility(
+    decision: &AnswerDecision,
+    handoff_items: &[HandoffItem],
+    best_manual_score: Option<f32>,
+    thresholds: &Thresholds,
+    already_escalated: bool,
+    draft_generation_enabled: bool,
+) -> PartialAnswerEligibility {
+    let AnswerDecision::Escalate { hearing, layer, .. } = decision else {
+        return PartialAnswerEligibility::NotApplicable;
+    };
+    if !matches!(*layer, 1 | 2) {
+        return PartialAnswerEligibility::NotApplicable;
+    }
+    if hearing.is_some() {
+        return PartialAnswerEligibility::Ineligible(PartialAnswerSkipReason::HearingDeclared);
+    }
+    if handoff_items.is_empty() {
+        return PartialAnswerEligibility::Ineligible(PartialAnswerSkipReason::NoHandoffItems);
+    }
+    if already_escalated {
+        return PartialAnswerEligibility::Ineligible(PartialAnswerSkipReason::AlreadyEscalated);
+    }
+    if !draft_generation_enabled {
+        return PartialAnswerEligibility::Ineligible(
+            PartialAnswerSkipReason::DraftGenerationDisabled,
+        );
+    }
+    if best_manual_score.is_some_and(|score| score >= thresholds.low) {
+        PartialAnswerEligibility::Eligible
+    } else {
+        PartialAnswerEligibility::Ineligible(PartialAnswerSkipReason::InsufficientRelevance)
+    }
+}
+
+/// 部分回答の可否（決定論、design doc §3.1）。`decision` が `Allowed` のときは常に `false`
+/// （部分回答という概念自体が `Escalate` 専用）。条件の詳細は [`partial_answer_eligibility`]
+/// を参照。
 pub fn can_draft_partial_answer(
     decision: &AnswerDecision,
-    handoff_items: &[String],
+    handoff_items: &[HandoffItem],
     best_manual_score: Option<f32>,
     thresholds: &Thresholds,
     already_escalated: bool,
     draft_generation_enabled: bool,
 ) -> bool {
-    let AnswerDecision::Escalate { hearing, layer, .. } = decision else {
-        return false;
-    };
-    if hearing.is_some() {
-        return false;
-    }
-    if !matches!(*layer, 1 | 2) {
-        return false;
-    }
-    if handoff_items.is_empty() {
-        return false;
-    }
-    if already_escalated || !draft_generation_enabled {
-        return false;
-    }
-    best_manual_score.is_some_and(|score| score >= thresholds.low)
+    matches!(
+        partial_answer_eligibility(
+            decision,
+            handoff_items,
+            best_manual_score,
+            thresholds,
+            already_escalated,
+            draft_generation_enabled,
+        ),
+        PartialAnswerEligibility::Eligible
+    )
 }
 
-/// 半角・全角数字の後に、任意の空白と任意の漢数字単位（万・千・百・億）を挟んで `円` / `%` / `％`
-/// が続く断定表現を検出する（design doc §3.5 の3、§5「既知の限界」: 単位を伴わない断定
-/// 「無料です」は対象外。egress gate の NG 辞書側で補う）。「3万円」「１，５４０円」
-/// 「5,000 円」「1万5千円（末尾の「5千円」で検出）」を拾う。
+/// 部分回答の下書きを見送った理由（design doc §3.1「見送りの記録」）。第1・2層の `Escalate` で
+/// [`can_draft_partial_answer`] が `false` を返したときに `Some` を返す。第3層・`Allowed`
+/// （記録対象外）、および可である場合は `None`。呼び出し側（`evaluate()`）はこれが `Some` の
+/// ときだけ `tracing::info!` を 1 行出す。
+pub fn partial_answer_skip_reason(
+    decision: &AnswerDecision,
+    handoff_items: &[HandoffItem],
+    best_manual_score: Option<f32>,
+    thresholds: &Thresholds,
+    already_escalated: bool,
+    draft_generation_enabled: bool,
+) -> Option<PartialAnswerSkipReason> {
+    match partial_answer_eligibility(
+        decision,
+        handoff_items,
+        best_manual_score,
+        thresholds,
+        already_escalated,
+        draft_generation_enabled,
+    ) {
+        PartialAnswerEligibility::Ineligible(reason) => Some(reason),
+        PartialAnswerEligibility::Eligible | PartialAnswerEligibility::NotApplicable => None,
+    }
+}
+
+/// 数字（半角・全角、桁区切り「,」「，」、小数点、「万」「億」を含む）または漢数字
+/// （〇一二三四五六七八九十百千万億）の並びの直後に、任意の空白を挟んで `円` / `%` / `％` が
+/// 続く断定表現、または数字の並びの直前に `￥` / `¥` が付く前置き記法を検出する（design doc
+/// §3.5 の3、2026-10-12 改訂。§5「既知の限界」: 単位を伴わない断定「無料です」は対象外。egress
+/// gate の NG 辞書側で補う）。「3万円」「１，５４０円」「5,000 円」「1万5千円（末尾の「5千円」で
+/// 検出）」「三万円」「百万円」「￥30,000」「¥30,000」を拾う。
 fn monetary_assertion_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"[0-9０-９][\s　]*[万千百億]?[\s　]*(円|%|％)")
-            .expect("monetary assertion regex must compile")
+        regex::Regex::new(
+            r"(?:[0-9０-９][0-9０-９,，.]*[\s　]*[万千百億]?[\s　]*|[〇一二三四五六七八九十百千万億]+[\s　]*)(?:円|%|％)|[￥¥][\s　]*[0-9０-９][0-9０-９,，.]*",
+        )
+        .expect("monetary assertion regex must compile")
     })
 }
 
@@ -115,14 +223,18 @@ fn monetary_assertion_regex() -> &'static regex::Regex {
 /// - `NO_ANSWER_TOKEN` そのもの（trim 後）は `partial_answer_ok` に関係なく**常に**不採用。
 ///   Allowed の下書きに混ざると、そのまま顧客へ送られる（`api.rs` の `ReplyAction::Answer`）
 ///   ため。
-/// - §3.5 の歯止め（ラベル網羅・金額断定）は `partial_answer_ok` のときだけ課す。通常の
-///   Allowed 下書きには余計な制約を課さない。
+/// - §3.5 の歯止め（金額断定。2026-10-09 改訂でラベル網羅検査は廃止した）は `partial_answer_ok`
+///   のときだけ課す。通常の Allowed 下書きには余計な制約を課さない。
+///
+/// `normalizer` は歯止め（取り次ぐ項目の表層形照合）が signal の `surface_forms` を引くために
+/// 使う（[`passes_handoff_safeguards`] にそのまま渡す）。
 ///
 /// `Err` の理由文字列に顧客発話・下書き本文は含まれない。
 pub fn accept_draft(
     draft: &str,
     partial_answer_ok: bool,
-    handoff_items: &[String],
+    handoff_items: &[HandoffItem],
+    normalizer: &LexiconNormalizer,
 ) -> Result<(), String> {
     if draft.trim() == NO_ANSWER_TOKEN {
         return Err(format!(
@@ -130,12 +242,12 @@ pub fn accept_draft(
         ));
     }
     if partial_answer_ok {
-        passes_handoff_safeguards(draft, handoff_items)?;
+        passes_handoff_safeguards(draft, handoff_items, normalizer)?;
     }
     Ok(())
 }
 
-/// 判定結果に対応する取り次ぐ項目（顧客提示用ラベル）を導出する（design doc §2）。
+/// 判定結果に対応する取り次ぐ項目を導出する（design doc §2）。
 ///
 /// `decide()` が内部で使ったのと同一の純関数・入力を再度呼ぶだけなので、判定結果とは必ず
 /// 一致する。layer=1 は**マッチした全ての第1層ルール**（`matching_layer1_rules`。
@@ -149,7 +261,7 @@ pub fn handoff_items_for_decision(
     accumulated: &SignalSet,
     question: &str,
     normalizer: &LexiconNormalizer,
-) -> Vec<String> {
+) -> Vec<HandoffItem> {
     match decision {
         AnswerDecision::Escalate { layer: 1, .. } => {
             let union: SignalSet = matching_layer1_rules(rules, accumulated)
@@ -165,43 +277,67 @@ pub fn handoff_items_for_decision(
     }
 }
 
-/// 安全側の歯止め（design doc §3.5 の2〜4）。1番（egress gate / 取扱外型番ゲート）は呼び出し側
-/// （`Harness::draft_customer_reply` 内の `egress_gate`、`api.rs` / `advisor/cs_support.rs` の
-/// `gate_customer_reply_draft`）で既に適用済みのため、ここでは対象外。
+/// 安全側の歯止め（design doc §3.5 の3・4。2026-10-09 改訂で旧2番「ラベル網羅」は廃止済み）。
+/// 1番（egress gate / 取扱外型番ゲート）は呼び出し側（`Harness::draft_customer_reply` 内の
+/// `egress_gate`、`api.rs` / `advisor/cs_support.rs` の `gate_customer_reply_draft`）で既に
+/// 適用済みのため、ここでは対象外。
 ///
-/// 1 つでも失敗すれば `Err`。返す理由の文字列には**顧客発話・下書き本文は含めない**
-/// （`handoff_items` のラベル自体は運用者が承認済みの顧客提示用文言なので含めてよい）。
+/// 1 つでも失敗すれば `Err`。返す理由の文字列には**顧客発話・下書き本文は含めない**。
 ///
-/// 既知の限界（design doc §3.5(3) の定義どおりで、ここでは塞がない）: 金額検査は「ラベルを含む
-/// 文（「。」区切り）」だけを見る。ラベルを含まない別の文での金額断定、短縮名（例「初期費用は
-/// …」）での断定、可否・条件の断定（数字+単位を伴わないもの）は検出しない。これらはプロンプト
-/// 指示と egress gate に委ねている（design doc §3.2・§5）。
-pub fn passes_handoff_safeguards(draft: &str, handoff_items: &[String]) -> Result<(), String> {
-    // 4. 下書きが NO_ANSWER_TOKEN そのものでない。運用ログの理由が「ラベル欠落」に化けない
-    //    よう、最初に判定する。
+/// 既知の限界（design doc §3.5(3) の定義どおりで、ここでは塞がない）: 金額検査は「取り次ぐ項目の
+/// 表層形を含む文（「。」「！」「？」区切り。改行は区切りにしない）」だけを見る。表層形を含まない
+/// 別の文での金額断定、可否・条件の断定（数字+単位を伴わないもの）は検出しない。これらは
+/// プロンプト指示と egress gate に委ねている（design doc §3.2・§5）。
+pub fn passes_handoff_safeguards(
+    draft: &str,
+    handoff_items: &[HandoffItem],
+    normalizer: &LexiconNormalizer,
+) -> Result<(), String> {
+    // 4. 下書きが NO_ANSWER_TOKEN そのものでない。最初に判定する。
     if draft.trim() == NO_ANSWER_TOKEN {
         return Err(format!(
             "the draft is exactly the {NO_ANSWER_TOKEN:?} token (no answerable part found)"
         ));
     }
-    // 2. handoff_items の各ラベルが下書きに1回以上現れる（黙って答えていない・黙って落として
-    //    いないことの確認）。
-    for label in handoff_items {
-        if !draft.contains(label.as_str()) {
-            return Err(format!(
-                "a handoff item label is missing from the draft: {label:?}"
-            ));
-        }
-    }
-    // 3. handoff_items のラベルを含む文（「。」区切り）に金額・数量の断定が含まれない。
-    for sentence in draft.split('。') {
-        let mentions_handoff_item = handoff_items
+    for item in handoff_items.iter().filter(|item| {
+        item.signals
             .iter()
-            .any(|label| sentence.contains(label.as_str()));
+            .all(|signal| normalizer.normalized_surface_forms_of(signal).is_none())
+    }) {
+        let names: Vec<&str> = item.signals.iter().map(Signal::as_str).collect();
+        tracing::warn!(
+            signals = ?names,
+            "handoff item has no surface forms to check (llm_only or unregistered signal); the monetary-assertion safeguard cannot cover it"
+        );
+    }
+    // 3. 取り次ぐ項目の signal の surface_forms（lexicon 正規化済み）を含む文
+    //    （「。」「！」「？」区切り。改行は区切りにしない。2026-10-12 改訂: 「・設置工事費\n
+    //    30,000円」のような箇条書きで表層形と金額が別の文に分かれて素通りするのを防ぐため、
+    //    改行を区切りから外した）に、金額・数量の断定が含まれない。ラベル文字列ではなく
+    //    表層形で照合するのは、LLM の言い換えに追従するため（2026-10-09 改訂）。本番で、LLM が
+    //    「設置工事費は担当者がご案内します」と自然に言い換えた下書きが、ラベル
+    //    「初期費用・設置工事費に関するご質問」の完全一致を要求する旧検査に落ちて全件
+    //    不採用になった事故が実際の契機。
+    for sentence in draft.split(['。', '！', '!', '？', '?']) {
+        let normalized_sentence = normalize_key(sentence);
+        let mentions_handoff_item = handoff_items.iter().any(|item| {
+            item.signals.iter().any(|signal| {
+                normalizer
+                    .normalized_surface_forms_of(signal)
+                    .is_some_and(|forms| {
+                        forms
+                            .iter()
+                            .any(|form| normalized_sentence.contains(form.as_str()))
+                    })
+            })
+        });
+        // 金額断定の検出は正規化前の生テキストに対して行う。全角/半角数字の区別が必要であり、
+        // `normalize_key` は英数字以外を除去するため、正規化後の文字列には規則表現が機能しない。
         if mentions_handoff_item && monetary_assertion_regex().is_match(sentence) {
             return Err(
-                "a sentence mentioning a handoff item label contains a monetary/quantity \
-                 assertion (the sentence text itself is not included in this message)"
+                "invalid draft: a sentence mentioning a handoff item's surface form contains a \
+                 monetary or quantity assertion (the sentence text itself is not included in \
+                 this message)"
                     .to_string(),
             );
         }
@@ -214,10 +350,13 @@ mod tests {
     use super::*;
     use crate::harness::decision::{AnswerSource, DisclosureScope, EscalateReason, Stakes};
     use crate::harness::rules::{Binding, HearingContract};
-    use crate::harness::signal::Signal;
 
     fn signals(values: &[&str]) -> SignalSet {
         values.iter().map(|v| Signal::new(*v)).collect()
+    }
+
+    fn labels_of(items: &[HandoffItem]) -> Vec<String> {
+        items.iter().map(|item| item.label.clone()).collect()
     }
 
     // ---- derive_handoff_items ----
@@ -227,7 +366,8 @@ mod tests {
             r#"{ "signals": [
                 { "signal": "zebra_question", "class": "context", "surface_forms": ["ゼブラ"],
                   "customer_label": "ゼブラに関するご質問" },
-                { "signal": "initial_cost_question", "class": "context", "surface_forms": ["初期費用"],
+                { "signal": "initial_cost_question", "class": "context",
+                  "surface_forms": ["初期費用", "設置費", "工事費", "工事代金"],
                   "customer_label": "初期費用・設置工事費に関するご質問" },
                 { "signal": "no_label_signal", "class": "context", "surface_forms": ["ラベル無し"] }
             ] }"#,
@@ -243,7 +383,7 @@ mod tests {
         let items =
             derive_handoff_items(&lex, &signals(&["initial_cost_question", "zebra_question"]));
         assert_eq!(
-            items,
+            labels_of(&items),
             vec![
                 "ゼブラに関するご質問".to_string(),
                 "初期費用・設置工事費に関するご質問".to_string(),
@@ -252,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_handoff_items_deduplicates_identical_labels() {
+    fn derive_handoff_items_deduplicates_identical_labels_and_merges_their_signals() {
         let lex = LexiconNormalizer::from_json(
             r#"{ "signals": [
                 { "signal": "a", "class": "context", "surface_forms": ["a"], "customer_label": "同じラベル" },
@@ -261,7 +401,13 @@ mod tests {
         )
         .unwrap();
         let items = derive_handoff_items(&lex, &signals(&["a", "b"]));
-        assert_eq!(items, vec!["同じラベル".to_string()]);
+        assert_eq!(items.len(), 1, "同じラベルは1件にまとまること");
+        assert_eq!(items[0].label, "同じラベル");
+        assert_eq!(
+            items[0].signals,
+            vec![Signal::new("a"), Signal::new("b")],
+            "両方の signal が同じ HandoffItem に束ねられること"
+        );
     }
 
     #[test]
@@ -270,7 +416,7 @@ mod tests {
         let (items, logs) = crate::test_support::capture_logs(|| {
             derive_handoff_items(&lex, &signals(&["zebra_question", "no_label_signal"]))
         });
-        assert_eq!(items, vec!["ゼブラに関するご質問".to_string()]);
+        assert_eq!(labels_of(&items), vec!["ゼブラに関するご質問".to_string()]);
         let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
         assert!(
             warnings.contains("no_label_signal"),
@@ -284,7 +430,7 @@ mod tests {
         assert!(derive_handoff_items(&lex, &SignalSet::new()).is_empty());
     }
 
-    // ---- can_draft_partial_answer ----
+    // ---- can_draft_partial_answer / partial_answer_skip_reason ----
 
     fn escalate(hearing: Option<HearingContract>) -> AnswerDecision {
         AnswerDecision::Escalate {
@@ -317,8 +463,11 @@ mod tests {
         }
     }
 
-    fn handoff_items_fixture() -> Vec<String> {
-        vec!["初期費用・設置工事費に関するご質問".to_string()]
+    fn handoff_items_fixture() -> Vec<HandoffItem> {
+        vec![HandoffItem {
+            label: "初期費用・設置工事費に関するご質問".to_string(),
+            signals: vec![Signal::new("initial_cost_question")],
+        }]
     }
 
     #[test]
@@ -476,49 +625,215 @@ mod tests {
         ));
     }
 
-    // ---- passes_handoff_safeguards ----
-
     #[test]
-    fn passes_handoff_safeguards_rejects_a_draft_missing_a_handoff_label() {
-        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
-        let drafted = "月額利用料金は1台1,540円（税込）です。";
-        assert!(passes_handoff_safeguards(drafted, &items).is_err());
+    fn partial_answer_skip_reason_is_none_for_an_allowed_decision() {
+        assert_eq!(
+            partial_answer_skip_reason(&allowed(), &[], Some(0.9), &thresholds(), false, true),
+            None
+        );
     }
 
     #[test]
-    fn passes_handoff_safeguards_rejects_a_monetary_assertion_in_a_sentence_with_the_label() {
-        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
-        let drafted = "初期費用・設置工事費に関するご質問は1,540円です。";
-        assert!(passes_handoff_safeguards(drafted, &items).is_err());
+    fn partial_answer_skip_reason_is_none_for_a_layer3_escalate() {
+        // 第3層は「見送り」ではなく対象外。記録対象にもしない（design doc §3.1）。
+        assert_eq!(
+            partial_answer_skip_reason(&escalate_at(3), &[], Some(0.9), &thresholds(), false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn partial_answer_skip_reason_is_none_when_eligible() {
+        assert_eq!(
+            partial_answer_skip_reason(
+                &escalate(None),
+                &handoff_items_fixture(),
+                Some(0.9),
+                &thresholds(),
+                false,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn partial_answer_skip_reason_reports_hearing_declared() {
+        assert_eq!(
+            partial_answer_skip_reason(
+                &escalate(Some(HearingContract::ProductAndSymptom)),
+                &handoff_items_fixture(),
+                Some(0.9),
+                &thresholds(),
+                false,
+                true
+            ),
+            Some(PartialAnswerSkipReason::HearingDeclared)
+        );
+    }
+
+    #[test]
+    fn partial_answer_skip_reason_reports_no_handoff_items() {
+        assert_eq!(
+            partial_answer_skip_reason(&escalate(None), &[], Some(0.9), &thresholds(), false, true),
+            Some(PartialAnswerSkipReason::NoHandoffItems)
+        );
+    }
+
+    #[test]
+    fn partial_answer_skip_reason_reports_insufficient_relevance() {
+        assert_eq!(
+            partial_answer_skip_reason(
+                &escalate(None),
+                &handoff_items_fixture(),
+                Some(0.1),
+                &thresholds(),
+                false,
+                true
+            ),
+            Some(PartialAnswerSkipReason::InsufficientRelevance)
+        );
+        assert_eq!(
+            partial_answer_skip_reason(
+                &escalate(None),
+                &handoff_items_fixture(),
+                None,
+                &thresholds(),
+                false,
+                true
+            ),
+            Some(PartialAnswerSkipReason::InsufficientRelevance)
+        );
+    }
+
+    #[test]
+    fn partial_answer_skip_reason_reports_already_escalated() {
+        assert_eq!(
+            partial_answer_skip_reason(
+                &escalate(None),
+                &handoff_items_fixture(),
+                Some(0.9),
+                &thresholds(),
+                true,
+                true
+            ),
+            Some(PartialAnswerSkipReason::AlreadyEscalated)
+        );
+    }
+
+    #[test]
+    fn partial_answer_skip_reason_reports_draft_generation_disabled() {
+        assert_eq!(
+            partial_answer_skip_reason(
+                &escalate(None),
+                &handoff_items_fixture(),
+                Some(0.9),
+                &thresholds(),
+                false,
+                false
+            ),
+            Some(PartialAnswerSkipReason::DraftGenerationDisabled)
+        );
+    }
+
+    // ---- passes_handoff_safeguards ----
+
+    const LABEL: &str = "初期費用・設置工事費に関するご質問";
+
+    /// 取り次ぐ項目の歯止めテスト専用 lexicon。design doc §3.5(3) の例と同じ surface_forms
+    /// （「初期費用」「設置費」「工事費」「工事代金」）を持つ。
+    fn lexicon_with_surface_forms() -> LexiconNormalizer {
+        LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "initial_cost_question", "class": "context",
+                  "surface_forms": ["初期費用", "設置費", "工事費", "工事代金"],
+                  "customer_label": "初期費用・設置工事費に関するご質問" }
+            ] }"#,
+        )
+        .expect("lexicon parses")
+    }
+
+    fn items_fixture() -> Vec<HandoffItem> {
+        vec![HandoffItem {
+            label: LABEL.to_string(),
+            signals: vec![Signal::new("initial_cost_question")],
+        }]
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_rejects_a_monetary_assertion_in_a_sentence_with_the_surface_form()
+    {
+        let lex = lexicon_with_surface_forms();
+        let drafted = "工事費は1,540円です。";
+        assert!(passes_handoff_safeguards(drafted, &items_fixture(), &lex).is_err());
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_warns_but_accepts_an_item_whose_signals_have_no_surface_forms() {
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "unclassified_risk", "class": "hazard", "surface_forms": [],
+                  "llm_only": true, "customer_label": "その他のご懸念" }
+            ] }"#,
+        )
+        .expect("lexicon parses");
+        let items = vec![HandoffItem {
+            label: "その他のご懸念".to_string(),
+            signals: vec![Signal::new("unclassified_risk")],
+        }];
+        let (result, logs) = crate::test_support::capture_logs(|| {
+            passes_handoff_safeguards("月額利用料金は1台1,540円です。", &items, &lex)
+        });
+        assert!(result.is_ok());
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            warnings.contains("unclassified_risk"),
+            "expected a warning naming the unchecked signal, got: {warnings}"
+        );
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_does_not_warn_for_an_item_with_surface_forms() {
+        let lex = lexicon_with_surface_forms();
+        let (result, logs) = crate::test_support::capture_logs(|| {
+            passes_handoff_safeguards("月額利用料金は1台1,540円です。", &items_fixture(), &lex)
+        });
+        assert!(result.is_ok());
+        let warnings = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(
+            !warnings.contains("no surface forms"),
+            "unexpected warning for a checkable item: {warnings}"
+        );
     }
 
     #[test]
     fn passes_handoff_safeguards_rejects_the_no_answer_token_verbatim() {
-        assert!(passes_handoff_safeguards(NO_ANSWER_TOKEN, &[]).is_err());
+        let lex = lexicon_with_surface_forms();
+        assert!(passes_handoff_safeguards(NO_ANSWER_TOKEN, &[], &lex).is_err());
         // 前後の空白は trim されるので同様に拒否される。
-        assert!(passes_handoff_safeguards(&format!("  {NO_ANSWER_TOKEN}  "), &[]).is_err());
+        assert!(passes_handoff_safeguards(&format!("  {NO_ANSWER_TOKEN}  "), &[], &lex).is_err());
     }
 
     #[test]
     fn passes_handoff_safeguards_accepts_a_clean_draft() {
-        let items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        let lex = lexicon_with_surface_forms();
         let drafted = "月額利用料金は1台1,540円（税込）です。初期費用・設置工事費に関する\
                         ご質問は担当者がご案内します。";
-        assert!(passes_handoff_safeguards(drafted, &items).is_ok());
+        assert!(passes_handoff_safeguards(drafted, &items_fixture(), &lex).is_ok());
     }
 
     #[test]
     fn passes_handoff_safeguards_is_vacuously_satisfied_when_there_are_no_handoff_items() {
-        // handoff_items が空のとき、2(ラベル網羅)・3(金額断定なし)は自動的に満たされる。
-        assert!(passes_handoff_safeguards("月額利用料金は1台1,540円です。", &[]).is_ok());
+        // handoff_items が空のとき、3(金額断定なし) は自動的に満たされる。
+        let lex = lexicon_with_surface_forms();
+        assert!(passes_handoff_safeguards("月額利用料金は1台1,540円です。", &[], &lex).is_ok());
     }
-
-    const LABEL: &str = "初期費用・設置工事費に関するご質問";
 
     #[test]
     fn passes_handoff_safeguards_rejects_monetary_assertions_with_unit_prefixes_widths_and_spaces()
     {
-        let items = vec![LABEL.to_string()];
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
         for amount in [
             "3万円",
             "１，５４０円",
@@ -527,74 +842,197 @@ mod tests {
             "10%",
             "1万5千円",
         ] {
-            let drafted = format!("{LABEL}は{amount}です。");
+            let drafted = format!("工事費は{amount}です。");
             assert!(
-                passes_handoff_safeguards(&drafted, &items).is_err(),
-                "{amount:?} next to the label must be rejected"
+                passes_handoff_safeguards(&drafted, &items, &lex).is_err(),
+                "{amount:?} next to the surface form must be rejected"
             );
         }
     }
 
     #[test]
-    fn passes_handoff_safeguards_accepts_an_amount_in_a_sentence_without_the_label() {
-        let items = vec![LABEL.to_string()];
-        let drafted = format!("月額は1,540円です。{LABEL}は担当者がご案内します。");
-        assert!(passes_handoff_safeguards(&drafted, &items).is_ok());
+    fn passes_handoff_safeguards_accepts_an_amount_in_a_sentence_without_the_surface_form() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        let drafted = "月額は1,540円です。工事費は担当者がご案内します。".to_string();
+        assert!(passes_handoff_safeguards(&drafted, &items, &lex).is_ok());
     }
 
     #[test]
-    fn passes_handoff_safeguards_known_limit_does_not_detect_an_amount_in_a_separate_sentence() {
-        let items = vec![LABEL.to_string()];
-        let drafted = format!("{LABEL}は担当者がご案内します。初期費用は1,540円です。");
+    fn passes_handoff_safeguards_rejects_an_amount_stated_using_a_shorter_surface_form_in_a_later_sentence(
+    ) {
+        // 旧仕様（ラベル文字列の完全一致）はラベル全文（「初期費用・設置工事費に関するご質問」）
+        // と異なる略称（「初期費用」単体）での金額断定を見逃していた。新仕様（表層形照合）は
+        // この略称自体が signal の surface_form なので検出する（旧仕様からの改善）。
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        let drafted = "工事費は担当者がご案内します。初期費用は1,540円です。";
+        assert!(passes_handoff_safeguards(drafted, &items, &lex).is_err());
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_known_limit_does_not_detect_a_non_monetary_assertion() {
+        // design doc §5 既知の限界: 数字 + 単位を伴わない断定（「無料です」等）は検出しない。
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        let drafted = "工事費は無料です。";
         // これは仕様上の既知の限界であり、望ましい挙動として固定しているのではない。
-        // spec を改訂して検出対象を広げるときは、このテストを反転（is_err）させる。
-        assert!(passes_handoff_safeguards(&drafted, &items).is_ok());
+        assert!(passes_handoff_safeguards(drafted, &items, &lex).is_ok());
     }
 
     #[test]
-    fn passes_handoff_safeguards_treats_a_newline_separated_clause_as_the_same_sentence() {
-        let items = vec![LABEL.to_string()];
-        // 区切りは「。」のみ（`split('。')`）なので、改行で分けても同一文として検出される。
+    fn passes_handoff_safeguards_no_longer_treats_a_newline_as_a_sentence_boundary() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        let drafted = "工事費は担当者がご案内します\n月額は1,540円です。";
+        assert!(passes_handoff_safeguards(drafted, &items, &lex).is_err());
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_rejects_a_monetary_assertion_following_a_newline_in_the_same_sentence(
+    ) {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
         let drafted = format!("{LABEL}は担当者がご案内します\n工事費は3万円です。");
-        assert!(passes_handoff_safeguards(&drafted, &items).is_err());
+        assert!(passes_handoff_safeguards(&drafted, &items, &lex).is_err());
     }
 
     #[test]
-    fn passes_handoff_safeguards_reports_the_no_answer_token_before_a_missing_label() {
-        let items = vec![LABEL.to_string()];
-        let err = passes_handoff_safeguards(NO_ANSWER_TOKEN, &items).unwrap_err();
+    fn passes_handoff_safeguards_rejects_kanji_numeral_amounts_and_bulleted_or_wrapped_amounts() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in [
+            "工事費は三万円です。",
+            "初期費用は百万円です。",
+            "・設置工事費\n30,000円",
+            "工事費は\n3万円です。",
+            "工事費は1.5万円です。",
+            "工事費は３０，０００円です。",
+        ] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_err(),
+                "{drafted:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_rejects_yen_prefixed_amounts_across_widths_separators_and_spaces()
+    {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in [
+            "工事費は￥30,000です。",
+            "工事費は¥30,000です。",
+            "工事費は￥３０，０００です。",
+            "工事費は¥1.5万です。",
+            "工事費は￥ 30,000です。",
+            "工事費は¥　30,000です。",
+        ] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_err(),
+                "{drafted:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_known_limit_does_not_detect_a_postfixed_yen_sign() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in ["工事費は5,000￥です。", "工事費は5,000¥です。"] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_ok(),
+                "{drafted:?} is a known limit and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_accepts_a_yen_prefixed_amount_in_a_sentence_without_the_surface_form(
+    ) {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        let drafted = "月額は￥1,540です。設置工事費は別途です。";
+        assert!(passes_handoff_safeguards(drafted, &items, &lex).is_ok());
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_accepts_amount_sentences_separated_by_a_terminator_other_than_a_period(
+    ) {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in [
+            "設置工事費用は別途かかります。月額は1,540円です。",
+            "月額1,540円です！設置工事費は別途です。",
+            "月額1,540円ですか？設置工事費は別途です。",
+            "月額1,540円です?設置工事費は別途です。",
+            "月額1,540円です!設置工事費は別途です。",
+        ] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_ok(),
+                "{drafted:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_handoff_safeguards_reports_the_no_answer_token_as_the_reason() {
+        let lex = lexicon_with_surface_forms();
+        let err = passes_handoff_safeguards(NO_ANSWER_TOKEN, &items_fixture(), &lex).unwrap_err();
         assert!(
             err.contains(NO_ANSWER_TOKEN),
-            "the reason must name the NO_ANSWER token, not a missing label: {err}"
+            "the reason must name the NO_ANSWER token: {err}"
         );
+    }
+
+    /// 2026-10-09 本番回帰: LLM が「設置工事費は担当者がご案内します」と自然に言い換えた下書きが、
+    /// ラベル「初期費用・設置工事費に関するご質問」の完全一致を要求する旧検査
+    /// （§3.5(2)、2026-10-09 廃止）に落ち、全件 `reason=a handoff item label is missing from
+    /// the draft` で不採用になった。旧検査は廃止済みであり、ラベル文字列を一度も使わない下書き
+    /// でも、表層形を含む文に金額断定が無ければ採用されることを固定する。
+    #[test]
+    fn passes_handoff_safeguards_accepts_a_draft_that_never_uses_the_customer_label_verbatim() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        let drafted = "月額利用料金は1台1,540円（税込）です。設置工事費は担当者がご案内します。";
+        assert!(
+            !drafted.contains(LABEL),
+            "precondition: the draft never contains the literal customer_label"
+        );
+        assert!(passes_handoff_safeguards(drafted, &items, &lex).is_ok());
     }
 
     // ---- accept_draft ----
 
     #[test]
     fn accept_draft_rejects_no_answer_token_for_a_non_partial_draft() {
-        assert!(accept_draft(NO_ANSWER_TOKEN, false, &[]).is_err());
-        assert!(accept_draft(&format!(" {NO_ANSWER_TOKEN}\n"), false, &[]).is_err());
+        let lex = lexicon_with_surface_forms();
+        assert!(accept_draft(NO_ANSWER_TOKEN, false, &[], &lex).is_err());
+        assert!(accept_draft(&format!(" {NO_ANSWER_TOKEN}\n"), false, &[], &lex).is_err());
     }
 
     #[test]
     fn accept_draft_imposes_no_handoff_safeguards_on_a_non_partial_draft() {
-        // ラベル欠落・金額を含んでいても、通常の Allowed 下書きは採用される。
-        let items = vec![LABEL.to_string()];
-        assert!(accept_draft("月額は1,540円です。", false, &items).is_ok());
+        // 表層形を含む文に金額があっても、通常の Allowed 下書きは採用される。
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        assert!(accept_draft("工事費は1,540円です。", false, &items, &lex).is_ok());
     }
 
     #[test]
-    fn accept_draft_rejects_a_partial_draft_missing_a_label() {
-        let items = vec![LABEL.to_string()];
-        assert!(accept_draft("月額は1,540円です。", true, &items).is_err());
+    fn accept_draft_rejects_a_partial_draft_with_a_monetary_assertion_on_the_surface_form() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        assert!(accept_draft("工事費は1,540円です。", true, &items, &lex).is_err());
     }
 
     #[test]
     fn accept_draft_accepts_a_clean_partial_draft() {
-        let items = vec![LABEL.to_string()];
-        let drafted = format!("月額は1,540円です。{LABEL}は担当者がご案内します。");
-        assert!(accept_draft(&drafted, true, &items).is_ok());
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        let drafted = "月額は1,540円です。工事費は担当者がご案内します。";
+        assert!(accept_draft(drafted, true, &items, &lex).is_ok());
     }
 
     // ---- handoff_items_for_decision ----
@@ -664,7 +1102,7 @@ mod tests {
             &lex,
         );
         assert_eq!(
-            items,
+            labels_of(&items),
             vec![
                 "初期費用に関するご質問".to_string(),
                 "解約に関するご質問".to_string()
@@ -690,7 +1128,7 @@ mod tests {
             "訴訟を考えています",
             &lex,
         );
-        assert_eq!(items, vec!["法的なご相談".to_string()]);
+        assert_eq!(labels_of(&items), vec!["法的なご相談".to_string()]);
     }
 
     #[test]

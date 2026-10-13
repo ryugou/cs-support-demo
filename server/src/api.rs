@@ -759,10 +759,14 @@ fn partial_answer_draft_for_escalation(
 ///
 /// `customer_reply_draft`（design doc `2026-10-07-partial-answer-with-handoff-design.md` §3.3）:
 /// `evaluate()` が返した部分回答の下書き（§3.1 の条件を満たし、§3.5 の歯止めを通過済み。満たさ
-/// なければ呼び出し元から渡る値はそもそも `None`）がある場合、この下書きを決定論ブロックに連結
-/// して返す。既に取次済み（上記の `build_already_escalated_reply` 分岐）が最優先で、次点が
-/// この下書き分岐で、受け止め文（`customer_ack` / LLM 生成 / 固定文）はいずれも満たさないときの
-/// フォールバックになる。
+/// なければ呼び出し元から渡る値はそもそも `None`）がある場合、下書き + 取次の一文
+/// （`escalation_reply::build_handoff_sentence`。何を担当者に回したかを LLM の出力に依存させ
+/// ないよう、コードが決定論で組み立てる）を空行で連結してから決定論ブロックへ渡す。既に取次済み
+/// （上記の `build_already_escalated_reply` 分岐）が最優先で、次点がこの下書き分岐で、受け止め文
+/// （`customer_ack` / LLM 生成 / 固定文）はいずれも満たさないときのフォールバックになる。
+///
+/// `handoff_items` は `outcome.handoff_items`（取り次ぐ項目の顧客提示用ラベル列）をそのまま
+/// 渡す。下書きが無い（＝取次の一文も組み立てない）ときはこの引数は読まれない。
 #[allow(clippy::too_many_arguments)]
 async fn build_escalation_reply_text(
     drafter: Option<&crate::llm::AnthropicClient>,
@@ -778,6 +782,7 @@ async fn build_escalation_reply_text(
     out_of_hours_now: bool,
     conv: &mut crate::harness::CaseConvState,
     customer_reply_draft: Option<&str>,
+    handoff_items: &[String],
 ) -> (String, bool) {
     if conv.is_already_escalated() {
         return (
@@ -793,7 +798,8 @@ async fn build_escalation_reply_text(
     if let Some(draft) = customer_reply_draft {
         let block =
             escalation_reply::build_deterministic_block(case_id, hours_label, out_of_hours_now);
-        let reply_text = escalation_reply::assemble_escalation_reply(draft, &block);
+        let reply_text =
+            escalation_reply::assemble_partial_answer_reply(draft, handoff_items, &block);
         arm_time_pref_solicitation(conv);
         return (reply_text, true);
     }
@@ -2194,6 +2200,7 @@ async fn reply_handler(
                         out_of_hours_now,
                         &mut conv,
                         partial_answer_draft_for_escalation(&outcome),
+                        &outcome.handoff_items,
                     )
                     .await;
 
@@ -2728,6 +2735,8 @@ mod tests {
             customer_reply_draft_truncated: false,
             product_references: Vec::new(),
             new_signals: crate::harness::signal::SignalSet::new(),
+            handoff_items: Vec::new(),
+            partial_answer: false,
         }
     }
 
@@ -3776,6 +3785,7 @@ mod tests {
             false,
             &mut conv,
             None,
+            &[],
         )
         .await;
 
@@ -3828,6 +3838,7 @@ mod tests {
             false,
             &mut conv,
             None,
+            &[],
         )
         .await;
 
@@ -3879,6 +3890,7 @@ mod tests {
             false,
             &mut conv,
             None,
+            &[],
         )
         .await;
 
@@ -3927,6 +3939,7 @@ mod tests {
             false,
             &mut conv,
             None,
+            &[],
         )
         .await;
 
@@ -3973,6 +3986,7 @@ mod tests {
             false,
             &mut conv,
             None,
+            &[],
         )
         .await;
 
@@ -4018,6 +4032,7 @@ mod tests {
             false,
             &mut conv,
             None,
+            &[],
         )
         .await;
 
@@ -4080,6 +4095,7 @@ mod tests {
             false,
             &mut conv,
             None,
+            &[],
         )
         .await;
 
@@ -4134,6 +4150,7 @@ mod tests {
             false,
             &mut conv,
             None,
+            &[],
         )
         .await;
 
@@ -4170,6 +4187,7 @@ mod tests {
         let mut conv = default_conv_state();
         let draft =
             "月額利用料金は1台1,540円（税込）です。初期費用・設置工事費に関するご質問は担当者がご案内します。";
+        let handoff_items = vec!["初期費用・設置工事費に関するご質問".to_string()];
 
         let (reply_text, conv_mutated) = build_escalation_reply_text(
             Some(&drafter),
@@ -4185,20 +4203,23 @@ mod tests {
             false,
             &mut conv,
             Some(draft),
+            &handoff_items,
         )
         .await;
 
         assert_eq!(
             reply_text,
-            escalation_reply::assemble_escalation_reply(
+            escalation_reply::assemble_partial_answer_reply(
                 draft,
+                &handoff_items,
                 &escalation_reply::build_deterministic_block(
                     "case-12345678-abcd",
                     "平日 10:00〜18:00",
                     false
                 )
             ),
-            "customer_reply_draft があるときは、それ + 決定論ブロックがそのまま応答になる"
+            "customer_reply_draft があるときは、それ + 空行 + 取次の一文 + 決定論ブロックが \
+             そのまま応答になる"
         );
         assert_eq!(
             log.lock().unwrap().len(),
@@ -4215,6 +4236,57 @@ mod tests {
         );
     }
 
+    /// 2026-10-09 本番回帰: LLM が「設置工事費は担当者がご案内します」と自然に言い換えた下書き
+    /// （ラベル「初期費用・設置工事費に関するご質問」の文字列を一度も使わない）が、`evaluate()`
+    /// 側（`handoff_items::accept_draft`）で採用され、`customer_reply_draft` として渡ってきた
+    /// ケース。`build_escalation_reply_text` はこの下書きの言い回しに関わらず、コードの取次の
+    /// 一文を組み立てて付けることを固定する（応答の組み立てはラベルの完全一致を前提にしない）。
+    #[tokio::test]
+    async fn build_escalation_reply_text_appends_the_handoff_sentence_to_a_paraphrased_draft() {
+        let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
+        let allowlist = response_gate_fixture_allowlist();
+        let mut conv = default_conv_state();
+        let draft = "月額利用料金は1台1,540円（税込）です。設置工事費は担当者がご案内します。";
+        let handoff_items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+        assert!(
+            !draft.contains(&handoff_items[0]),
+            "precondition: the draft never contains the literal customer_label"
+        );
+
+        let (reply_text, _) = build_escalation_reply_text(
+            Some(&drafter),
+            &test_ng(),
+            700,
+            "導入にどれくらいの費用がかかるの？",
+            false,
+            None,
+            &allowlist,
+            "req-1",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+            &mut conv,
+            Some(draft),
+            &handoff_items,
+        )
+        .await;
+
+        assert_eq!(
+            reply_text,
+            escalation_reply::assemble_partial_answer_reply(
+                draft,
+                &handoff_items,
+                &escalation_reply::build_deterministic_block(
+                    "case-12345678-abcd",
+                    "平日 10:00〜18:00",
+                    false
+                )
+            ),
+            "言い換えられた下書きでも、コードの取次の一文が付いた応答になる"
+        );
+        assert_eq!(log.lock().unwrap().len(), 0);
+    }
+
     #[tokio::test]
     async fn build_escalation_reply_text_prefers_the_partial_answer_draft_over_a_declared_customer_ack(
     ) {
@@ -4224,6 +4296,7 @@ mod tests {
         let mut conv = default_conv_state();
         let draft =
             "月額利用料金は1台1,540円（税込）です。初期費用・設置工事費に関するご質問は担当者がご案内します。";
+        let handoff_items = vec!["初期費用・設置工事費に関するご質問".to_string()];
 
         let (reply_text, conv_mutated) = build_escalation_reply_text(
             Some(&drafter),
@@ -4239,13 +4312,15 @@ mod tests {
             false,
             &mut conv,
             Some(draft),
+            &handoff_items,
         )
         .await;
 
         assert_eq!(
             reply_text,
-            escalation_reply::assemble_escalation_reply(
+            escalation_reply::assemble_partial_answer_reply(
                 draft,
+                &handoff_items,
                 &escalation_reply::build_deterministic_block(
                     "case-12345678-abcd",
                     "平日 10:00〜18:00",
@@ -4274,6 +4349,7 @@ mod tests {
         conv.awaiting_time_pref = true; // 受付番号発行済みの後続ターンを模す
         let draft =
             "月額利用料金は1台1,540円（税込）です。初期費用・設置工事費に関するご質問は担当者がご案内します。";
+        let handoff_items = vec!["初期費用・設置工事費に関するご質問".to_string()];
 
         let (reply_text, conv_mutated) = build_escalation_reply_text(
             Some(&drafter),
@@ -4289,6 +4365,7 @@ mod tests {
             false,
             &mut conv,
             Some(draft),
+            &handoff_items,
         )
         .await;
 
