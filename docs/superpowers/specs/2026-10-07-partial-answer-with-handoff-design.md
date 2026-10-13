@@ -176,8 +176,8 @@ user message には現行の材料（上位 3 件・各 2,500 字まで）と質
 
 ### 10.3 検証（§9 の改訂）
 
-- スモークの材料は手で選ばず、**本番 MCP `search_manual` の実結果**を入力にする。`CS_VERIFY_SECTIONS_JSON` に代えて `CS_VERIFY_HITS_JSON`（`search_manual` の返却 JSON をそのまま保存したファイル。質問文の検索結果と、補助検索語での検索結果の 2 つを `{"question_hits": ..., "signal_hits": ...}` で持つ）を受け、§10.2 の併合をコード側の同じ関数で行う。
-- 言い回しを複数回す: `CS_VERIFY_QUESTION` を 1 つではなく、`CS_VERIFY_CASES_JSON`（`[{"question": ..., "hits_json": <path>}, ...]`）で与える。最低 3 件: 「導入にいくらかかる？」「導入にどれくらいの費用がかかるの？」「費用はどれくらい？」。
+- スモークの材料は手で選ばず、**本番 MCP `search_manual` の実結果**を入力にする。入力は `CS_VERIFY_CASES_JSON`（旧 `CS_VERIFY_SECTIONS_JSON` / `CS_VERIFY_QUESTION` は廃止）で、形式は `[{"question": <言い回し>, "expect": "handoff" | "allowed", "hits_json": <path>}, ...]`。各 `hits_json` は、質問文での `search_manual` の返却 JSON と、補助検索語（取り次ぐ signal の `description` + `surface_forms`）での返却 JSON を `{"question_hits": <返却 JSON>, "signal_hits": <返却 JSON>}` で持つ 1 ファイル。併合は §10.2 の本番と同じ関数で行う。
+- 言い回しは最低 3 件の相異なるもの: 「導入にいくらかかる？」（本番の回帰。必須）「導入にどれくらいの費用がかかるの？」「費用はどれくらい？」。`expect` の意味は §10.5。
 - 合否に「最終応答文に料金節の金額（`1,540`）が含まれる」を全ケースで要求する（補助検索が効いていることの確認）。
 - 本番の最終確認は、LINE ではなく MCP `evaluate_answerability` を同じ 3 文で呼び、`customer_reply_draft` に金額が含まれ `partial_answer = true` であることを確認する（実施者はオーケストレータ）。
 
