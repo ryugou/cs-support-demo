@@ -133,8 +133,9 @@ pub(super) fn fold_signal_search_results(
                     request_id = %request_id,
                     signal = signal.as_str(),
                     error = %err,
-                    "signal-guided supplementary search failed; continuing with the \
-                     question-text search results only"
+                    "signal-guided supplementary search failed for this signal; skipping it \
+                     and continuing with the question-text results plus any other signal's \
+                     supplementary hits"
                 );
             }
         }

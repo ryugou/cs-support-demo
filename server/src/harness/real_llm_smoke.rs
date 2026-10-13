@@ -168,6 +168,13 @@ fn assert_case_paraphrases(cases: &[VerifyCase]) {
         "{CASES_ENV} must include the production regression \"{PRODUCTION_REGRESSION_QUESTION}\" \
          as a \"handoff\" case (design doc §10.5), got handoff questions {handoff:?}"
     );
+    // #73 の料金問い合わせ（回答のみ）の経路も必ず 1 件は通す（Copilot レビュー）。
+    let allowed = distinct_questions(Some(CaseExpectation::Allowed));
+    assert!(
+        !allowed.is_empty(),
+        "{CASES_ENV} must include at least one distinct \"allowed\" paraphrase (the #73 \
+         answer-only price inquiry path, design doc §10.5), got none"
+    );
 }
 
 /// `CS_VERIFY_CASES_JSON`（`[{"question": ..., "hits_json": <path>, "expect": ...}, ...]`）を読み、
