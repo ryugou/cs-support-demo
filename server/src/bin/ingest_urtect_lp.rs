@@ -369,7 +369,15 @@ fn extract_price_box_line(box_el: ElementRef<'_>) -> Result<String> {
             }
             let raw = extract_text_excluding_noise(price_el);
             let collapsed = collapse_numeric_spacing(&raw);
-            collapsed.chars().filter(|c| !c.is_whitespace()).collect()
+            let value: String = collapsed.chars().filter(|c| !c.is_whitespace()).collect();
+            if value.is_empty() {
+                anyhow::bail!(
+                    "anchor #price: price box {label:?} has a .price-box-price element that \
+                     extracted to an empty value — the site structure may have changed since \
+                     this ingest CLI was written — aborting without writing anything"
+                );
+            }
+            value
         }
     };
     Ok(format!("{label}: {value}"))
@@ -446,7 +454,23 @@ fn price_bullet_line(fragment: &str) -> Result<String> {
     let (label, value) = without_marker
         .split_once('→')
         .expect("arrow_count == 1 was just checked above");
-    Ok(format!("{}: {}", label.trim(), value.trim()))
+    let label = label.trim();
+    let value = value.trim();
+    if label.is_empty() {
+        anyhow::bail!(
+            "anchor #price: a price bullet fragment has an empty label before \"→\": \
+             {without_marker:?} — the site structure may have changed since this ingest CLI \
+             was written — aborting without writing anything"
+        );
+    }
+    if value.is_empty() {
+        anyhow::bail!(
+            "anchor #price: a price bullet fragment has an empty value after \"→\": \
+             {without_marker:?} — the site structure may have changed since this ingest CLI \
+             was written — aborting without writing anything"
+        );
+    }
+    Ok(format!("{label}: {value}"))
 }
 
 /// `.price-text` 配下の箇条書き行と末尾の注記行を組み立てる。
@@ -1106,6 +1130,12 @@ mod tests {
                 "no .price-box-contents price boxes found",
             ),
             (
+                "empty price value",
+                r#"<div class="price-box-price">"#,
+                r#"<div class="price-box-price"></div><div class="not-a-price-value">"#.into(),
+                "extracted to an empty value",
+            ),
+            (
                 "missing trailing note paragraph",
                 "<p>※別途設置工事費用がかかります。</p>",
                 String::new(),
@@ -1122,6 +1152,18 @@ mod tests {
                 "・カメラ2台 → 2,640円（税込）／月",
                 "・カメラ2台 2,640円（税込）／月".into(),
                 "has 0 \"→\" separator(s), expected exactly 1",
+            ),
+            (
+                "bullet with empty label",
+                "・カメラ2台 → 2,640円",
+                "・ → 2,640円".into(),
+                "empty label",
+            ),
+            (
+                "bullet with empty value",
+                "・カメラ2台 → 2,640円（税込）／月",
+                "・カメラ2台 → ".into(),
+                "empty value",
             ),
             (
                 "bullet with two arrows",
