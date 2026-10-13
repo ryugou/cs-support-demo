@@ -1,4 +1,4 @@
-//! design doc `2026-10-07-partial-answer-with-handoff-design.md` §10.3「検証」。
+//! design doc `2026-10-07-partial-answer-with-handoff-design.md` §10.3・§10.5「検証」。
 //!
 //! 単体テストと reviewer の判定だけでは、顧客に返る最終文面を確認したことにならない
 //! （2026-10-09 の本番で下書きが全件捨てられていた実例、2026-10-13 の本番で検索依存の
@@ -7,6 +7,11 @@
 //! と、本番 MCP `search_manual` の実結果を使い、取次ターンでも答えられる部分（料金）が実際に
 //! 顧客向け文面に出ることを確認する。材料は手で選ばず、§10.2 の併合をコード側の同じ関数
 //! （`super::supplementary_search::fold_signal_search_results`）で行う。
+//!
+//! 言い回しによって判定が `Escalate`（取次）と `Allowed`（回答のみ）に割れる（§10.5）。各ケースは
+//! `expect` で自分がどちらになるはずかを宣言し、本テストは本番 `evaluate()` と同じ条件
+//! （`handoff_items::is_partial_answer_candidate`）でだけ補助検索を併合し、`expect` ごとに
+//! 異なる最終応答文の形（取次の一文・受付番号あり、または下書きそのまま）を確認する。
 //!
 //! `#[ignore]`: 実 API キー・ネットワーク到達性・`CS_VERIFY_CASES_JSON`（本番 MCP
 //! `search_manual` の実結果ファイル）を要求するため CI では走らせない。
@@ -35,7 +40,14 @@ use std::sync::Arc;
 const LLM_API_KEY_ENV: &str = "CS_SUPPORT_LLM_API_KEY";
 const CASES_ENV: &str = "CS_VERIFY_CASES_JSON";
 const MIN_VERIFY_CASES: usize = 3;
+const MIN_HANDOFF_CASES: usize = 2;
 const SUPPLEMENTARY_SEARCH_SIGNAL: &str = "initial_cost_question";
+/// design doc §10.5: 本番で取次になるべきだった回帰の質問文。handoff ケースに必ず含める。
+const PRODUCTION_REGRESSION_QUESTION: &str = "導入にいくらかかる？";
+/// 料金ページに載る月額料金の表記。最終応答文に出ることを確認する。
+const MONTHLY_FEE_TEXT: &str = "1,540";
+/// 取次ターンの確定文面（`escalation_reply::build_deterministic_block`）に付く受付番号行の接頭辞。
+const CASE_REFERENCE_PREFIX: &str = "受付番号: ";
 
 /// `server/` 相対パスを `CARGO_MANIFEST_DIR` 基準で解決する。cwd 非依存にするため
 /// （`production_ng_dictionary` / `test_support::load_bundled_escalation_rules` と同じ作法）。
@@ -84,31 +96,102 @@ struct CaseHitsFile {
     signal_hits: SearchManualHits,
 }
 
+/// design doc §10.5 の `expect`: このケースの判定・最終応答文がどちらの形になるはずか。
+/// 文字列以外・未知の文字列（綴りミス等）は、追加の検証コードを書かず serde のデシリアライズ
+/// エラーに委ねる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CaseExpectation {
+    /// 判定が第1層 `Escalate`。部分回答の下書きが採用され、最終応答文に取次の一文・受付番号が
+    /// 付く。
+    Handoff,
+    /// 判定が `Allowed`。`customer_reply_draft` が採用され、最終応答文は下書きそのもの。
+    Allowed,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct VerifyCase {
     question: String,
     hits_json: String,
+    expect: CaseExpectation,
 }
 
-/// `CS_VERIFY_CASES_JSON`（`[{"question": ..., "hits_json": <path>}, ...]`）を読み、各ケースの
-/// `hits_json` が指す本番 MCP `search_manual` の実結果（`{"question_hits": ..., "signal_hits":
-/// ...}`）を読み込む。戻り値は `(question, question_hits, signal_hits)` のタプル列
-/// （design doc §10.3）。
-fn load_verify_cases() -> Vec<(String, Vec<SectionHit>, Vec<SectionHit>)> {
+/// `load_verify_cases` が1ケースについて読み込んだ結果（design doc §10.5）。`question_hits` は
+/// 判定に、`signal_hits` は補助検索の材料（未加工）に使う。
+struct LoadedVerifyCase {
+    question: String,
+    question_hits: Vec<SectionHit>,
+    signal_hits: Vec<SectionHit>,
+    expect: CaseExpectation,
+}
+
+/// design doc §10.3・§10.5 の「言い回しの検証」: 相異なる言い回し数、handoff 側の相異なる数、
+/// production 回帰質問を含むことを確認する。
+fn assert_case_paraphrases(cases: &[VerifyCase]) {
+    for (index, case) in cases.iter().enumerate() {
+        assert!(
+            !case.question.trim().is_empty(),
+            "{CASES_ENV} case {} has an empty question (hits_json {:?})",
+            index + 1,
+            case.hits_json
+        );
+    }
+    // design doc §10.3: 同じ通りやすい言い回しを複製しても合格しないよう、言い回しは相異なる
+    // ことを要求する（codex レビュー RH-8）。
+    let distinct_questions = |expect: Option<CaseExpectation>| -> std::collections::BTreeSet<&str> {
+        cases
+            .iter()
+            .filter(|case| expect.is_none_or(|e| case.expect == e))
+            .map(|case| case.question.trim())
+            .collect()
+    };
+    let distinct = distinct_questions(None);
+    assert!(
+        distinct.len() >= MIN_VERIFY_CASES,
+        "{CASES_ENV} must list at least {MIN_VERIFY_CASES} distinct paraphrases (design doc \
+         §10.3), got {} distinct of {}",
+        distinct.len(),
+        cases.len()
+    );
+    // design doc §10.5: 言い回しによって判定が `Allowed` に割れることがあるため、取次
+    // （`"handoff"`）の退行を検出できるよう、相異なる言い回しの handoff ケースを要求し、
+    // 本番の回帰の質問文をその1つに含めることを強制する。
+    let handoff = distinct_questions(Some(CaseExpectation::Handoff));
+    assert!(
+        handoff.len() >= MIN_HANDOFF_CASES,
+        "{CASES_ENV} must list at least {MIN_HANDOFF_CASES} distinct \"handoff\" paraphrases \
+         (design doc §10.5), got {} distinct",
+        handoff.len()
+    );
+    assert!(
+        handoff.contains(PRODUCTION_REGRESSION_QUESTION),
+        "{CASES_ENV} must include the production regression \"{PRODUCTION_REGRESSION_QUESTION}\" \
+         as a \"handoff\" case (design doc §10.5), got handoff questions {handoff:?}"
+    );
+}
+
+/// `CS_VERIFY_CASES_JSON`（`[{"question": ..., "hits_json": <path>, "expect": ...}, ...]`）を読み、
+/// 各ケースの `hits_json` が指す本番 MCP `search_manual` の実結果（`{"question_hits": ...,
+/// "signal_hits": ...}`）を読み込む（design doc §10.3・§10.5）。
+fn load_verify_cases() -> Vec<LoadedVerifyCase> {
     let cases_path = std::env::var(CASES_ENV).unwrap_or_else(|_| {
         panic!(
             "{CASES_ENV} is not set; point it at a json file of `[{{\"question\": ..., \
-             \"hits_json\": <path>}}, ...]` (at least 3 paraphrases of the pricing question; \
-             each hits_json file holds the real `search_manual` output for the question text \
-             and for the signal-guided supplementary search; see design doc \
-             2026-10-07-partial-answer-with-handoff-design.md §10.3)"
+             \"hits_json\": <path>, \"expect\": \"handoff\" | \"allowed\"}}, ...]` (at least 3 \
+             paraphrases of the pricing question; each hits_json file holds the real \
+             `search_manual` output for the question text and for the signal-guided \
+             supplementary search; see design doc 2026-10-07-partial-answer-with-handoff-design.md \
+             §10.3, §10.5)"
         )
     });
     let body = std::fs::read_to_string(&cases_path).unwrap_or_else(|err| {
         panic!("{CASES_ENV} must point at a readable file ({cases_path:?}): {err}")
     });
     let cases: Vec<VerifyCase> = serde_json::from_str(&body).unwrap_or_else(|err| {
-        panic!("{CASES_ENV} ({cases_path:?}) is not a json array of {{question, hits_json}}: {err}")
+        panic!(
+            "{CASES_ENV} ({cases_path:?}) is not a json array of {{question, hits_json, \
+             expect}}: {err}"
+        )
     });
     assert!(
         cases.len() >= MIN_VERIFY_CASES,
@@ -116,17 +199,7 @@ fn load_verify_cases() -> Vec<(String, Vec<SectionHit>, Vec<SectionHit>)> {
          the pricing question, design doc §10.3), got {}",
         cases.len()
     );
-    // design doc §10.3: 同じ通りやすい言い回しを複製しても合格しないよう、言い回しは相異なる
-    // ことを要求する（codex レビュー RH-8）。
-    let distinct: std::collections::BTreeSet<&str> =
-        cases.iter().map(|case| case.question.trim()).collect();
-    assert!(
-        distinct.len() >= MIN_VERIFY_CASES,
-        "{CASES_ENV} ({cases_path:?}) must list at least {MIN_VERIFY_CASES} distinct paraphrases \
-         (design doc §10.3), got {} distinct of {}",
-        distinct.len(),
-        cases.len()
-    );
+    assert_case_paraphrases(&cases);
     cases
         .into_iter()
         .map(|case| {
@@ -143,11 +216,12 @@ fn load_verify_cases() -> Vec<(String, Vec<SectionHit>, Vec<SectionHit>)> {
                     case.question, case.hits_json
                 )
             });
-            (
-                case.question,
-                hits_file.question_hits.hits,
-                hits_file.signal_hits.hits,
-            )
+            LoadedVerifyCase {
+                question: case.question,
+                question_hits: hits_file.question_hits.hits,
+                signal_hits: hits_file.signal_hits.hits,
+                expect: case.expect,
+            }
         })
         .collect()
 }
@@ -288,16 +362,18 @@ fn build_fixture(
     }
 }
 
-/// signal 抽出から `decide` までを実行し、第1層 `initial-cost-quote` の取次であることを確かめる。
-/// `question_hits` は本番 MCP `search_manual` の実結果（質問文検索。補助検索より前に判定へ渡る
-/// ので merge 前のまま使う。`evaluate()` と同じ順序）。
-async fn decide_and_assert_layer1(
+/// signal 抽出から `decide` までを実行する。判定内容そのものへの assert はここでは行わず、
+/// 呼び出し側（`run_once`）が `expect`（design doc §10.5）に応じて [`assert_handoff_decision`] /
+/// [`assert_allowed_decision`] のどちらを課すか選ぶ。`question_hits` は本番 MCP `search_manual`
+/// の実結果（質問文検索。補助検索より前に判定へ渡るので merge 前のまま使う。`evaluate()` と同じ
+/// 順序）。
+async fn decide_for_case(
     fx: &Fixture,
     question: &str,
     question_hits: &[SectionHit],
     case_index: usize,
     total_cases: usize,
-) -> (extraction::ExtractionResult, AnswerDecision) {
+) -> (extraction::ExtractionResult, AnswerDecision, Vec<String>) {
     let extracted = fx.harness.extractor.extract(question).await;
     let (signals, mode) = (&extracted.signals, extracted.mode);
     // 製品言及抽出は signal 抽出と完全に独立したコンポーネント（Issue #52）。この質問は
@@ -328,7 +404,10 @@ async fn decide_and_assert_layer1(
              out-of-scope)"
         )
     });
-    let price_section_key = top_hit.section_key.clone();
+    let section_keys: Vec<String> = question_hits
+        .iter()
+        .map(|h| h.section_key.clone())
+        .collect();
     let decision = decision::decide(&DecisionInput {
         question_signals: signals,
         question_raw: question,
@@ -336,7 +415,7 @@ async fn decide_and_assert_layer1(
         domains: &fx.prohibited_domains,
         resolutions: &[],
         best_manual_score: Some(top_hit.score),
-        best_manual_sections: std::slice::from_ref(&price_section_key),
+        best_manual_sections: &section_keys,
         stakes_input,
         thresholds: &fx.thresholds,
         default_route: &fx.config.harness.default_escalation_route,
@@ -347,30 +426,86 @@ async fn decide_and_assert_layer1(
         .collect();
     println!("decision: {decision:?}");
     println!("matched layer-1 rule ids: {matched_layer1_rule_ids:?}");
+    (extracted, decision, matched_layer1_rule_ids)
+}
 
-    // 判定の合否は下書き生成より先に見る（判定が外れたまま下書き失敗で panic すると
-    // 失敗理由が誤誘導になる）。併発ルールがあっても `decide` が選ぶルールが
-    // initial-cost-quote なら §10.3 は満たされる。
+/// `decide_for_case` の判定が design doc §10.5 の `"handoff"` ケースの期待（第1層 `Escalate`
+/// かつ選択ルールが `initial-cost-quote`）を満たすことを確かめる。併発ルールがあっても `decide`
+/// が選ぶルールが `initial-cost-quote` なら §10.5 は満たされる。
+fn assert_handoff_decision(
+    decision: &AnswerDecision,
+    escalation_rules: &[rules::EscalationRule],
+    signals: &signal::SignalSet,
+    matched_layer1_rule_ids: &[String],
+    question: &str,
+    case_index: usize,
+    total_cases: usize,
+) {
     assert!(
-        matches!(&decision, AnswerDecision::Escalate { layer: 1, .. }),
-        "case {case_index}/{total_cases} ({question:?}): expected a layer-1 escalate decision, \
-         got {decision:?}"
+        matches!(decision, AnswerDecision::Escalate { layer: 1, .. }),
+        "case {case_index}/{total_cases} ({question:?}): expected a layer-1 escalate decision for \
+         a \"handoff\" case (design doc §10.5), got {decision:?}"
     );
-    let selected_rule_id = match_layer1(&fx.escalation_rules, signals).map(|r| r.id.as_str());
+    let selected_rule_id = match_layer1(escalation_rules, signals).map(|r| r.id.as_str());
     assert_eq!(
         selected_rule_id,
         Some("initial-cost-quote"),
         "case {case_index}/{total_cases} ({question:?}): expected initial-cost-quote to be the \
-         selected layer-1 rule (matched: {matched_layer1_rule_ids:?})"
+         selected layer-1 rule for a \"handoff\" case (design doc §10.5; matched: \
+         {matched_layer1_rule_ids:?})"
     );
-    (extracted, decision)
+}
+
+/// `decide_for_case` の判定が design doc §10.5 の `"allowed"` ケースの期待（`Allowed`）を
+/// 満たすことを確かめる。
+fn assert_allowed_decision(
+    decision: &AnswerDecision,
+    question: &str,
+    case_index: usize,
+    total_cases: usize,
+) {
+    assert!(
+        matches!(decision, AnswerDecision::Allowed { .. }),
+        "case {case_index}/{total_cases} ({question:?}): expected an allowed decision for an \
+         \"allowed\" case (design doc §10.5), got {decision:?}"
+    );
+}
+
+/// `expect`（design doc §10.5）に応じて [`assert_handoff_decision`] / [`assert_allowed_decision`]
+/// のどちらを課すか選ぶ。
+#[allow(clippy::too_many_arguments)]
+fn assert_decision_matches(
+    decision: &AnswerDecision,
+    expect: CaseExpectation,
+    escalation_rules: &[rules::EscalationRule],
+    signals: &signal::SignalSet,
+    matched_layer1_rule_ids: &[String],
+    question: &str,
+    case_index: usize,
+    total_cases: usize,
+) {
+    match expect {
+        CaseExpectation::Handoff => assert_handoff_decision(
+            decision,
+            escalation_rules,
+            signals,
+            matched_layer1_rule_ids,
+            question,
+            case_index,
+            total_cases,
+        ),
+        CaseExpectation::Allowed => {
+            assert_allowed_decision(decision, question, case_index, total_cases)
+        }
+    }
 }
 
 /// 下書きを生成し、本番と同じ採否判定（`accept_draft`、truncated 判定、取扱外型番ゲート）を
-/// 通して本文を返す。`merged_hits` / `merged_best_score` は質問文検索と補助検索を
-/// `super::supplementary_search::fold_signal_search_results` で併合した後の値（design doc §10.2「取り次ぐ項目を
-/// 導出した後」の本番の評価順序と同じ: 判定（`decide_and_assert_layer1`）は merge 前、下書きは
-/// merge 後の材料を使う）。
+/// 通して本文を返す。`merged_hits` / `merged_best_score` は `run_once` が design doc §10.2 の
+/// 条件で確定した下書き材料（取次候補のときは質問文検索と補助検索を
+/// `super::supplementary_search::fold_signal_search_results` で併合した後の値、それ以外は質問文
+/// 検索の結果そのまま）。この関数自体は `decision` / `items` の種類（`Escalate` / `Allowed`）に
+/// 依らない汎用の採否判定（`plan_reply_draft` が `is_allowed` を見て方針を決める）。
 #[allow(clippy::too_many_arguments)]
 async fn draft_accepted_text(
     fx: &Fixture,
@@ -449,25 +584,150 @@ async fn draft_accepted_text(
     draft.text
 }
 
-/// `question_hits` は判定（`decide_and_assert_layer1`）に、`merged_hits` /
-/// `merged_best_score`（質問文検索と補助検索を design doc §10.2 の規則で併合した後の値）は
-/// 下書き生成に使う。本番 `evaluate()` の評価順序（判定確定 → handoff_items 確定 → 補助検索 →
-/// 下書き）と同じ。
+/// Handoff ケースの最終応答文を組み立て、design doc §10.5 の条件（取次の一文・受付番号）を
+/// 確認する。戻り値は確認済みの最終応答文（呼び出し側が println する）。
+fn assemble_and_assert_handoff_reply(
+    fx: &Fixture,
+    draft_text: &str,
+    labels: &[String],
+    question: &str,
+    case_index: usize,
+    total_cases: usize,
+) -> String {
+    let case_id = format!("case-smoketest{case_index:020}");
+    let deterministic_block =
+        escalation_reply::build_deterministic_block(&case_id, &fx.hours_label, false);
+    let final_reply =
+        escalation_reply::assemble_partial_answer_reply(draft_text, labels, &deterministic_block);
+
+    let handoff_sentence = escalation_reply::build_handoff_sentence(labels);
+    assert!(
+        final_reply.contains(&handoff_sentence),
+        "case {case_index}/{total_cases} ({question:?}): final reply does not contain the \
+         handoff sentence ({handoff_sentence:?}):\n{final_reply}"
+    );
+    assert!(
+        final_reply.contains(CASE_REFERENCE_PREFIX),
+        "case {case_index}/{total_cases} ({question:?}): final reply does not contain the case \
+         reference line:\n{final_reply}"
+    );
+    final_reply
+}
+
+/// Allowed ケースの最終応答文（下書きそのもの。`api.rs` の `decide_reply_action`（
+/// `AnswerDecision::Allowed` で採用済み非truncated下書きがあるときに `ReplyAction::Answer` が
+/// 採用する経路と同じ））について、取次項目が無いこと・受付番号を含まないことを design doc
+/// §10.5 に沿って確認する。
+fn assert_allowed_final_reply(
+    final_reply: &str,
+    labels: &[String],
+    question: &str,
+    case_index: usize,
+    total_cases: usize,
+) {
+    // `handoff_items_for_decision` の既存の doc コメント（layer=3 と Allowed は空）どおり、
+    // Allowed では取次項目が無いことを明示的に確認する。
+    assert!(
+        labels.is_empty(),
+        "case {case_index}/{total_cases} ({question:?}): expected no handoff items for an \
+         \"allowed\" case (design doc §10.5), got {labels:?}"
+    );
+    assert!(
+        !final_reply.contains(CASE_REFERENCE_PREFIX),
+        "case {case_index}/{total_cases} ({question:?}): final reply for an \"allowed\" case \
+         must not contain the case reference line (design doc §10.5):\n{final_reply}"
+    );
+}
+
+/// design doc §10.2・本番 `evaluate()`（`server/src/harness/mod.rs` の
+/// `handoff_items::is_partial_answer_candidate` 分岐）と同じ条件: 取次候補
+/// （第1・2層 Escalate かつ取り次ぐ項目が1つ以上、hearing宣言なし）のときだけ、マッチした signal
+/// の lexicon 語彙で引いた補助検索を質問文検索の結果と併合する。それ以外（Allowed・第3層）は
+/// 質問文検索の結果（取扱外型番は既に除外済み）をそのまま下書きの材料にする（検索回数を増やさ
+/// ない）。
+#[allow(clippy::too_many_arguments)]
+fn select_material_hits(
+    fx: &Fixture,
+    decision: &AnswerDecision,
+    items: &[handoff_items::HandoffItem],
+    question_hits: &[SectionHit],
+    signal_hits: &[SectionHit],
+    question: &str,
+    case_index: usize,
+    total_cases: usize,
+) -> (Vec<SectionHit>, Option<f32>) {
+    if handoff_items::is_partial_answer_candidate(decision, items) {
+        let item_signals: std::collections::BTreeSet<&signal::Signal> =
+            items.iter().flat_map(|item| item.signals.iter()).collect();
+        let covered = signal::Signal::new(SUPPLEMENTARY_SEARCH_SIGNAL);
+        assert!(
+            item_signals.len() == 1 && item_signals.contains(&covered),
+            "case {case_index}/{total_cases} ({question:?}): the case's signal_hits only cover \
+             {SUPPLEMENTARY_SEARCH_SIGNAL:?}, but production searches every signal of every \
+             handoff item, so the materials would differ from production; handoff item signals: \
+             {item_signals:?}"
+        );
+        let question_best = question_hits.first().map(|h| h.score);
+        let (merged_hits, merged_best_score, _) =
+            super::supplementary_search::fold_signal_search_results(
+                question_hits.to_vec(),
+                question_best,
+                Vec::new(),
+                vec![(
+                    signal::Signal::new(SUPPLEMENTARY_SEARCH_SIGNAL),
+                    Ok((signal_hits.to_vec(), Vec::new())),
+                )],
+                &fx.allowlist,
+                &format!("smoke-case-{case_index}"),
+            );
+        (merged_hits, merged_best_score)
+    } else {
+        (
+            question_hits.to_vec(),
+            question_hits.first().map(|h| h.score),
+        )
+    }
+}
+
+/// `question_hits` は判定（`decide_for_case`）に使う（本番 `evaluate()` の評価順序で判定確定が
+/// 補助検索より先に来るため、merge 前のまま渡す）。`signal_hits` は補助検索語で引いた結果
+/// （未加工。`fold_signal_search_results` が内部で取扱外型番の除外を行う）。`expect` で design
+/// doc §10.5 の2種類のケースを分岐する。
 #[allow(clippy::too_many_arguments)]
 async fn run_once(
     fx: &Fixture,
     question: &str,
     question_hits: &[SectionHit],
-    merged_hits: &[SectionHit],
-    merged_best_score: Option<f32>,
+    signal_hits: &[SectionHit],
+    expect: CaseExpectation,
     case_index: usize,
     total_cases: usize,
 ) {
     println!(
-        "==== real_llm_partial_answer_smoke case {case_index}/{total_cases}: {question:?} ===="
+        "==== real_llm_partial_answer_smoke case {case_index}/{total_cases} ({expect:?}): \
+         {question:?} ===="
     );
-    let (extracted, decision) =
-        decide_and_assert_layer1(fx, question, question_hits, case_index, total_cases).await;
+    let (extracted, decision, matched_layer1_rule_ids) =
+        decide_for_case(fx, question, question_hits, case_index, total_cases).await;
+    assert!(
+        extracted.mode != extraction::ExtractionMode::LexiconFallback,
+        "case {case_index}/{total_cases} ({question:?}): decide_reply_action forces an \
+         EscalationReply on LexiconFallback and skips the draft, so this test's premise fails"
+    );
+    assert_decision_matches(
+        &decision,
+        expect,
+        &fx.escalation_rules,
+        &extracted.signals,
+        &matched_layer1_rule_ids,
+        question,
+        case_index,
+        total_cases,
+    );
+    // design doc `2026-10-07-partial-answer-with-handoff-design.md` §2・§3.1: 取り次ぐ項目
+    // （customer_label の列）を、マッチした第1層ルールの `condition` / 第2層禁止領域の
+    // `domain_signals` から導出する。layer=1 はマッチした**全**ルールの和集合、layer=3 と
+    // Allowed は空。
     let items = handoff_items::handoff_items_for_decision(
         &decision,
         &fx.escalation_rules,
@@ -478,55 +738,133 @@ async fn run_once(
     );
     let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
     println!("handoff items: {labels:?}");
-
+    let (material_hits, material_best_score) = select_material_hits(
+        fx,
+        &decision,
+        &items,
+        question_hits,
+        signal_hits,
+        question,
+        case_index,
+        total_cases,
+    );
     let draft_text = draft_accepted_text(
         fx,
         &decision,
         extracted.mode,
         &items,
         question,
-        merged_hits,
-        merged_best_score,
+        &material_hits,
+        material_best_score,
         case_index,
         total_cases,
     )
     .await;
-
-    let case_id = format!("case-smoketest{case_index:020}");
-    let deterministic_block =
-        escalation_reply::build_deterministic_block(&case_id, &fx.hours_label, false);
-    let final_reply =
-        escalation_reply::assemble_partial_answer_reply(&draft_text, &labels, &deterministic_block);
+    let outcome = build_outcome(&decision, &extracted, &material_hits, draft_text);
+    let final_reply = assert_final_reply(
+        fx,
+        expect,
+        &outcome,
+        &labels,
+        question,
+        case_index,
+        total_cases,
+    );
     println!("final reply:\n{final_reply}");
-
-    let handoff_sentence = escalation_reply::build_handoff_sentence(&labels);
-    assert!(
-        final_reply.contains("1,540"),
-        "case {case_index}/{total_cases} ({question:?}): final reply does not mention the \
-         monthly fee (1,540):\n{final_reply}"
-    );
-    assert!(
-        final_reply.contains(&handoff_sentence),
-        "case {case_index}/{total_cases} ({question:?}): final reply does not contain the \
-         handoff sentence ({handoff_sentence:?}):\n{final_reply}"
-    );
-    assert!(
-        final_reply.contains("受付番号: "),
-        "case {case_index}/{total_cases} ({question:?}): final reply does not contain the case \
-         reference line:\n{final_reply}"
-    );
 }
 
-/// design doc §10.3 の実出力検証。本番と同じ部品（signal-lexicon.json、rules.json、
+/// 本番 `evaluate()` が返す `EvaluationOutcome` を、このテストが持つ値（単ターンなので
+/// `signals` = `accumulated_signals`）から組み立てる。`decide_reply_action` に渡すため。
+fn build_outcome(
+    decision: &AnswerDecision,
+    extracted: &extraction::ExtractionResult,
+    material_hits: &[SectionHit],
+    draft_text: String,
+) -> super::EvaluationOutcome {
+    super::EvaluationOutcome {
+        decision: decision.clone(),
+        signals: extracted.signals.clone(),
+        accumulated_signals: extracted.signals.clone(),
+        case_id: "case-smoketest".to_owned(),
+        clarification_allowed: super::clarification_allowed(decision),
+        hits: material_hits.to_vec(),
+        audit_event_id: String::new(),
+        related_cases: Vec::new(),
+        extraction_mode: extracted.mode,
+        customer_reply_draft: Some(draft_text),
+        customer_reply_draft_truncated: false,
+        product_references: Vec::new(),
+        new_signals: extracted.signals.clone(),
+        handoff_items: Vec::new(),
+        partial_answer: false,
+    }
+}
+
+/// 本番の `decide_reply_action` で最終応答の種別を算出し、`expect` に応じた最終応答文を組み立てて
+/// 形を確認する。どちらのケースにも共通の月額料金の言及（design doc §10.5）をここで1回だけ確認
+/// する。戻り値は確認済みの最終応答文。
+fn assert_final_reply(
+    fx: &Fixture,
+    expect: CaseExpectation,
+    outcome: &super::EvaluationOutcome,
+    labels: &[String],
+    question: &str,
+    case_index: usize,
+    total_cases: usize,
+) -> String {
+    let conv = super::CaseConvState {
+        clarify_turns: 0,
+        awaiting_time_pref: false,
+        time_pref_false_count: 0,
+        preferred_contact_time: None,
+        time_pref_extraction_error_count: 0,
+        escalation_confirmed: false,
+    };
+    let action = crate::api::decide_reply_action(outcome, &conv, &fx.config.api);
+    let final_reply = match (expect, action) {
+        (CaseExpectation::Handoff, crate::api::ReplyAction::EscalationReply) => {
+            let draft_text = outcome
+                .customer_reply_draft
+                .as_deref()
+                .expect("build_outcome always sets customer_reply_draft");
+            assemble_and_assert_handoff_reply(
+                fx,
+                draft_text,
+                labels,
+                question,
+                case_index,
+                total_cases,
+            )
+        }
+        (CaseExpectation::Allowed, crate::api::ReplyAction::Answer(text)) => {
+            assert_allowed_final_reply(&text, labels, question, case_index, total_cases);
+            text
+        }
+        (expect, action) => panic!(
+            "case {case_index}/{total_cases} ({question:?}): decide_reply_action returned \
+             {action:?} for a {expect:?} case (expected EscalationReply for \"handoff\", \
+             Answer for \"allowed\")"
+        ),
+    };
+    assert!(
+        final_reply.contains(MONTHLY_FEE_TEXT),
+        "case {case_index}/{total_cases} ({question:?}): final reply does not mention the \
+         monthly fee ({MONTHLY_FEE_TEXT}):\n{final_reply}"
+    );
+    final_reply
+}
+
+/// design doc §10.3・§10.5 の実出力検証。本番と同じ部品（signal-lexicon.json、rules.json、
 /// config.cloudrun.toml の `[llm]`/`[harness]`、実 LLM 抽出・下書き生成）と、本番 MCP
 /// `search_manual` の実結果（`CS_VERIFY_CASES_JSON`）を使い、費用を尋ねる複数の言い回しが
-/// 第1層 `initial-cost-quote` にマッチし、下書きが採用され、最終応答文に月額料金・取次の
-/// 一文・受付番号が含まれることを確認する。1 ケースでも外れたら即座に失敗させる。
+/// `expect` どおりの判定（取次 or 回答のみ）になり、最終応答文がそれぞれの形（取次の一文・受付
+/// 番号あり、または下書きそのまま）で月額料金を含むことを確認する。1 ケースでも外れたら即座に
+/// 失敗させる。
 #[tokio::test]
 #[ignore = "requires CS_SUPPORT_LLM_API_KEY, network access to the Anthropic API, and \
             CS_VERIFY_CASES_JSON (real search_manual output for the question text and for the \
             signal-guided supplementary search); see design doc \
-            2026-10-07-partial-answer-with-handoff-design.md §10.3"]
+            2026-10-07-partial-answer-with-handoff-design.md §10.3, §10.5"]
 async fn real_llm_partial_answer_smoke() {
     let (config, client) = load_config_and_client();
     let cases = load_verify_cases();
@@ -545,35 +883,71 @@ async fn real_llm_partial_answer_smoke() {
     let fx = build_fixture(config, harness, lexicon);
 
     let total_cases = cases.len();
-    for (index, (question, question_hits, signal_hits)) in cases.into_iter().enumerate() {
+    for (index, case) in cases.into_iter().enumerate() {
         let case_index = index + 1;
-        // 本番 `evaluate()` と同じ順序: 質問文検索の hits を取扱外型番の除外（`filter_out_of_scope_hits`）
-        // に通してから判定へ渡し、補助検索の hits は `fold_signal_search_results`（内部で同じ除外を
-        // 通してから §10.2 の規則で併合する）に渡す。判定（decide_and_assert_layer1）は併合前の
-        // 質問文検索の hits をそのまま使い、併合後の hits・最良 score は下書き生成にのみ使う。
-        let question_hits = super::filter_out_of_scope_hits(question_hits, &fx.allowlist);
-        let question_best = question_hits.first().map(|h| h.score);
-        let (merged_hits, merged_best_score, _) =
-            super::supplementary_search::fold_signal_search_results(
-                question_hits.clone(),
-                question_best,
-                Vec::new(),
-                vec![(
-                    signal::Signal::new(SUPPLEMENTARY_SEARCH_SIGNAL),
-                    Ok((signal_hits, Vec::new())),
-                )],
-                &fx.allowlist,
-                &format!("smoke-case-{case_index}"),
-            );
+        // 本番 `evaluate()` と同じ順序: 質問文検索の hits を取扱外型番の除外
+        // （`filter_out_of_scope_hits`）に通してから判定・下書きへ渡す。補助検索の併合は取次
+        // 候補のときだけ `run_once` 内で行う（design doc §10.2・§10.5）。
+        let question_hits = super::filter_out_of_scope_hits(case.question_hits, &fx.allowlist);
         run_once(
             &fx,
-            &question,
+            &case.question,
             &question_hits,
-            &merged_hits,
-            merged_best_score,
+            &case.signal_hits,
+            case.expect,
             case_index,
             total_cases,
         )
         .await;
     }
+}
+
+/// `CS_VERIFY_CASES_JSON` の各ケースは `expect` の綴り・大小文字・型を人手の JSON 編集で
+/// 崩しうる。`#[derive(serde::Deserialize)]` だけで不正値が確実に `Err` になることを、実 API
+/// キーもネットワークも要らない単体テストで確認する。
+#[test]
+fn verify_case_rejects_invalid_expect() {
+    let cases: [(&str, &str); 4] = [
+        (
+            "expect field missing",
+            r#"{"question":"q","hits_json":"h.json"}"#,
+        ),
+        (
+            "expect capitalized (\"Handoff\")",
+            r#"{"question":"q","hits_json":"h.json","expect":"Handoff"}"#,
+        ),
+        (
+            "expect misspelled (\"handof\")",
+            r#"{"question":"q","hits_json":"h.json","expect":"handof"}"#,
+        ),
+        (
+            "expect is a number",
+            r#"{"question":"q","hits_json":"h.json","expect":1}"#,
+        ),
+    ];
+    for (label, json) in cases {
+        assert!(
+            serde_json::from_str::<VerifyCase>(json).is_err(),
+            "expected {label} ({json:?}) to fail VerifyCase deserialization, but it succeeded"
+        );
+    }
+}
+
+/// 空・空白のみの `question` は、`trim()` 後に1つの「相異なる言い回し」として数えられてしまう
+/// ため、入口（`assert_case_paraphrases`）で拒否する。他は合格する入力にして、拒否の原因が
+/// 空の質問だけであることを固定する。
+#[test]
+#[should_panic(expected = "case 4 has an empty question")]
+fn case_paraphrases_reject_an_empty_question() {
+    let case = |question: &str, expect: CaseExpectation| VerifyCase {
+        question: question.to_string(),
+        hits_json: "h.json".to_string(),
+        expect,
+    };
+    assert_case_paraphrases(&[
+        case(PRODUCTION_REGRESSION_QUESTION, CaseExpectation::Handoff),
+        case("導入費用を教えてください", CaseExpectation::Handoff),
+        case("設定方法を教えてください", CaseExpectation::Allowed),
+        case("   ", CaseExpectation::Allowed),
+    ]);
 }
