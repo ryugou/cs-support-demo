@@ -107,8 +107,10 @@ enum PartialAnswerEligibility {
     Ineligible(PartialAnswerSkipReason),
 }
 
-/// [`can_draft_partial_answer`] と [`partial_answer_skip_reason`] が共有する判定本体
-/// （design doc §3.1）。
+/// design doc §3.1 の条件1・2（判定が第1層・第2層の `Escalate`、hearing 宣言なし、取り次ぐ項目が
+/// 1つ以上）だけを見る。[`partial_answer_eligibility`] の前半であり、§10.2 の signal 誘導補助検索の
+/// 起動条件（[`is_partial_answer_candidate`]）と同じ判定を1か所に持つ。条件を満たすとき
+/// `Eligible` を返す（残りの条件は呼び出し側が続けて見る）。
 ///
 /// - `hearing` を宣言したルールにマッチしたターンは一律不可とする。spec §3.1 の条件は
 ///   「hearing による `Clarify` ではない」だが、`Clarify` になるかどうかは `evaluate()` の後に
@@ -118,13 +120,9 @@ enum PartialAnswerEligibility {
 /// - 判定が第1層または第2層の取次である。第3層（根拠不足・確信度不足）は `handoff_items` の
 ///   中身に依存せず、`layer` で明示的に除外する（`handoff_items_for_decision` が将来第3層で
 ///   非空を返しても、spec 変更なしに部分回答が有効化されないようにするため）。
-fn partial_answer_eligibility(
+fn partial_answer_structural_eligibility(
     decision: &AnswerDecision,
     handoff_items: &[HandoffItem],
-    best_manual_score: Option<f32>,
-    thresholds: &Thresholds,
-    already_escalated: bool,
-    draft_generation_enabled: bool,
 ) -> PartialAnswerEligibility {
     let AnswerDecision::Escalate { hearing, layer, .. } = decision else {
         return PartialAnswerEligibility::NotApplicable;
@@ -137,6 +135,36 @@ fn partial_answer_eligibility(
     }
     if handoff_items.is_empty() {
         return PartialAnswerEligibility::Ineligible(PartialAnswerSkipReason::NoHandoffItems);
+    }
+    PartialAnswerEligibility::Eligible
+}
+
+/// design doc §10.2: signal 誘導補助検索を行うターンかどうか（§3.1 の条件1・2を満たすか）。
+/// 検索回数を増やさないため、部分回答の対象にならないターン（`Allowed`・第3層・hearing 宣言あり・
+/// 取り次ぐ項目なし）では補助検索を行わない。
+pub fn is_partial_answer_candidate(
+    decision: &AnswerDecision,
+    handoff_items: &[HandoffItem],
+) -> bool {
+    matches!(
+        partial_answer_structural_eligibility(decision, handoff_items),
+        PartialAnswerEligibility::Eligible
+    )
+}
+
+/// [`can_draft_partial_answer`] と [`partial_answer_skip_reason`] が共有する判定本体
+/// （design doc §3.1）。条件1・2は [`partial_answer_structural_eligibility`] が見る。
+fn partial_answer_eligibility(
+    decision: &AnswerDecision,
+    handoff_items: &[HandoffItem],
+    best_manual_score: Option<f32>,
+    thresholds: &Thresholds,
+    already_escalated: bool,
+    draft_generation_enabled: bool,
+) -> PartialAnswerEligibility {
+    match partial_answer_structural_eligibility(decision, handoff_items) {
+        PartialAnswerEligibility::Eligible => {}
+        not_eligible => return not_eligible,
     }
     if already_escalated {
         return PartialAnswerEligibility::Ineligible(PartialAnswerSkipReason::AlreadyEscalated);
@@ -623,6 +651,45 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn is_partial_answer_candidate_is_false_for_an_allowed_decision() {
+        assert!(!is_partial_answer_candidate(
+            &allowed(),
+            &handoff_items_fixture()
+        ));
+    }
+
+    #[test]
+    fn is_partial_answer_candidate_is_false_for_a_layer3_escalate() {
+        assert!(!is_partial_answer_candidate(
+            &escalate_at(3),
+            &handoff_items_fixture()
+        ));
+    }
+
+    #[test]
+    fn is_partial_answer_candidate_is_false_when_a_hearing_contract_is_declared() {
+        assert!(!is_partial_answer_candidate(
+            &escalate(Some(HearingContract::ProductAndSymptom)),
+            &handoff_items_fixture()
+        ));
+    }
+
+    #[test]
+    fn is_partial_answer_candidate_is_false_when_there_are_no_handoff_items() {
+        assert!(!is_partial_answer_candidate(&escalate(None), &[]));
+    }
+
+    #[test]
+    fn is_partial_answer_candidate_is_true_for_layer1_and_layer2_escalates_with_handoff_items() {
+        for layer in [1, 2] {
+            assert!(
+                is_partial_answer_candidate(&escalate_at(layer), &handoff_items_fixture()),
+                "layer {layer} must be a candidate"
+            );
+        }
     }
 
     #[test]

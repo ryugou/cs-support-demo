@@ -60,7 +60,7 @@ use crate::model::SectionHit;
 const MAX_EXCERPT_CHARS: usize = 2_500;
 
 /// LLM に渡す抜粋の最大件数。上位ヒットだけで十分な下書きは書ける。
-const MAX_EXCERPTS: usize = 3;
+pub(crate) const MAX_EXCERPTS: usize = 3;
 
 /// 材料が質問のどの部分にも答えていないことを示す固定トークン（design doc
 /// `2026-10-07-partial-answer-with-handoff-design.md` §3.2）。LLM にはこの場合、本文を書かず
@@ -496,6 +496,13 @@ pub fn build_reply_system_prompt(
         "- 費用・料金・条件を答えるときは、次の3つに分けて書く: 材料に金額や値があるもの\
          （そのまま書く）、条件で変わるもの（材料にある範囲で何によって変わるかを書く）、材料に\
          値が無く担当者が確認するもの（項目名だけ挙げる）。\n",
+    );
+    // design doc `2026-10-07-partial-answer-with-handoff-design.md` §11.2: run8 の実 LLM
+    // スモークで、台数ごとに分かれた材料（1台/2台/3台の月額）のうち1台分だけを書き落とす
+    // 揺れが観測された。上記の3分類指示と同じ適用範囲（`match brief.kind` より前、
+    // `ReplyKind::Answer` / `ReplyKind::Escalation` と部分回答の有無を問わず常に適用）に置く。
+    p.push_str(
+        "- 材料に金額があるものは、台数や条件ごとに全て書く。一部だけを書いて他を省かない。\n",
     );
     if !handoff_items.is_empty() && partial_answer_mode {
         let items = handoff_items
@@ -1778,6 +1785,10 @@ mod tests {
             assert!(
                 p.contains("条件で変わるもの"),
                 "cost categorization instruction missing: {p}"
+            );
+            assert!(
+                p.contains("台数や条件ごとに全て書く"),
+                "amount-omission guard instruction missing: {p}"
             );
             assert!(p.contains(NO_ANSWER_TOKEN), "{p}");
         }

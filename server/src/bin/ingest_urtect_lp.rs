@@ -25,14 +25,30 @@
 /// フィールド追加はその 2 バイナリの呼び出し箇所修正を強制する（本 Issue は既存バイナリの
 /// 変更をしない）。そのため本バイナリは `GraphNode` を直接組み立てるローカル関数を持つ。
 ///
-/// 料金節の既知の欠落（設計時点で確認済み。ページに書かれていない）:
-/// - 設置初期費用の金額（見出しのみで値が無い。「別途設置工事費用がかかります」とのみ記載）
-/// - 月額「1,540円~」の「~」が何で変動するか
-/// - カメラ 4 台以上の月額（1〜3 台分のみ例示）
+/// 料金節（`#price`）の本文構造化（Issue #96、design doc
+/// `2026-10-07-partial-answer-with-handoff-design.md` §11 で追加）:
 ///
-/// これらを本文から省略すると LLM が数字から推測・計算してしまうため、料金節の本文には
-/// 「書かれていないこと」自体を明示する注記を追記する（詳しい料金は引き続き取次とする。
-/// プロダクト責任者判断）。
+/// 当初は他の6節と同じ「ノイズ除去 → 空白正規化」の単一文字列化パイプラインで料金節も
+/// 平坦化していたが、実 LLM スモーク（§10 run8）で「導入にどれくらいの費用がかかるの？」に
+/// 対し下書きが1台分の月額（￥1,540）を書き落とす不具合が実測された。平坦化後の本文
+/// 「Price 基本料金 設置初期費用 月額利用料金 (1台) ￥1,540 (税込) ~ …」では、
+/// どのラベル（設置初期費用／月額利用料金）にどの金額が対応するかが文字列上あいまいで、
+/// 取り次ぐ項目（設置初期費用）の金額を書かないという指示と衝突し、モデルが安全側に倒して
+/// 月額分まで省いたと判断した。
+///
+/// 対策として、料金節だけは HTML のラベル要素（`.price-box-name` 等）と値要素
+/// （`.price-box-price` 等）の DOM 対応を保ったまま「ラベル: 値」の行として本文を
+/// 組み立て直す（`build_price_body` 以下）。値の無いラベル（設置初期費用）は
+/// 「ラベル: 金額の記載なし」と機械的に表記する。これにより、ページに実際に書かれていない
+/// 情報（「~」が何で変動するか・カメラ4台以上の月額）は従来どおり本文に出現しない一方、
+/// 以前のように「書かれていないこと」をコードの固定文言（旧 `PRICE_DISCLAIMER`）として
+/// 注記する必要が無くなった: 値の有無は DOM から導出されるため、ページの実際の構造を
+/// 離れた文言をコードに持たずに済む。
+///
+/// ラベルと値の対応が DOM から一意に取れない場合（見出しが0個/2個以上、価格ボックスに
+/// ラベルが無い、1つのラベルに値が2個以上ある、箇条書きの区切り記号「→」が無い等）は、
+/// 従来の平坦化本文へフォールバックせず fail closed でエラーにする（料金ページの改変に
+/// 気づくため。詳細は各抽出関数の doc コメントを参照）。
 ///
 /// 既知の痩せた節（投入 OK、抽出失敗ではない）: `#about` は見出し「ユアテクトとは？」以外の
 /// 本文テキストを持たない（実体は動画 `<video>` と画像のみで、説明文の `<p>` が無い）。
@@ -52,7 +68,7 @@ use cs_support_mcp::{
     model::{GraphBuild, GraphEdge, GraphNode},
     vegapunk::VegapunkClient,
 };
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Node, Selector};
 use serde_json::json;
 use std::{env, fs, path::PathBuf, sync::OnceLock};
 use url::Url;
@@ -80,10 +96,20 @@ const ANCHORS: [(&str, &str); 7] = [
     ("faq", "よくあるご質問"),
 ];
 
-/// 料金節の本文に必ず追記する注記（Issue #69 要件）。ページに書かれていない3点
-/// （初期費用の金額・「1,540円~」の内訳条件・4台以上の月額）を明示しないと、LLM が
-/// 本文の数字から推測・計算して誤った金額を答えかねない。詳しい料金は引き続き取次とする。
-const PRICE_DISCLAIMER: &str = "【このページに書かれていないこと】設置初期費用の具体的な金額はこのページに記載されていない（「別途設置工事費用がかかります」とのみ記載）。月額「1,540円~」の「~」が何によって変動するかはこのページに記載が無い。カメラ4台以上の場合の月額料金もこのページには記載が無い（1〜3台分の料金のみ例示されている）。詳細な料金は担当者への確認（取次）が必要。";
+/// 値要素（`.price-box-price`）が無い価格ボックスの値として機械的に表記する文言。
+const PRICE_VALUE_ABSENT: &str = "金額の記載なし";
+
+/// 料金節の見出しブロックにある装飾ラベル（「Price」）。本文として使わないことを明示した
+/// 唯一の無視対象で、これ以外の未消費テキストは `ensure_price_text_fully_consumed` が弾く。
+const PRICE_DECORATIVE_LABEL_SELECTOR: &str = ".sub-ttl";
+
+/// 料金節の抽出関数が実際に読む要素のセレクタ（`PRICE_DECORATIVE_LABEL_SELECTOR` は別扱い）。
+const PRICE_CONSUMED_SELECTORS: [&str; 4] = [
+    "h2",
+    ".price-box > .price-box-contents .price-box-name",
+    ".price-box > .price-box-contents .price-box-price",
+    ".price-text > p",
+];
 
 /// 1 ページ分の抽出結果（ネットワーク非依存、テスト可能な中間表現）。
 #[derive(Debug)]
@@ -261,6 +287,292 @@ fn collapse_numeric_spacing(body: &str) -> String {
         .into_owned()
 }
 
+/// 料金節（`#price`）見出しの抽出。
+///
+/// `#price` コンテナ配下から `h2` 要素を探し、ちょうど 1 個であることを要求する
+/// （価格ボックス群より上位にある見出しはこの 1 個のみ、という実ページの構造を前提にする）。
+/// 0 個・2 個以上は fail closed（どれが見出しか一意に決められないため）。
+fn extract_price_heading(container: ElementRef<'_>) -> Result<String> {
+    let selector = Selector::parse("h2").expect("valid selector: static string \"h2\" must parse");
+    let mut headings = container.select(&selector);
+    let heading = headings.next().with_context(|| {
+        "anchor #price: no h2 heading found; the site structure may have changed since this \
+         ingest CLI was written — aborting without writing anything"
+            .to_string()
+    })?;
+    if headings.next().is_some() {
+        anyhow::bail!(
+            "anchor #price: more than one h2 heading found; cannot determine which one titles \
+             the price block — the site structure may have changed since this ingest CLI was \
+             written — aborting without writing anything"
+        );
+    }
+    let text = normalize_body(&heading.text().collect::<String>());
+    if text.is_empty() {
+        anyhow::bail!(
+            "anchor #price: the h2 heading extracted to an empty text — aborting without \
+             writing anything"
+        );
+    }
+    Ok(text)
+}
+
+/// 価格ボックス（`.price-box-contents`）1 個分の「ラベル: 値」行を組み立てる。
+///
+/// ラベルは `.price-box-name` のテキストを `normalize_body` で正規化したもの（内部の空白は
+/// 保持する。例:「月額利用料金」と「(1台)」の間の半角スペース）。`.price-box-name` が
+/// 0 個・2 個以上なら fail closed（ラベルを一意に決められないため）。
+///
+/// 値は `.price-box-price` 配下の全テキストを `extract_text_excluding_noise` で集め、
+/// `collapse_numeric_spacing` でタグ分割由来の数字周りの空白を潰したうえで、残る空白を
+/// 全て除去する（価格表記はタグ境界ごとに空白が挟まるだけで、意味のある空白を内部に
+/// 持たないため丸ごと詰めてよい）。`.price-box-price` が無ければ値は「金額の記載なし」。
+/// 2 個以上あれば fail closed（どちらが正か決められないため）。
+fn extract_price_box_line(box_el: ElementRef<'_>) -> Result<String> {
+    let name_selector = Selector::parse(".price-box-name")
+        .expect("valid selector: static string \".price-box-name\" must parse");
+    let price_selector = Selector::parse(".price-box-price")
+        .expect("valid selector: static string \".price-box-price\" must parse");
+
+    let mut names = box_el.select(&name_selector);
+    let name_el = names.next().with_context(|| {
+        "anchor #price: a price box has no .price-box-name label — the site structure may have \
+         changed since this ingest CLI was written — aborting without writing anything"
+            .to_string()
+    })?;
+    if names.next().is_some() {
+        anyhow::bail!(
+            "anchor #price: a price box has more than one .price-box-name label — cannot \
+             determine which one is authoritative — the site structure may have changed since \
+             this ingest CLI was written — aborting without writing anything"
+        );
+    }
+    let label = normalize_body(&name_el.text().collect::<String>());
+    if label.is_empty() {
+        anyhow::bail!(
+            "anchor #price: a .price-box-name label extracted to an empty text — aborting \
+             without writing anything"
+        );
+    }
+
+    let mut prices = box_el.select(&price_selector);
+    let value = match prices.next() {
+        None => PRICE_VALUE_ABSENT.to_string(),
+        Some(price_el) => {
+            if prices.next().is_some() {
+                anyhow::bail!(
+                    "anchor #price: price box {label:?} has more than one .price-box-price \
+                     value — cannot determine which one is authoritative — the site structure \
+                     may have changed since this ingest CLI was written — aborting without \
+                     writing anything"
+                );
+            }
+            let raw = extract_text_excluding_noise(price_el);
+            let collapsed = collapse_numeric_spacing(&raw);
+            let value: String = collapsed.chars().filter(|c| !c.is_whitespace()).collect();
+            if value.is_empty() {
+                anyhow::bail!(
+                    "anchor #price: price box {label:?} has a .price-box-price element that \
+                     extracted to an empty value — the site structure may have changed since \
+                     this ingest CLI was written — aborting without writing anything"
+                );
+            }
+            value
+        }
+    };
+    Ok(format!("{label}: {value}"))
+}
+
+/// `.price-box` の直接の子である `.price-box-contents` を出現順に処理し、価格ボックス行を
+/// 組み立てる。1 個も無ければ fail closed（料金ブロックの構造自体が想定と異なるため）。
+fn extract_price_box_lines(container: ElementRef<'_>) -> Result<Vec<String>> {
+    let contents_selector = Selector::parse(".price-box > .price-box-contents")
+        .expect("valid selector: static string \".price-box > .price-box-contents\" must parse");
+    let mut lines = Vec::new();
+    for box_el in container.select(&contents_selector) {
+        lines.push(extract_price_box_line(box_el)?);
+    }
+    if lines.is_empty() {
+        anyhow::bail!(
+            "anchor #price: no .price-box-contents price boxes found under .price-box — the \
+             site structure may have changed since this ingest CLI was written — aborting \
+             without writing anything"
+        );
+    }
+    Ok(lines)
+}
+
+/// `<p>` 要素の直接の子ノードを前から走査し、`<br>` が現れるたびにフラグメントを区切る
+/// 関数（テキストの文字列分割ではなく DOM の子ノード境界で分割する。将来 `<br>` の数が
+/// 変わっても追従できるようにするため）。テキストと `<br>` とコメント以外の子要素は
+/// 想定外の構造なので fail closed（コメントは読み飛ばす）。
+fn split_on_br(p: ElementRef<'_>) -> Result<Vec<String>> {
+    let mut fragments = Vec::new();
+    let mut current = String::new();
+    for child in p.children() {
+        match child.value() {
+            Node::Element(el) if el.name() == "br" => {
+                fragments.push(std::mem::take(&mut current));
+            }
+            Node::Text(text) => current.push_str(text),
+            Node::Element(el) => anyhow::bail!(
+                "anchor #price: a price bullet paragraph contains an unexpected <{}> element — \
+                 the site structure may have changed since this ingest CLI was written — \
+                 aborting without writing anything",
+                el.name()
+            ),
+            _ => {}
+        }
+    }
+    fragments.push(current);
+    Ok(fragments)
+}
+
+/// 箇条書きフラグメント 1 個を「ラベル: 値」行へ変換する。
+///
+/// 先頭が全角中点「・」であることを確認して取り除き（無ければ fail closed）、残りを
+/// 「→」（U+2192）でちょうど 1 回だけ分割する（0 回・2 回以上は fail closed。ラベルと値の
+/// 対応を一意に決められないため）。前後は `trim` のみ行う（空白の正規化はせず、内部の
+/// 空白をそのまま残す）。
+fn price_bullet_line(fragment: &str) -> Result<String> {
+    let trimmed = fragment.trim();
+    let without_marker = trimmed.strip_prefix('・').with_context(|| {
+        format!(
+            "anchor #price: a price bullet fragment does not start with \"・\": {trimmed:?} — \
+             the site structure may have changed since this ingest CLI was written — aborting \
+             without writing anything"
+        )
+    })?;
+    let arrow_count = without_marker.matches('→').count();
+    if arrow_count != 1 {
+        anyhow::bail!(
+            "anchor #price: a price bullet fragment has {arrow_count} \"→\" separator(s), \
+             expected exactly 1: {without_marker:?} — the site structure may have changed \
+             since this ingest CLI was written — aborting without writing anything"
+        );
+    }
+    let (label, value) = without_marker
+        .split_once('→')
+        .expect("arrow_count == 1 was just checked above");
+    let label = label.trim();
+    let value = value.trim();
+    if label.is_empty() {
+        anyhow::bail!(
+            "anchor #price: a price bullet fragment has an empty label before \"→\": \
+             {without_marker:?} — the site structure may have changed since this ingest CLI \
+             was written — aborting without writing anything"
+        );
+    }
+    if value.is_empty() {
+        anyhow::bail!(
+            "anchor #price: a price bullet fragment has an empty value after \"→\": \
+             {without_marker:?} — the site structure may have changed since this ingest CLI \
+             was written — aborting without writing anything"
+        );
+    }
+    Ok(format!("{label}: {value}"))
+}
+
+/// `.price-text` 配下の箇条書き行と末尾の注記行を組み立てる。
+///
+/// `.price-text > p` のうち最後の 1 個を注記（「※別途設置工事費用がかかります。」等。
+/// そのままの文を 1 行として残す）、それより前を箇条書きの対象にする。`<p>` の数を固定
+/// 個数に決め打ちしない（将来台数の例示が増減しても追従できるようにするため）。
+/// `.price-text > p` が 1 個以下なら fail closed（箇条書きと注記の両方が揃わないため）。
+fn extract_price_bullets_and_note(container: ElementRef<'_>) -> Result<(Vec<String>, String)> {
+    let p_selector = Selector::parse(".price-text > p")
+        .expect("valid selector: static string \".price-text > p\" must parse");
+    let paragraphs: Vec<ElementRef<'_>> = container.select(&p_selector).collect();
+    if paragraphs.len() <= 1 {
+        anyhow::bail!(
+            "anchor #price: .price-text has {} <p> element(s), need at least 2 (a bullet list \
+             and a trailing note) — the site structure may have changed since this ingest CLI \
+             was written — aborting without writing anything",
+            paragraphs.len()
+        );
+    }
+    let (bullet_paragraphs, note_paragraphs) = paragraphs.split_at(paragraphs.len() - 1);
+
+    let note_line = normalize_body(&note_paragraphs[0].text().collect::<String>());
+    if note_line.is_empty() {
+        anyhow::bail!(
+            "anchor #price: the trailing .price-text note paragraph extracted to an empty \
+             text — aborting without writing anything"
+        );
+    }
+
+    let mut bullet_lines = Vec::new();
+    for p in bullet_paragraphs {
+        for fragment in split_on_br(*p)? {
+            bullet_lines.push(price_bullet_line(&fragment)?);
+        }
+    }
+    if bullet_lines.is_empty() {
+        anyhow::bail!(
+            "anchor #price: no bullet fragments found under .price-text — aborting without \
+             writing anything"
+        );
+    }
+    Ok((bullet_lines, note_line))
+}
+
+/// 料金節（`#price`）専用の本文組み立て。
+///
+/// 他の 6 節と異なり、単一文字列への平坦化はしない: 見出し行・価格ボックス行・箇条書き行・
+/// 注記行を個別に組み立て、`"\n"` で結合する（各行の中身だけを個別に正規化し、結合後に
+/// `normalize_body` へ通さない。`normalize_body` は改行も半角スペース 1 個へ畳むため、
+/// 通すと行構造が壊れる）。ファイル冒頭の doc コメントに設計の背景（Issue #96）を記載。
+fn build_price_body(container: ElementRef<'_>) -> Result<String> {
+    let mut lines = Vec::with_capacity(4);
+    lines.push(extract_price_heading(container)?);
+    lines.extend(extract_price_box_lines(container)?);
+    let (bullet_lines, note_line) = extract_price_bullets_and_note(container)?;
+    lines.extend(bullet_lines);
+    lines.push(note_line);
+    ensure_price_text_fully_consumed(container)?;
+    Ok(lines.join("\n"))
+}
+
+/// `#price` 配下のテキストのうち、抽出関数が読む要素と装飾ラベルのどちらにも属さないものが
+/// あれば fail closed にする（新しい金額・注記が静かに本文から落ちるのを防ぐ）。
+/// 全体のテキストの語（空白区切り）の多重集合から、読んだ要素の語を引いた残りを未消費とする。
+fn ensure_price_text_fully_consumed(container: ElementRef<'_>) -> Result<()> {
+    let mut remaining: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for word in extract_text_excluding_noise(container).split_whitespace() {
+        *remaining.entry(word.to_string()).or_insert(0) += 1;
+    }
+    let consumed_selectors = PRICE_CONSUMED_SELECTORS
+        .iter()
+        .copied()
+        .chain(std::iter::once(PRICE_DECORATIVE_LABEL_SELECTOR));
+    for selector_text in consumed_selectors {
+        let selector = Selector::parse(selector_text)
+            .expect("valid selector: price consumed selectors are static strings");
+        for element in container.select(&selector) {
+            for word in extract_text_excluding_noise(element).split_whitespace() {
+                if let Some(count) = remaining.get_mut(word) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+        }
+    }
+    let mut leftover: Vec<String> = remaining
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(word, _)| word)
+        .collect();
+    if leftover.is_empty() {
+        return Ok(());
+    }
+    leftover.sort();
+    anyhow::bail!(
+        "anchor #price: unconsumed text not covered by the recognized price elements: {} — the \
+         site structure may have changed since this ingest CLI was written — aborting without \
+         writing anything",
+        leftover.join(" ")
+    )
+}
+
 /// 取得済み HTML から 7 節を切り出す純関数（ネットワーク非依存、テスト可能）。
 ///
 /// fail closed: アンカーが 1 つでも見つからない、または本文が空になった節が 1 つでもあれば
@@ -277,30 +589,32 @@ fn extract_lp_sections(html: &str) -> Result<Vec<LpSection>> {
                  (about/price/product/voice/case/flow/faq) — aborting without writing anything"
             )
         })?;
-        let raw = extract_text_excluding_noise(container);
-        let normalized = normalize_body(&raw);
-        // タグ分割（<span>等）由来で金額表記に紛れ込んだ空白をここで潰す。本 Issue の目的が
-        // 「料金を正確に答えられるようにする」ことであり、`￥ 1 , 540` のような表記は
-        // 桁の読み違いに直結するため、全節に一律適用する（price 以外の節にも金額的な
-        // フラグメントが混ざる可能性があり、対象パターン自体が狭いので害が無い）。
-        //
-        // CJK文字同士の間の空白一般まで対象を広げないこと: 一度実装し、実データで有害と
-        // 判明して差し戻した（`extract_text_excluding_noise` が挟む空白の大半は語の途中の
-        // 分割ではなく、箇条書き・段落・別セルの区切り。詰めると別項目が融合する）。意図的な
-        // 設計判断であることは
-        // `collapse_numeric_spacing_preserves_element_boundary_and_word_internal_cjk_spacing`
-        // で固定している。
-        let mut body = collapse_numeric_spacing(&normalized);
+        let body = if anchor == "price" {
+            // Issue #96: 料金節だけは DOM 構造を保った行組み立てにする（理由はファイル冒頭の
+            // doc コメントと `build_price_body` の doc コメントを参照）。
+            build_price_body(container)?
+        } else {
+            let raw = extract_text_excluding_noise(container);
+            let normalized = normalize_body(&raw);
+            // タグ分割（<span>等）由来で金額表記に紛れ込んだ空白をここで潰す。本 Issue の目的が
+            // 「料金を正確に答えられるようにする」ことであり、`￥ 1 , 540` のような表記は
+            // 桁の読み違いに直結するため、価格ボックス以外の節にも一律適用する（金額的な
+            // フラグメントが混ざる可能性があり、対象パターン自体が狭いので害が無い）。
+            //
+            // CJK文字同士の間の空白一般まで対象を広げないこと: 一度実装し、実データで有害と
+            // 判明して差し戻した（`extract_text_excluding_noise` が挟む空白の大半は語の途中の
+            // 分割ではなく、箇条書き・段落・別セルの区切り。詰めると別項目が融合する）。意図的な
+            // 設計判断であることは
+            // `collapse_numeric_spacing_preserves_element_boundary_and_word_internal_cjk_spacing`
+            // で固定している。
+            collapse_numeric_spacing(&normalized)
+        };
         if body.is_empty() {
             anyhow::bail!(
                 "anchor #{anchor} extracted to an empty body after removing script/style/nav/\
                  header/footer noise; the section markup may have changed — aborting without \
                  writing anything"
             );
-        }
-        if anchor == "price" {
-            body.push(' ');
-            body.push_str(PRICE_DISCLAIMER);
         }
         sections.push(LpSection {
             anchor,
@@ -557,35 +871,49 @@ mod tests {
     <p>ユアテクトは福岡・北九州エリアを中心に、住宅・店舗向けの防犯カメラの導入・設置を行うサービスです。</p>
 </div>
 <div class="price wrap anchor" id="price">
-    <div class="price-ttl"><h2>基本料金</h2></div>
-    <div class="price-contents wrap-contents">
-        <div class="price-box">
-            <div class="price-box-contents price-box01">
-                <div class="price-box-text">
-                    <p class="price-box-name">設置初期費用</p>
-                </div>
+        <div class="price-ttl">
+            <div class="block-ttl block-ttl02 ttl-contents">
+                <div class="sub-ttl">Price</div>
+                <div class="ttl-line"></div>
+                <h2>基本料金</h2>
             </div>
-            <div class="price-box-contents price-box02">
-                <div class="price-box-text">
-                    <p class="price-box-name">月額利用料金 (1台)</p>
-                    <div class="price-box-line"></div>
-                    <div class="price-box-price">
-                        <p class="price-box-price01"><span class="fs90">￥</span>1<span class="fs90">,</span>540
-                        </p>
+        </div>
+        <div class="price-contents wrap-contents">
+            <div class="price-box">
+                <div class="price-box-contents price-box01 inview_re fadeIn is-show">
+                    <div class="price-box-img">
+                        <img class="" alt="" src="img/price-box-img01.png">
+                    </div>
+                    <div class="price-box-text">
+                        <p class="price-box-name">設置初期費用</p>
+                    </div>
+                </div>
+                <div class="price-box-contents price-box02 inview_re fadeIn is-show">
+                    <div class="price-box-img">
+                        <img class="" alt="" src="img/price-box-img02.png">
+                    </div>
+                    <div class="price-box-text">
+                        <p class="price-box-name">月額利用料金 (1台)</p>
+                        <div class="price-box-line"></div>
+                        <div class="price-box-price">
+                            <p class="price-box-price01"><span class="fs90">￥</span>1<span class="fs90">,</span>540
+                            </p>
             <p class="price-box-price02">
                 <span class="price-box-price02-01">(税込)</span>
             <span class="price-box-price02-02">~</span>
             </div>
 
+                    </div>
                 </div>
+
+<img class="price-plus-icon" alt="" src="img/price-plus-icon.png">
             </div>
-        </div>
-        <div class="price-text">
+            <div class="price-text">
             <p>・カメラ2台 → 2,640円（税込）／月　<br class="brsp">・カメラ3台 → 3,960円（税込）／月</p>
             <p>※別途設置工事費用がかかります。</p>
+            </div>
         </div>
     </div>
-</div>
 <div class="product wrap anchor" id="product">
     <h2>取り扱い機器</h2>
     <div class="product-box product01">
@@ -713,26 +1041,6 @@ mod tests {
     }
 
     #[test]
-    fn price_section_states_what_is_not_written() {
-        let sections = extract_lp_sections(FIXTURE_HTML).expect("fixture must parse");
-        let price = sections.iter().find(|s| s.anchor == "price").unwrap();
-        // 原文の金額情報自体は残る(￥1,540・~・1〜3台の例示は検索対象として有用)。
-        assert!(price.body.contains("￥1,540"));
-        assert!(price.body.contains("2,640円"));
-        assert!(price.body.contains("3,960円"));
-        // 3点の欠落を明示する注記が追記されている。
-        assert!(price
-            .body
-            .contains("設置初期費用の具体的な金額はこのページに記載されていない"));
-        assert!(price
-            .body
-            .contains("「~」が何によって変動するかはこのページに記載が無い"));
-        assert!(price
-            .body
-            .contains("カメラ4台以上の場合の月額料金もこのページには記載が無い"));
-    }
-
-    #[test]
     fn price_section_amounts_are_not_broken_by_tag_splitting() {
         // 実サイトの price 節フィクスチャ（￥/1/,/540 がそれぞれ別 <span> に分割されたマークアップ）
         // から抽出した結果、金額がスペース混じりにならず、そのまま現れること。
@@ -748,6 +1056,151 @@ mod tests {
         // 崩れた表記が残っていないことも確認する（読み違いの余地を残さない）。
         assert!(!price.body.contains("1 , 540"));
         assert!(!price.body.contains("￥ 1"));
+    }
+
+    // design doc `2026-10-07-partial-answer-with-handoff-design.md` §11.3「料金ブロックの
+    // 整形」の受け入れ基準: フィクスチャから抽出した行構造を実ページの文字（半角/全角とも
+    // 実ページの実際の表記に従う）でそのまま固定する。
+    #[test]
+    fn price_section_body_is_structured_as_label_value_lines() {
+        let sections = extract_lp_sections(FIXTURE_HTML).expect("fixture must parse");
+        let price = sections.iter().find(|s| s.anchor == "price").unwrap();
+        assert_eq!(
+            price.body,
+            "基本料金\n\
+             設置初期費用: 金額の記載なし\n\
+             月額利用料金 (1台): ￥1,540(税込)~\n\
+             カメラ2台: 2,640円（税込）／月\n\
+             カメラ3台: 3,960円（税込）／月\n\
+             ※別途設置工事費用がかかります。"
+        );
+    }
+
+    #[test]
+    fn price_section_rejects_unexpected_markup() {
+        let name_label = r#"<p class="price-box-name">設置初期費用</p>"#;
+        let bullet_tail = "・カメラ3台 → 3,960円（税込）／月</p>";
+        let cases: &[(&str, &str, String, &str)] = &[
+            (
+                "zero h2",
+                "<h2>基本料金</h2>",
+                "<p>基本料金</p>".into(),
+                "no h2 heading found",
+            ),
+            (
+                "two h2",
+                "<h2>基本料金</h2>",
+                "<h2>基本料金</h2><h2>追加</h2>".into(),
+                "more than one h2 heading",
+            ),
+            (
+                "empty h2",
+                "<h2>基本料金</h2>",
+                "<h2> </h2>".into(),
+                "the h2 heading extracted to an empty text",
+            ),
+            (
+                "missing name label",
+                name_label,
+                r#"<p class="not-a-name-label">設置初期費用</p>"#.into(),
+                "has no .price-box-name label",
+            ),
+            (
+                "two name labels",
+                name_label,
+                format!(r#"{name_label}<p class="price-box-name">二重</p>"#),
+                "more than one .price-box-name label",
+            ),
+            (
+                "empty name label",
+                name_label,
+                r#"<p class="price-box-name"> </p>"#.into(),
+                "a .price-box-name label extracted to an empty text",
+            ),
+            (
+                "two price values",
+                r#"<div class="price-box-price">"#,
+                r#"<div class="price-box-price">1円</div><div class="price-box-price">"#.into(),
+                "more than one .price-box-price value",
+            ),
+            (
+                "no price box contents",
+                r#"<div class="price-box">"#,
+                r#"<div class="price-boxes">"#.into(),
+                "no .price-box-contents price boxes found",
+            ),
+            (
+                "empty price value",
+                r#"<div class="price-box-price">"#,
+                r#"<div class="price-box-price"></div><div class="not-a-price-value">"#.into(),
+                "extracted to an empty value",
+            ),
+            (
+                "missing trailing note paragraph",
+                "<p>※別途設置工事費用がかかります。</p>",
+                String::new(),
+                "has 1 <p> element(s), need at least 2",
+            ),
+            (
+                "bullet without marker",
+                "・カメラ2台 → 2,640円",
+                "カメラ2台 → 2,640円".into(),
+                "does not start with",
+            ),
+            (
+                "bullet without arrow",
+                "・カメラ2台 → 2,640円（税込）／月",
+                "・カメラ2台 2,640円（税込）／月".into(),
+                "has 0 \"→\" separator(s), expected exactly 1",
+            ),
+            (
+                "bullet with empty label",
+                "・カメラ2台 → 2,640円",
+                "・ → 2,640円".into(),
+                "empty label",
+            ),
+            (
+                "bullet with empty value",
+                "・カメラ2台 → 2,640円（税込）／月",
+                "・カメラ2台 → ".into(),
+                "empty value",
+            ),
+            (
+                "bullet with two arrows",
+                "・カメラ2台 → 2,640円",
+                "・カメラ2台 → → 2,640円".into(),
+                "has 2 \"→\" separator(s), expected exactly 1",
+            ),
+            (
+                "bullet paragraph with a child element",
+                bullet_tail,
+                "・カメラ3台 → 3,960円（税込）／月<b>強調</b></p>".into(),
+                "unexpected <b> element",
+            ),
+            (
+                "unconsumed text inside price-box-text",
+                name_label,
+                format!(r#"{name_label}<p class="price-box-note">4台目以降 +1,100円／月</p>"#),
+                "4台目以降",
+            ),
+            (
+                "unconsumed text directly under price-contents",
+                r#"<div class="price-text">"#,
+                r#"<p>追加料金 500円</p><div class="price-text">"#.into(),
+                "追加料金",
+            ),
+        ];
+        for (case, from, to, expected) in cases {
+            let broken = FIXTURE_HTML.replacen(from, to, 1);
+            assert_ne!(broken, FIXTURE_HTML, "case {case}: mutation did not apply");
+            let err = extract_lp_sections(&broken)
+                .expect_err(&format!("case {case}: markup must be rejected"));
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("anchor #price") && message.contains(expected),
+                "case {case}: expected an error containing {expected:?}, got: {message}"
+            );
+        }
     }
 
     #[test]
@@ -867,21 +1320,6 @@ mod tests {
             "ユアテクト とは？"
         );
         assert_eq!(collapse_numeric_spacing("お客様 の 声"), "お客様 の 声");
-    }
-
-    #[test]
-    fn only_price_section_gets_the_disclaimer() {
-        let sections = extract_lp_sections(FIXTURE_HTML).expect("fixture must parse");
-        for section in &sections {
-            if section.anchor == "price" {
-                continue;
-            }
-            assert!(
-                !section.body.contains("このページに書かれていないこと"),
-                "anchor {} must not carry the price disclaimer",
-                section.anchor
-            );
-        }
     }
 
     #[test]

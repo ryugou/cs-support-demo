@@ -136,10 +136,14 @@ fn mask_suppressed(normalized: &str, suppress_forms: &[String]) -> String {
 }
 
 /// vocabulary_for_prompt 向けに保持する語彙 1 件分（signal, class, description）。
+/// `surface_forms` は正規化前の生の値（`llm_only` signal も含めて全件を保持する `vocabulary`
+/// 経由であることが `supplementary_search_term_of` の前提。`entries`/`CompiledEntry` は
+/// `llm_only` を除外するため使えない）。
 struct VocabularyEntry {
     signal: String,
     class: SignalClass,
     description: String,
+    surface_forms: Vec<String>,
 }
 
 pub struct LexiconNormalizer {
@@ -194,6 +198,7 @@ impl LexiconNormalizer {
                 signal: entry.signal.clone(),
                 class: entry.class,
                 description: entry.description.clone(),
+                surface_forms: entry.surface_forms.clone(),
             })
             .collect();
         let declaration_order: Vec<String> = file
@@ -340,6 +345,29 @@ impl LexiconNormalizer {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// signal の lexicon description と(正規化前の生の) surface_forms を空白区切りで
+    /// 連結した検索語を返す(design doc `2026-10-07-partial-answer-with-handoff-design.md`
+    /// §10.2 の signal 誘導補助検索専用)。顧客提示には使わない内部語彙を含むため、
+    /// customer_label_of と混同しないこと。
+    /// lexicon に signal が未登録、または description も surface_forms も無い場合は None。
+    pub(crate) fn supplementary_search_term_of(&self, signal: &Signal) -> Option<String> {
+        let entry = self
+            .vocabulary
+            .iter()
+            .find(|e| e.signal == signal.as_str())?;
+        let mut parts: Vec<&str> = Vec::new();
+        if !entry.description.is_empty() {
+            parts.push(entry.description.as_str());
+        }
+        parts.extend(entry.surface_forms.iter().map(String::as_str));
+        let term = parts.join(" ");
+        if term.trim().is_empty() {
+            None
+        } else {
+            Some(term)
+        }
     }
 }
 
@@ -699,6 +727,71 @@ mod tests {
         let lex = lexicon();
         assert_eq!(
             lex.normalized_surface_forms_of(&Signal::new("totally_unknown")),
+            None
+        );
+    }
+
+    #[test]
+    fn supplementary_search_term_of_joins_description_and_surface_forms() {
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "mold", "class": "hazard", "surface_forms": ["カビ", "かび"],
+                  "description": "カビの発生に関する申告" }
+            ] }"#,
+        )
+        .unwrap();
+        let term = lex
+            .supplementary_search_term_of(&Signal::new("mold"))
+            .expect("mold has both description and surface_forms");
+        assert!(term.contains("カビの発生に関する申告"));
+        assert!(term.contains("カビ"));
+        assert!(term.contains("かび"));
+    }
+
+    #[test]
+    fn supplementary_search_term_of_uses_description_only_for_an_llm_only_signal() {
+        // llm_only の signal は entries/CompiledEntry に積まれないため、vocabulary 経由で
+        // 取得できることの確認(normalized_surface_forms_of は None を返す対照)。
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "unclassified_risk", "class": "hazard", "surface_forms": [], "llm_only": true,
+                  "description": "既存のどの signal にも分類できないが、安全・契約・法務上の不安がある発話" }
+            ] }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lex.supplementary_search_term_of(&Signal::new("unclassified_risk")),
+            Some(
+                "既存のどの signal にも分類できないが、安全・契約・法務上の不安がある発話"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            lex.normalized_surface_forms_of(&Signal::new("unclassified_risk")),
+            None
+        );
+    }
+
+    #[test]
+    fn supplementary_search_term_of_returns_none_for_an_unregistered_signal() {
+        let lex = lexicon();
+        assert_eq!(
+            lex.supplementary_search_term_of(&Signal::new("totally_unknown")),
+            None
+        );
+    }
+
+    #[test]
+    fn supplementary_search_term_of_returns_none_when_description_and_surface_forms_are_both_empty()
+    {
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "blank_vocab_test", "class": "hazard", "surface_forms": [], "llm_only": true }
+            ] }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            lex.supplementary_search_term_of(&Signal::new("blank_vocab_test")),
             None
         );
     }
