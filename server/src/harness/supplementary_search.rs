@@ -16,6 +16,10 @@ use std::collections::{HashMap, HashSet};
 /// 上位に割り当てる（design doc §10.2）。
 const QUESTION_SLOTS: usize = 2;
 
+fn has_higher_score(candidate: &SectionHit, kept: &SectionHit) -> bool {
+    candidate.score > kept.score
+}
+
 /// 複数 signal の検索結果を跨いだ `section_key` の重複を除去する。最初に現れた位置を保ち、
 /// 後から現れた同一キーの score が厳密に高ければ、その位置の内容だけを差し替える（同点なら
 /// 先に現れた方を残す）。HashMap の反復順に依存しないので、本番が全 score を 1.0 で返しても
@@ -26,7 +30,7 @@ fn dedupe_keeping_first_seen_order(hits: Vec<SectionHit>) -> Vec<SectionHit> {
     for hit in hits {
         match index_of_key.get(&hit.section_key) {
             Some(&index) => {
-                if hit.score > deduped[index].score {
+                if has_higher_score(&hit, &deduped[index]) {
                     deduped[index] = hit;
                 }
             }
@@ -58,6 +62,17 @@ pub(super) fn merge_question_and_signal_hits(
     for hit in question_hits.iter().take(QUESTION_SLOTS) {
         if used.insert(hit.section_key.clone()) {
             selected.push(hit.clone());
+        }
+    }
+
+    for hit in selected.iter_mut() {
+        if let Some(duplicate) = signal_hits
+            .iter()
+            .find(|signal_hit| signal_hit.section_key == hit.section_key)
+        {
+            if has_higher_score(duplicate, hit) {
+                *hit = duplicate.clone();
+            }
         }
     }
 
@@ -206,6 +221,17 @@ mod tests {
         let signal_hits = vec![scored_hit("a", 0.95), scored_hit("f", 0.4)];
         let merged = merge_question_and_signal_hits(question_hits, signal_hits);
         assert_eq!(section_keys_of(&merged), vec!["a", "b", "f"]);
+        assert_eq!(merged[0].score, 0.95);
+    }
+
+    #[test]
+    fn merge_question_and_signal_hits_keeps_the_question_hit_score_when_the_signal_duplicate_score_is_lower(
+    ) {
+        let question_hits = vec![scored_hit("a", 0.9), scored_hit("b", 0.8)];
+        let signal_hits = vec![scored_hit("a", 0.5), scored_hit("f", 0.4)];
+        let merged = merge_question_and_signal_hits(question_hits, signal_hits);
+        assert_eq!(section_keys_of(&merged), vec!["a", "b", "f"]);
+        assert_eq!(merged[0].score, 0.9);
     }
 
     #[test]
