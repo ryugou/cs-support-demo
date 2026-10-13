@@ -1,13 +1,15 @@
-//! design doc `2026-10-07-partial-answer-with-handoff-design.md` §9「実出力の検証」。
+//! design doc `2026-10-07-partial-answer-with-handoff-design.md` §10.3「検証」。
 //!
 //! 単体テストと reviewer の判定だけでは、顧客に返る最終文面を確認したことにならない
-//! （2026-10-09 の本番で下書きが全件捨てられていた実例を参照）。ここは本番と同じ部品
-//! （`data/urtect/signal-lexicon.json` / `data/urtect/rules.json` /
-//! `config.cloudrun.toml` の `[llm]` / `[harness]`、実 Anthropic API）を使い、取次ターンでも
-//! 答えられる部分（料金）が実際に顧客向け文面に出ることを確認する。
+//! （2026-10-09 の本番で下書きが全件捨てられていた実例、2026-10-13 の本番で検索依存の
+//! 取りこぼしがあった実例を参照）。ここは本番と同じ部品（`data/urtect/signal-lexicon.json` /
+//! `data/urtect/rules.json` / `config.cloudrun.toml` の `[llm]` / `[harness]`、実 Anthropic API）
+//! と、本番 MCP `search_manual` の実結果を使い、取次ターンでも答えられる部分（料金）が実際に
+//! 顧客向け文面に出ることを確認する。材料は手で選ばず、§10.2 の併合をコード側の同じ関数
+//! （`super::supplementary_search::fold_signal_search_results`）で行う。
 //!
-//! `#[ignore]`: 実 API キー・ネットワーク到達性・`ingest_urtect_lp --dry-run` の出力ファイルを
-//! 要求するため CI では走らせない。
+//! `#[ignore]`: 実 API キー・ネットワーク到達性・`CS_VERIFY_CASES_JSON`（本番 MCP
+//! `search_manual` の実結果ファイル）を要求するため CI では走らせない。
 //! ```sh
 //! cargo test --manifest-path server/Cargo.toml --lib real_llm_partial_answer_smoke -- \
 //!   --ignored --nocapture
@@ -31,11 +33,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const LLM_API_KEY_ENV: &str = "CS_SUPPORT_LLM_API_KEY";
-const SECTIONS_ENV: &str = "CS_VERIFY_SECTIONS_JSON";
-const QUESTION_ENV: &str = "CS_VERIFY_QUESTION";
-const RUNS_ENV: &str = "CS_VERIFY_RUNS";
-const DEFAULT_QUESTION: &str = "導入にどれくらいの費用がかかるの？";
-const DEFAULT_RUNS: usize = 5;
+const CASES_ENV: &str = "CS_VERIFY_CASES_JSON";
+const MIN_VERIFY_CASES: usize = 3;
+const SUPPLEMENTARY_SEARCH_SIGNAL: &str = "initial_cost_question";
 
 /// `server/` 相対パスを `CARGO_MANIFEST_DIR` 基準で解決する。cwd 非依存にするため
 /// （`production_ng_dictionary` / `test_support::load_bundled_escalation_rules` と同じ作法）。
@@ -69,74 +69,76 @@ fn seed_product_models() -> Vec<String> {
     products.into_iter().map(|p| p.model).collect()
 }
 
-/// `ingest_urtect_lp --dry-run` が出力する 1 節分の形（`anchor` / `title_ja` / `body` /
-/// `source_url` のみ使う。`body_chars` は無視する）。
+/// MCP `search_manual` の返却 JSON（`SearchManualResponse`、`server/src/rmcp_server.rs`
+/// 参照）をそのまま読むための、このファイル専用の読み取り専用デシリアライズ型。
 #[derive(Debug, serde::Deserialize)]
-struct DrySection {
-    anchor: String,
-    title_ja: String,
-    body: String,
-    source_url: String,
+struct SearchManualHits {
+    hits: Vec<SectionHit>,
+}
+
+/// `CS_VERIFY_CASES_JSON` の各 `hits_json` が指すファイルの形
+/// （design doc `2026-10-07-partial-answer-with-handoff-design.md` §10.3）。
+#[derive(Debug, serde::Deserialize)]
+struct CaseHitsFile {
+    question_hits: SearchManualHits,
+    signal_hits: SearchManualHits,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct DryRunOutput {
-    sections: Vec<DrySection>,
+struct VerifyCase {
+    question: String,
+    hits_json: String,
 }
 
-/// design doc §9 の材料固定: sections JSON の `price` / `faq` / `flow` を、この順で
-/// スコア 0.9 / 0.7 / 0.6 の `SectionHit` にする。本番の上位 3 件の厳密な再現ではないが、
-/// 料金ページの本文は同一である。
-fn material_hits(sections_json_path: &str) -> Vec<SectionHit> {
-    let body = std::fs::read_to_string(sections_json_path).unwrap_or_else(|err| {
+/// `CS_VERIFY_CASES_JSON`（`[{"question": ..., "hits_json": <path>}, ...]`）を読み、各ケースの
+/// `hits_json` が指す本番 MCP `search_manual` の実結果（`{"question_hits": ..., "signal_hits":
+/// ...}`）を読み込む。戻り値は `(question, question_hits, signal_hits)` のタプル列
+/// （design doc §10.3）。
+fn load_verify_cases() -> Vec<(String, Vec<SectionHit>, Vec<SectionHit>)> {
+    let cases_path = std::env::var(CASES_ENV).unwrap_or_else(|_| {
         panic!(
-            "{SECTIONS_ENV} must point at a readable file ({sections_json_path:?}); run \
-             `ingest_urtect_lp --dry-run` and point {SECTIONS_ENV} at its output: {err}"
+            "{CASES_ENV} is not set; point it at a json file of `[{{\"question\": ..., \
+             \"hits_json\": <path>}}, ...]` (at least 3 paraphrases of the pricing question; \
+             each hits_json file holds the real `search_manual` output for the question text \
+             and for the signal-guided supplementary search; see design doc \
+             2026-10-07-partial-answer-with-handoff-design.md §10.3)"
         )
     });
-    let parsed: DryRunOutput = serde_json::from_str(&body).unwrap_or_else(|err| {
-        panic!(
-            "{SECTIONS_ENV} ({sections_json_path:?}) is not `ingest_urtect_lp --dry-run` JSON: \
-             {err}"
-        )
+    let body = std::fs::read_to_string(&cases_path).unwrap_or_else(|err| {
+        panic!("{CASES_ENV} must point at a readable file ({cases_path:?}): {err}")
     });
-    [("price", 0.9_f32), ("faq", 0.7), ("flow", 0.6)]
+    let cases: Vec<VerifyCase> = serde_json::from_str(&body).unwrap_or_else(|err| {
+        panic!("{CASES_ENV} ({cases_path:?}) is not a json array of {{question, hits_json}}: {err}")
+    });
+    assert!(
+        cases.len() >= MIN_VERIFY_CASES,
+        "{CASES_ENV} ({cases_path:?}) must list at least {MIN_VERIFY_CASES} cases (paraphrases of \
+         the pricing question, design doc §10.3), got {}",
+        cases.len()
+    );
+    cases
         .into_iter()
-        .map(|(anchor, score)| {
-            let section = parsed
-                .sections
-                .iter()
-                .find(|s| s.anchor == anchor)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{SECTIONS_ENV} ({sections_json_path:?}) has no section with anchor \
-                         {anchor:?}; re-run `ingest_urtect_lp --dry-run` against the current site"
-                    )
-                });
-            SectionHit {
-                section_key: format!("lp#{anchor}"),
-                title_ja: section.title_ja.clone(),
-                body_ja: Some(section.body.clone()),
-                body_en: None,
-                translation_status: None,
-                breadcrumb: vec!["URTECT".to_string(), section.title_ja.clone()],
-                score,
-                source_url: Some(section.source_url.clone()),
-            }
+        .map(|case| {
+            let hits_body = std::fs::read_to_string(&case.hits_json).unwrap_or_else(|err| {
+                panic!(
+                    "case {:?}: hits_json {:?} must be a readable file: {err}",
+                    case.question, case.hits_json
+                )
+            });
+            let hits_file: CaseHitsFile = serde_json::from_str(&hits_body).unwrap_or_else(|err| {
+                panic!(
+                    "case {:?}: hits_json {:?} is not {{question_hits, signal_hits}} \
+                     search_manual output: {err}",
+                    case.question, case.hits_json
+                )
+            });
+            (
+                case.question,
+                hits_file.question_hits.hits,
+                hits_file.signal_hits.hits,
+            )
         })
         .collect()
-}
-
-/// `CS_VERIFY_RUNS`（既定 [`DEFAULT_RUNS`]）を正の整数として読む。
-fn runs_from_env() -> usize {
-    let Ok(raw) = std::env::var(RUNS_ENV) else {
-        return DEFAULT_RUNS;
-    };
-    let runs: usize = raw
-        .parse()
-        .unwrap_or_else(|err| panic!("{RUNS_ENV} must be a positive integer, got {raw:?}: {err}"));
-    assert!(runs > 0, "{RUNS_ENV} must be greater than 0, got {runs}");
-    runs
 }
 
 struct TempDir(PathBuf);
@@ -162,18 +164,16 @@ struct Fixture {
     thresholds: Thresholds,
     allowlist: ProductAllowlist,
     hours_label: String,
-    hits: Vec<SectionHit>,
-    question: String,
 }
 
 fn load_config_and_client() -> (AppConfig, AnthropicClient) {
     let config = AppConfig::load(&server_path("config.cloudrun.toml"))
         .expect("load server/config.cloudrun.toml");
-    // 下書きが無効なら本番は下書きを作らず、§9 の合否は成立しない（`Harness::build` と同じ前提）。
+    // 下書きが無効なら本番は下書きを作らず、§10.3 の合否は成立しない（`Harness::build` と同じ前提）。
     assert!(
         config.harness.customer_reply_draft_enabled,
         "config.cloudrun.toml must have [harness] customer_reply_draft_enabled = true; \
-         production builds no draft otherwise, so this smoke test cannot verify §9"
+         production builds no draft otherwise, so this smoke test cannot verify §10.3"
     );
     assert!(
         config.harness.customer_reply_draft_max_tokens > 0,
@@ -255,8 +255,6 @@ fn build_fixture(
     config: AppConfig,
     harness: Harness,
     lexicon: Arc<signal::LexiconNormalizer>,
-    hits: Vec<SectionHit>,
-    question: String,
 ) -> Fixture {
     let prohibited_domains = load_bundled_prohibited_domains();
     let mandatory_domains: Vec<rules::ProhibitedDomain> = prohibited_domains
@@ -275,24 +273,25 @@ fn build_fixture(
         thresholds,
         allowlist: ProductAllowlist::from_models(seed_product_models()),
         hours_label,
-        hits,
-        question,
         config,
     }
 }
 
 /// signal 抽出から `decide` までを実行し、第1層 `initial-cost-quote` の取次であることを確かめる。
+/// `question_hits` は本番 MCP `search_manual` の実結果（質問文検索。補助検索より前に判定へ渡る
+/// ので merge 前のまま使う。`evaluate()` と同じ順序）。
 async fn decide_and_assert_layer1(
     fx: &Fixture,
-    run: usize,
-    runs: usize,
+    question: &str,
+    question_hits: &[SectionHit],
+    case_index: usize,
+    total_cases: usize,
 ) -> (extraction::ExtractionResult, AnswerDecision) {
-    let question = &fx.question;
     let extracted = fx.harness.extractor.extract(question).await;
     let (signals, mode) = (&extracted.signals, extracted.mode);
     // 製品言及抽出は signal 抽出と完全に独立したコンポーネント（Issue #52）。この質問は
     // 型番言及を含まないため判定には使わないが、本番と同じ配線を実際に動かして確認する
-    // （design doc §9「実 LLM による...製品言及抽出」）。
+    // （design doc §10.3「実 LLM による...製品言及抽出」）。
     let product_references = fx
         .harness
         .product_reference_extractor
@@ -311,14 +310,21 @@ async fn decide_and_assert_layer1(
             .filter(|s| fx.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
             .count(),
     };
-    let price_section_key = fx.hits[0].section_key.clone();
+    let top_hit = question_hits.first().unwrap_or_else(|| {
+        panic!(
+            "case {case_index}/{total_cases} ({question:?}): question_hits is empty (the \
+             search_manual result for the question text has no hit, or every hit was excluded as \
+             out-of-scope)"
+        )
+    });
+    let price_section_key = top_hit.section_key.clone();
     let decision = decision::decide(&DecisionInput {
         question_signals: signals,
         question_raw: question,
         rules: &fx.escalation_rules,
         domains: &fx.prohibited_domains,
         resolutions: &[],
-        best_manual_score: Some(fx.hits[0].score),
+        best_manual_score: Some(top_hit.score),
         best_manual_sections: std::slice::from_ref(&price_section_key),
         stakes_input,
         thresholds: &fx.thresholds,
@@ -333,30 +339,38 @@ async fn decide_and_assert_layer1(
 
     // 判定の合否は下書き生成より先に見る（判定が外れたまま下書き失敗で panic すると
     // 失敗理由が誤誘導になる）。併発ルールがあっても `decide` が選ぶルールが
-    // initial-cost-quote なら §9 は満たされる。
+    // initial-cost-quote なら §10.3 は満たされる。
     assert!(
         matches!(&decision, AnswerDecision::Escalate { layer: 1, .. }),
-        "run {run}/{runs}: expected a layer-1 escalate decision, got {decision:?}"
+        "case {case_index}/{total_cases} ({question:?}): expected a layer-1 escalate decision, \
+         got {decision:?}"
     );
     let selected_rule_id = match_layer1(&fx.escalation_rules, signals).map(|r| r.id.as_str());
     assert_eq!(
         selected_rule_id,
         Some("initial-cost-quote"),
-        "run {run}/{runs}: expected initial-cost-quote to be the selected layer-1 rule \
-         (matched: {matched_layer1_rule_ids:?})"
+        "case {case_index}/{total_cases} ({question:?}): expected initial-cost-quote to be the \
+         selected layer-1 rule (matched: {matched_layer1_rule_ids:?})"
     );
     (extracted, decision)
 }
 
 /// 下書きを生成し、本番と同じ採否判定（`accept_draft`、truncated 判定、取扱外型番ゲート）を
-/// 通して本文を返す。
+/// 通して本文を返す。`merged_hits` / `merged_best_score` は質問文検索と補助検索を
+/// `super::supplementary_search::fold_signal_search_results` で併合した後の値（design doc §10.2「取り次ぐ項目を
+/// 導出した後」の本番の評価順序と同じ: 判定（`decide_and_assert_layer1`）は merge 前、下書きは
+/// merge 後の材料を使う）。
+#[allow(clippy::too_many_arguments)]
 async fn draft_accepted_text(
     fx: &Fixture,
     decision: &AnswerDecision,
     mode: extraction::ExtractionMode,
     items: &[handoff_items::HandoffItem],
-    run: usize,
-    runs: usize,
+    question: &str,
+    merged_hits: &[SectionHit],
+    merged_best_score: Option<f32>,
+    case_index: usize,
+    total_cases: usize,
 ) -> String {
     let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
     let policy = ReplyDraftPolicy::SkipWhenUnused {
@@ -369,7 +383,7 @@ async fn draft_accepted_text(
         items,
         mode,
         false,
-        Some(fx.hits[0].score),
+        merged_best_score,
         &fx.thresholds,
         fx.config.harness.customer_reply_draft_enabled,
     );
@@ -377,9 +391,9 @@ async fn draft_accepted_text(
     let draft = if plan.generate {
         fx.harness
             .draft_customer_reply(
-                &fx.question,
+                question,
                 decision,
-                &fx.hits,
+                merged_hits,
                 &[],
                 &[],
                 false,
@@ -394,21 +408,21 @@ async fn draft_accepted_text(
 
     let Some(draft) = draft else {
         panic!(
-            "run {run}/{runs}: draft_customer_reply did not generate a draft \
-             (plan.generate={}, plan.partial_answer_ok={})",
+            "case {case_index}/{total_cases} ({question:?}): draft_customer_reply did not \
+             generate a draft (plan.generate={}, plan.partial_answer_ok={})",
             plan.generate, plan.partial_answer_ok
         )
     };
     if let Err(reason) =
         handoff_items::accept_draft(&draft.text, plan.partial_answer_ok, items, &fx.lexicon)
     {
-        panic!("run {run}/{runs}: draft was not accepted: {reason}");
+        panic!("case {case_index}/{total_cases} ({question:?}): draft was not accepted: {reason}");
     }
     assert!(
         !draft.truncated,
-        "run {run}/{runs}: draft was truncated at the generation limit; production's \
-         partial_answer_draft_for_escalation discards it and falls back to the \
-         acknowledgement text instead of using it:\n{}",
+        "case {case_index}/{total_cases} ({question:?}): draft was truncated at the generation \
+         limit; production's partial_answer_draft_for_escalation discards it and falls back to \
+         the acknowledgement text instead of using it:\n{}",
         draft.text
     );
     // api.rs の `gate_customer_reply_draft`（private）§3.5(1) と同じ判定。
@@ -416,7 +430,7 @@ async fn draft_accepted_text(
     let out_of_scope = fx.allowlist.out_of_scope_mentions(&draft.text);
     assert!(
         out_of_scope.is_empty(),
-        "run {run}/{runs}: draft mentions out-of-scope models \
+        "case {case_index}/{total_cases} ({question:?}): draft mentions out-of-scope models \
          {out_of_scope:?} (production would discard it):\n{}",
         draft.text
     );
@@ -424,23 +438,50 @@ async fn draft_accepted_text(
     draft.text
 }
 
-async fn run_once(fx: &Fixture, run: usize, runs: usize) {
-    println!("==== real_llm_partial_answer_smoke run {run}/{runs} ====");
-    let (extracted, decision) = decide_and_assert_layer1(fx, run, runs).await;
+/// `question_hits` は判定（`decide_and_assert_layer1`）に、`merged_hits` /
+/// `merged_best_score`（質問文検索と補助検索を design doc §10.2 の規則で併合した後の値）は
+/// 下書き生成に使う。本番 `evaluate()` の評価順序（判定確定 → handoff_items 確定 → 補助検索 →
+/// 下書き）と同じ。
+#[allow(clippy::too_many_arguments)]
+async fn run_once(
+    fx: &Fixture,
+    question: &str,
+    question_hits: &[SectionHit],
+    merged_hits: &[SectionHit],
+    merged_best_score: Option<f32>,
+    case_index: usize,
+    total_cases: usize,
+) {
+    println!(
+        "==== real_llm_partial_answer_smoke case {case_index}/{total_cases}: {question:?} ===="
+    );
+    let (extracted, decision) =
+        decide_and_assert_layer1(fx, question, question_hits, case_index, total_cases).await;
     let items = handoff_items::handoff_items_for_decision(
         &decision,
         &fx.escalation_rules,
         &fx.prohibited_domains,
         &extracted.signals,
-        &fx.question,
+        question,
         &fx.lexicon,
     );
     let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
     println!("handoff items: {labels:?}");
 
-    let draft_text = draft_accepted_text(fx, &decision, extracted.mode, &items, run, runs).await;
+    let draft_text = draft_accepted_text(
+        fx,
+        &decision,
+        extracted.mode,
+        &items,
+        question,
+        merged_hits,
+        merged_best_score,
+        case_index,
+        total_cases,
+    )
+    .await;
 
-    let case_id = format!("case-smoketest{run:020}");
+    let case_id = format!("case-smoketest{case_index:020}");
     let deterministic_block =
         escalation_reply::build_deterministic_block(&case_id, &fx.hours_label, false);
     let final_reply =
@@ -450,40 +491,34 @@ async fn run_once(fx: &Fixture, run: usize, runs: usize) {
     let handoff_sentence = escalation_reply::build_handoff_sentence(&labels);
     assert!(
         final_reply.contains("1,540"),
-        "run {run}/{runs}: final reply does not mention the monthly fee (1,540):\n{final_reply}"
+        "case {case_index}/{total_cases} ({question:?}): final reply does not mention the \
+         monthly fee (1,540):\n{final_reply}"
     );
     assert!(
         final_reply.contains(&handoff_sentence),
-        "run {run}/{runs}: final reply does not contain the handoff sentence \
-         ({handoff_sentence:?}):\n{final_reply}"
+        "case {case_index}/{total_cases} ({question:?}): final reply does not contain the \
+         handoff sentence ({handoff_sentence:?}):\n{final_reply}"
     );
     assert!(
         final_reply.contains("受付番号: "),
-        "run {run}/{runs}: final reply does not contain the case reference line:\n{final_reply}"
+        "case {case_index}/{total_cases} ({question:?}): final reply does not contain the case \
+         reference line:\n{final_reply}"
     );
 }
 
-/// design doc §9 の実出力検証。本番と同じ部品（signal-lexicon.json、rules.json、
-/// config.cloudrun.toml の `[llm]`/`[harness]`、実 LLM 抽出・下書き生成）を使い、
-/// 「導入にどれくらいの費用がかかるの？」が第1層 `initial-cost-quote` にマッチし、
-/// 下書きが採用され、最終応答文に月額料金・取次の一文・受付番号が含まれることを
-/// `CS_VERIFY_RUNS` 回連続で確認する。1 run でも外れたら即座に失敗させる。
+/// design doc §10.3 の実出力検証。本番と同じ部品（signal-lexicon.json、rules.json、
+/// config.cloudrun.toml の `[llm]`/`[harness]`、実 LLM 抽出・下書き生成）と、本番 MCP
+/// `search_manual` の実結果（`CS_VERIFY_CASES_JSON`）を使い、費用を尋ねる複数の言い回しが
+/// 第1層 `initial-cost-quote` にマッチし、下書きが採用され、最終応答文に月額料金・取次の
+/// 一文・受付番号が含まれることを確認する。1 ケースでも外れたら即座に失敗させる。
 #[tokio::test]
 #[ignore = "requires CS_SUPPORT_LLM_API_KEY, network access to the Anthropic API, and \
-            CS_VERIFY_SECTIONS_JSON (ingest_urtect_lp --dry-run output); see design doc \
-            2026-10-07-partial-answer-with-handoff-design.md §9"]
+            CS_VERIFY_CASES_JSON (real search_manual output for the question text and for the \
+            signal-guided supplementary search); see design doc \
+            2026-10-07-partial-answer-with-handoff-design.md §10.3"]
 async fn real_llm_partial_answer_smoke() {
     let (config, client) = load_config_and_client();
-    let sections_json_path = std::env::var(SECTIONS_ENV).unwrap_or_else(|_| {
-        panic!(
-            "{SECTIONS_ENV} is not set; point it at the output file of \
-             `ingest_urtect_lp --dry-run` (the price/faq/flow sections of the URTECT landing \
-             page)"
-        )
-    });
-    let question = std::env::var(QUESTION_ENV).unwrap_or_else(|_| DEFAULT_QUESTION.to_string());
-    let runs = runs_from_env();
-    let hits = material_hits(&sections_json_path);
+    let cases = load_verify_cases();
 
     let lexicon = Arc::new(
         signal::LexiconNormalizer::from_path(&resolve_server_path(
@@ -496,8 +531,38 @@ async fn real_llm_partial_answer_smoke() {
     std::fs::create_dir_all(&dir.0).expect("create temp dir for the harness worm audit log/queue");
 
     let harness = build_harness(&config, client, &lexicon, &dir.0);
-    let fx = build_fixture(config, harness, lexicon, hits, question);
-    for run in 1..=runs {
-        run_once(&fx, run, runs).await;
+    let fx = build_fixture(config, harness, lexicon);
+
+    let total_cases = cases.len();
+    for (index, (question, question_hits, signal_hits)) in cases.into_iter().enumerate() {
+        let case_index = index + 1;
+        // 本番 `evaluate()` と同じ順序: 質問文検索の hits を取扱外型番の除外（`filter_out_of_scope_hits`）
+        // に通してから判定へ渡し、補助検索の hits は `fold_signal_search_results`（内部で同じ除外を
+        // 通してから §10.2 の規則で併合する）に渡す。判定（decide_and_assert_layer1）は併合前の
+        // 質問文検索の hits をそのまま使い、併合後の hits・最良 score は下書き生成にのみ使う。
+        let question_hits = super::filter_out_of_scope_hits(question_hits, &fx.allowlist);
+        let question_best = question_hits.first().map(|h| h.score);
+        let (merged_hits, merged_best_score, _) =
+            super::supplementary_search::fold_signal_search_results(
+                question_hits.clone(),
+                question_best,
+                Vec::new(),
+                vec![(
+                    signal::Signal::new(SUPPLEMENTARY_SEARCH_SIGNAL),
+                    Ok((signal_hits, Vec::new())),
+                )],
+                &fx.allowlist,
+                &format!("smoke-case-{case_index}"),
+            );
+        run_once(
+            &fx,
+            &question,
+            &question_hits,
+            &merged_hits,
+            merged_best_score,
+            case_index,
+            total_cases,
+        )
+        .await;
     }
 }

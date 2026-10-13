@@ -19,6 +19,7 @@ pub mod reply;
 pub mod rules;
 pub mod scope;
 pub mod signal;
+mod supplementary_search;
 pub mod time_pref;
 
 use crate::config::AppConfig;
@@ -1483,6 +1484,136 @@ impl Harness {
         })
     }
 
+    /// design doc `2026-10-07-partial-answer-with-handoff-design.md` §10.2: 取り次ぐ項目の signal
+    /// ごとに、lexicon の語彙（description + surface_forms）を検索語にした補助検索を
+    /// `manual_search_hits` で行い、signal と検索結果の組を signal の順（`SignalSet` の順）で返す。
+    /// 検索の失敗はここでは握りつぶさず `Err` のまま返し、畳み込み
+    /// （`supplementary_search::fold_signal_search_results`）が warn して続行する。lexicon に
+    /// signal 自体が未登録、または description/surface_forms が両方空の場合（実運用では起きない
+    /// はずだが起きても質問文検索の結果だけで続行する。design doc §10.4）は、その signal を
+    /// warn して飛ばす。
+    #[allow(clippy::too_many_arguments)]
+    async fn search_handoff_signals(
+        &self,
+        ctx: &RequestContext,
+        handoff_items: &[handoff_items::HandoffItem],
+        accumulated: &signal::SignalSet,
+        product_key: Option<&str>,
+        manual_corpus: Option<&crate::proto::graphrag::GetGraphSnapshotResponse>,
+        live_snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+        tools: &ToolService,
+    ) -> Vec<(signal::Signal, supplementary_search::SignalSearchResult)> {
+        let handoff_signals: signal::SignalSet = handoff_items
+            .iter()
+            .flat_map(|item| item.signals.iter().cloned())
+            .collect();
+        let mut results = Vec::new();
+        for signal in handoff_signals {
+            let Some(term) = self.lexicon.supplementary_search_term_of(&signal) else {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    signal = signal.as_str(),
+                    "no supplementary search term for a handoff signal (lexicon has no \
+                     description/surface_forms); skipping the signal-guided supplementary \
+                     search for this signal"
+                );
+                continue;
+            };
+            let result = self
+                .manual_search_hits(
+                    ctx,
+                    &term,
+                    accumulated,
+                    product_key,
+                    manual_corpus,
+                    live_snapshot,
+                    tools,
+                )
+                .await;
+            results.push((signal, result));
+        }
+        results
+    }
+
+    /// manual 検索を manual_schema で分岐して呼ぶ 1 か所(design doc
+    /// `2026-10-07-partial-answer-with-handoff-design.md` §10.2)。`evaluate()` の質問文検索・
+    /// signal 誘導の補助検索の両方がここを呼ぶ(KM-9: 同じ分岐ロジックを複製しない)。各分岐の
+    /// 挙動は既存どおり(ManualV1: ManualStore の意味検索 + 決定論検索の max、LegacySection:
+    /// tools.search_manual_with_snapshot)で、呼び出しを 1 か所へ集約するだけ。`live_snapshot`
+    /// は参照で受け、LegacySection 分岐の中でだけ呼び出しごとに `.clone()` する(消費される
+    /// 関数のため)。ctx/query/accumulated/product_key/manual_corpus/live_snapshot/tools の
+    /// 7 引数(+ self)は、質問文検索・signal 誘導の補助検索の両方の呼び出しに必要な値を
+    /// そのまま渡せる最小構成で、入力構造体への集約は挙動不変・最小差分の範囲を超えるため
+    /// 意図した引数数として許可する(`manual/retrieval.rs::search_with_snapshot` の同種の
+    /// `#[allow]` と同じ判断)。
+    #[allow(clippy::too_many_arguments)]
+    async fn manual_search_hits(
+        &self,
+        ctx: &RequestContext,
+        query: &str,
+        accumulated: &signal::SignalSet,
+        product_key: Option<&str>,
+        manual_corpus: Option<&crate::proto::graphrag::GetGraphSnapshotResponse>,
+        live_snapshot: &crate::proto::graphrag::GetGraphSnapshotResponse,
+        tools: &ToolService,
+    ) -> Result<(Vec<SectionHit>, Vec<String>)> {
+        match ctx.manual_schema {
+            crate::config::ManualSchemaKind::ManualV1 => {
+                let store = self
+                    .manual
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("manual store not configured"))?;
+                let vector_hits = store
+                    .vector_hits(
+                        self.vector_route_enabled,
+                        &ctx.schema,
+                        query,
+                        EVALUATE_TOP_K,
+                    )
+                    .await;
+                let manual_corpus = manual_corpus
+                    .ok_or_else(|| anyhow!("manual corpus missing for ManualV1 evaluate"))?;
+                let hits = store.search_with_snapshot(
+                    &ctx.schema,
+                    query,
+                    accumulated,
+                    None,
+                    EVALUATE_TOP_K,
+                    manual_corpus,
+                    &vector_hits,
+                )?;
+                let ids = hits
+                    .iter()
+                    .map(|h| {
+                        crate::manual::schema_ids::manual_node_id(
+                            &ctx.schema,
+                            "ManualSection",
+                            &h.section_key,
+                        )
+                    })
+                    .collect();
+                let converted = hits.into_iter().map(SectionHit::from).collect();
+                Ok((converted, ids))
+            }
+            crate::config::ManualSchemaKind::LegacySection => {
+                let hits = tools
+                    .search_manual_with_snapshot(
+                        &ctx.schema,
+                        query,
+                        product_key,
+                        5,
+                        live_snapshot.clone(),
+                    )
+                    .await?;
+                let ids = hits
+                    .iter()
+                    .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
+                    .collect();
+                Ok((hits, ids))
+            }
+        }
+    }
+
     /// S1-1 パイプライン後半: [取得] → [正規化] → [会話層 累積] → [(B) 3 層判定] → [記録]。
     /// 会話層（S1-0 / 遵守事項 1）: case_id 単位の累積 signal 集合をサーバ側で維持し、
     /// **毎ターン累積集合で再判定**する。条件が増えたら（変色 → 変色+カビ）再判定が
@@ -1710,78 +1841,27 @@ impl Harness {
         // body 全文(B) の max）、LegacySection は従来の tools.search_manual_with_snapshot。
         // 判定へは共通の best_manual_score / best_manual_sections に落とし、
         // EvaluationOutcome.hits へは SectionHit に揃えて返す（From<ManualHit> で変換）。
-        let (section_hits, retrieved_manual_ids): (Vec<SectionHit>, Vec<String>) =
-            match ctx.manual_schema {
-                crate::config::ManualSchemaKind::ManualV1 => {
-                    let store = self
-                        .manual
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("manual store not configured"))?;
-                    // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
-                    // 決定論の search_with_snapshot が握る。ここでは候補材料を用意するだけ。
-                    let vector_hits = store
-                        .vector_hits(
-                            self.vector_route_enabled,
-                            &ctx.schema,
-                            question,
-                            EVALUATE_TOP_K,
-                        )
-                        .await;
-                    let manual_corpus = manual_corpus
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("manual corpus missing for ManualV1 evaluate"))?;
-                    // 回答可能性（coverage / best_manual_score）は product で hard-scope しない。
-                    // product スコープは「当該 Product を DESCRIBES する節 or 機種非依存の節」だけを
-                    // 残し、他機種のみを DESCRIBES する節を除外する。ところがパスワードリセットのような
-                    // 機種横断 how-to は特定機種ページとして DESCRIBES 辺を持つことがあり、resolve 済み
-                    // product で絞ると本来 answerable なページが候補から消え、best_manual_score が低く
-                    // 出て false-escalate する（実測: スコープ有 0.561 < 閾値、スコープ無 0.917）。
-                    // そこで evaluate の内部検索は product_key=None で走らせ、best_manual_score と
-                    // best_manual_sections（＝ evidence lineage）を同一 hit 列から coherent に導出する
-                    // （score は横断ページ、evidence は別ページ、という不整合を作らない）。
-                    // product は「絞り込み」から「（任意の）加点」へ格下げする方針で、現状は加点も
-                    // 掛けない（最小差分・ゲート挙動優先）。search_manual ツールが明示 product_key を
-                    // 尊重する挙動は search_with_snapshot 側で不変（本変更は evaluate の呼び出しのみ）。
-                    let hits = store.search_with_snapshot(
-                        &ctx.schema,
-                        question,
-                        &accumulated,
-                        None,
-                        EVALUATE_TOP_K,
-                        manual_corpus,
-                        &vector_hits,
-                    )?;
-                    let ids = hits
-                        .iter()
-                        .map(|h| {
-                            crate::manual::schema_ids::manual_node_id(
-                                &ctx.schema,
-                                "ManualSection",
-                                &h.section_key,
-                            )
-                        })
-                        .collect();
-                    let converted = hits.into_iter().map(SectionHit::from).collect();
-                    (converted, ids)
-                }
-                crate::config::ManualSchemaKind::LegacySection => {
-                    // search 側は snapshot を消費するため、共有元のここでだけ clone する
-                    let hits = tools
-                        .search_manual_with_snapshot(
-                            &ctx.schema,
-                            question,
-                            product_key,
-                            5,
-                            live_snapshot.clone(),
-                        )
-                        .await?;
-                    let ids = hits
-                        .iter()
-                        .map(|h| crate::ingest::section_node_id(&ctx.schema, &h.section_key))
-                        .collect();
-                    (hits, ids)
-                }
-            };
+        // 回答可能性（coverage / best_manual_score）は product で hard-scope しない。
+        // product スコープは「当該 Product を DESCRIBES する節 or 機種非依存の節」だけを
+        // 残し、他機種のみを DESCRIBES する節を除外する。ところがパスワードリセットのような
+        // 機種横断 how-to は特定機種ページとして DESCRIBES 辺を持つことがあり、resolve 済み
+        // product で絞ると本来 answerable なページが候補から消え、best_manual_score が低く
+        // 出て false-escalate する（実測: スコープ有 0.561 < 閾値、スコープ無 0.917）。
+        // そこで evaluate の内部検索は product_key=None で走らせ、best_manual_score と
+        // best_manual_sections（＝ evidence lineage）を同一 hit 列から coherent に導出する
+        // （score は横断ページ、evidence は別ページ、という不整合を作らない）。この固定は
+        // `manual_search_hits`（ManualV1 分岐）の内部に残る。
+        let (section_hits, retrieved_manual_ids): (Vec<SectionHit>, Vec<String>) = self
+            .manual_search_hits(
+                ctx,
+                question,
+                &accumulated,
+                product_key,
+                manual_corpus.as_deref(),
+                &live_snapshot,
+                tools,
+            )
+            .await?;
         // Issue #28 codex レビュー採用1(Critical): カバレッジ判定(decide())より前に、取扱外
         // 型番のみを言及する hit を除外する。`retrieved_manual_ids`（監査 lineage）はこの
         // フィルタの影響を受けない意図的な設計（「何を検索で取得したか」の監査記録は、判定・
@@ -1820,6 +1900,38 @@ impl Harness {
             question,
             &self.lexicon,
         );
+        // design doc `2026-10-07-partial-answer-with-handoff-design.md` §10.2: 部分回答の対象
+        // ターン（§3.1 の条件1・2: 第1・2層の Escalate、hearing 宣言なし、取り次ぐ項目が1つ以上。
+        // `handoff_items::is_partial_answer_candidate` が `can_draft_partial_answer` と同じ判定を
+        // 共有する）でだけ、マッチした signal の lexicon 語彙（description + surface_forms）を
+        // 検索語にした補助検索を行い、質問文検索の結果と併合する（検索回数を増やさない）。
+        // **判定（上の decide()）と handoff_items の確定には一切影響しない**（両方とも既に確定
+        // 済みの入力を使っており、ここでは `section_hits` / `best_manual_score` /
+        // `retrieved_manual_ids` の 3 束縛だけを後続処理向けにシャドーイングする）。
+        let (section_hits, best_manual_score, retrieved_manual_ids) =
+            if handoff_items::is_partial_answer_candidate(&decision_result, &handoff_items) {
+                let signal_results = self
+                    .search_handoff_signals(
+                        ctx,
+                        &handoff_items,
+                        &accumulated,
+                        product_key,
+                        manual_corpus.as_deref(),
+                        &live_snapshot,
+                        tools,
+                    )
+                    .await;
+                supplementary_search::fold_signal_search_results(
+                    section_hits,
+                    best_manual_score,
+                    retrieved_manual_ids,
+                    signal_results,
+                    &allowlist,
+                    &ctx.request_id,
+                )
+            } else {
+                (section_hits, best_manual_score, retrieved_manual_ids)
+            };
         // [観測] Issue #79: 第1層の取次で、宣言された customer_ack が複数ルールのマッチにより
         // 使われなかったことを観測できるようにする。下書き生成方針（policy）とは独立に出す。
         // 発話本文・signal の値・宣言文の本文は出力しない

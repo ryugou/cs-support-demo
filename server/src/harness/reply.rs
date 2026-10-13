@@ -60,7 +60,7 @@ use crate::model::SectionHit;
 const MAX_EXCERPT_CHARS: usize = 2_500;
 
 /// LLM に渡す抜粋の最大件数。上位ヒットだけで十分な下書きは書ける。
-const MAX_EXCERPTS: usize = 3;
+pub(crate) const MAX_EXCERPTS: usize = 3;
 
 /// 材料が質問のどの部分にも答えていないことを示す固定トークン（design doc
 /// `2026-10-07-partial-answer-with-handoff-design.md` §3.2）。LLM にはこの場合、本文を書かず
