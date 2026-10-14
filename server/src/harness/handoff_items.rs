@@ -1,10 +1,5 @@
 //! 取り次ぐ項目（handoff items）の導出と、部分回答下書きの可否判定・安全側の歯止め。
 //!
-//! 正本: `docs/superpowers/specs/2026-10-07-partial-answer-with-handoff-design.md` §2, §3.1,
-//! §3.5（2026-10-09 改訂: §3.5(2) のラベル網羅検査を廃止し、§3.5(3) をラベル文字列照合から
-//! signal の surface_forms 照合へ変更。2026-10-12 改訂: §3.5(3) の文の区切りを「。！？」のみに
-//! 変更し改行を区切りから除外、金額の断定を桁区切り・小数点・漢数字まで拾う正規表現に拡張。
-//! 同日の追加改訂で、`￥` / `¥` の検出を後置から、数字の並びの直前に付く前置き記法だけに変更）。
 //! **`decision::decide` 自体は変更しない。** ここは
 //! `decide` が確定した `AnswerDecision`・マッチしたルール/禁止領域から「顧客に見せてよい取次
 //! 項目」を導出し、下書き生成の可否と、生成された下書きが歯止めを通るかを判定する純関数の集まり。
@@ -90,8 +85,7 @@ pub enum PartialAnswerSkipReason {
     NoHandoffItems,
     /// 材料の関連度が `thresholds.low` 未満（または取得不可）。
     InsufficientRelevance,
-    /// その case が既に取次済み。
-    AlreadyEscalated,
+    PartialAnswerDisabled,
     /// 下書き生成そのものが無効（`customer_reply_draft_enabled = false`、または LLM 未設定）。
     DraftGenerationDisabled,
 }
@@ -152,22 +146,22 @@ pub fn is_partial_answer_candidate(
     )
 }
 
-/// [`can_draft_partial_answer`] と [`partial_answer_skip_reason`] が共有する判定本体
-/// （design doc §3.1）。条件1・2は [`partial_answer_structural_eligibility`] が見る。
 fn partial_answer_eligibility(
     decision: &AnswerDecision,
     handoff_items: &[HandoffItem],
     best_manual_score: Option<f32>,
     thresholds: &Thresholds,
-    already_escalated: bool,
+    partial_answer_enabled: bool,
     draft_generation_enabled: bool,
 ) -> PartialAnswerEligibility {
     match partial_answer_structural_eligibility(decision, handoff_items) {
         PartialAnswerEligibility::Eligible => {}
         not_eligible => return not_eligible,
     }
-    if already_escalated {
-        return PartialAnswerEligibility::Ineligible(PartialAnswerSkipReason::AlreadyEscalated);
+    if !partial_answer_enabled {
+        return PartialAnswerEligibility::Ineligible(
+            PartialAnswerSkipReason::PartialAnswerDisabled,
+        );
     }
     if !draft_generation_enabled {
         return PartialAnswerEligibility::Ineligible(
@@ -181,15 +175,12 @@ fn partial_answer_eligibility(
     }
 }
 
-/// 部分回答の可否（決定論、design doc §3.1）。`decision` が `Allowed` のときは常に `false`
-/// （部分回答という概念自体が `Escalate` 専用）。条件の詳細は [`partial_answer_eligibility`]
-/// を参照。
 pub fn can_draft_partial_answer(
     decision: &AnswerDecision,
     handoff_items: &[HandoffItem],
     best_manual_score: Option<f32>,
     thresholds: &Thresholds,
-    already_escalated: bool,
+    partial_answer_enabled: bool,
     draft_generation_enabled: bool,
 ) -> bool {
     matches!(
@@ -198,7 +189,7 @@ pub fn can_draft_partial_answer(
             handoff_items,
             best_manual_score,
             thresholds,
-            already_escalated,
+            partial_answer_enabled,
             draft_generation_enabled,
         ),
         PartialAnswerEligibility::Eligible
@@ -214,7 +205,7 @@ pub fn partial_answer_skip_reason(
     handoff_items: &[HandoffItem],
     best_manual_score: Option<f32>,
     thresholds: &Thresholds,
-    already_escalated: bool,
+    partial_answer_enabled: bool,
     draft_generation_enabled: bool,
 ) -> Option<PartialAnswerSkipReason> {
     match partial_answer_eligibility(
@@ -222,7 +213,7 @@ pub fn partial_answer_skip_reason(
         handoff_items,
         best_manual_score,
         thresholds,
-        already_escalated,
+        partial_answer_enabled,
         draft_generation_enabled,
     ) {
         PartialAnswerEligibility::Ineligible(reason) => Some(reason),
@@ -505,7 +496,7 @@ mod tests {
             &handoff_items_fixture(),
             Some(0.6),
             &thresholds(),
-            false,
+            true,
             true
         ));
         assert!(can_draft_partial_answer(
@@ -513,7 +504,7 @@ mod tests {
             &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
-            false,
+            true,
             true
         ));
     }
@@ -526,7 +517,7 @@ mod tests {
             &[],
             Some(0.9),
             &thresholds(),
-            false,
+            true,
             true
         ));
     }
@@ -541,22 +532,19 @@ mod tests {
             &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
-            false,
+            true,
             true
         ));
     }
 
     #[test]
     fn can_draft_partial_answer_is_false_when_there_are_no_handoff_items() {
-        // design doc §3.1: 取り次ぐ項目が1つも無いとき（第3層の取次を含む）は部分回答の対象に
-        // しない。他の条件（関連十分・未取次・下書き有効・hearing なし）をすべて満たしていても
-        // false になることを固定する。
         assert!(!can_draft_partial_answer(
             &escalate(None),
             &[],
             Some(0.9),
             &thresholds(),
-            false,
+            true,
             true
         ));
     }
@@ -572,7 +560,7 @@ mod tests {
             &[],
             Some(0.9),
             &thresholds(),
-            false,
+            true,
             true
         ));
     }
@@ -586,7 +574,7 @@ mod tests {
             &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
-            false,
+            true,
             true
         ));
     }
@@ -601,7 +589,7 @@ mod tests {
                     &handoff_items_fixture(),
                     Some(0.9),
                     &thresholds(),
-                    false,
+                    true,
                     true
                 ),
                 "layer {layer} must be eligible"
@@ -616,7 +604,7 @@ mod tests {
             &handoff_items_fixture(),
             Some(0.59),
             &thresholds(),
-            false,
+            true,
             true
         ));
         assert!(!can_draft_partial_answer(
@@ -624,19 +612,37 @@ mod tests {
             &handoff_items_fixture(),
             None,
             &thresholds(),
-            false,
+            true,
             true
         ));
     }
 
     #[test]
-    fn can_draft_partial_answer_is_false_when_the_case_is_already_escalated() {
+    fn can_draft_partial_answer_is_true_for_an_already_escalated_case_when_partial_answer_is_enabled(
+    ) {
+        for layer in [1, 2] {
+            assert!(
+                can_draft_partial_answer(
+                    &escalate_at(layer),
+                    &handoff_items_fixture(),
+                    Some(0.9),
+                    &thresholds(),
+                    true,
+                    true
+                ),
+                "layer {layer} must remain eligible even for an already-escalated case"
+            );
+        }
+    }
+
+    #[test]
+    fn can_draft_partial_answer_is_false_when_partial_answer_is_disabled() {
         assert!(!can_draft_partial_answer(
             &escalate(None),
             &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
-            true,
+            false,
             true
         ));
     }
@@ -648,7 +654,7 @@ mod tests {
             &handoff_items_fixture(),
             Some(0.9),
             &thresholds(),
-            false,
+            true,
             false
         ));
     }
@@ -695,7 +701,7 @@ mod tests {
     #[test]
     fn partial_answer_skip_reason_is_none_for_an_allowed_decision() {
         assert_eq!(
-            partial_answer_skip_reason(&allowed(), &[], Some(0.9), &thresholds(), false, true),
+            partial_answer_skip_reason(&allowed(), &[], Some(0.9), &thresholds(), true, true),
             None
         );
     }
@@ -704,7 +710,7 @@ mod tests {
     fn partial_answer_skip_reason_is_none_for_a_layer3_escalate() {
         // 第3層は「見送り」ではなく対象外。記録対象にもしない（design doc §3.1）。
         assert_eq!(
-            partial_answer_skip_reason(&escalate_at(3), &[], Some(0.9), &thresholds(), false, true),
+            partial_answer_skip_reason(&escalate_at(3), &[], Some(0.9), &thresholds(), true, true),
             None
         );
     }
@@ -717,7 +723,7 @@ mod tests {
                 &handoff_items_fixture(),
                 Some(0.9),
                 &thresholds(),
-                false,
+                true,
                 true
             ),
             None
@@ -732,7 +738,7 @@ mod tests {
                 &handoff_items_fixture(),
                 Some(0.9),
                 &thresholds(),
-                false,
+                true,
                 true
             ),
             Some(PartialAnswerSkipReason::HearingDeclared)
@@ -742,7 +748,7 @@ mod tests {
     #[test]
     fn partial_answer_skip_reason_reports_no_handoff_items() {
         assert_eq!(
-            partial_answer_skip_reason(&escalate(None), &[], Some(0.9), &thresholds(), false, true),
+            partial_answer_skip_reason(&escalate(None), &[], Some(0.9), &thresholds(), true, true),
             Some(PartialAnswerSkipReason::NoHandoffItems)
         );
     }
@@ -755,7 +761,7 @@ mod tests {
                 &handoff_items_fixture(),
                 Some(0.1),
                 &thresholds(),
-                false,
+                true,
                 true
             ),
             Some(PartialAnswerSkipReason::InsufficientRelevance)
@@ -766,7 +772,7 @@ mod tests {
                 &handoff_items_fixture(),
                 None,
                 &thresholds(),
-                false,
+                true,
                 true
             ),
             Some(PartialAnswerSkipReason::InsufficientRelevance)
@@ -774,17 +780,17 @@ mod tests {
     }
 
     #[test]
-    fn partial_answer_skip_reason_reports_already_escalated() {
+    fn partial_answer_skip_reason_reports_partial_answer_disabled() {
         assert_eq!(
             partial_answer_skip_reason(
                 &escalate(None),
                 &handoff_items_fixture(),
                 Some(0.9),
                 &thresholds(),
-                true,
+                false,
                 true
             ),
-            Some(PartialAnswerSkipReason::AlreadyEscalated)
+            Some(PartialAnswerSkipReason::PartialAnswerDisabled)
         );
     }
 
@@ -796,7 +802,7 @@ mod tests {
                 &handoff_items_fixture(),
                 Some(0.9),
                 &thresholds(),
-                false,
+                true,
                 false
             ),
             Some(PartialAnswerSkipReason::DraftGenerationDisabled)

@@ -238,15 +238,7 @@ pub async fn run_support_turn(
             // 下書きを使わない（design doc
             // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。事前判定には、下の
             // 二段目ゲート（`second_stage_short_circuit`）に渡すのと同じ `allowlist` を使う。
-            //
-            // design doc `2026-10-07-partial-answer-with-handoff-design.md` §1「対象」:
-            // homesec アドバイザー（CS 連携モードを含む）は部分回答下書きの対象外で、現行の
-            // 挙動（Escalate では下書きを生成しない）を変えない。`already_escalated: true`
-            // 固定で `handoff_items::can_draft_partial_answer` を常に `false` にする。
-            ReplyDraftPolicy::SkipWhenUnused {
-                response_allowlist: &allowlist,
-                already_escalated: true,
-            },
+            support_reply_draft_policy(&allowlist),
             // Issue #61: アドバイザー経路は製品切り替え検知を行わないので抽出済みの値は無い
             // （内部で抽出する）。
             None,
@@ -549,6 +541,14 @@ async fn build_post_evaluate_reply(
                 (SupportReplyKind::Escalation, reply_text)
             }
         }
+    }
+}
+
+fn support_reply_draft_policy(allowlist: &ProductAllowlist) -> ReplyDraftPolicy<'_> {
+    ReplyDraftPolicy::SkipWhenUnused {
+        response_allowlist: allowlist,
+        already_escalated: false,
+        partial_answer_enabled: false,
     }
 }
 
@@ -909,6 +909,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn support_reply_draft_policy_uses_accumulated_signals_and_disables_partial_answer() {
+        let allowlist = ProductAllowlist::from_models(vec!["HS-100".to_string()]);
+        let policy = support_reply_draft_policy(&allowlist);
+        match policy {
+            ReplyDraftPolicy::SkipWhenUnused {
+                response_allowlist,
+                already_escalated,
+                partial_answer_enabled,
+            } => {
+                assert!(std::ptr::eq(response_allowlist, &allowlist));
+                assert!(!already_escalated);
+                assert!(!partial_answer_enabled);
+            }
+            ReplyDraftPolicy::Always => panic!("expected SkipWhenUnused, got Always"),
+        }
+    }
+
     fn test_tool_service() -> ToolService {
         let client = crate::vegapunk::VegapunkClient::connect_lazy_with_limits(
             "http://vegapunk.invalid:6840",
@@ -1039,6 +1057,7 @@ mod tests {
             new_signals: SignalSet::new(),
             handoff_items: Vec::new(),
             partial_answer: false,
+            decision_basis: crate::harness::DecisionBasis::Accumulated,
         }
     }
 

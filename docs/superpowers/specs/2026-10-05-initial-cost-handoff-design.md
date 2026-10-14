@@ -75,7 +75,7 @@ customer_ack: { type: string }
 
 ### 3.3 判定への伝搬
 
-`harness::decision::decide` は、第 1 層でマッチしたルールが**ちょうど 1 件**のときだけ、そのルールの `customer_ack` を `AnswerDecision::Escalate.customer_ack` に複製する。マッチ件数は、会話単位で累積した signal 集合に対する件数で、`harness::rules::count_layer1_matches`（`match_layer1` と同一のマッチ条件、binding を問わない）で数える。2 件以上マッチしたときは、選ばれたルールが宣言を持っていても `None` にする（LLM が受け止め文を作る）。第 2 層・第 3 層の取次では常に `None` にする。1 件のときは `binding` による抑止をしない（`hearing_contract` と異なり、mandatory でも宣言を有効にする）。
+`harness::decision::decide` は、第 1 層でマッチしたルールが**ちょうど 1 件**のときだけ、そのルールの `customer_ack` を `AnswerDecision::Escalate.customer_ack` に複製する。マッチ件数は、`decide` に渡した signal 集合（会話単位で累積した signal 集合。取次済み `/api/reply` のターンでは今ターンの signal のみ。`2026-10-14-answer-after-escalation-design.md` §2）に対する件数で、`harness::rules::count_layer1_matches`（`match_layer1` と同一のマッチ条件、binding を問わない）で数える。2 件以上マッチしたときは、選ばれたルールが宣言を持っていても `None` にする（LLM が受け止め文を作る）。第 2 層・第 3 層の取次では常に `None` にする。1 件のときは `binding` による抑止をしない（`hearing_contract` と異なり、mandatory でも宣言を有効にする）。
 
 宣言文は「そのルールの理由」を顧客に述べる文であり、他のルールにも当たる発話では相談の主題と食い違うため、件数で適用可否を決める。取次の可否・route・`missing`・`hearing` と `match_layer1` の選択規則は変えない。
 
@@ -85,7 +85,7 @@ customer_ack: { type: string }
 
 取次応答（`ReplyAction::EscalationReply`）の受け止め文を次の順で決める。
 
-1. case が取次確定済み（`conv.is_already_escalated()`）の場合は現行どおり `build_already_escalated_reply` を使う。`customer_ack` は使わない。
+1. case が取次確定済み（`conv.is_already_escalated()`）の場合、`customer_ack` は使わない。今ターンの判定に答えられる下書きが無いときは `build_already_escalated_reply` を使う。下書きがあるときの分岐は `2026-10-14-answer-after-escalation-design.md` §4 を正本とする。
 2. 判定が `customer_ack: Some(text)` を持つ場合、LLM を呼ばず `text` を受け止め文にする。`is_continuation` の値によらず同じ文を使う。
 3. それ以外は現行どおり（`draft_ack_text`、drafter が無ければ `fallback_ack`）。
 

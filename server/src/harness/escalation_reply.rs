@@ -297,6 +297,52 @@ pub fn assemble_partial_answer_reply(
     )
 }
 
+const ALREADY_ESCALATED_ANSWER_NOTE_PREFIX: &str = "※先にお受けしたお問い合わせ（";
+const ALREADY_ESCALATED_ANSWER_NOTE_SUFFIX: &str = "）は、担当者が確認を進めています。";
+const ALREADY_ESCALATED_HANDOFF_NOTE_SUFFIX: &str = " で担当者が確認を進めています。";
+
+fn already_escalated_block(note: String, hours_label: &str, out_of_hours_now: bool) -> String {
+    let mut lines = vec![note];
+    if out_of_hours_now {
+        lines.push(out_of_hours_line(hours_label));
+    }
+    lines.join("\n")
+}
+
+pub fn build_answer_in_escalated_case(
+    draft: &str,
+    case_id: &str,
+    hours_label: &str,
+    out_of_hours_now: bool,
+) -> String {
+    let note = format!(
+        "{ALREADY_ESCALATED_ANSWER_NOTE_PREFIX}{}{ALREADY_ESCALATED_ANSWER_NOTE_SUFFIX}",
+        case_ref_line(case_id)
+    );
+    assemble_escalation_reply(
+        draft,
+        &already_escalated_block(note, hours_label, out_of_hours_now),
+    )
+}
+
+pub fn build_partial_answer_in_escalated_case(
+    draft: &str,
+    handoff_labels: &[String],
+    case_id: &str,
+    hours_label: &str,
+    out_of_hours_now: bool,
+) -> String {
+    let note = format!(
+        "{}{ALREADY_ESCALATED_HANDOFF_NOTE_SUFFIX}",
+        case_ref_line(case_id)
+    );
+    assemble_partial_answer_reply(
+        draft,
+        handoff_labels,
+        &already_escalated_block(note, hours_label, out_of_hours_now),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +575,111 @@ mod tests {
             reply,
             "下書きです。\n\n設置日程に関するご質問は、担当者が確認してご案内します。\n\n受付番号: 12345678"
         );
+    }
+
+    #[test]
+    fn build_answer_in_escalated_case_has_three_lines_with_the_draft_first_and_the_case_ref() {
+        let reply = build_answer_in_escalated_case(
+            "下書きです。",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+        );
+        let lines: Vec<&str> = reply.lines().collect();
+        assert_eq!(lines.len(), 3, "unexpected reply: {reply:?}");
+        assert_eq!(lines[0], "下書きです。");
+        assert_eq!(lines[1], "");
+        assert_eq!(
+            lines[2],
+            "※先にお受けしたお問い合わせ（受付番号: 12345678）は、担当者が確認を進めています。"
+        );
+    }
+
+    #[test]
+    fn build_answer_in_escalated_case_uses_the_cases_own_case_ref() {
+        let reply = build_answer_in_escalated_case(
+            "下書きです。",
+            "case-abcdefgh-9999",
+            "平日 10:00〜18:00",
+            false,
+        );
+        assert!(
+            reply.contains(&case_ref("case-abcdefgh-9999")),
+            "the note must reference the case's own case_ref: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn build_answer_in_escalated_case_adds_a_fourth_line_when_out_of_hours() {
+        let reply = build_answer_in_escalated_case(
+            "下書きです。",
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            true,
+        );
+        let lines: Vec<&str> = reply.lines().collect();
+        assert_eq!(lines.len(), 4, "unexpected reply: {reply:?}");
+        let full_block = build_deterministic_block("case-12345678-abcd", "平日 10:00〜18:00", true);
+        let full_block_lines: Vec<&str> = full_block.lines().collect();
+        assert_eq!(lines[3], full_block_lines[2]);
+    }
+
+    #[test]
+    fn build_partial_answer_in_escalated_case_orders_draft_handoff_sentence_and_note_with_blank_lines(
+    ) {
+        let reply = build_partial_answer_in_escalated_case(
+            "下書きです。",
+            &["設置日程に関するご質問".to_string()],
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+        );
+        let lines: Vec<&str> = reply.lines().collect();
+        assert_eq!(lines.len(), 5, "unexpected reply: {reply:?}");
+        assert_eq!(lines[0], "下書きです。");
+        assert_eq!(lines[1], "");
+        assert_eq!(
+            lines[2],
+            "設置日程に関するご質問は、担当者が確認してご案内します。"
+        );
+        assert_eq!(lines[3], "");
+        assert_eq!(
+            lines[4],
+            "受付番号: 12345678 で担当者が確認を進めています。"
+        );
+    }
+
+    #[test]
+    fn build_partial_answer_in_escalated_case_adds_a_sixth_line_when_out_of_hours() {
+        let reply = build_partial_answer_in_escalated_case(
+            "下書きです。",
+            &["設置日程に関するご質問".to_string()],
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            true,
+        );
+        let lines: Vec<&str> = reply.lines().collect();
+        assert_eq!(lines.len(), 6, "unexpected reply: {reply:?}");
+        let full_block = build_deterministic_block("case-12345678-abcd", "平日 10:00〜18:00", true);
+        let full_block_lines: Vec<&str> = full_block.lines().collect();
+        assert_eq!(lines[5], full_block_lines[2]);
+    }
+
+    #[test]
+    fn build_partial_answer_in_escalated_case_uses_the_multi_item_handoff_sentence() {
+        let labels = vec![
+            "初期費用・設置工事費に関するご質問".to_string(),
+            "設置日程に関するご質問".to_string(),
+        ];
+        let reply = build_partial_answer_in_escalated_case(
+            "下書きです。",
+            &labels,
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+        );
+        assert!(reply.contains(&build_handoff_sentence(&labels)));
+        assert!(reply.contains("受付番号: 12345678 で担当者が確認を進めています。"));
     }
 
     /// stub LLM に `draft_text` / `stop_reason` を返させ、`draft_ack_text` の結果を返す。

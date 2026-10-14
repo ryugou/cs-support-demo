@@ -1338,6 +1338,7 @@ mod tests {
             new_signals: crate::harness::signal::SignalSet::new(),
             handoff_items,
             partial_answer,
+            decision_basis: crate::harness::DecisionBasis::Accumulated,
         }
     }
 
@@ -1363,6 +1364,24 @@ mod tests {
         assert_eq!(
             value["handoff_items"],
             serde_json::json!(["初期費用の見積もり"])
+        );
+    }
+
+    #[test]
+    fn evaluate_answerability_response_does_not_leak_decision_basis() {
+        let decision = crate::harness::decision::AnswerDecision::Allowed {
+            source: crate::harness::decision::AnswerSource::Manual,
+            evidence_section_keys: vec!["doc#sec1".to_string()],
+            known_resolution_id: None,
+            stakes: crate::harness::decision::Stakes::Low,
+            threshold: 0.8,
+        };
+        let outcome = evaluation_outcome_with_handoff_items(decision, Vec::new(), false);
+        let response = EvaluateAnswerabilityResponse::from_outcome(outcome, "req-3".to_string());
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(
+            value.get("decision_basis").is_none(),
+            "decision_basis must not appear in the MCP response, got: {value}"
         );
     }
 

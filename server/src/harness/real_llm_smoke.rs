@@ -97,10 +97,7 @@ struct CaseHitsFile {
 }
 
 /// design doc §10.5 の `expect`: このケースの判定・最終応答文がどちらの形になるはずか。
-/// 文字列以外・未知の文字列（綴りミス等）は、追加の検証コードを書かず serde のデシリアライズ
-/// エラーに委ねる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaseExpectation {
     /// 判定が第1層 `Escalate`。部分回答の下書きが採用され、最終応答文に取次の一文・受付番号が
     /// 付く。
@@ -109,43 +106,163 @@ enum CaseExpectation {
     Allowed,
 }
 
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawExpectation {
+    Handoff,
+    Allowed,
+    EscalatedFollowup,
+}
+
+impl RawExpectation {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Handoff => "handoff",
+            Self::Allowed => "allowed",
+            Self::EscalatedFollowup => "escalated_followup",
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVerifyCase {
+    question: String,
+    hits_json: String,
+    expect: RawExpectation,
+    #[serde(default)]
+    followup_question: Option<String>,
+    #[serde(default)]
+    followup_hits_json: Option<String>,
+}
+
+#[derive(Debug)]
+struct FollowupTurn {
+    question: String,
+    hits_json: String,
+}
+
+#[derive(Debug)]
+enum Expectation {
+    Single(CaseExpectation),
+    EscalatedFollowup(FollowupTurn),
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(try_from = "RawVerifyCase")]
 struct VerifyCase {
     question: String,
     hits_json: String,
-    expect: CaseExpectation,
+    expectation: Expectation,
 }
 
-/// `load_verify_cases` が1ケースについて読み込んだ結果（design doc §10.5）。`question_hits` は
-/// 判定に、`signal_hits` は補助検索の材料（未加工）に使う。
+fn non_empty_field(field: &str, value: String, question: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err(format!(
+            "invalid field \"{field}\": empty (case {question:?})"
+        ));
+    }
+    Ok(value)
+}
+
+fn required_followup_field(
+    field: &str,
+    value: Option<String>,
+    question: &str,
+) -> Result<String, String> {
+    let value = value.ok_or_else(|| {
+        format!(
+            "invalid field \"{field}\": required for expect \"escalated_followup\" (case {question:?})"
+        )
+    })?;
+    non_empty_field(field, value, question)
+}
+
+fn reject_followup_fields(raw: &RawVerifyCase) -> Result<(), String> {
+    for (field, value) in [
+        ("followup_question", &raw.followup_question),
+        ("followup_hits_json", &raw.followup_hits_json),
+    ] {
+        if value.is_some() {
+            return Err(format!(
+                "invalid field \"{field}\": not allowed for expect \"{}\" (case {:?})",
+                raw.expect.tag(),
+                raw.question
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl TryFrom<RawVerifyCase> for VerifyCase {
+    type Error = String;
+
+    fn try_from(raw: RawVerifyCase) -> Result<Self, String> {
+        let question = non_empty_field("question", raw.question.clone(), &raw.question)?;
+        let hits_json = non_empty_field("hits_json", raw.hits_json.clone(), &raw.question)?;
+        let expectation = match raw.expect {
+            RawExpectation::EscalatedFollowup => {
+                let question = required_followup_field(
+                    "followup_question",
+                    raw.followup_question,
+                    &raw.question,
+                )?;
+                let hits_json = required_followup_field(
+                    "followup_hits_json",
+                    raw.followup_hits_json,
+                    &raw.question,
+                )?;
+                Expectation::EscalatedFollowup(FollowupTurn {
+                    question,
+                    hits_json,
+                })
+            }
+            RawExpectation::Handoff => {
+                reject_followup_fields(&raw)?;
+                Expectation::Single(CaseExpectation::Handoff)
+            }
+            RawExpectation::Allowed => {
+                reject_followup_fields(&raw)?;
+                Expectation::Single(CaseExpectation::Allowed)
+            }
+        };
+        Ok(Self {
+            question,
+            hits_json,
+            expectation,
+        })
+    }
+}
+
+enum LoadedExpectation {
+    Single(CaseExpectation),
+    EscalatedFollowup {
+        question: String,
+        hits: Vec<SectionHit>,
+    },
+}
+
 struct LoadedVerifyCase {
     question: String,
     question_hits: Vec<SectionHit>,
     signal_hits: Vec<SectionHit>,
-    expect: CaseExpectation,
+    expectation: LoadedExpectation,
 }
 
 /// design doc §10.3・§10.5 の「言い回しの検証」: 相異なる言い回し数、handoff 側の相異なる数、
 /// production 回帰質問を含むことを確認する。
 fn assert_case_paraphrases(cases: &[VerifyCase]) {
-    for (index, case) in cases.iter().enumerate() {
-        assert!(
-            !case.question.trim().is_empty(),
-            "{CASES_ENV} case {} has an empty question (hits_json {:?})",
-            index + 1,
-            case.hits_json
-        );
-    }
     // design doc §10.3: 同じ通りやすい言い回しを複製しても合格しないよう、言い回しは相異なる
     // ことを要求する（codex レビュー RH-8）。
-    let distinct_questions = |expect: Option<CaseExpectation>| -> std::collections::BTreeSet<&str> {
-        cases
-            .iter()
-            .filter(|case| expect.is_none_or(|e| case.expect == e))
-            .map(|case| case.question.trim())
-            .collect()
-    };
-    let distinct = distinct_questions(None);
+    let distinct_questions =
+        |keep: &dyn Fn(&Expectation) -> bool| -> std::collections::BTreeSet<&str> {
+            cases
+                .iter()
+                .filter(|case| keep(&case.expectation))
+                .map(|case| case.question.trim())
+                .collect()
+        };
+    let distinct = distinct_questions(&|_| true);
     assert!(
         distinct.len() >= MIN_VERIFY_CASES,
         "{CASES_ENV} must list at least {MIN_VERIFY_CASES} distinct paraphrases (design doc \
@@ -156,7 +273,8 @@ fn assert_case_paraphrases(cases: &[VerifyCase]) {
     // design doc §10.5: 言い回しによって判定が `Allowed` に割れることがあるため、取次
     // （`"handoff"`）の退行を検出できるよう、相異なる言い回しの handoff ケースを要求し、
     // 本番の回帰の質問文をその1つに含めることを強制する。
-    let handoff = distinct_questions(Some(CaseExpectation::Handoff));
+    let handoff =
+        distinct_questions(&|e| matches!(e, Expectation::Single(CaseExpectation::Handoff)));
     assert!(
         handoff.len() >= MIN_HANDOFF_CASES,
         "{CASES_ENV} must list at least {MIN_HANDOFF_CASES} distinct \"handoff\" paraphrases \
@@ -169,11 +287,19 @@ fn assert_case_paraphrases(cases: &[VerifyCase]) {
          as a \"handoff\" case (design doc §10.5), got handoff questions {handoff:?}"
     );
     // #73 の料金問い合わせ（回答のみ）の経路も必ず 1 件は通す（Copilot レビュー）。
-    let allowed = distinct_questions(Some(CaseExpectation::Allowed));
+    let allowed =
+        distinct_questions(&|e| matches!(e, Expectation::Single(CaseExpectation::Allowed)));
     assert!(
         !allowed.is_empty(),
         "{CASES_ENV} must include at least one distinct \"allowed\" paraphrase (the #73 \
          answer-only price inquiry path, design doc §10.5), got none"
+    );
+    let followup = distinct_questions(&|e| matches!(e, Expectation::EscalatedFollowup(_)));
+    assert!(
+        !followup.is_empty(),
+        "{CASES_ENV} must include at least one distinct \"escalated_followup\" case (the #101 \
+         answer-after-escalation path, design doc 2026-10-14-answer-after-escalation-design.md \
+         §6), got none"
     );
 }
 
@@ -207,30 +333,38 @@ fn load_verify_cases() -> Vec<LoadedVerifyCase> {
         cases.len()
     );
     assert_case_paraphrases(&cases);
-    cases
-        .into_iter()
-        .map(|case| {
-            let hits_body = std::fs::read_to_string(&case.hits_json).unwrap_or_else(|err| {
-                panic!(
-                    "case {:?}: hits_json {:?} must be a readable file: {err}",
-                    case.question, case.hits_json
-                )
-            });
-            let hits_file: CaseHitsFile = serde_json::from_str(&hits_body).unwrap_or_else(|err| {
-                panic!(
-                    "case {:?}: hits_json {:?} is not {{question_hits, signal_hits}} \
-                     search_manual output: {err}",
-                    case.question, case.hits_json
-                )
-            });
-            LoadedVerifyCase {
-                question: case.question,
-                question_hits: hits_file.question_hits.hits,
-                signal_hits: hits_file.signal_hits.hits,
-                expect: case.expect,
-            }
-        })
-        .collect()
+    cases.into_iter().map(load_verify_case).collect()
+}
+
+fn read_case_hits_file(question: &str, field: &str, path: &str) -> CaseHitsFile {
+    let body = std::fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!("case {question:?}: {field} {path:?} must be a readable file: {err}")
+    });
+    serde_json::from_str(&body).unwrap_or_else(|err| {
+        panic!(
+            "case {question:?}: {field} {path:?} is not {{question_hits, signal_hits}} \
+             search_manual output: {err}"
+        )
+    })
+}
+
+fn load_verify_case(case: VerifyCase) -> LoadedVerifyCase {
+    let hits_file = read_case_hits_file(&case.question, "hits_json", &case.hits_json);
+    let expectation = match case.expectation {
+        Expectation::Single(expect) => LoadedExpectation::Single(expect),
+        Expectation::EscalatedFollowup(turn) => LoadedExpectation::EscalatedFollowup {
+            hits: read_case_hits_file(&case.question, "followup_hits_json", &turn.hits_json)
+                .question_hits
+                .hits,
+            question: turn.question,
+        },
+    };
+    LoadedVerifyCase {
+        question: case.question,
+        question_hits: hits_file.question_hits.hits,
+        signal_hits: hits_file.signal_hits.hits,
+        expectation,
+    }
 }
 
 struct TempDir(PathBuf);
@@ -529,6 +663,7 @@ async fn draft_accepted_text(
     let policy = ReplyDraftPolicy::SkipWhenUnused {
         response_allowlist: &fx.allowlist,
         already_escalated: false,
+        partial_answer_enabled: true,
     };
     let plan = super::plan_reply_draft(
         &policy,
@@ -780,6 +915,145 @@ async fn run_once(
     println!("final reply:\n{final_reply}");
 }
 
+async fn assert_turn1_escalates_to_set_up_the_case(
+    fx: &Fixture,
+    turn1_question: &str,
+    turn1_question_hits: &[SectionHit],
+    case_index: usize,
+    total_cases: usize,
+) {
+    let (_, decision1, _) = decide_for_case(
+        fx,
+        turn1_question,
+        turn1_question_hits,
+        case_index,
+        total_cases,
+    )
+    .await;
+    assert!(
+        matches!(decision1, AnswerDecision::Escalate { layer: 1 | 2, .. }),
+        "case {case_index}/{total_cases}: turn 1 ({turn1_question:?}) must escalate at layer 1 \
+         or 2 to set up the already-escalated case, got {decision1:?}"
+    );
+}
+
+async fn draft_allowed_turn2_answer(
+    fx: &Fixture,
+    turn2_question: &str,
+    turn2_question_hits: &[SectionHit],
+    case_index: usize,
+    total_cases: usize,
+) -> (extraction::ExtractionResult, AnswerDecision, String) {
+    let (extracted2, decision2, _) = decide_for_case(
+        fx,
+        turn2_question,
+        turn2_question_hits,
+        case_index,
+        total_cases,
+    )
+    .await;
+    assert!(
+        matches!(decision2, AnswerDecision::Allowed { .. }),
+        "case {case_index}/{total_cases}: turn 2 ({turn2_question:?}) must be answerable on its \
+         own, got {decision2:?}"
+    );
+    let items = handoff_items::handoff_items_for_decision(
+        &decision2,
+        &fx.escalation_rules,
+        &fx.prohibited_domains,
+        &extracted2.signals,
+        turn2_question,
+        &fx.lexicon,
+    );
+    assert!(
+        items.is_empty(),
+        "case {case_index}/{total_cases}: an Allowed decision must have no handoff items, got \
+         {items:?}"
+    );
+    let best_score = turn2_question_hits.first().map(|h| h.score);
+    let draft_text = draft_accepted_text(
+        fx,
+        &decision2,
+        extracted2.mode,
+        &items,
+        turn2_question,
+        turn2_question_hits,
+        best_score,
+        case_index,
+        total_cases,
+    )
+    .await;
+    (extracted2, decision2, draft_text)
+}
+
+async fn run_escalated_followup_case(
+    fx: &Fixture,
+    turn1_question: &str,
+    turn1_question_hits: &[SectionHit],
+    turn2_question: &str,
+    turn2_question_hits: &[SectionHit],
+    case_index: usize,
+    total_cases: usize,
+) {
+    println!(
+        "==== real_llm_partial_answer_smoke case {case_index}/{total_cases} \
+         (EscalatedFollowup): turn1={turn1_question:?} turn2={turn2_question:?} ===="
+    );
+    assert_turn1_escalates_to_set_up_the_case(
+        fx,
+        turn1_question,
+        turn1_question_hits,
+        case_index,
+        total_cases,
+    )
+    .await;
+    let case_id = format!("case-smoketest-escalated{case_index:08}");
+    let (extracted2, decision2, draft_text) = draft_allowed_turn2_answer(
+        fx,
+        turn2_question,
+        turn2_question_hits,
+        case_index,
+        total_cases,
+    )
+    .await;
+    let outcome = build_outcome(
+        &decision2,
+        &extracted2,
+        turn2_question_hits,
+        draft_text.clone(),
+    );
+    let conv = super::CaseConvState {
+        clarify_turns: 0,
+        awaiting_time_pref: false,
+        time_pref_false_count: 0,
+        preferred_contact_time: None,
+        time_pref_extraction_error_count: 0,
+        escalation_confirmed: true,
+    };
+    let action = crate::api::decide_reply_action(&outcome, &conv, &fx.config.api);
+    let text = match action {
+        crate::api::ReplyAction::Answer(text) => text,
+        other => panic!(
+            "case {case_index}/{total_cases}: turn 2 ({turn2_question:?}) must map to \
+             ReplyAction::Answer for an Allowed decision with a non-truncated draft, got {other:?}"
+        ),
+    };
+    let final_reply =
+        crate::api::compose_answer_reply_text(&conv, text, &case_id, &fx.hours_label, false);
+    let expected_reply = escalation_reply::build_answer_in_escalated_case(
+        &draft_text,
+        &case_id,
+        &fx.hours_label,
+        false,
+    );
+    assert_eq!(
+        final_reply, expected_reply,
+        "case {case_index}/{total_cases}: final reply is not the drafted answer followed by the \
+         already-escalated note"
+    );
+    println!("final reply:\n{final_reply}");
+}
+
 /// 本番 `evaluate()` が返す `EvaluationOutcome` を、このテストが持つ値（単ターンなので
 /// `signals` = `accumulated_signals`）から組み立てる。`decide_reply_action` に渡すため。
 fn build_outcome(
@@ -804,6 +1078,7 @@ fn build_outcome(
         new_signals: extracted.signals.clone(),
         handoff_items: Vec::new(),
         partial_answer: false,
+        decision_basis: super::DecisionBasis::Accumulated,
     }
 }
 
@@ -896,16 +1171,36 @@ async fn real_llm_partial_answer_smoke() {
         // （`filter_out_of_scope_hits`）に通してから判定・下書きへ渡す。補助検索の併合は取次
         // 候補のときだけ `run_once` 内で行う（design doc §10.2・§10.5）。
         let question_hits = super::filter_out_of_scope_hits(case.question_hits, &fx.allowlist);
-        run_once(
-            &fx,
-            &case.question,
-            &question_hits,
-            &case.signal_hits,
-            case.expect,
-            case_index,
-            total_cases,
-        )
-        .await;
+        match case.expectation {
+            LoadedExpectation::EscalatedFollowup {
+                question: followup_question,
+                hits: followup_hits,
+            } => {
+                let followup_hits = super::filter_out_of_scope_hits(followup_hits, &fx.allowlist);
+                run_escalated_followup_case(
+                    &fx,
+                    &case.question,
+                    &question_hits,
+                    &followup_question,
+                    &followup_hits,
+                    case_index,
+                    total_cases,
+                )
+                .await;
+            }
+            LoadedExpectation::Single(expect) => {
+                run_once(
+                    &fx,
+                    &case.question,
+                    &question_hits,
+                    &case.signal_hits,
+                    expect,
+                    case_index,
+                    total_cases,
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -940,21 +1235,135 @@ fn verify_case_rejects_invalid_expect() {
     }
 }
 
-/// 空・空白のみの `question` は、`trim()` 後に1つの「相異なる言い回し」として数えられてしまう
-/// ため、入口（`assert_case_paraphrases`）で拒否する。他は合格する入力にして、拒否の原因が
-/// 空の質問だけであることを固定する。
-#[test]
-#[should_panic(expected = "case 4 has an empty question")]
-fn case_paraphrases_reject_an_empty_question() {
-    let case = |question: &str, expect: CaseExpectation| VerifyCase {
+fn paraphrase_case(question: &str, expect: CaseExpectation) -> VerifyCase {
+    VerifyCase {
         question: question.to_string(),
         hits_json: "h.json".to_string(),
-        expect,
-    };
+        expectation: Expectation::Single(expect),
+    }
+}
+
+fn followup_paraphrase_case(question: &str) -> VerifyCase {
+    VerifyCase {
+        question: question.to_string(),
+        hits_json: "h.json".to_string(),
+        expectation: Expectation::EscalatedFollowup(FollowupTurn {
+            question: "設定方法を教えてください".to_string(),
+            hits_json: "f.json".to_string(),
+        }),
+    }
+}
+
+#[test]
+#[should_panic(expected = "at least one distinct \"escalated_followup\" case")]
+fn case_paraphrases_reject_a_list_without_an_escalated_followup_case() {
     assert_case_paraphrases(&[
-        case(PRODUCTION_REGRESSION_QUESTION, CaseExpectation::Handoff),
-        case("導入費用を教えてください", CaseExpectation::Handoff),
-        case("設定方法を教えてください", CaseExpectation::Allowed),
-        case("   ", CaseExpectation::Allowed),
+        paraphrase_case(PRODUCTION_REGRESSION_QUESTION, CaseExpectation::Handoff),
+        paraphrase_case("導入費用を教えてください", CaseExpectation::Handoff),
+        paraphrase_case("設定方法を教えてください", CaseExpectation::Allowed),
     ]);
+}
+
+#[test]
+fn case_paraphrases_accept_a_list_with_an_escalated_followup_case() {
+    assert_case_paraphrases(&[
+        paraphrase_case(PRODUCTION_REGRESSION_QUESTION, CaseExpectation::Handoff),
+        paraphrase_case("導入費用を教えてください", CaseExpectation::Handoff),
+        paraphrase_case("設定方法を教えてください", CaseExpectation::Allowed),
+        followup_paraphrase_case("取付工事の費用はいくらですか"),
+    ]);
+}
+
+#[test]
+fn verify_case_followup_fields_are_validated_against_expect() {
+    let case_json = |expect: &str, question: bool, hits: bool| {
+        let mut fields = vec![
+            r#""question":"q""#.to_string(),
+            r#""hits_json":"h.json""#.to_string(),
+            format!(r#""expect":"{expect}""#),
+        ];
+        if question {
+            fields.push(r#""followup_question":"q2""#.to_string());
+        }
+        if hits {
+            fields.push(r#""followup_hits_json":"f.json""#.to_string());
+        }
+        format!("{{{}}}", fields.join(","))
+    };
+    let cases: [(&str, String, Option<&str>); 12] = [
+        (
+            "escalated_followup with both fields",
+            case_json("escalated_followup", true, true),
+            None,
+        ),
+        (
+            "handoff without followup fields",
+            case_json("handoff", false, false),
+            None,
+        ),
+        (
+            "escalated_followup without followup_question",
+            case_json("escalated_followup", false, true),
+            Some("invalid field \"followup_question\": required"),
+        ),
+        (
+            "escalated_followup without followup_hits_json",
+            case_json("escalated_followup", true, false),
+            Some("invalid field \"followup_hits_json\": required"),
+        ),
+        (
+            "handoff with followup_question",
+            case_json("handoff", true, false),
+            Some("invalid field \"followup_question\": not allowed for expect \"handoff\""),
+        ),
+        (
+            "handoff with followup_hits_json",
+            case_json("handoff", false, true),
+            Some("invalid field \"followup_hits_json\": not allowed for expect \"handoff\""),
+        ),
+        (
+            "allowed with followup_question",
+            case_json("allowed", true, false),
+            Some("invalid field \"followup_question\": not allowed for expect \"allowed\""),
+        ),
+        (
+            "allowed with followup_hits_json",
+            case_json("allowed", false, true),
+            Some("invalid field \"followup_hits_json\": not allowed for expect \"allowed\""),
+        ),
+        (
+            "unknown field",
+            r#"{"question":"q","hits_json":"h.json","expect":"handoff","followup_questoin":"q2"}"#.to_string(),
+            Some("unknown field `followup_questoin`"),
+        ),
+        (
+            "empty question",
+            r#"{"question":"","hits_json":"h.json","expect":"handoff"}"#.to_string(),
+            Some("invalid field \"question\": empty"),
+        ),
+        (
+            "whitespace-only followup_question",
+            r#"{"question":"q","hits_json":"h.json","expect":"escalated_followup","followup_question":"  \n","followup_hits_json":"f.json"}"#.to_string(),
+            Some("invalid field \"followup_question\": empty"),
+        ),
+        (
+            "empty followup_hits_json",
+            r#"{"question":"q","hits_json":"h.json","expect":"escalated_followup","followup_question":"q2","followup_hits_json":""}"#.to_string(),
+            Some("invalid field \"followup_hits_json\": empty"),
+        ),
+    ];
+    for (label, json, expected_error) in cases {
+        match (serde_json::from_str::<VerifyCase>(&json), expected_error) {
+            (Ok(_), None) => {}
+            (Err(err), Some(fragment)) => assert!(
+                err.to_string().contains(fragment)
+                    && (!fragment.starts_with("invalid field")
+                        || err.to_string().contains("(case \"")),
+                "{label}: expected an error containing {fragment:?}, got {err:?}"
+            ),
+            (result, expected) => {
+                panic!("{label}: expected error {expected:?}, got {result:?}")
+            }
+        }
+    }
 }

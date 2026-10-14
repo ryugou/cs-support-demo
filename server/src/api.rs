@@ -729,13 +729,6 @@ fn partial_answer_draft_for_escalation(
 /// Issue #54 A-2 (b): `ReplyAction::EscalationReply` の応答文を組み立てる（`reply_handler` の
 /// 同分岐から抽出した部品）。
 ///
-/// `conv.is_already_escalated()`（受付番号発行済みの後続ターン）なら、フルブロック（受け止め文の
-/// LLM 生成 + `build_deterministic_block` の再掲）を作らず、`escalation_reply::
-/// build_already_escalated_reply` の簡潔な応答に倒す。LLM を一切呼ばないため、A-2 (a) の
-/// 「質問しない」制約はそもそも LLM 生成物にしないことで構造的に満たす。この経路では `conv` を
-/// 一切変更しない（新たに希望時間帯を聞き直す必要が無いため `arm_time_pref_solicitation` を
-/// 呼ばない）。
-///
 /// 新規のエスカレーション確定（`is_already_escalated() == false`）では、従来どおり受け止め文を
 /// 生成し（`drafter` が `None` なら `fallback_ack`）、§3.5 応答側ゲート（`gate_generated_text`）を
 /// 通してから `build_deterministic_block` と連結する。`arm_time_pref_solicitation(conv)` を呼び、
@@ -757,14 +750,6 @@ fn partial_answer_draft_for_escalation(
 /// NG 表現ゲート（`escalation_reply::gate_declared_ack_text`）と、直後の取扱製品ゲート
 /// （`gate_generated_text`）の両方を通す。
 ///
-/// `customer_reply_draft`（design doc `2026-10-07-partial-answer-with-handoff-design.md` §3.3）:
-/// `evaluate()` が返した部分回答の下書き（§3.1 の条件を満たし、§3.5 の歯止めを通過済み。満たさ
-/// なければ呼び出し元から渡る値はそもそも `None`）がある場合、下書き + 取次の一文
-/// （`escalation_reply::build_handoff_sentence`。何を担当者に回したかを LLM の出力に依存させ
-/// ないよう、コードが決定論で組み立てる）を空行で連結してから決定論ブロックへ渡す。既に取次済み
-/// （上記の `build_already_escalated_reply` 分岐）が最優先で、次点がこの下書き分岐で、受け止め文
-/// （`customer_ack` / LLM 生成 / 固定文）はいずれも満たさないときのフォールバックになる。
-///
 /// `handoff_items` は `outcome.handoff_items`（取り次ぐ項目の顧客提示用ラベル列）をそのまま
 /// 渡す。下書きが無い（＝取次の一文も組み立てない）ときはこの引数は読まれない。
 #[allow(clippy::too_many_arguments)]
@@ -784,6 +769,26 @@ async fn build_escalation_reply_text(
     customer_reply_draft: Option<&str>,
     handoff_items: &[String],
 ) -> (String, bool) {
+    if let Some(draft) = customer_reply_draft {
+        if conv.is_already_escalated() {
+            return (
+                escalation_reply::build_partial_answer_in_escalated_case(
+                    draft,
+                    handoff_items,
+                    case_id,
+                    hours_label,
+                    out_of_hours_now,
+                ),
+                false,
+            );
+        }
+        let block =
+            escalation_reply::build_deterministic_block(case_id, hours_label, out_of_hours_now);
+        let reply_text =
+            escalation_reply::assemble_partial_answer_reply(draft, handoff_items, &block);
+        arm_time_pref_solicitation(conv);
+        return (reply_text, true);
+    }
     if conv.is_already_escalated() {
         return (
             escalation_reply::build_already_escalated_reply(
@@ -794,14 +799,6 @@ async fn build_escalation_reply_text(
             ),
             false,
         );
-    }
-    if let Some(draft) = customer_reply_draft {
-        let block =
-            escalation_reply::build_deterministic_block(case_id, hours_label, out_of_hours_now);
-        let reply_text =
-            escalation_reply::assemble_partial_answer_reply(draft, handoff_items, &block);
-        arm_time_pref_solicitation(conv);
-        return (reply_text, true);
     }
     let ack_text = match customer_ack {
         Some(declared) => escalation_reply::gate_declared_ack_text(declared, ng, is_continuation),
@@ -835,6 +832,25 @@ async fn build_escalation_reply_text(
     let reply_text = escalation_reply::assemble_escalation_reply(&ack_text, &block);
     arm_time_pref_solicitation(conv);
     (reply_text, true)
+}
+
+pub(crate) fn compose_answer_reply_text(
+    conv: &crate::harness::CaseConvState,
+    text: String,
+    case_id: &str,
+    hours_label: &str,
+    out_of_hours_now: bool,
+) -> String {
+    if conv.is_already_escalated() {
+        escalation_reply::build_answer_in_escalated_case(
+            &text,
+            case_id,
+            hours_label,
+            out_of_hours_now,
+        )
+    } else {
+        text
+    }
 }
 
 /// 「初回か継続か」をサーバがコードで判定する純関数（会話フロー v1.1 design doc §3）。
@@ -1397,6 +1413,17 @@ fn conv_state_load_failed(err: &anyhow::Error, request_id: &str, case_id: &str) 
     )
 }
 
+fn already_escalated_before_evaluate(
+    loaded: anyhow::Result<crate::harness::CaseConvState>,
+    request_id: &str,
+    case_id: &str,
+) -> Result<bool, Response> {
+    match loaded {
+        Ok(conv) => Ok(conv.is_already_escalated()),
+        Err(err) => Err(conv_state_load_failed(&err, request_id, case_id)),
+    }
+}
+
 /// conv state の保存に失敗した場合の共通処理。
 fn conv_state_save_failed(err: &anyhow::Error, request_id: &str, case_id: &str) -> Response {
     tracing::error!(
@@ -1857,28 +1884,14 @@ async fn reply_handler(
         evaluate_inputs_for_turn(case_switch.is_some(), req.case_id.as_deref(), &history);
     let is_continuation = is_continuation(eval_history, eval_case_id);
 
-    // design doc `2026-10-07-partial-answer-with-handoff-design.md` §3.1・§3.6: 部分回答の
-    // 可否判定に使う「この case は既に取次済みか」を、evaluate() を呼ぶ前に確定済みの
-    // `eval_case_id` から読む（`outcome.case_id` は evaluate() が確定した**後**にしか無いため、
-    // ここでは使えない）。
-    // - `eval_case_id` が既存 case を指すとき: その会話状態の `is_already_escalated()`。
-    // - 会話状態の読み取り自体が失敗したとき: `true`（安全側。部分回答を試みず現行動作に倒す。
-    //   ターン欠落より応答継続を優先する既存の設計思想に合わせる）。
-    // - 新規会話（`eval_case_id` が `None`）のとき: `false`。
     let already_escalated = match eval_case_id {
-        Some(case_id) => match state.harness.load_conv_state(&ctx, case_id).await {
-            Ok(conv) => conv.is_already_escalated(),
-            Err(err) => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    case_id = %case_id,
-                    error = %err,
-                    "answer api: failed to load conv state before evaluate(); treating this \
-                     turn as already escalated (safe side) so the partial-answer draft path is \
-                     skipped (the main evaluate() call below still proceeds)"
-                );
-                true
-            }
+        Some(case_id) => match already_escalated_before_evaluate(
+            state.harness.load_conv_state(&ctx, case_id).await,
+            &request_id,
+            case_id,
+        ) {
+            Ok(value) => value,
+            Err(response) => return response,
         },
         None => false,
     };
@@ -1902,11 +1915,10 @@ async fn reply_handler(
             // 下書きを使わない（design doc
             // `2026-10-05-skip-unused-draft-and-ack-log-design.md` §2.2）。事前判定には、下の
             // 二段目ゲート（`second_stage_short_circuit`）に渡すのと同じ `allowlist` を使う。
-            // `already_escalated` は部分回答の可否（§3.1・§3.6）専用で、上記の省略規則とは
-            // 独立に `handoff_items::can_draft_partial_answer` が見る。
             ReplyDraftPolicy::SkipWhenUnused {
                 response_allowlist: &allowlist,
                 already_escalated,
+                partial_answer_enabled: true,
             },
             // Issue #61: 切り替え検知で抽出済みなら（切り替えターンの新 case 判定も含め）同じ
             // 抽出結果（signal + 生の製品参照）を渡し、evaluate() 内部での再抽出を省く。採用規則
@@ -2059,8 +2071,21 @@ async fn reply_handler(
                 );
             }
 
+            let out_of_hours_now = !hours::is_within_business_hours(
+                &state.config.api.business_hours,
+                chrono::Utc::now(),
+            );
+            let hours_label = hours::business_hours_label(&state.config.api.business_hours);
+
             match action {
                 ReplyAction::Answer(text) => {
+                    let reply_text = compose_answer_reply_text(
+                        &conv,
+                        text,
+                        &outcome.case_id,
+                        &hours_label,
+                        out_of_hours_now,
+                    );
                     ok_reply_response(
                         &state,
                         &ctx,
@@ -2068,7 +2093,7 @@ async fn reply_handler(
                         &req.message,
                         &outcome.audit_event_id,
                         effective_end_user_id,
-                        text,
+                        reply_text,
                         outcome.case_id,
                         case_reset,
                     )
@@ -2171,18 +2196,6 @@ async fn reply_handler(
                     .await
                 }
                 ReplyAction::EscalationReply => {
-                    // Issue #54: 確定済み（受付番号発行済み）case の後続ターンかどうかで、
-                    // フルブロック生成（LLM + 決定的ブロック）と簡潔な確定済み応答を切り替える。
-                    // Warning 1 是正（reviewer 第2ラウンド）: 以前はここで `conv.is_already_
-                    // escalated()` を先読みし、「この分岐に来る前に conv を変更するコードが
-                    // 無い」という散文コメントだけを根拠に `save_conv_state` の要否を決めていた。
-                    // いまは `build_escalation_reply_text` 自身が返す `conv_mutated` を根拠にする
-                    // （先読みした古い判定に基づいて将来の変更を黙って捨てる事故を防ぐ）。
-                    let out_of_hours_now = !hours::is_within_business_hours(
-                        &state.config.api.business_hours,
-                        chrono::Utc::now(),
-                    );
-                    let hours_label = hours::business_hours_label(&state.config.api.business_hours);
                     // Issue #76: マッチした第1層ルールが顧客向けの受け止め文を宣言していれば、
                     // それを使う（`build_escalation_reply_text` 内で LLM 生成を一切行わない）。
                     let customer_ack = escalation_customer_ack(&outcome.decision);
@@ -2737,6 +2750,7 @@ mod tests {
             new_signals: crate::harness::signal::SignalSet::new(),
             handoff_items: Vec::new(),
             partial_answer: false,
+            decision_basis: crate::harness::DecisionBasis::Accumulated,
         }
     }
 
@@ -2796,6 +2810,23 @@ mod tests {
             time_pref_extraction_error_count: 0,
             escalation_confirmed: false,
         }
+    }
+
+    #[test]
+    fn already_escalated_before_evaluate_reads_the_loaded_conv_state() {
+        let mut conv = default_conv_state();
+        assert!(!already_escalated_before_evaluate(Ok(conv.clone()), "r", "c").unwrap());
+        conv.escalation_confirmed = true;
+        assert!(already_escalated_before_evaluate(Ok(conv), "r", "c").unwrap());
+    }
+
+    #[test]
+    fn already_escalated_before_evaluate_returns_500_instead_of_assuming_escalated_on_load_failure()
+    {
+        let response =
+            already_escalated_before_evaluate(Err(anyhow::anyhow!("vegapunk down")), "r", "c")
+                .unwrap_err();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     fn default_api_config() -> crate::config::ApiConfig {
@@ -2981,6 +3012,19 @@ mod tests {
         outcome.extraction_mode = crate::harness::extraction::ExtractionMode::LexiconFallback;
         let mut conv = default_conv_state();
         conv.clarify_turns = 2; // < clarify_max_turns(3): 通常なら Clarify になる
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    #[test]
+    fn decide_reply_action_forces_escalation_when_extraction_mode_is_lexicon_fallback_even_when_the_case_is_already_escalated(
+    ) {
+        let mut outcome = base_outcome(allowed_decision(), true);
+        outcome.customer_reply_draft = Some("下書き本文".to_string());
+        outcome.customer_reply_draft_truncated = false;
+        outcome.extraction_mode = crate::harness::extraction::ExtractionMode::LexiconFallback;
+        let mut conv = default_conv_state();
+        conv.escalation_confirmed = true;
         let action = decide_reply_action(&outcome, &conv, &default_api_config());
         assert_eq!(action, ReplyAction::EscalationReply);
     }
@@ -4342,49 +4386,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_escalation_reply_text_ignores_the_partial_answer_draft_when_already_escalated() {
-        let (drafter, log) = stub_drafter("この下書きも絶対に使われてはならない").await;
-        let allowlist = response_gate_fixture_allowlist();
-        let mut conv = default_conv_state();
-        conv.awaiting_time_pref = true; // 受付番号発行済みの後続ターンを模す
-        let draft =
-            "月額利用料金は1台1,540円（税込）です。初期費用・設置工事費に関するご質問は担当者がご案内します。";
-        let handoff_items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+    async fn build_escalation_reply_text_uses_the_partial_answer_draft_when_already_escalated() {
+        for (label, awaiting_time_pref, escalation_confirmed) in [
+            ("awaiting_time_pref", true, false),
+            ("escalation_confirmed alone", false, true),
+        ] {
+            let (drafter, log) = stub_drafter("この下書きも絶対に使われてはならない").await;
+            let allowlist = response_gate_fixture_allowlist();
+            let mut conv = default_conv_state();
+            conv.awaiting_time_pref = awaiting_time_pref;
+            conv.escalation_confirmed = escalation_confirmed;
+            let draft =
+                "月額利用料金は1台1,540円（税込）です。初期費用・設置工事費に関するご質問は担当者がご案内します。";
+            let handoff_items = vec!["初期費用・設置工事費に関するご質問".to_string()];
+            let preferred_contact_time_before = conv.preferred_contact_time.clone();
 
-        let (reply_text, conv_mutated) = build_escalation_reply_text(
-            Some(&drafter),
-            &test_ng(),
-            700,
-            "追加の補足です",
-            true,
-            None,
-            &allowlist,
-            "req-1",
+            let (reply_text, conv_mutated) = build_escalation_reply_text(
+                Some(&drafter),
+                &test_ng(),
+                700,
+                "追加の補足です",
+                true,
+                None,
+                &allowlist,
+                "req-1",
+                "case-12345678-abcd",
+                "平日 10:00〜18:00",
+                false,
+                &mut conv,
+                Some(draft),
+                &handoff_items,
+            )
+            .await;
+
+            assert_eq!(
+                reply_text,
+                escalation_reply::build_partial_answer_in_escalated_case(
+                    draft,
+                    &handoff_items,
+                    "case-12345678-abcd",
+                    "平日 10:00〜18:00",
+                    false,
+                ),
+                "{label}"
+            );
+            assert_eq!(log.lock().unwrap().len(), 0, "{label}");
+            assert!(!conv_mutated, "{label}");
+            assert_eq!(conv.awaiting_time_pref, awaiting_time_pref, "{label}");
+            assert_eq!(conv.escalation_confirmed, escalation_confirmed, "{label}");
+            assert_eq!(
+                conv.preferred_contact_time, preferred_contact_time_before,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_answer_reply_text_returns_the_text_verbatim_when_not_already_escalated() {
+        let conv = default_conv_state();
+        let text = compose_answer_reply_text(
+            &conv,
+            "回答本文".to_string(),
             "case-12345678-abcd",
             "平日 10:00〜18:00",
             false,
-            &mut conv,
-            Some(draft),
-            &handoff_items,
-        )
-        .await;
+        );
+        assert_eq!(text, "回答本文");
+    }
 
+    #[test]
+    fn compose_answer_reply_text_wraps_the_text_when_already_escalated() {
+        let mut conv = default_conv_state();
+        conv.escalation_confirmed = true;
+        let text = compose_answer_reply_text(
+            &conv,
+            "回答本文".to_string(),
+            "case-12345678-abcd",
+            "平日 10:00〜18:00",
+            false,
+        );
         assert_eq!(
-            reply_text,
-            escalation_reply::build_already_escalated_reply(
+            text,
+            escalation_reply::build_answer_in_escalated_case(
+                "回答本文",
                 "case-12345678-abcd",
                 "平日 10:00〜18:00",
-                true,
-                false
-            ),
-            "既に取次済みの case では customer_reply_draft があっても既取次応答を使うこと\
-             （design doc §3.3 の分岐1が分岐2より優先する）"
-        );
-        assert!(!reply_text.contains(draft));
-        assert_eq!(log.lock().unwrap().len(), 0);
-        assert!(
-            !conv_mutated,
-            "既取次応答の経路は conv_mutated = false を報告すること"
+                false,
+            )
         );
     }
 
