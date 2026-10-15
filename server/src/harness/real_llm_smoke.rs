@@ -27,6 +27,7 @@ use super::extraction::{
     ClassifyProductReferences, HybridExtractor, ProductReferenceExtractor,
 };
 use super::product_gate::ProductAllowlist;
+use super::reply::{ReplyHistoryRole, ReplyHistoryTurn};
 use super::rules::{match_layer1, matching_layer1_rules};
 use super::{audit, authn, egress, escalation_reply, handoff_items, hours, rules, signal};
 use super::{Harness, ReplyDraftPolicy};
@@ -528,12 +529,34 @@ async fn decide_for_case(
     println!("signals: {signals:?} (extraction_mode={mode:?})");
     println!("product_references: {product_references:?}");
 
-    // `Harness::evaluate` と同じ式（単ターンなので accumulated = signals）。
+    let (decision, matched_layer1_rule_ids) = decide_on_signals(
+        fx,
+        question,
+        question_hits,
+        signals,
+        signals,
+        case_index,
+        total_cases,
+    );
+    println!("decision: {decision:?}");
+    println!("matched layer-1 rule ids: {matched_layer1_rule_ids:?}");
+    (extracted, decision, matched_layer1_rule_ids)
+}
+
+fn decide_on_signals(
+    fx: &Fixture,
+    question: &str,
+    question_hits: &[SectionHit],
+    question_signals: &signal::SignalSet,
+    accumulated: &signal::SignalSet,
+    case_index: usize,
+    total_cases: usize,
+) -> (AnswerDecision, Vec<String>) {
     let stakes_input = StakesInput {
-        mandatory_domain_near: rules::match_layer2(&fx.mandatory_domains, signals, question)
+        mandatory_domain_near: rules::match_layer2(&fx.mandatory_domains, accumulated, question)
             .is_some(),
         ng_near_hit: fx.harness.ng.near_hit(question),
-        hazard_signal_count: signals
+        hazard_signal_count: accumulated
             .iter()
             .filter(|s| fx.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
             .count(),
@@ -550,7 +573,7 @@ async fn decide_for_case(
         .map(|h| h.section_key.clone())
         .collect();
     let decision = decision::decide(&DecisionInput {
-        question_signals: signals,
+        question_signals,
         question_raw: question,
         rules: &fx.escalation_rules,
         domains: &fx.prohibited_domains,
@@ -561,13 +584,12 @@ async fn decide_for_case(
         thresholds: &fx.thresholds,
         default_route: &fx.config.harness.default_escalation_route,
     });
-    let matched_layer1_rule_ids: Vec<String> = matching_layer1_rules(&fx.escalation_rules, signals)
-        .into_iter()
-        .map(|rule| rule.id.clone())
-        .collect();
-    println!("decision: {decision:?}");
-    println!("matched layer-1 rule ids: {matched_layer1_rule_ids:?}");
-    (extracted, decision, matched_layer1_rule_ids)
+    let matched_layer1_rule_ids: Vec<String> =
+        matching_layer1_rules(&fx.escalation_rules, question_signals)
+            .into_iter()
+            .map(|rule| rule.id.clone())
+            .collect();
+    (decision, matched_layer1_rule_ids)
 }
 
 /// `decide_for_case` の判定が design doc §10.5 の `"handoff"` ケースの期待（第1層 `Escalate`
@@ -656,13 +678,14 @@ async fn draft_accepted_text(
     question: &str,
     merged_hits: &[SectionHit],
     merged_best_score: Option<f32>,
+    history: &[ReplyHistoryTurn],
     case_index: usize,
     total_cases: usize,
 ) -> String {
     let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
     let policy = ReplyDraftPolicy::SkipWhenUnused {
         response_allowlist: &fx.allowlist,
-        already_escalated: false,
+        already_escalated: !history.is_empty(),
         partial_answer_enabled: true,
     };
     let plan = super::plan_reply_draft(
@@ -683,8 +706,8 @@ async fn draft_accepted_text(
                 decision,
                 merged_hits,
                 &[],
-                &[],
-                false,
+                history,
+                !history.is_empty(),
                 &fx.allowlist,
                 &labels,
                 plan.partial_answer_ok,
@@ -898,11 +921,12 @@ async fn run_once(
         question,
         &material_hits,
         material_best_score,
+        &[],
         case_index,
         total_cases,
     )
     .await;
-    let outcome = build_outcome(&decision, &extracted, &material_hits, draft_text);
+    let outcome = build_single_turn_outcome(&decision, &extracted, &material_hits, draft_text);
     let final_reply = assert_final_reply(
         fx,
         expect,
@@ -915,14 +939,20 @@ async fn run_once(
     println!("final reply:\n{final_reply}");
 }
 
+struct EscalatedTurn1 {
+    extracted: extraction::ExtractionResult,
+    assistant_reply: String,
+}
+
 async fn assert_turn1_escalates_to_set_up_the_case(
     fx: &Fixture,
     turn1_question: &str,
     turn1_question_hits: &[SectionHit],
+    case_id: &str,
     case_index: usize,
     total_cases: usize,
-) {
-    let (_, decision1, _) = decide_for_case(
+) -> EscalatedTurn1 {
+    let (extracted, decision1, _) = decide_for_case(
         fx,
         turn1_question,
         turn1_question_hits,
@@ -935,33 +965,140 @@ async fn assert_turn1_escalates_to_set_up_the_case(
         "case {case_index}/{total_cases}: turn 1 ({turn1_question:?}) must escalate at layer 1 \
          or 2 to set up the already-escalated case, got {decision1:?}"
     );
+    let assistant_reply = escalation_reply::assemble_escalation_reply(
+        escalation_reply::fallback_ack(false).0,
+        &escalation_reply::build_deterministic_block(case_id, &fx.hours_label, false),
+    );
+    EscalatedTurn1 {
+        extracted,
+        assistant_reply,
+    }
 }
 
-async fn draft_allowed_turn2_answer(
+fn select_turn_only_signals<'a>(
+    fx: &Fixture,
+    turn2_signals: &'a signal::SignalSet,
+    accumulated: &'a signal::SignalSet,
+    case_index: usize,
+    total_cases: usize,
+) -> &'a signal::SignalSet {
+    let policy = ReplyDraftPolicy::SkipWhenUnused {
+        response_allowlist: &fx.allowlist,
+        already_escalated: true,
+        partial_answer_enabled: true,
+    };
+    let (decide_signals, basis) =
+        super::decide_signals_for_policy(&policy, turn2_signals, accumulated);
+    assert_eq!(
+        basis,
+        super::DecisionBasis::TurnOnly,
+        "case {case_index}/{total_cases}: an already-escalated case must decide on the current \
+         turn's signals only"
+    );
+    assert_eq!(
+        decide_signals, turn2_signals,
+        "case {case_index}/{total_cases}: the selected signal set must be turn 2's own signals"
+    );
+    decide_signals
+}
+
+fn assert_accumulated_signals_would_escalate(
     fx: &Fixture,
     turn2_question: &str,
     turn2_question_hits: &[SectionHit],
+    accumulated: &signal::SignalSet,
     case_index: usize,
     total_cases: usize,
-) -> (extraction::ExtractionResult, AnswerDecision, String) {
-    let (extracted2, decision2, _) = decide_for_case(
+) {
+    let (accumulated_decision, _) = decide_on_signals(
         fx,
         turn2_question,
         turn2_question_hits,
+        accumulated,
+        accumulated,
         case_index,
         total_cases,
-    )
-    .await;
+    );
+    assert!(
+        matches!(accumulated_decision, AnswerDecision::Escalate { .. }),
+        "case {case_index}/{total_cases}: deciding turn 2 ({turn2_question:?}) on the accumulated \
+         signals must escalate (the pre-fix behavior), otherwise this case does not depend on the \
+         turn-only selection; got {accumulated_decision:?}"
+    );
+}
+
+fn decide_allowed_turn2(
+    fx: &Fixture,
+    turn2_question: &str,
+    turn2_question_hits: &[SectionHit],
+    decide_signals: &signal::SignalSet,
+    accumulated: &signal::SignalSet,
+    case_index: usize,
+    total_cases: usize,
+) -> AnswerDecision {
+    let (decision2, _) = decide_on_signals(
+        fx,
+        turn2_question,
+        turn2_question_hits,
+        decide_signals,
+        accumulated,
+        case_index,
+        total_cases,
+    );
+    println!("decision: {decision2:?}");
     assert!(
         matches!(decision2, AnswerDecision::Allowed { .. }),
         "case {case_index}/{total_cases}: turn 2 ({turn2_question:?}) must be answerable on its \
          own, got {decision2:?}"
     );
+    assert_accumulated_signals_would_escalate(
+        fx,
+        turn2_question,
+        turn2_question_hits,
+        accumulated,
+        case_index,
+        total_cases,
+    );
+    decision2
+}
+
+async fn draft_allowed_turn2_answer(
+    fx: &Fixture,
+    turn1: &EscalatedTurn1,
+    turn1_question: &str,
+    turn2_question: &str,
+    turn2_question_hits: &[SectionHit],
+    case_index: usize,
+    total_cases: usize,
+) -> (
+    extraction::ExtractionResult,
+    signal::SignalSet,
+    AnswerDecision,
+    String,
+) {
+    let extracted2 = fx.harness.extractor.extract(turn2_question).await;
+    let signals2 = &extracted2.signals;
+    println!(
+        "signals: {signals2:?} (extraction_mode={:?})",
+        extracted2.mode
+    );
+    let accumulated: signal::SignalSet = turn1.extracted.signals.union(signals2).cloned().collect();
+    let decide_signals =
+        select_turn_only_signals(fx, signals2, &accumulated, case_index, total_cases);
+    let decision2 = decide_allowed_turn2(
+        fx,
+        turn2_question,
+        turn2_question_hits,
+        decide_signals,
+        &accumulated,
+        case_index,
+        total_cases,
+    );
     let items = handoff_items::handoff_items_for_decision(
         &decision2,
         &fx.escalation_rules,
         &fx.prohibited_domains,
-        &extracted2.signals,
+        signals2,
         turn2_question,
         &fx.lexicon,
     );
@@ -970,6 +1107,16 @@ async fn draft_allowed_turn2_answer(
         "case {case_index}/{total_cases}: an Allowed decision must have no handoff items, got \
          {items:?}"
     );
+    let history = [
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: turn1_question.to_owned(),
+        },
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Assistant,
+            text: turn1.assistant_reply.clone(),
+        },
+    ];
     let best_score = turn2_question_hits.first().map(|h| h.score);
     let draft_text = draft_accepted_text(
         fx,
@@ -979,11 +1126,12 @@ async fn draft_allowed_turn2_answer(
         turn2_question,
         turn2_question_hits,
         best_score,
+        &history,
         case_index,
         total_cases,
     )
     .await;
-    (extracted2, decision2, draft_text)
+    (extracted2, accumulated, decision2, draft_text)
 }
 
 async fn run_escalated_followup_case(
@@ -999,28 +1147,41 @@ async fn run_escalated_followup_case(
         "==== real_llm_partial_answer_smoke case {case_index}/{total_cases} \
          (EscalatedFollowup): turn1={turn1_question:?} turn2={turn2_question:?} ===="
     );
-    assert_turn1_escalates_to_set_up_the_case(
+    let case_id = format!("case-smoketest-escalated{case_index:08}");
+    let turn1 = assert_turn1_escalates_to_set_up_the_case(
         fx,
         turn1_question,
         turn1_question_hits,
+        &case_id,
         case_index,
         total_cases,
     )
     .await;
-    let case_id = format!("case-smoketest-escalated{case_index:08}");
-    let (extracted2, decision2, draft_text) = draft_allowed_turn2_answer(
+    let (extracted2, accumulated, decision2, draft_text) = draft_allowed_turn2_answer(
         fx,
+        &turn1,
+        turn1_question,
         turn2_question,
         turn2_question_hits,
         case_index,
         total_cases,
     )
     .await;
+    let new_signals: signal::SignalSet = extracted2
+        .signals
+        .difference(&turn1.extracted.signals)
+        .cloned()
+        .collect();
     let outcome = build_outcome(
         &decision2,
         &extracted2,
         turn2_question_hits,
         draft_text.clone(),
+        TurnSignals {
+            accumulated,
+            new_signals,
+            basis: super::DecisionBasis::TurnOnly,
+        },
     );
     let conv = super::CaseConvState {
         clarify_turns: 0,
@@ -1054,18 +1215,42 @@ async fn run_escalated_followup_case(
     println!("final reply:\n{final_reply}");
 }
 
-/// 本番 `evaluate()` が返す `EvaluationOutcome` を、このテストが持つ値（単ターンなので
-/// `signals` = `accumulated_signals`）から組み立てる。`decide_reply_action` に渡すため。
-fn build_outcome(
+struct TurnSignals {
+    accumulated: signal::SignalSet,
+    new_signals: signal::SignalSet,
+    basis: super::DecisionBasis,
+}
+
+fn build_single_turn_outcome(
     decision: &AnswerDecision,
     extracted: &extraction::ExtractionResult,
     material_hits: &[SectionHit],
     draft_text: String,
 ) -> super::EvaluationOutcome {
+    build_outcome(
+        decision,
+        extracted,
+        material_hits,
+        draft_text,
+        TurnSignals {
+            accumulated: extracted.signals.clone(),
+            new_signals: extracted.signals.clone(),
+            basis: super::DecisionBasis::Accumulated,
+        },
+    )
+}
+
+fn build_outcome(
+    decision: &AnswerDecision,
+    extracted: &extraction::ExtractionResult,
+    material_hits: &[SectionHit],
+    draft_text: String,
+    turn: TurnSignals,
+) -> super::EvaluationOutcome {
     super::EvaluationOutcome {
         decision: decision.clone(),
         signals: extracted.signals.clone(),
-        accumulated_signals: extracted.signals.clone(),
+        accumulated_signals: turn.accumulated,
         case_id: "case-smoketest".to_owned(),
         clarification_allowed: super::clarification_allowed(decision),
         hits: material_hits.to_vec(),
@@ -1075,10 +1260,10 @@ fn build_outcome(
         customer_reply_draft: Some(draft_text),
         customer_reply_draft_truncated: false,
         product_references: Vec::new(),
-        new_signals: extracted.signals.clone(),
+        new_signals: turn.new_signals,
         handoff_items: Vec::new(),
         partial_answer: false,
-        decision_basis: super::DecisionBasis::Accumulated,
+        decision_basis: turn.basis,
     }
 }
 
