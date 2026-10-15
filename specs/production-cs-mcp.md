@@ -122,7 +122,7 @@ vegapunk / PunkRecord
 - **例**: health_food で異常申告 → 安全担当 / 化粧品で肌反応 + 継続可否 → 皮膚科リエゾン。
 - **特徴**: マッチしたら問答無用で確定ルーティング、回答生成に進ませない。数は多くなくてよい。
 - **学習**: 効かせない。固定ルール。メモ化対象外。
-- **ルール属性 `customer_ack`（Issue #76）**: ルールは任意で顧客向けの受け止め文を宣言できる。累積 signal 集合（会話単位）にマッチする第 1 層ルールがちょうど 1 件で、そのルールが宣言を持つときだけ、`/{project_id}/api/reply` は LLM で受け止め文を生成せず宣言文をそのまま使う（NG 表現ゲート・取扱製品ゲートは通す。2 件以上マッチしたときは宣言を使わず LLM が作る。並び順・読み込み順には依存しない）。`binding` による抑止は無い（mandatory のルールも宣言できる。`hearing` 属性とは異なる扱い）。型・検証・伝搬経路の正本は `docs/superpowers/specs/2026-10-05-initial-cost-handoff-design.md`。
+- **ルール属性 `customer_ack`（Issue #76）**: ルールは任意で顧客向けの受け止め文を宣言できる。`decide` に渡した signal 集合（会話単位の累積 signal 集合。取次済み `/api/reply` のターンでは今ターンの signal のみ。`docs/superpowers/specs/2026-10-14-answer-after-escalation-design.md` §2）にマッチする第 1 層ルールがちょうど 1 件で、そのルールが宣言を持つときだけ、`/{project_id}/api/reply` は LLM で受け止め文を生成せず宣言文をそのまま使う（NG 表現ゲート・取扱製品ゲートは通す。2 件以上マッチしたときは宣言を使わず LLM が作る。並び順・読み込み順には依存しない）。`binding` による抑止は無い（mandatory のルールも宣言できる。`hearing` 属性とは異なる扱い）。型・検証・伝搬経路の正本は `docs/superpowers/specs/2026-10-05-initial-cost-handoff-design.md`。
 
 ### 第2層 — 禁止領域
 
@@ -564,7 +564,7 @@ PunkRecord 側の Step 1 実装方針は別紙『PunkRecord Step 1 前方互換�
 **今回作る（最小形で実装）**
 
 - 案1 本体: 3 層判定 / known_resolution / AccessScope（Cedar 境界）/ evidence_sufficient / message_policy
-- **会話層（最小）**: マルチターンの累積 signal 集合の維持・毎ターン累積集合での再判定・聞き返し。利用者が担当者でも会話は曖昧・小出しで来る前提（フェーズロードマップ章の不変条件を参照）
+- **会話層（最小）**: マルチターンの累積 signal 集合の維持・毎ターン累積集合での再判定・聞き返し。利用者が担当者でも会話は曖昧・小出しで来る前提（フェーズロードマップ章の不変条件を参照）。取次済み `/api/reply` のターンだけは `decide` の `question_signals` に今ターンの signal のみを渡す（S1-11 節の注記と `docs/superpowers/specs/2026-10-14-answer-after-escalation-design.md` §2）
 - 追加 4 点（いずれも最小形）:
   1. **出口ゲート**（egress gate）: 決定論 NG 辞書 + abstain。暗示効能は保留に倒す（C′ 本体は次段）
   2. **stakes 3 段離散**: low / mid / high。第2層列挙漏れ（fail-open）を高 stakes 厳格化で拾う
@@ -844,7 +844,7 @@ S1-9「残る確定事項（MCP 側）」および未決事項のうち、次を
    - `Claims.sub` → config の actor 表（role / allowed_schemas）で AccessScope を自明写像する（サーバ導出・I1）。
    - JWT secret 未設定時は config の `default_actor` に明示ログ付きでフォールバックする（ローカル開発専用。GCE では secret 必須）。
 3. **会話層の累積 signal 集合はサーバ側で `support_case` に永続する（2026-07-03 追加）。**
-   - `evaluate_answerability` は `case_id` を受け取り（無ければ新規 `support_case` を作成）、当該 case の累積 signal 集合をサーバ側で維持する。判定は常に「累積 signal 集合 + known_resolution」に対して行う。
+   - `evaluate_answerability` は `case_id` を受け取り（無ければ新規 `support_case` を作成）、当該 case の累積 signal 集合をサーバ側で維持する。MCP `evaluate_answerability` の判定は常に「累積 signal 集合 + known_resolution」に対して行う。`/api/reply` 限定で、取次済みのターンには累積集合での再判定の例外がある。対象と理由は `docs/superpowers/specs/2026-10-14-answer-after-escalation-design.md` §2 を正本とする。
    - client から prior signals を受け取らない。累積集合を client 供給にすると hazard signal の欠落（改変）で誤マッチし得るため、I1 と同じ入力不信原則を会話層にも適用する。
    - 格納は `support_case -[HAS_SIGNAL]-> Signal` 辺（I2 準拠・グラフネイティブ）。
    - 聞き返し（clarification）は会話層の第一級行為として、判定結果に `clarification_allowed` を決定論で付与し、文面生成は client に委ねる（message_policy 原則）。**Issue #54 改訂**（詳細は上記§「追記: 会話フロー v1.1」参照）: 第3層 insufficient_directness / unknown_added_signal は常に true。第1層は `binding = advisory`（契約・保証関連等）かつ情報不足のときのみ true、`binding = mandatory`（担当者取次・安全事故等）は常に false。第2層（禁止ドメイン）は常に false。
@@ -994,7 +994,7 @@ Step 3 で新設するもの（逐次処理系＋実行系。既存音声エー�
 
 S1-0 の三原則に加え、Step 2 / Step 3 を無改修で載せるために Step 1 実装で守ること:
 
-1. **会話層を Step 1 から持つ**。マルチターンの累積 signal 集合を維持し、毎ターン累積集合で判定層を再判定する（条件が増えたら——変色→変色+カビ——再判定で自動的にエスカレーションへ倒れる。照合原則の変更は不要）。聞き返し（clarification）を第一級の会話行為として持つ。判定の根拠は常に「累積 signal 集合 + known_resolution」であり、会話履歴の言質（「さっき OK と言った」）は判定入力にしない。判定層は純関数を保ち、この再判定呼び出しに耐える形にする。
+1. **会話層を Step 1 から持つ**。マルチターンの累積 signal 集合を維持し、毎ターン累積集合で判定層を再判定する（条件が増えたら——変色→変色+カビ——再判定で自動的にエスカレーションへ倒れる。照合原則の変更は不要）。聞き返し（clarification）を第一級の会話行為として持つ。判定の根拠は常に「累積 signal 集合 + known_resolution」であり、会話履歴の言質（「さっき OK と言った」）は判定入力にしない（`/api/reply` 限定の例外は S1-11 節の注記を参照）。判定層は純関数を保ち、この再判定呼び出しに耐える形にする。
 2. **egress_gate の入力単位を「全文」に固定しない**。シグネチャは任意のテキスト断片（全文でも文単位でも）を受けられる形にする。Step 1・2 は全文で呼び、Step 3 は文単位で呼ぶ。中身の差し替え（辞書→C′）とは独立に、呼び出し粒度の自由を最初から確保する。
 3. **known_resolution の `grade` を Step 1 から運用する**。`auto_answer_audited` への昇格・降格（S1-3）は Step 2 の「顧客直に即答してよいか」の判定にそのまま直結する。Step 1 で昇格制度を回さないと Step 2 に移行できない。
 4. **応答の「折り返し変換」を decision の語彙に含める**。Escalate 時の disclosure_scope（既定）に、顧客直チャネル向けの「確認して折り返します」系の応答方針が乗ることを想定し、チャネル種別（operator / customer_chat / customer_voice）を EmitContext に最初から持たせる（Step 1 は operator 固定でよい）。

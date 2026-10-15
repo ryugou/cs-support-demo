@@ -86,6 +86,7 @@ MCP 経由で case_id を打ち間違えたときに黙って新規 case へ合�
 | allowed かつ下書きが truncated（生成上限で途中切断） | `[api] fallback_reply_text`（切れた文を顧客へ送らない。§4 の他行と同じくフォールバック扱い） |
 | escalate | `[api] fallback_reply_text` |
 | rule_match | `[api] fallback_reply_text` |
+| 取次済み case（受付番号発行済み）の後続ターン | 今ターンの判定に応じて変わる。`docs/superpowers/specs/2026-10-14-answer-after-escalation-design.md` §4 を正本とする |
 
 - `[api] fallback_reply_text` の既定値: 「お問い合わせありがとうございます。担当者が確認のうえ、あらためてご連絡いたします。」
 - truncated な下書きを捨てる理由: 生成上限で途中切断された下書きは、切れ目がたまたま「。」の直後に落ちると完成文に見え、日本語のビジネス文では末尾に来る安全上の但し書きだけが欠落しうる（`llm.rs` の `ReplyDraft` doc コメント）。MCP 経路は人間の CS 担当が下書きを検分してから送るため `truncated=true` を返すだけで足りるが、`/api/reply` は人間の検分が一切入らない自動送信経路のため同じ扱いにはできない
