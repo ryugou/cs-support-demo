@@ -521,7 +521,8 @@ mod tests {
     /// (Issue #47)。既存テストは NG 判定を検証対象にしていないため、この空辞書を渡せば新しい
     /// ゲートは発火せず、既存の期待値・挙動を一切変えない。
     fn permissive_ng() -> NgDictionary {
-        NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).unwrap()
+        NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[],"customer_leak_terms":[]}"#)
+            .unwrap()
     }
 
     /// `tempfile` crate は `server/Cargo.toml` に無いため、`std::env::temp_dir()` 配下に
@@ -1493,8 +1494,10 @@ mod tests {
         // title_ja に NG block_term を仕込んでカードだけが落ちることを確認する。
         let dir = TempImagesDir::new("ng-gate-title-block-term");
         let m = own_product("own_product:adc-v724", "絶対に安全なカメラ", "ADC-V724");
-        let ng = NgDictionary::from_json(r#"{"block_terms":["絶対に安全"],"abstain_terms":[]}"#)
-            .expect("ng dictionary parses");
+        let ng = NgDictionary::from_json(
+            r#"{"block_terms":["絶対に安全"],"abstain_terms":[],"customer_leak_terms":[]}"#,
+        )
+        .expect("ng dictionary parses");
         let (cards, logs) = crate::test_support::capture_logs(|| {
             select_cards(
                 "ADC-V724がおすすめです",
@@ -1517,8 +1520,10 @@ mod tests {
         let dir = TempImagesDir::new("ng-gate-description-abstain-term");
         let mut m = own_product("own_product:adc-v724", "URTECT ADC-V724", "ADC-V724");
         m.card_description = Some("これで必ず治ると言われています".to_string());
-        let ng = NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":["治る"]}"#)
-            .expect("ng dictionary parses");
+        let ng = NgDictionary::from_json(
+            r#"{"block_terms":[],"abstain_terms":["治る"],"customer_leak_terms":[]}"#,
+        )
+        .expect("ng dictionary parses");
         let (cards, logs) = crate::test_support::capture_logs(|| {
             select_cards(
                 "ADC-V724がおすすめです",
@@ -1546,8 +1551,10 @@ mod tests {
         let dir = TempImagesDir::new("ng-gate-title-description-boundary");
         let mut m = own_product("own_product:adc-v724", "とても絶対に", "ADC-V724");
         m.card_description = Some("安全な製品です".to_string());
-        let ng = NgDictionary::from_json(r#"{"block_terms":["絶対に安全"],"abstain_terms":[]}"#)
-            .expect("ng dictionary parses");
+        let ng = NgDictionary::from_json(
+            r#"{"block_terms":["絶対に安全"],"abstain_terms":[],"customer_leak_terms":[]}"#,
+        )
+        .expect("ng dictionary parses");
         let cards = select_cards(
             "ADC-V724がおすすめです",
             &[m],

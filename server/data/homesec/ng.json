@@ -8,5 +8,6 @@
     "分電盤",
     "屋内配線"
   ],
-  "abstain_terms": []
+  "abstain_terms": [],
+  "customer_leak_terms": []
 }

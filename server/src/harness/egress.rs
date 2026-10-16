@@ -8,6 +8,8 @@ use std::path::Path;
 pub struct NgDictionary {
     pub block_terms: Vec<String>,
     pub abstain_terms: Vec<String>,
+    /// Terms that must never appear in customer-facing text; `egress_gate` blocks a match and `NgDictionary::near_hit` does not use them.
+    pub customer_leak_terms: Vec<String>,
 }
 
 impl NgDictionary {
@@ -76,6 +78,9 @@ pub fn egress_gate(text: &str, _ctx: &EmitContext, ng: &NgDictionary) -> EgressV
     if let Some(term) = ng.block_terms.iter().find(|t| contains(t)) {
         return EgressVerdict::Block { term: term.clone() };
     }
+    if let Some(term) = ng.customer_leak_terms.iter().find(|t| contains(t)) {
+        return EgressVerdict::Block { term: term.clone() };
+    }
     if let Some(term) = ng.abstain_terms.iter().find(|t| contains(t)) {
         return EgressVerdict::Abstain { term: term.clone() };
     }
@@ -89,7 +94,8 @@ mod tests {
     fn ng() -> NgDictionary {
         NgDictionary::from_json(
             r#"{ "block_terms": ["必ず治ります", "副作用はありません"],
-                 "abstain_terms": ["治る", "痩せる"] }"#,
+                 "abstain_terms": ["治る", "痩せる"],
+                 "customer_leak_terms": [] }"#,
         )
         .expect("ng dictionary parses")
     }
@@ -168,6 +174,49 @@ mod tests {
                 EgressVerdict::Block { .. }
             ));
         }
+    }
+
+    fn ng_with_leak_terms() -> NgDictionary {
+        NgDictionary::from_json(
+            r#"{ "block_terms": ["必ず治ります"],
+                 "abstain_terms": ["治る"],
+                 "customer_leak_terms": ["資料に基づくと", "資料を"] }"#,
+        )
+        .expect("ng dictionary with leak terms parses")
+    }
+
+    #[test]
+    fn customer_leak_term_blocks() {
+        match egress_gate(
+            "資料に基づくと、保証期間は1年です",
+            &operator(),
+            &ng_with_leak_terms(),
+        ) {
+            EgressVerdict::Block { term } => assert_eq!(term, "資料に基づくと"),
+            other => panic!("expected block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn near_hit_ignores_customer_leak_terms() {
+        assert!(!ng_with_leak_terms().near_hit("資料を送ってください"));
+    }
+
+    #[test]
+    fn dictionary_without_customer_leak_terms_is_rejected() {
+        assert!(NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).is_err());
+    }
+
+    #[test]
+    fn customer_leak_term_wins_over_abstain_term() {
+        assert!(matches!(
+            egress_gate(
+                "資料に基づくと治ると言われています",
+                &operator(),
+                &ng_with_leak_terms()
+            ),
+            EgressVerdict::Block { .. }
+        ));
     }
 
     #[test]

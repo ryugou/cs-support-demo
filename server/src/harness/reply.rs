@@ -37,7 +37,7 @@ use crate::harness::decision::{AnswerDecision, AnswerSource, DisclosureScope};
 use crate::harness::product_gate::ProductAllowlist;
 use crate::harness::prompt_input::{
     neutralize_delimiters, truncate_chars, truncate_question, CLOSER_BAN_PHRASE,
-    CONTINUATION_OPENER_RULE, MARKDOWN_BAN_RULE,
+    CONTINUATION_OPENER_RULE, MARKDOWN_BAN_RULE, SOURCE_MENTION_BAN_RULE,
 };
 use crate::model::SectionHit;
 
@@ -467,6 +467,8 @@ pub fn build_reply_system_prompt(
          内部情報の秘匿規則:\n\
          顧客へ返す文では、こちらの内部の仕組みに言及しない。材料の有無、判定の仕組み、社内の\
          分類名を書かない。\n\
+         {SOURCE_MENTION_BAN_RULE}\
+         与えられた内容は、出典に触れずに当社の案内として直接書く。\n\
          答えを持っていないときは、その事柄を自社が答えるべきかで書き分ける。\n\
          - 自社の製品・料金・契約・サポートのこと → 当社で確認すべきことである旨を書く。どこまで\
          書けるかは、後述の開示範囲の指示を優先する。\n\
@@ -1218,6 +1220,20 @@ mod tests {
     }
 
     #[test]
+    fn every_prompt_forbids_source_mentions_in_customer_text() {
+        let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")], false);
+        let prompts = [
+            build_reply_system_prompt(&brief, false, &test_allowlist()),
+            build_reply_system_prompt(&brief, true, &test_allowlist()),
+            partial_answer_prompt(None),
+        ];
+        for p in prompts {
+            assert!(p.contains(SOURCE_MENTION_BAN_RULE), "{p}");
+            assert!(p.contains("出典に触れずに当社の案内として直接書く"), "{p}");
+        }
+    }
+
+    #[test]
     fn partial_answer_prompt_never_instructs_to_include_the_declared_handoff_ack() {
         let declared = "初期費用はお客様の状況によって異なりますので、担当者におつなぎします。";
         let p = partial_answer_prompt(Some(declared));
@@ -1498,7 +1514,7 @@ mod tests {
             egress_gate, EgressVerdict, EmitChannel, EmitContext, NgDictionary,
         };
         let ng = NgDictionary::from_json(
-            r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"]}"#,
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"],"customer_leak_terms":[]}"#,
         )
         .unwrap();
         let ctx = EmitContext {

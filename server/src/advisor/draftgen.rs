@@ -3239,7 +3239,7 @@ mod tests {
 
     fn ng_with_block_term(term: &str) -> NgDictionary {
         NgDictionary::from_json(&format!(
-            r#"{{"block_terms": [{term:?}], "abstain_terms": []}}"#
+            r#"{{"block_terms": [{term:?}], "abstain_terms": [], "customer_leak_terms": []}}"#
         ))
         .expect("test ng dictionary must parse")
     }
@@ -3247,8 +3247,10 @@ mod tests {
     fn no_ng_hits() -> NgDictionary {
         // block_terms / abstain_terms を空にする(このテストファイルの draft はどれも NG
         // 語を意図的に含めない限り安全な文言のため)。
-        NgDictionary::from_json(r#"{"block_terms": [], "abstain_terms": []}"#)
-            .expect("test ng dictionary must parse")
+        NgDictionary::from_json(
+            r#"{"block_terms": [], "abstain_terms": [], "customer_leak_terms": []}"#,
+        )
+        .expect("test ng dictionary must parse")
     }
 
     fn draft(text: &str, truncated: bool) -> crate::llm::ReplyDraft {

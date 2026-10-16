@@ -2826,8 +2826,10 @@ mod tests {
             extractor: Arc::new(extraction::HybridExtractor::new(lexicon.clone(), None)),
             product_reference_extractor: extraction::ProductReferenceExtractor::new(None),
             lexicon,
-            ng: egress::NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#)
-                .unwrap(),
+            ng: egress::NgDictionary::from_json(
+                r#"{"block_terms":[],"abstain_terms":[],"customer_leak_terms":[]}"#,
+            )
+            .unwrap(),
             worm: Arc::new(audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap()),
             knowledge: None,
             thresholds: decision::Thresholds {

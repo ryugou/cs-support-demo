@@ -1587,7 +1587,7 @@ mod tests {
             ),
             lexicon,
             ng: crate::harness::egress::NgDictionary::from_json(
-                r#"{"block_terms":[],"abstain_terms":[]}"#,
+                r#"{"block_terms":[],"abstain_terms":[],"customer_leak_terms":[]}"#,
             )
             .unwrap(),
             worm: Arc::new(
