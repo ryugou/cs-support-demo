@@ -2309,7 +2309,7 @@ mod tests {
 
     /// `schema_path` の `nodes.support_case.attributes` から宣言済みキー集合を取り出す。
     /// cwd 非依存にするため呼び出し側は `CARGO_MANIFEST_DIR` 起点の絶対パスを渡すこと
-    /// （`harness::mod::production_ng_dictionary` と同じ規律）。
+    /// （`harness::egress::production_ng_dictionary` と同じ規律）。
     fn declared_support_case_attribute_keys(
         schema_path: &std::path::Path,
     ) -> std::collections::HashSet<String> {

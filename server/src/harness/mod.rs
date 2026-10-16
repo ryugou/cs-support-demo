@@ -4055,18 +4055,6 @@ mod tests {
     // ここを間接的な検証（ゲート単体の呼び出し）で済ませると、`draft_customer_reply` から
     // `egress_gate` の呼び出しを外しても**全テストが緑のまま NG 表現の統制だけが外れる**。
 
-    /// 本番（Cloud Run）が読むのと同じ NG 辞書。**推測の NG 語をテストに書かない**ため、
-    /// 実データを読み、そこから語を取る（`server/config.cloudrun.toml` の
-    /// `ng_dictionary_path = "data/urtect/ng-dictionary.json"`）。
-    /// パスは cwd 非依存にする（`cargo test` の起動位置に依存させない）。
-    fn production_ng_dictionary() -> egress::NgDictionary {
-        let path = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/data/urtect/ng-dictionary.json"
-        ));
-        egress::NgDictionary::from_path(path).expect("production ng dictionary must load and parse")
-    }
-
     fn operator_emit_context() -> egress::EmitContext {
         egress::EmitContext {
             channel: egress::EmitChannel::Operator,
@@ -4114,7 +4102,7 @@ mod tests {
 
         let harness = Harness {
             reply_drafter: Some(drafter),
-            ng: production_ng_dictionary(),
+            ng: egress::production_ng_dictionary(),
             ..harness_for_test()
         };
         let decision = decision::AnswerDecision::Allowed {
@@ -4206,7 +4194,7 @@ mod tests {
 
         let harness = Harness {
             reply_drafter: Some(drafter),
-            ng: production_ng_dictionary(),
+            ng: egress::production_ng_dictionary(),
             ..harness_for_test_with_lexicon(HANDOFF_LEXICON_JSON)
         };
 
@@ -4463,7 +4451,11 @@ mod tests {
         // ここが落ち、テスト本体の失敗と区別できる）。
         assert!(
             matches!(
-                egress::egress_gate(CLEAN, &operator_emit_context(), &production_ng_dictionary()),
+                egress::egress_gate(
+                    CLEAN,
+                    &operator_emit_context(),
+                    &egress::production_ng_dictionary()
+                ),
                 egress::EgressVerdict::Pass
             ),
             "precondition: pick a draft text that the current NG dictionary passes"
@@ -4478,7 +4470,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_generated_draft_with_a_blocked_ng_term_is_dropped() {
-        let ng = production_ng_dictionary();
+        let ng = egress::production_ng_dictionary();
         let term = ng
             .block_terms
             .first()
@@ -4504,7 +4496,7 @@ mod tests {
     #[tokio::test]
     async fn a_generated_draft_with_an_abstain_ng_term_is_dropped() {
         // block だけを特別扱いする実装（abstain を素通し）を許さない。
-        let ng = production_ng_dictionary();
+        let ng = egress::production_ng_dictionary();
         let term = ng
             .abstain_terms
             .first()
