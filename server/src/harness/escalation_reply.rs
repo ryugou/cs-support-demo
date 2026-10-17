@@ -10,7 +10,7 @@
 use crate::harness::egress::{EmitChannel, EmitContext, NgDictionary};
 use crate::harness::prompt_input::{
     apply_draft_gate_or_fallback, neutralize_delimiters, truncate_question,
-    CONTINUATION_OPENER_RULE, MARKDOWN_BAN_RULE,
+    CONTINUATION_OPENER_RULE, MARKDOWN_BAN_RULE, SOURCE_MENTION_BAN_RULE,
 };
 
 /// 受け止め文の生成失敗・生成上限による途中切断・egress gate 却下時の定型文（初回、
@@ -166,6 +166,7 @@ pub fn build_ack_prompt(question: &str, is_continuation: bool) -> (String, Strin
     // Issue #27: LINE は Markdown を描画しないため、生成プロンプトへ Markdown 禁止を伝える。
     // `is_continuation` の分岐より前に置き、常に適用する。
     system.push_str(MARKDOWN_BAN_RULE);
+    system.push_str(SOURCE_MENTION_BAN_RULE);
     if is_continuation {
         system.push_str(CONTINUATION_OPENER_RULE);
     }
@@ -349,7 +350,7 @@ mod tests {
 
     fn ng() -> NgDictionary {
         NgDictionary::from_json(
-            r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"]}"#,
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"],"customer_leak_terms":[]}"#,
         )
         .unwrap()
     }
@@ -399,6 +400,12 @@ mod tests {
         let (system, _) = build_ack_prompt("エラーが出て困っています", false);
         assert!(system.contains("回答内容・解決方法・原因の推測は、いかなる場合も一切書かない"));
         assert!(system.contains("期限の約束"));
+    }
+
+    #[test]
+    fn ack_prompt_forbids_source_phrasing_in_customer_text() {
+        let (system, _) = build_ack_prompt("質問", false);
+        assert!(system.contains(SOURCE_MENTION_BAN_RULE));
     }
 
     /// Issue #54 A-2 (a): 受け止め文は質問をしない（時間帯の確認はコード側の決定的ブロックで
@@ -860,9 +867,10 @@ mod tests {
 
     #[test]
     fn gate_declared_ack_text_falls_back_to_the_conversation_stage_fallback_when_blocked() {
-        let blocking_ng =
-            NgDictionary::from_json(r#"{"block_terms":["絶対に治ります"],"abstain_terms":[]}"#)
-                .unwrap();
+        let blocking_ng = NgDictionary::from_json(
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":[],"customer_leak_terms":[]}"#,
+        )
+        .unwrap();
         let declared = "この方法で絶対に治りますのでご安心ください。";
 
         assert_eq!(
@@ -879,9 +887,10 @@ mod tests {
 
     #[test]
     fn gate_declared_ack_text_warns_pointing_at_rules_json_on_rejection() {
-        let blocking_ng =
-            NgDictionary::from_json(r#"{"block_terms":["絶対に治ります"],"abstain_terms":[]}"#)
-                .unwrap();
+        let blocking_ng = NgDictionary::from_json(
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":[],"customer_leak_terms":[]}"#,
+        )
+        .unwrap();
         let (_, logs) = crate::test_support::capture_logs(|| {
             gate_declared_ack_text(
                 "この方法で絶対に治りますのでご安心ください。",

@@ -3805,8 +3805,10 @@ mod tests {
     }
 
     fn test_ng() -> crate::harness::egress::NgDictionary {
-        crate::harness::egress::NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#)
-            .unwrap()
+        crate::harness::egress::NgDictionary::from_json(
+            r#"{"block_terms":[],"abstain_terms":[],"customer_leak_terms":[]}"#,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -3963,7 +3965,7 @@ mod tests {
         let declared = "この対応で絶対に治ります。担当者におつなぎします。";
         let (drafter, log) = stub_drafter("この下書きは絶対に使われてはならない").await;
         let ng = crate::harness::egress::NgDictionary::from_json(
-            r#"{"block_terms":["絶対に治ります"],"abstain_terms":[]}"#,
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":[],"customer_leak_terms":[]}"#,
         )
         .unwrap();
         let allowlist = response_gate_fixture_allowlist();
@@ -6018,7 +6020,7 @@ mod tests {
             ),
             lexicon,
             ng: crate::harness::egress::NgDictionary::from_json(
-                r#"{"block_terms":[],"abstain_terms":[]}"#,
+                r#"{"block_terms":[],"abstain_terms":[],"customer_leak_terms":[]}"#,
             )
             .unwrap(),
             worm: Arc::new(

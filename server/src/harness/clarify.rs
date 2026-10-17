@@ -10,7 +10,7 @@ use crate::harness::egress::{EmitChannel, EmitContext, NgDictionary};
 use crate::harness::product_gate::ProductAllowlist;
 use crate::harness::prompt_input::{
     apply_draft_gate_or_fallback, neutralize_delimiters, truncate_question, CLOSER_BAN_PHRASE,
-    CONTINUATION_OPENER_RULE, MARKDOWN_BAN_RULE,
+    CONTINUATION_OPENER_RULE, MARKDOWN_BAN_RULE, SOURCE_MENTION_BAN_RULE,
 };
 
 /// 生成失敗・生成上限による途中切断・egress gate 却下時の定型文（design doc §3 の文字列そのまま）。
@@ -88,6 +88,7 @@ pub fn build_clarify_prompt(
     // Issue #27: LINE は Markdown を描画しないため、生成プロンプトへ Markdown 禁止を伝える。
     // `is_continuation` の分岐より前に置き、常に適用する。
     system.push_str(MARKDOWN_BAN_RULE);
+    system.push_str(SOURCE_MENTION_BAN_RULE);
     if is_continuation {
         system.push_str(CONTINUATION_OPENER_RULE);
     }
@@ -170,7 +171,7 @@ mod tests {
 
     fn ng() -> NgDictionary {
         NgDictionary::from_json(
-            r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"]}"#,
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"],"customer_leak_terms":[]}"#,
         )
         .unwrap()
     }
@@ -185,6 +186,12 @@ mod tests {
             &test_allowlist(),
         );
         assert!(system.contains("回答・手順・仕様・解決方法の内容は、いかなる場合も一切書かない"));
+    }
+
+    #[test]
+    fn prompt_forbids_source_phrasing_in_customer_text() {
+        let (system, _) = build_clarify_prompt("質問", "不足", "", false, &test_allowlist());
+        assert!(system.contains(SOURCE_MENTION_BAN_RULE));
     }
 
     #[test]

@@ -1333,6 +1333,13 @@ fn assert_final_reply(
             signal-guided supplementary search); see design doc \
             2026-10-07-partial-answer-with-handoff-design.md §10.3, §10.5"]
 async fn real_llm_partial_answer_smoke() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stdout)
+        .try_init()
+        .expect(
+            "the warn subscriber could not be installed because another global subscriber exists; run this smoke alone as in the module doc command",
+        );
     let (config, client) = load_config_and_client();
     let cases = load_verify_cases();
 

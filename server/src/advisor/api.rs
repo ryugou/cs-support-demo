@@ -2383,7 +2383,10 @@ mod tests {
                 None,
             ),
             lexicon,
-            ng: NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).unwrap(),
+            ng: NgDictionary::from_json(
+                r#"{"block_terms":[],"abstain_terms":[],"customer_leak_terms":[]}"#,
+            )
+            .unwrap(),
             worm: Arc::new(
                 crate::harness::audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap(),
             ),
@@ -2446,7 +2449,10 @@ clarify_max_turns = 3
             harness: Arc::new(advisor_test_harness(knowledge)),
             llm: test_llm_client(),
             ng: Arc::new(
-                NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).unwrap(),
+                NgDictionary::from_json(
+                    r#"{"block_terms":[],"abstain_terms":[],"customer_leak_terms":[]}"#,
+                )
+                .unwrap(),
             ),
             vegapunk,
             api_key: api_key.to_string(),
@@ -2751,7 +2757,10 @@ clarify_max_turns = 3
                 None,
             ),
             lexicon,
-            ng: NgDictionary::from_json(r#"{"block_terms":[],"abstain_terms":[]}"#).unwrap(),
+            ng: NgDictionary::from_json(
+                r#"{"block_terms":[],"abstain_terms":[],"customer_leak_terms":[]}"#,
+            )
+            .unwrap(),
             worm: Arc::new(
                 crate::harness::audit::WormAuditLog::open(&dir.join("audit.jsonl")).unwrap(),
             ),

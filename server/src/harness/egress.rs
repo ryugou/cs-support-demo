@@ -8,6 +8,8 @@ use std::path::Path;
 pub struct NgDictionary {
     pub block_terms: Vec<String>,
     pub abstain_terms: Vec<String>,
+    /// Terms that must never appear in customer-facing text; `egress_gate` blocks a match and `NgDictionary::near_hit` does not use them.
+    pub customer_leak_terms: Vec<String>,
 }
 
 impl NgDictionary {
@@ -76,6 +78,9 @@ pub fn egress_gate(text: &str, _ctx: &EmitContext, ng: &NgDictionary) -> EgressV
     if let Some(term) = ng.block_terms.iter().find(|t| contains(t)) {
         return EgressVerdict::Block { term: term.clone() };
     }
+    if let Some(term) = ng.customer_leak_terms.iter().find(|t| contains(t)) {
+        return EgressVerdict::Block { term: term.clone() };
+    }
     if let Some(term) = ng.abstain_terms.iter().find(|t| contains(t)) {
         return EgressVerdict::Abstain { term: term.clone() };
     }
@@ -83,96 +88,13 @@ pub fn egress_gate(text: &str, _ctx: &EmitContext, ng: &NgDictionary) -> EgressV
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ng() -> NgDictionary {
-        NgDictionary::from_json(
-            r#"{ "block_terms": ["必ず治ります", "副作用はありません"],
-                 "abstain_terms": ["治る", "痩せる"] }"#,
-        )
-        .expect("ng dictionary parses")
-    }
-
-    fn operator() -> EmitContext {
-        EmitContext {
-            channel: EmitChannel::Operator,
-        }
-    }
-
-    #[test]
-    fn explicit_ng_word_blocks() {
-        match egress_gate(
-            "この商品で必ず治りますのでご安心ください",
-            &operator(),
-            &ng(),
-        ) {
-            EgressVerdict::Block { term } => assert_eq!(term, "必ず治ります"),
-            other => panic!("expected block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn implied_efficacy_abstains() {
-        // 暗示効能は「検出して通す」でなく「疑わしきは出さない」（S1-4）
-        match egress_gate("継続すると治ると言われています", &operator(), &ng()) {
-            EgressVerdict::Abstain { term } => assert_eq!(term, "治る"),
-            other => panic!("expected abstain, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn block_takes_precedence_over_abstain() {
-        assert!(matches!(
-            egress_gate("必ず治りますし痩せます", &operator(), &ng()),
-            EgressVerdict::Block { .. }
-        ));
-    }
-
-    #[test]
-    fn clean_draft_passes() {
-        assert!(matches!(
-            egress_gate(
-                "保存方法は直射日光を避けて常温で保管してください",
-                &operator(),
-                &ng()
-            ),
-            EgressVerdict::Pass
-        ));
-    }
-
-    #[test]
-    fn gate_accepts_sentence_fragments() {
-        // 入力単位を全文に固定しない（Step 3 は文単位で呼ぶ。遵守事項 2）
-        assert!(matches!(
-            egress_gate("治る", &operator(), &ng()),
-            EgressVerdict::Abstain { .. }
-        ));
-        assert!(matches!(
-            egress_gate("", &operator(), &ng()),
-            EgressVerdict::Pass
-        ));
-    }
-
-    #[test]
-    fn verdict_is_channel_invariant() {
-        // 判定水準はチャネルで変えない（フェーズ不変条件）
-        for channel in [
-            EmitChannel::Operator,
-            EmitChannel::CustomerChat,
-            EmitChannel::CustomerVoice,
-        ] {
-            let ctx = EmitContext { channel };
-            assert!(matches!(
-                egress_gate("必ず治ります", &ctx, &ng()),
-                EgressVerdict::Block { .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn near_hit_detects_question_proximity() {
-        assert!(ng().near_hit("これを飲むと治るのでしょうか"));
-        assert!(!ng().near_hit("送料はいくらですか"));
-    }
+pub(crate) fn production_ng_dictionary() -> NgDictionary {
+    NgDictionary::from_path(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/data/urtect/ng-dictionary.json"
+    )))
+    .expect("production ng dictionary must load and parse")
 }
+
+#[cfg(test)]
+mod tests;

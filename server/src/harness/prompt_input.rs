@@ -52,6 +52,10 @@ pub(crate) const MARKDOWN_BAN_RULE: &str =
     "- Markdown 記法（太字・見出し・箇条書き記号・コードブロック・リンク記法）を使わない。\
      プレーンテキストのみで書く。強調したい語は記号ではなく語順と文で表現する。\n";
 
+pub(crate) const SOURCE_MENTION_BAN_RULE: &str =
+    "- 資料・マニュアル・材料・出典・承認済みの回答・ノウハウといった内部の呼び名と、\
+     「〜によると」「〜に基づくと」「記載がありません」のような出典の言い回しも書かない。\n";
+
 /// 制御文字（改行・復帰等）を半角スペースへ潰し、Unicode 空白（`char::is_whitespace()` が
 /// 拾う U+2028 / U+2029 等を含む）で連続分割してから半角スペース 1 つで再結合し、trim する。
 /// 「1 値 = 必ず 1 行」という不変条件を、呼び出し側ごとに個別実装させず共通化するための関数。
@@ -445,7 +449,7 @@ mod tests {
 
     fn ng() -> NgDictionary {
         NgDictionary::from_json(
-            r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"]}"#,
+            r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"],"customer_leak_terms":[]}"#,
         )
         .unwrap()
     }
