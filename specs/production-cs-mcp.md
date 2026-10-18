@@ -179,6 +179,17 @@ vegapunk / PunkRecord
 
 詳細は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7（Jev へ渡す state・閾値・フォールバック・監査を含む）。他の層・質問への拡張（実会話記録による較正確認後の判定置き換え検討）は同 design doc §6 を参照。
 
+### 追記: 全ルールのヒアリング先行化（Issue #109、2026-10-17、設計承認済み・実装前）
+
+**設計の正本は `docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md`。** 実装（子 Issue の PR 1〜4）が main に入った時点で、本書の次の記述は同設計で置き換わる。それまでは現行記述が実装と一致している。
+
+- 第1層ルールのマッチは即時エスカレーションを意味しなくなる。advisory・mandatory を問わず、`/{project_id}/api/reply` では「ヒアリング → 材料で回答 → 解決確認」の取り扱い（handling）に入り、答えられない・解決しないものだけを聞き取り内容（取次サマリ）付きで取り次ぐ。`human-handoff` もまず用件を聞き、回答で終わる場合がある。置き換わる記述: 上記「追記: Jev の適用範囲」節の「mandatory の即時エスカレーション契約は不変」「mandatory への `hearing` 宣言の拒否」、下記「追記: 会話フロー v1.1」の Issue #54 改訂と「S1-11. 追記」節の「第1層 mandatory は常に聞き返し不可」（いずれも `/api/reply` の会話層について。MCP の `clarification_allowed` は変わらない）。
+- 第2層（禁止領域）は即時取次のまま、評価順を第1層 mandatory より前にする。`electrical-work` はパターン（「電気工事」「高所作業」）のみで発火する。
+- Jev（TypeSafe）への顧客発話送信は全ルールのヒアリングと解決確認に広がる（assistant 発話は送らない。`[jev] enabled = false` で全停止）。
+- KnownResolution は回答ステップの材料であり、候補は取次前は会話の累積 signal、取次後は今ターンの signal から選び、LLM の適用可否判定で 1 件に絞る（Issue #103 の「今ターンの signal のみ」を変更）。
+- MCP `evaluate_answerability` は取り扱いを持たない。変わるのは第2層の評価順・KR 選定・ルール順序の決定論化のみ。
+- 本番挙動の変更点（ユーザー承認済み、2026-10-18）: 安全注意文 2 件と解決時の返信文は固定文、`initial-cost-quote` は部分回答を付けずヒアリング後に取次、`warranty-failure` は取次済み案件と MCP で部分回答の対象になる、`data/rules.sample.json` のエスカレーションルール 2 件を削除する。
+
 ## 課題 1: ノウハウの蓄積（GMR + 人間検証ループ）
 
 ノウハウの蓄積とは、元データから情報を取得するだけではなく、「その情報をどう活用して回答すべきか」「実際にどう回答したか」「結果がどうだったか」を PunkRecord に残し、次回以降の回答品質に活かす仕組みである。
