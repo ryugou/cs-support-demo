@@ -181,14 +181,18 @@ vegapunk / PunkRecord
 
 ### 追記: 全ルールのヒアリング先行化（Issue #109、2026-10-17、設計承認済み・実装前）
 
-**設計の正本は `docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md`。** 実装（子 Issue の PR 1〜4）が main に入った時点で、本書の次の記述は同設計で置き換わる。それまでは現行記述が実装と一致している。
+**設計の正本は `docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md`。** 実装は 4 本の PR（同 §12。子 Issue #103 / #110 / #111 / #112）に分かれ、**各 PR がそれぞれ挙動を変える**。本書の記述は、下表の PR が main に入った時点でその PR が置き換える（各 PR が同じ PR 内で本書を更新する）。該当 PR が入るまでは現行記述が実装と一致している。
 
-- 第1層ルールのマッチは即時エスカレーションを意味しなくなる。advisory・mandatory を問わず、`/{project_id}/api/reply` では「ヒアリング → 材料で回答 → 解決確認」の取り扱い（handling）に入り、答えられない・解決しないものだけを聞き取り内容（取次サマリ）付きで取り次ぐ。`human-handoff` もまず用件を聞き、回答で終わる場合がある。置き換わる記述: 上記「追記: Jev の適用範囲」節の「mandatory の即時エスカレーション契約は不変」「mandatory への `hearing` 宣言の拒否」、下記「追記: 会話フロー v1.1」の Issue #54 改訂と「S1-11. 追記」節の「第1層 mandatory は常に聞き返し不可」（いずれも `/api/reply` の会話層について。MCP の `clarification_allowed` は変わらない）。
-- 第2層（禁止領域）は即時取次のまま、評価順を第1層 mandatory より前にする。`electrical-work` はパターン（「電気工事」「高所作業」）のみで発火する。
-- Jev（TypeSafe）への顧客発話送信は全ルールのヒアリングと解決確認に広がる（assistant 発話は送らない。`[jev] enabled = false` で全停止）。
-- KnownResolution は回答ステップの材料であり、候補は取次前は会話の累積 signal、取次後は今ターンの signal から選び、LLM の適用可否判定で 1 件に絞る（Issue #103 の「今ターンの signal のみ」を変更）。
-- MCP `evaluate_answerability` は取り扱いを持たない。変わるのは第2層の評価順・KR 選定・ルール順序の決定論化のみ。
-- 本番挙動の変更点（ユーザー承認済み、2026-10-18）: 安全注意文 2 件と解決時の返信文は固定文、`initial-cost-quote` は部分回答を付けずヒアリング後に取次、`warranty-failure` は取次済み案件と MCP で部分回答の対象になる、`data/rules.sample.json` のエスカレーションルール 2 件を削除する。
+| PR（子 Issue） | 変わる挙動 | 置き換わる本書の記述 |
+| --- | --- | --- |
+| PR 1（#103） | KnownResolution は回答の材料になり、`signals` が decide の signal 集合（取次前は会話の累積、取次後は今ターン。main の現行と同じ集合）に含まれる候補を最大 3 件選び、LLM の適用可否判定で 1 件に絞る（設計 §8） | 上記「判定アーキテクチャ：3 層構造」の第3層「known_resolution 再利用」の扱い |
+| PR 2（#110） | 第2層（禁止領域）を第1層 mandatory より先に評価する。`electrical-work` はパターン（「電気工事」「高所作業」）のみで発火する。MCP でも、これらのパターンを含む工事の質問の監査ラベルが `construction-risk` から `electrical-work` に変わる（設計 §2.3） | 上記「判定アーキテクチャ：3 層構造」の層の順序の図と「安全に関わる層（1・2）を必ず先に置き」 |
+| PR 3（#111） | `/{project_id}/api/reply` で第1層ルールにマッチすると、advisory・mandatory を問わず「ヒアリング → 材料で回答 → 解決確認」の取り扱い（handling）に入る。ヒアリング後すぐ取り次ぐのは `after_hearing = handoff` のルール（`initial-cost-quote`）だけで、ほかは答えられない・解決しない場合、または聞き返し・回答の回数上限に達した場合に取り次ぐ。`human-handoff` もまず用件を聞く。取り扱いからの取次の受け止め文は取り扱い中ルールの `customer_ack`。Jev（TypeSafe）へは全ルールのヒアリングと解決確認で顧客発話を送る（assistant 発話は送らない。`[jev] enabled = false` で全停止）。`ingest_rules` は mandatory への `hearing` 宣言を受理し、`hearing` / `hearing_items_ja` / `after_hearing` を必須にする（設計 §3〜§7.3、§9） | 上記「第1層 — 明示エスカレーションルール」の「マッチしたら問答無用で確定ルーティング、回答生成に進ませない」と `customer_ack` の「ちょうど 1 件」の条件（取り扱いからの取次について）、上記「追記: Jev（TypeSafe System One）の適用範囲（Issue #56 / #58、2026-09-21）」の適用対象・第三者への送信範囲・「mandatory の即時エスカレーション契約は不変」・投入前の検証、下記「課題 3: 確実なエスカレーション」の回答生成への経路を閉じる記述、下記「追記: 会話フロー v1.1」の Issue #54 改訂（いずれも `/api/reply` の会話層について） |
+| PR 4（#112） | 取次時に取次サマリ（見出し「用件」「聞き取った内容」「案内した対処」「結果」）を生成し、管理画面のスレッド詳細に表示する。PR 3 から PR 4 までの間はサマリが無い（設計 §7.1） | なし（追加のみ） |
+
+MCP `evaluate_answerability` は取り扱いを持たない。MCP に及ぶ変更は、PR 1 の KR 選定、PR 2 の第2層の評価順・`electrical-work`・監査ラベル、ルール順序の決定論化（`order` 属性）、PR 3 の `Escalate.hearing` の扱い（legacy ではないルールでは付かなくなるため、`warranty-failure` の取次でも部分回答の `HearingDeclared` 除外が外れ、部分回答の対象になる）。MCP の `clarification_allowed` の値は変わらない。
+
+ユーザー承認済みの本番挙動の変更（2026-10-18）: 安全注意文 2 件と解決時の返信文は固定文、`initial-cost-quote` は部分回答を付けずにヒアリング後に取り次ぐ、`warranty-failure` は取次済み案件と MCP で部分回答の対象になる、`data/rules.sample.json` のエスカレーションルール 2 件を削除する。
 
 ## 課題 1: ノウハウの蓄積（GMR + 人間検証ループ）
 
