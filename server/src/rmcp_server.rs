@@ -783,8 +783,10 @@ impl CsSupportRmcpServer {
             .await
             .map_err(to_error)?;
         // 照合は Rust 集合演算（rules::match_known_resolution）。tool は結果を返すだけ。
-        let (match_kind, resolution, leftover) = known_resolution_match_view(
-            crate::harness::rules::match_known_resolution(&resolutions, &question_signals),
+        let (match_kind, resolution, leftover) = excluding_known_resolution_view(
+            resolutions,
+            &self.harness.excluded_known_resolution_ids,
+            &question_signals,
         );
         let retrieved = resolution
             .iter()
@@ -1223,6 +1225,18 @@ impl ServerHandler for CsSupportRmcpServer {
     }
 }
 
+fn excluding_known_resolution_view(
+    resolutions: Vec<crate::harness::rules::KnownResolution>,
+    excluded: &[String],
+    question_signals: &crate::harness::signal::SignalSet,
+) -> (String, Option<KnownResolutionView>, Vec<String>) {
+    let resolutions = crate::harness::rules::exclude_known_resolutions(resolutions, excluded);
+    known_resolution_match_view(crate::harness::rules::match_known_resolution(
+        &resolutions,
+        question_signals,
+    ))
+}
+
 fn known_resolution_match_view(
     matched: KrMatch<'_>,
 ) -> (String, Option<KnownResolutionView>, Vec<String>) {
@@ -1277,6 +1291,30 @@ mod tests {
         assert_eq!(status, "blocked_by_added_signal");
         assert!(resolution.is_none());
         assert_eq!(leftover, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn search_known_resolutions_view_ignores_an_excluded_resolution() {
+        use crate::harness::signal::{Signal, SignalSet};
+        let question: SignalSet = [Signal::new("a")].into_iter().collect();
+        let kr = crate::harness::rules::KnownResolution {
+            signal_set: question.clone(),
+            ..crate::test_support::kr_fixture("kr1", "answer")
+        };
+        let cases: [(Vec<String>, &str, bool); 2] = [
+            (vec!["kr1".to_string()], "none", false),
+            (vec![], "applicable", true),
+        ];
+        for (excluded, expected_status, expected_resolved) in cases {
+            let (status, resolution, _) =
+                excluding_known_resolution_view(vec![kr.clone()], &excluded, &question);
+            assert_eq!(status, expected_status, "excluded: {excluded:?}");
+            assert_eq!(
+                resolution.is_some(),
+                expected_resolved,
+                "excluded: {excluded:?}"
+            );
+        }
     }
 
     // ---- ProductReferenceJson::from（Issue #28 Suggestion 3） ----

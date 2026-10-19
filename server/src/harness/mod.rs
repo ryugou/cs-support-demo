@@ -1448,6 +1448,9 @@ impl Harness {
                 "permission_denied: add_known_resolution requires supervisor or admin role"
             );
         }
+        if answer.trim().is_empty() {
+            anyhow::bail!("invalid answer: empty");
+        }
         // legacy schema (sivira) には Rationale ノード型が無いため、rationale_text を
         // サイレントに落とすのではなく admission 側で拒否する（build 側は無視するだけになる）。
         if ctx.manual_schema == crate::config::ManualSchemaKind::LegacySection
@@ -3980,6 +3983,44 @@ mod tests {
             err.to_string().contains("evidence anchor"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn admit_known_resolution_rejects_a_blank_answer() {
+        let harness = harness_for_test_with_lexicon(
+            r#"{ "signals": [
+                { "signal": "mold", "class": "hazard", "surface_forms": ["カビ"] }
+            ] }"#,
+        );
+        let ctx = RequestContext {
+            actor: authn::Actor {
+                sub: "sup-001".to_string(),
+                email: "sup@sivira.co".to_string(),
+                role: authn::Role::Supervisor,
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+            },
+            scope: scope::AccessScope {
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+                max_sensitivity: None,
+                label_allowlist: None,
+            },
+            schema: "sivira-cs-demo".to_string(),
+            request_id: "req-test".to_string(),
+            manual_schema: crate::config::ManualSchemaKind::LegacySection,
+        };
+        let anchors = ["sec#a".to_string()];
+        for blank in ["", "   ", "\n\t "] {
+            let err = harness
+                .admit_known_resolution(&ctx, &["mold".to_string()], blank, None, &anchors)
+                .expect_err("blank answer must be rejected");
+            assert!(
+                err.to_string().contains("invalid answer: empty"),
+                "unexpected error: {err}"
+            );
+        }
+        harness
+            .admit_known_resolution(&ctx, &["mold".to_string()], "answer", None, &anchors)
+            .expect("a non-blank answer must be admitted");
     }
 
     #[test]

@@ -702,6 +702,11 @@ fn known_resolutions_from_nodes(
                 .get("kr_id")
                 .cloned()
                 .ok_or_else(|| anyhow!("KnownResolution missing kr_id"))?;
+            let answer = attrs
+                .get("answer_text")
+                .filter(|v| !v.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| anyhow!("invalid answer_text: empty (kr_id={kr_id})"))?;
             let verified_at = attrs
                 .get("verified_at")
                 .filter(|v| !v.is_empty())
@@ -715,7 +720,7 @@ fn known_resolutions_from_nodes(
                 id: kr_id,
                 signal_set: kr_signals.remove(&node.node_id).unwrap_or_default(),
                 applicability: get("applicability"),
-                answer: get("answer_text"),
+                answer,
                 source_authority: match get("source_authority").as_str() {
                     "non_authoritative" => SourceAuthority::NonAuthoritative,
                     _ => SourceAuthority::Authoritative,
@@ -2818,6 +2823,23 @@ mod tests {
             .to_string();
         assert!(err.contains("invalid verified_at"), "{err}");
         assert!(err.contains("kr_id=kr-1"), "{err}");
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_rejects_a_missing_or_blank_answer_text() {
+        for answer in [None, Some(""), Some("  \n\t")] {
+            let mut node = kr_node_with_verified_at(None);
+            match answer {
+                Some(raw) => node
+                    .attributes
+                    .insert("answer_text".to_string(), raw.to_string()),
+                None => node.attributes.remove("answer_text"),
+            };
+            let err = known_resolutions_from_nodes(vec![node], HashMap::new())
+                .expect_err("must reject")
+                .to_string();
+            assert_eq!(err, "invalid answer_text: empty (kr_id=kr-1)", "{answer:?}");
+        }
     }
 
     #[test]
