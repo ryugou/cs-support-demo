@@ -1084,6 +1084,7 @@ mod tests {
             }],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 

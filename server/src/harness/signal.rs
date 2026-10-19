@@ -347,6 +347,14 @@ impl LexiconNormalizer {
             .join("\n")
     }
 
+    /// Returns the vocabulary description of `signal`, or `None` when it is not registered.
+    pub fn description_of(&self, signal: &Signal) -> Option<&str> {
+        self.vocabulary
+            .iter()
+            .find(|entry| entry.signal == signal.as_str())
+            .map(|entry| entry.description.as_str())
+    }
+
     /// signal の lexicon description と(正規化前の生の) surface_forms を空白区切りで
     /// 連結した検索語を返す(design doc `2026-10-07-partial-answer-with-handoff-design.md`
     /// §10.2 の signal 誘導補助検索専用)。顧客提示には使わない内部語彙を含むため、
@@ -720,6 +728,20 @@ mod tests {
             lex.normalized_surface_forms_of(&Signal::new("mold")),
             Some(["カビ".to_string(), "かび".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn description_of_returns_the_vocabulary_description() {
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [ { "signal": "mold", "class": "hazard", "surface_forms": ["カビ"], "description": "カビの発生" } ] }"#,
+        )
+        .expect("lexicon parses");
+        assert_eq!(lex.description_of(&Signal::new("mold")), Some("カビの発生"));
+    }
+
+    #[test]
+    fn description_of_is_none_for_an_unknown_signal() {
+        assert_eq!(lexicon().description_of(&Signal::new("nope")), None);
     }
 
     #[test]

@@ -11,6 +11,8 @@ pub mod grading;
 pub mod handoff_items;
 pub mod hours;
 pub mod knowledge;
+/// Judge that selects the known resolution applicable to a question from the signal-matched candidates.
+pub mod kr_applicability;
 pub mod product_gate;
 pub(crate) mod prompt_input;
 #[cfg(test)]
@@ -1893,6 +1895,7 @@ impl Harness {
             stakes_input,
             thresholds: &self.thresholds,
             default_route: &self.default_route,
+            known_resolution: None,
         });
         let handoff_items = handoff_items::handoff_items_for_decision(
             &decision_result,
@@ -3187,6 +3190,7 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
+            known_resolution: None,
         })
     }
 
@@ -3327,6 +3331,7 @@ mod tests {
             missing: Vec::new(),
             hearing: Some(rules::HearingContract::ProductAndSymptom),
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -4576,6 +4581,7 @@ mod tests {
             missing,
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -4702,6 +4708,7 @@ mod tests {
             rejection_count: 0,
             approver_set: Vec::new(),
             origin: "test".to_string(),
+            verified_at: None,
             binding: rules::Binding::Advisory,
             registration_trigger: "single_ruling".to_string(),
             knowledge_class: "commercial".to_string(),
@@ -4735,6 +4742,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(d, decision::AnswerDecision::Escalate { layer: 1, .. }),
@@ -4773,6 +4781,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(d, decision::AnswerDecision::Escalate { layer: 1, .. }),
@@ -4815,6 +4824,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(d, decision::AnswerDecision::Escalate { layer: 1, .. }),
@@ -4850,6 +4860,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(d, decision::AnswerDecision::Escalate { layer: 2, .. }),
@@ -4884,6 +4895,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(d, decision::AnswerDecision::Escalate { layer: 2, .. }),
@@ -4912,6 +4924,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(
@@ -4947,6 +4960,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(
@@ -5139,6 +5153,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(d_unfiltered, decision::AnswerDecision::Allowed { .. }),
@@ -5167,6 +5182,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             !matches!(d, decision::AnswerDecision::Allowed { .. }),

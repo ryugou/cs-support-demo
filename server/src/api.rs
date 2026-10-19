@@ -2592,6 +2592,7 @@ mod tests {
             }],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -2611,6 +2612,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -2626,6 +2628,7 @@ mod tests {
             missing: vec![],
             hearing: Some(crate::harness::rules::HearingContract::ProductAndSymptom),
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -2643,6 +2646,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -2659,6 +2663,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: Some(customer_ack.to_string()),
+            known_resolution_id: None,
         }
     }
 
@@ -2710,6 +2715,7 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(decision, AnswerDecision::Escalate { layer: 1, .. }),
@@ -3215,6 +3221,7 @@ mod tests {
             missing: Vec::new(),
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
         let outcome = base_outcome(decision, false);
         let conv = default_conv_state();
@@ -3242,6 +3249,7 @@ mod tests {
             }],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
         let outcome = base_outcome(decision, true);
         let conv = default_conv_state();

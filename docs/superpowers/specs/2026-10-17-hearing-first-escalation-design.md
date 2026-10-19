@@ -365,6 +365,8 @@ Only the matching input changes: instead of matching signals itself, `decide` re
 3. LLM failure, unparsable output, or `LexiconFallback` → no applicable KR; warn with `request_id` and the error.
 4. Skipped when §4.2 says so; then no applicable KR.
 
+Decision: the applicability call of step 2 goes through the trait `kr_applicability::JudgeKrApplicability`, whose only production implementation is `AnthropicKrApplicability`. It is an external I/O and test boundary (KM-8): it isolates the LLM call so that tests replace it with a stub.
+
 Layer-3 reason: `decide` still calls `match_known_resolution` on the decide signal set only to choose between `EscalateReason::UnknownAddedSignal` (`BlockedByAddedSignal`) and `InsufficientDirectness`, as today; it never applies a KR from that call.
 
 The selected KR is exposed as `EvaluationOutcome.applicable_known_resolution` and used by the answer step (§5). MCP `evaluate_answerability` runs the same selection on its question.
@@ -434,7 +436,7 @@ Existing tests that fix the old behavior. A test name in a PR 1 row that does no
 | Test | Action | PR (§12) |
 | --- | --- | --- |
 | `harness/decision.rs` | add `mandatory_and_layer2_together_is_layer2` (main has no test that pins layer 1 over layer 2): a mandatory layer-1 rule and a layer-2 domain matching together yield layer 2 | 2 |
-| `harness/decision.rs` `mandatory_wins_over_a_matching_kr`, `layer2_wins_over_a_matching_kr`, `kr_with_advisory_escalates_with_the_kr_id`, `kr_alone_is_allowed_known_resolution`, `advisory_without_kr_keeps_missing_hearing_and_ack_rules` | rewrite: the KR is passed pre-selected (§8); the expected results are unchanged | 1 |
+| `harness/decision.rs` `mandatory_and_layer2_win_over_a_matching_kr` (one table test covering a mandatory rule and a layer-2 domain), `kr_with_advisory_escalates_with_the_kr_id`, `kr_alone_is_allowed_known_resolution`, `advisory_without_kr_keeps_missing_hearing_and_ack_rules` | rewrite: the KR is passed pre-selected (§8); the expected results are unchanged | 1 |
 | `harness/decision.rs` `layer3_reuses_known_resolution`, `layer1_short_circuits_everything` | rewrite: the KR is passed pre-selected to `decide` (§8); the expected results are unchanged (`Allowed{KnownResolution}` with `kr1`; layer-1 escalation to `safety_team` despite a matching KR) | 1 |
 | `harness/decision.rs` `hazard_blocks_kr` | move to the selection (§8): a hazard in the accumulated signals yields no candidates | 1 |
 | `harness/decision.rs` `kr_matches_turn_signals_not_question_signals` | invert and rename to `kr_candidates_use_the_decide_signal_set`: before escalation candidates come from the accumulated signals, after escalation from the turn signals only (both cases asserted) | 1 |

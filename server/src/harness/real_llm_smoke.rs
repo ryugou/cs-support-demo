@@ -583,6 +583,7 @@ fn decide_on_signals(
         stakes_input,
         thresholds: &fx.thresholds,
         default_route: &fx.config.harness.default_escalation_route,
+        known_resolution: None,
     });
     let matched_layer1_rule_ids: Vec<String> =
         matching_layer1_rules(&fx.escalation_rules, question_signals)

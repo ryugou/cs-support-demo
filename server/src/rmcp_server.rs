@@ -1353,6 +1353,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
         let outcome = evaluation_outcome_with_handoff_items(
             decision,
@@ -1411,6 +1412,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
         let allowed = || crate::harness::decision::AnswerDecision::Allowed {
             source: crate::harness::decision::AnswerSource::Manual,

@@ -461,6 +461,7 @@ mod tests {
             missing: Vec::new(),
             hearing,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -1146,6 +1147,7 @@ mod tests {
             missing: Vec::new(),
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 

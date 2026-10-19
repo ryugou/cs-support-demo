@@ -788,6 +788,7 @@ mod tests {
             missing: Vec::new(),
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -803,6 +804,7 @@ mod tests {
             missing: Vec::new(),
             hearing: None,
             customer_ack: Some(customer_ack.to_string()),
+            known_resolution_id: None,
         }
     }
 
