@@ -21,7 +21,7 @@
 //! ```
 //! API キーは env からのみ読み（`llm::AnthropicClient::from_config`）、ファイル・ログには書かない。
 
-use super::decision::{self, AnswerDecision, DecisionInput, StakesInput, Thresholds};
+use super::decision::{self, AnswerDecision, DecisionInput, Thresholds};
 use super::extraction::{
     self, AnthropicProductReferenceClassifier, AnthropicSignalClassifier, ClassifyLlm,
     ClassifyProductReferences, HybridExtractor, ProductReferenceExtractor,
@@ -387,7 +387,6 @@ struct Fixture {
     lexicon: Arc<signal::LexiconNormalizer>,
     escalation_rules: Vec<rules::EscalationRule>,
     prohibited_domains: Vec<rules::ProhibitedDomain>,
-    mandatory_domains: Vec<rules::ProhibitedDomain>,
     thresholds: Thresholds,
     allowlist: ProductAllowlist,
     hours_label: String,
@@ -475,6 +474,8 @@ fn build_harness(
         reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
         product_gate: None,
         jev_client: None,
+        kr_applicability: None,
+        excluded_known_resolution_ids: Vec::new(),
     }
 }
 
@@ -484,11 +485,6 @@ fn build_fixture(
     lexicon: Arc<signal::LexiconNormalizer>,
 ) -> Fixture {
     let prohibited_domains = load_bundled_prohibited_domains();
-    let mandatory_domains: Vec<rules::ProhibitedDomain> = prohibited_domains
-        .iter()
-        .filter(|d| d.binding == rules::Binding::Mandatory)
-        .cloned()
-        .collect();
     let thresholds: Thresholds = (&config.harness.thresholds).into();
     let hours_label = hours::business_hours_label(&config.api.business_hours);
     Fixture {
@@ -496,7 +492,6 @@ fn build_fixture(
         lexicon,
         escalation_rules: load_bundled_escalation_rules(),
         prohibited_domains,
-        mandatory_domains,
         thresholds,
         allowlist: ProductAllowlist::from_models(seed_product_models()),
         hours_label,
@@ -552,15 +547,9 @@ fn decide_on_signals(
     case_index: usize,
     total_cases: usize,
 ) -> (AnswerDecision, Vec<String>) {
-    let stakes_input = StakesInput {
-        mandatory_domain_near: rules::match_layer2(&fx.mandatory_domains, accumulated, question)
-            .is_some(),
-        ng_near_hit: fx.harness.ng.near_hit(question),
-        hazard_signal_count: accumulated
-            .iter()
-            .filter(|s| fx.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
-            .count(),
-    };
+    let stakes_input =
+        fx.harness
+            .stakes_input_for_turn(&fx.prohibited_domains, accumulated, question);
     let top_hit = question_hits.first().unwrap_or_else(|| {
         panic!(
             "case {case_index}/{total_cases} ({question:?}): question_hits is empty (the \
@@ -704,6 +693,7 @@ async fn draft_accepted_text(
         fx.harness
             .draft_customer_reply(
                 question,
+                "smoke-request-id",
                 decision,
                 merged_hits,
                 &[],
@@ -1265,6 +1255,7 @@ fn build_outcome(
         handoff_items: Vec::new(),
         partial_answer: false,
         decision_basis: turn.basis,
+        applicable_known_resolution: None,
     }
 }
 

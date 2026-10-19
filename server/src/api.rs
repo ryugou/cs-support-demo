@@ -1901,6 +1901,7 @@ async fn reply_handler(
         .evaluate(
             &ctx,
             &req.message,
+            &req.message,
             None,
             eval_case_id,
             &state.tools,
@@ -2757,6 +2758,7 @@ mod tests {
             handoff_items: Vec::new(),
             partial_answer: false,
             decision_basis: crate::harness::DecisionBasis::Accumulated,
+            applicable_known_resolution: None,
         }
     }
 
@@ -6061,6 +6063,8 @@ mod tests {
                 ]),
             )),
             jev_client: None,
+            kr_applicability: None,
+            excluded_known_resolution_ids: Vec::new(),
         }
     }
 

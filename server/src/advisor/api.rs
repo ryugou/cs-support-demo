@@ -2412,6 +2412,8 @@ mod tests {
             reply_draft_max_tokens: 700,
             product_gate: None,
             jev_client: None,
+            kr_applicability: None,
+            excluded_known_resolution_ids: Vec::new(),
         }
     }
 
@@ -2791,6 +2793,8 @@ clarify_max_turns = 3
                 ),
             )),
             jev_client: None,
+            kr_applicability: None,
+            excluded_known_resolution_ids: Vec::new(),
         };
         state.support_harness = Arc::new(support_harness);
         state.support_schema = support_schema.to_string();

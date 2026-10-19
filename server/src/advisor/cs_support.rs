@@ -226,6 +226,7 @@ pub async fn run_support_turn(
         .evaluate(
             &ctx,
             message,
+            message,
             None,
             case_id,
             tools,
@@ -906,6 +907,8 @@ mod tests {
                 ),
             )),
             jev_client: None,
+            kr_applicability: None,
+            excluded_known_resolution_ids: Vec::new(),
         }
     }
 
@@ -1058,6 +1061,7 @@ mod tests {
             handoff_items: Vec::new(),
             partial_answer: false,
             decision_basis: crate::harness::DecisionBasis::Accumulated,
+            applicable_known_resolution: None,
         }
     }
 
