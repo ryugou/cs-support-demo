@@ -98,9 +98,12 @@ pub(crate) fn build_user_message(
 
 pub(crate) fn parse_applicable_ids(raw: &str) -> anyhow::Result<Vec<String>> {
     let body = crate::llm::strip_markdown_fence(raw);
-    let parsed: ApplicableIds = serde_json::from_str(body).with_context(|| {
-        format!(
-            "invalid kr applicability output: expected {{\"applicable_ids\":[...]}} (len={} chars)",
+    let parsed: ApplicableIds = serde_json::from_str(body).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid kr applicability output: expected {{\"applicable_ids\":[...]}} (category={:?} line={} column={} len={} chars)",
+            err.classify(),
+            err.line(),
+            err.column(),
             body.chars().count()
         )
     })?;

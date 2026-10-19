@@ -282,3 +282,27 @@ fn candidate_fields_cannot_close_the_candidate_tag() {
         );
     }
 }
+
+#[test]
+fn malformed_output_errors_name_the_category_and_never_echo_the_content() {
+    let marker = "SECRET-CUSTOMER-TEXT";
+    let cases = [
+        (format!(r#"{{"applicable_ids":"{marker}"}}"#), "Data"),
+        (
+            format!(r#"{{"applicable_ids":["kr-1"],"{marker}":1}}"#),
+            "Data",
+        ),
+        (format!(r#"{{"applicable_ids":["kr-1", "{marker}""#), "Eof"),
+        (format!("{marker} is not json"), "Syntax"),
+    ];
+    for (raw, category) in cases {
+        let err = parse_applicable_ids(&raw).expect_err("malformed output is rejected");
+        let message = format!("{err:#}");
+        assert!(!message.contains(marker), "{message}");
+        assert!(message.contains(category), "{message}");
+        assert!(message.contains("applicable_ids"), "{message}");
+        assert!(message.contains("line="), "{message}");
+        assert!(message.contains("column="), "{message}");
+        assert!(message.contains("len="), "{message}");
+    }
+}

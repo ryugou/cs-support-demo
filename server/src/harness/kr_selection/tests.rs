@@ -146,3 +146,20 @@ async fn lexicon_fallback_warns_without_the_customer_text() {
     assert!(warns.contains("fell back to the lexicon"), "{warns}");
     assert!(!warns.contains(CUSTOMER_TEXT), "{warns}");
 }
+
+#[tokio::test]
+async fn malformed_judge_output_selects_no_kr_and_warns_without_the_customer_text() {
+    let echoed = format!(r#"{{"applicable_ids":"{CUSTOMER_TEXT}"}}"#);
+    let judge = KrStubJudge::new(Ok(&echoed));
+    let harness = kr_selection_harness(Some(judge.clone()), &[]);
+    let case = KrTurnCase::new(&["a"], &["a"]);
+    let krs = [contract_test_kr("kr1", &["a"])];
+    let ((selected, _), logs) =
+        crate::test_support::capture_logs_async(run_kr_turn(&harness, &case, &krs)).await;
+    assert_eq!(selected, None);
+    assert_eq!(judge.calls(), 1);
+    let warns = crate::test_support::filter_warn_and_error_lines(&logs);
+    assert!(warns.contains("req-register-test"), "{warns}");
+    assert!(warns.contains("invalid kr applicability output"), "{warns}");
+    assert!(!warns.contains(CUSTOMER_TEXT), "{warns}");
+}
