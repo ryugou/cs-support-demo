@@ -10,7 +10,7 @@
 //!
 //! 言い回しによって判定が `Escalate`（取次）と `Allowed`（回答のみ）に割れる（§10.5）。各ケースは
 //! `expect` で自分がどちらになるはずかを宣言し、本テストは本番 `evaluate()` と同じ条件
-//! （`handoff_items::is_partial_answer_candidate`）でだけ補助検索を併合し、`expect` ごとに
+//! （`super::should_search_handoff_signals`）でだけ補助検索を併合し、`expect` ごとに
 //! 異なる最終応答文の形（取次の一文・受付番号あり、または下書きそのまま）を確認する。
 //!
 //! `#[ignore]`: 実 API キー・ネットワーク到達性・`CS_VERIFY_CASES_JSON`（本番 MCP
@@ -796,7 +796,7 @@ fn assert_allowed_final_reply(
 }
 
 /// design doc §10.2・本番 `evaluate()`（`server/src/harness/mod.rs` の
-/// `handoff_items::is_partial_answer_candidate` 分岐）と同じ条件: 取次候補
+/// `should_search_handoff_signals` 分岐）と同じ条件: 取次候補
 /// （第1・2層 Escalate かつ取り次ぐ項目が1つ以上、hearing宣言なし）のときだけ、マッチした signal
 /// の lexicon 語彙で引いた補助検索を質問文検索の結果と併合する。それ以外（Allowed・第3層）は
 /// 質問文検索の結果（取扱外型番は既に除外済み）をそのまま下書きの材料にする（検索回数を増やさ
@@ -812,7 +812,7 @@ fn select_material_hits(
     case_index: usize,
     total_cases: usize,
 ) -> (Vec<SectionHit>, Option<f32>) {
-    if handoff_items::is_partial_answer_candidate(decision, items) {
+    if super::should_search_handoff_signals(decision, items) {
         let item_signals: std::collections::BTreeSet<&signal::Signal> =
             items.iter().flat_map(|item| item.signals.iter()).collect();
         let covered = signal::Signal::new(SUPPLEMENTARY_SEARCH_SIGNAL);

@@ -703,6 +703,16 @@ fn already_escalated_for_policy(policy: &ReplyDraftPolicy<'_>) -> bool {
     }
 }
 
+/// §10.2 の signal 誘導補助検索を行うかどうか。既知解決（KR）を載せた取次では、材料が KR の
+/// 回答だけで補助検索の結果は使われないため行わない。
+fn should_search_handoff_signals(
+    decision: &decision::AnswerDecision,
+    handoff_items: &[handoff_items::HandoffItem],
+) -> bool {
+    decision.known_resolution_id().is_none()
+        && handoff_items::is_partial_answer_candidate(decision, handoff_items)
+}
+
 fn partial_answer_enabled_for_policy(policy: &ReplyDraftPolicy<'_>) -> bool {
     match policy {
         ReplyDraftPolicy::Always => true,
@@ -1978,7 +1988,7 @@ impl Harness {
         // 済みの入力を使っており、ここでは `section_hits` / `best_manual_score` /
         // `retrieved_manual_ids` の 3 束縛だけを後続処理向けにシャドーイングする）。
         let (section_hits, best_manual_score, retrieved_manual_ids) =
-            if handoff_items::is_partial_answer_candidate(&decision_result, &handoff_items) {
+            if should_search_handoff_signals(&decision_result, &handoff_items) {
                 let signal_results = self
                     .search_handoff_signals(
                         ctx,
@@ -4372,6 +4382,16 @@ mod tests {
             .is_ok()
         });
         (draft, log)
+    }
+
+    #[test]
+    fn handoff_signal_search_is_skipped_when_a_known_resolution_rides_the_escalation() {
+        let items = handoff_items_fixture();
+        let plain =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        assert!(should_search_handoff_signals(&plain, &items));
+        let [_, riding] = kr_decisions("kr1");
+        assert!(!should_search_handoff_signals(&riding, &items));
     }
 
     #[tokio::test]
