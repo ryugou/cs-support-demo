@@ -724,6 +724,18 @@ fn assert_draft_accepted(
     );
 }
 
+/// Builds the skip-when-unused draft policy the smoke tests share with production.
+fn skip_when_unused_policy(
+    allowlist: &ProductAllowlist,
+    already_escalated: bool,
+) -> ReplyDraftPolicy<'_> {
+    ReplyDraftPolicy::SkipWhenUnused {
+        response_allowlist: allowlist,
+        already_escalated,
+        partial_answer_enabled: true,
+    }
+}
+
 /// The draft plan `/api/reply` computes for a turn; shared by `draft_accepted_text` and the unit
 /// test that has no `Fixture`.
 #[allow(clippy::too_many_arguments)]
@@ -737,11 +749,7 @@ fn plan_draft(
     thresholds: &Thresholds,
     draft_enabled: bool,
 ) -> super::ReplyDraftPlan {
-    let policy = ReplyDraftPolicy::SkipWhenUnused {
-        response_allowlist: allowlist,
-        already_escalated,
-        partial_answer_enabled: true,
-    };
+    let policy = skip_when_unused_policy(allowlist, already_escalated);
     super::plan_reply_draft(
         &policy,
         decision,
@@ -1057,11 +1065,7 @@ fn select_turn_only_signals<'a>(
     case_index: usize,
     total_cases: usize,
 ) -> &'a signal::SignalSet {
-    let policy = ReplyDraftPolicy::SkipWhenUnused {
-        response_allowlist: &fx.allowlist,
-        already_escalated: true,
-        partial_answer_enabled: true,
-    };
+    let policy = skip_when_unused_policy(&fx.allowlist, true);
     let (decide_signals, basis) =
         super::decide_signals_for_policy(&policy, turn2_signals, accumulated);
     assert_eq!(
@@ -1682,6 +1686,12 @@ fn parse_kr_fixture(body: &str) -> Result<Vec<rules::KnownResolution>, String> {
         .collect()
 }
 
+/// Returns the bundled production signal lexicon, panicking when it cannot be loaded.
+fn load_bundled_lexicon() -> signal::LexiconNormalizer {
+    signal::LexiconNormalizer::from_path(&server_path("data/urtect/signal-lexicon.json"))
+        .expect("bundled signal lexicon must load")
+}
+
 fn load_kr_fixture() -> Vec<rules::KnownResolution> {
     let path = server_path("data/urtect/known-resolutions.sample.json");
     let body = std::fs::read_to_string(&path)
@@ -2195,11 +2205,7 @@ async fn select_kr_riding_turn<'a>(
     label: &str,
     warns_before: usize,
 ) -> super::KrTurn<'a> {
-    let policy = ReplyDraftPolicy::SkipWhenUnused {
-        response_allowlist: &fx.allowlist,
-        already_escalated: false,
-        partial_answer_enabled: true,
-    };
+    let policy = skip_when_unused_policy(&fx.allowlist, false);
     let kr_turn = fx
         .harness
         .prepare_kr_turn(
@@ -2424,9 +2430,7 @@ async fn assert_draft_follows_kr(
 fn kr_smoke_cases_produce_the_intended_candidates() {
     use super::signal::SignalNormalizer;
 
-    let lexicon =
-        signal::LexiconNormalizer::from_path(&server_path("data/urtect/signal-lexicon.json"))
-            .expect("bundled signal lexicon must load");
+    let lexicon = load_bundled_lexicon();
     let fixture = load_kr_fixture();
     for case in kr_applicability_cases() {
         let signals = lexicon.normalize(case.utterance);
@@ -2457,9 +2461,7 @@ fn digit_runs_ignore_thousands_separators() {
 fn kr_scope_only_cases_share_one_applicability_and_keep_their_candidates() {
     use super::signal::SignalNormalizer;
 
-    let lexicon =
-        signal::LexiconNormalizer::from_path(&server_path("data/urtect/signal-lexicon.json"))
-            .expect("bundled signal lexicon must load");
+    let lexicon = load_bundled_lexicon();
     let fixture = load_kr_fixture();
     let mut checked = 0;
     for case in kr_applicability_cases() {
@@ -2581,14 +2583,21 @@ fn led_procedure_check_rejects_drafts_that_change_the_procedure() {
     }
 }
 
-const LED_FULL_ANSWER_PARAPHRASE: &str = "ADC-V724Xの赤い点滅は「起動中」の表示です（Wi-Fi未接続は赤の点灯です）。\n数分待っても点滅が続いて繋がらない場合は、初期化はせず、APモードでWi-Fiを設定し直してください（Wi-Fiを変更した場合は新しいWi-Fiを選びます）。\n1. カメラの電源は入れたままにする\n2. 背面のWPS/Resetボタンを5〜7秒長押しし、白く点滅したら離す\n3. スマホのWi-Fi設定で「ADC-V724/724X（XX:XX:XX）」に接続する\n4. ブラウザで 192.168.1.1 を開く\n5. 接続したいWi-FiのSSIDを選び、パスワードを入力する\n6. カメラのLEDが緑の点灯になれば完了です\n⚠ ボタンを15秒以上押さないでください。15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。";
-
 #[test]
 fn led_procedure_check_accepts_the_sample_answer_and_its_paraphrase() {
-    assert_eq!(check_led_procedure(LED_FULL_ANSWER_PARAPHRASE), Ok(()));
-    let paraphrase = LED_FULL_ANSWER_PARAPHRASE.replace(
+    let answer = load_kr_fixture()
+        .into_iter()
+        .find(|record| record.id == KR_LED)
+        .unwrap_or_else(|| panic!("known resolution {KR_LED} is absent from the KR fixture"))
+        .answer;
+    assert_eq!(check_led_procedure(&answer), Ok(()));
+    let paraphrase = answer.replace(
         "15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます",
         "15秒以上押し続けると工場出荷時の設定に戻り、設定が消えてしまいます",
+    );
+    assert_ne!(
+        paraphrase, answer,
+        "the paraphrase replacement must change the {KR_LED} answer"
     );
     assert_eq!(check_led_procedure(&paraphrase), Ok(()), "{paraphrase}");
 }
@@ -2684,9 +2693,7 @@ fn led_procedure_check_rejects_a_draft_without_a_15_second_prohibition() {
 fn kr_riding_advisory_turn_escalates_with_the_kr_and_plans_a_partial_answer() {
     use super::signal::SignalNormalizer;
 
-    let lexicon =
-        signal::LexiconNormalizer::from_path(&server_path("data/urtect/signal-lexicon.json"))
-            .expect("bundled signal lexicon must load");
+    let lexicon = load_bundled_lexicon();
     let config = AppConfig::load(&server_path("config.cloudrun.toml"))
         .expect("load server/config.cloudrun.toml");
     let fixture = load_kr_fixture();
