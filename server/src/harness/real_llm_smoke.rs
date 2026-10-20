@@ -724,6 +724,36 @@ fn assert_draft_accepted(
     );
 }
 
+/// The draft plan `/api/reply` computes for a turn; shared by `draft_accepted_text` and the unit
+/// test that has no `Fixture`.
+#[allow(clippy::too_many_arguments)]
+fn plan_draft(
+    allowlist: &ProductAllowlist,
+    already_escalated: bool,
+    decision: &AnswerDecision,
+    items: &[handoff_items::HandoffItem],
+    mode: extraction::ExtractionMode,
+    best_manual_score: Option<f32>,
+    thresholds: &Thresholds,
+    draft_enabled: bool,
+) -> super::ReplyDraftPlan {
+    let policy = ReplyDraftPolicy::SkipWhenUnused {
+        response_allowlist: allowlist,
+        already_escalated,
+        partial_answer_enabled: true,
+    };
+    super::plan_reply_draft(
+        &policy,
+        decision,
+        items,
+        mode,
+        false,
+        best_manual_score,
+        thresholds,
+        draft_enabled,
+    )
+}
+
 /// 下書きを生成し、本番と同じ採否判定（`accept_draft`、truncated 判定、取扱外型番ゲート）を
 /// 通して本文を返す。`merged_hits` / `merged_best_score` は `run_once` が design doc §10.2 の
 /// 条件で確定した下書き材料（取次候補のときは質問文検索と補助検索を
@@ -742,19 +772,15 @@ async fn draft_accepted_text(
     history: &[ReplyHistoryTurn],
     case_index: usize,
     total_cases: usize,
+    resolutions: &[rules::KnownResolution],
 ) -> String {
     let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
-    let policy = ReplyDraftPolicy::SkipWhenUnused {
-        response_allowlist: &fx.allowlist,
-        already_escalated: !history.is_empty(),
-        partial_answer_enabled: true,
-    };
-    let plan = super::plan_reply_draft(
-        &policy,
+    let plan = plan_draft(
+        &fx.allowlist,
+        !history.is_empty(),
         decision,
         items,
         mode,
-        false,
         merged_best_score,
         &fx.thresholds,
         fx.config.harness.customer_reply_draft_enabled,
@@ -767,7 +793,7 @@ async fn draft_accepted_text(
                 "smoke-request-id",
                 decision,
                 merged_hits,
-                &[],
+                resolutions,
                 history,
                 !history.is_empty(),
                 &fx.allowlist,
@@ -972,6 +998,7 @@ async fn run_once(
         &[],
         case_index,
         total_cases,
+        &[],
     )
     .await;
     let outcome = build_single_turn_outcome(&decision, &extracted, &material_hits, draft_text);
@@ -1177,6 +1204,7 @@ async fn draft_allowed_turn2_answer(
         &history,
         case_index,
         total_cases,
+        &[],
     )
     .await;
     (extracted2, accumulated, decision2, draft_text)
@@ -1723,7 +1751,7 @@ struct KrCase {
     utterance: &'static str,
     candidate_ids: &'static [&'static str],
     expected: Option<&'static str>,
-    draft_keeps_numbers: bool,
+    draft_follows_kr: bool,
     /// Replaces every candidate's `applicability` with one identical scope-only string, so the judge
     /// must decide on the answer and the signal descriptions instead of a topic-naming applicability.
     scope_only_applicability: bool,
@@ -1758,7 +1786,7 @@ fn kr_applicability_cases() -> [KrCase; 5] {
             utterance: "録画が何日も止まっています",
             candidate_ids: &[KR_RETENTION],
             expected: None,
-            draft_keeps_numbers: false,
+            draft_follows_kr: false,
             scope_only_applicability: false,
         },
         KrCase {
@@ -1766,7 +1794,7 @@ fn kr_applicability_cases() -> [KrCase; 5] {
             utterance: "クラウドの保存期間は何日ですか？",
             candidate_ids: &[KR_RETENTION],
             expected: Some(KR_RETENTION),
-            draft_keeps_numbers: true,
+            draft_follows_kr: true,
             scope_only_applicability: false,
         },
         KrCase {
@@ -1774,7 +1802,7 @@ fn kr_applicability_cases() -> [KrCase; 5] {
             utterance: "ADC-V724X のランプが赤く点滅しています",
             candidate_ids: &[KR_LED],
             expected: Some(KR_LED),
-            draft_keeps_numbers: true,
+            draft_follows_kr: true,
             scope_only_applicability: false,
         },
         KrCase {
@@ -1782,7 +1810,7 @@ fn kr_applicability_cases() -> [KrCase; 5] {
             utterance: "常時録画の設定は済んでいます。クラウドの保存期間は何日ですか？",
             candidate_ids: &[KR_ALWAYS_ON, KR_RETENTION],
             expected: Some(KR_RETENTION),
-            draft_keeps_numbers: false,
+            draft_follows_kr: false,
             scope_only_applicability: true,
         },
         KrCase {
@@ -1790,10 +1818,19 @@ fn kr_applicability_cases() -> [KrCase; 5] {
             utterance: "常時録画にしています。画質の設定はどこで変えられますか？動画の保存期間は気にしていません。",
             candidate_ids: &[KR_ALWAYS_ON, KR_RETENTION],
             expected: None,
-            draft_keeps_numbers: false,
+            draft_follows_kr: false,
             scope_only_applicability: true,
         },
     ]
+}
+
+/// The digit runs of `answer` (a known resolution's answer) that `text` does not contain.
+fn missing_numbers(answer: &str, text: &str) -> Vec<String> {
+    let present = digit_runs(text);
+    digit_runs(answer)
+        .into_iter()
+        .filter(|number| !present.contains(number))
+        .collect()
 }
 
 fn digit_runs(text: &str) -> Vec<String> {
@@ -1822,11 +1859,38 @@ const KR_RIDING_CASE_INDEX: usize = 6;
 struct KrRidingTurn {
     decision: AnswerDecision,
     items: Vec<handoff_items::HandoffItem>,
-    plan: super::ReplyDraftPlan,
 }
 
-/// Decides and plans the draft the way `/api/reply` does for the first turn of a conversation
-/// (no manual material: the KR alone has to make the partial answer eligible).
+/// Decides a first-turn question carrying a selected known resolution the way `/api/reply` does
+/// (no manual material: the known resolution alone is the evidence).
+#[allow(clippy::too_many_arguments)]
+fn decide_kr_turn(
+    config: &AppConfig,
+    escalation_rules: &[rules::EscalationRule],
+    prohibited_domains: &[rules::ProhibitedDomain],
+    thresholds: &Thresholds,
+    signals: &signal::SignalSet,
+    utterance: &str,
+    resolutions: &[rules::KnownResolution],
+    selected: Option<&rules::KnownResolution>,
+    stakes_input: &decision::StakesInput,
+) -> AnswerDecision {
+    decision::decide(&DecisionInput {
+        question_signals: signals,
+        question_raw: utterance,
+        rules: escalation_rules,
+        domains: prohibited_domains,
+        resolutions,
+        best_manual_score: None,
+        best_manual_sections: &[],
+        stakes_input: stakes_input.clone(),
+        thresholds,
+        default_route: &config.harness.default_escalation_route,
+        known_resolution: selected,
+    })
+}
+
+/// Decides the riding-advisory question and derives its handoff items.
 #[allow(clippy::too_many_arguments)]
 fn decide_kr_riding_turn(
     config: &AppConfig,
@@ -1839,19 +1903,17 @@ fn decide_kr_riding_turn(
     selected: Option<&rules::KnownResolution>,
     stakes_input: &decision::StakesInput,
 ) -> KrRidingTurn {
-    let decision = decision::decide(&DecisionInput {
-        question_signals: signals,
-        question_raw: KR_RIDING_UTTERANCE,
-        rules: escalation_rules,
-        domains: prohibited_domains,
-        resolutions,
-        best_manual_score: None,
-        best_manual_sections: &[],
-        stakes_input: stakes_input.clone(),
+    let decision = decide_kr_turn(
+        config,
+        escalation_rules,
+        prohibited_domains,
         thresholds,
-        default_route: &config.harness.default_escalation_route,
-        known_resolution: selected,
-    });
+        signals,
+        KR_RIDING_UTTERANCE,
+        resolutions,
+        selected,
+        stakes_input,
+    );
     let items = handoff_items::handoff_items_for_decision(
         &decision,
         escalation_rules,
@@ -1860,27 +1922,7 @@ fn decide_kr_riding_turn(
         KR_RIDING_UTTERANCE,
         lexicon,
     );
-    let allowlist = ProductAllowlist::from_models(seed_product_models());
-    let policy = ReplyDraftPolicy::SkipWhenUnused {
-        response_allowlist: &allowlist,
-        already_escalated: false,
-        partial_answer_enabled: true,
-    };
-    let plan = super::plan_reply_draft(
-        &policy,
-        &decision,
-        &items,
-        extraction::ExtractionMode::Hybrid,
-        false,
-        None,
-        thresholds,
-        config.harness.customer_reply_draft_enabled,
-    );
-    KrRidingTurn {
-        decision,
-        items,
-        plan,
-    }
+    KrRidingTurn { decision, items }
 }
 
 const CONTRACT_LABEL: &str = "契約・解約・プラン変更・請求に関するご相談";
@@ -1909,12 +1951,16 @@ fn assert_kr_riding_turn(
         labels.contains(&CONTRACT_LABEL),
         "handoff items must name the contract topic, got {labels:?}"
     );
+}
+
+/// The KR must make the partial-answer draft eligible without manual material.
+fn assert_partial_answer_plan(plan: &super::ReplyDraftPlan) {
     assert!(
-        turn.plan.generate && turn.plan.partial_answer_ok,
+        plan.generate && plan.partial_answer_ok,
         "the KR must make the partial-answer draft eligible without manual material \
          (generate={}, partial_answer_ok={})",
-        turn.plan.generate,
-        turn.plan.partial_answer_ok
+        plan.generate,
+        plan.partial_answer_ok
     );
 }
 
@@ -1939,16 +1985,49 @@ fn find_after(haystack: &str, needle: &str, from: usize) -> Option<usize> {
         .map(|offset| from + offset + needle.len())
 }
 
+/// Notations that join the two ends of the 5-7 second press (the text is already normalized, so 〜/～ are `~`).
+const PRESS_RANGE_SEPARATORS: [&str; 8] = ["~", "-", "－", "ー", "—", "–", "―", "から"];
+
+/// Markers that make a sentence a prohibition (`押さないでください`, `お控えください`).
+const LED_PROHIBITION: [&str; 10] = [
+    "ないで",
+    "ないよう",
+    "控え",
+    "禁止",
+    "避け",
+    "せず",
+    "押さず",
+    "行わず",
+    "不要",
+    "必要はありません",
+];
+/// Request or command forms that make a sentence an instruction to the customer.
+const LED_REQUEST_FORMS: [&str; 6] = [
+    "ください",
+    "て下さい",
+    "ましょう",
+    "お願いします",
+    "ること",
+    "お試し",
+];
+/// Te-form presses (`長押しして`): a sentence that chains the press into another action instructs it.
+const LED_PRESS_TE_FORMS: [&str; 4] = ["押して", "長押しして", "押し続けて", "押したまま"];
+/// The factory-reset concept; the bare Reset button is not it.
+const LED_RESET_CONCEPT: [&str; 3] = ["初期化", "工場出荷", "リセットされ"];
+
 /// The procedure of the LED known resolution (sample-4) as the draft must keep it: the AP-mode
 /// route, the 5-7 second press, the order of the steps, and the warning that holding the button
 /// for 15 seconds or more factory-resets the camera. Wording is free; only the anchors, the order
 /// and the polarity of the warning are checked.
 fn check_led_procedure(draft_text: &str) -> Result<(), String> {
-    const PROHIBITION: [&str; 5] = ["ないで", "禁止", "避け", "注意", "⚠"];
-    const CONSEQUENCE: [&str; 5] = ["初期化され", "初期化と", "消え", "消去", "なります"];
-    const RESET_SAFE: [&str; 7] = ["ないで", "せず", "禁止", "避け", "注意", "⚠", "され"];
-
     let text = normalize_for_match(draft_text);
+    check_led_anchors(&text)?;
+    check_led_step_order(&text)?;
+    check_led_warning_polarity(draft_text)
+}
+
+/// The anchors the procedure cannot lose: the AP mode, the address, the Reset button and the 5-7 second press.
+fn check_led_anchors(text: &str) -> Result<(), String> {
     for anchor in ["apモード", "192.168.1.1"] {
         if !text.contains(anchor) {
             return Err(format!("the draft lacks {anchor:?}"));
@@ -1957,24 +2036,28 @@ fn check_led_procedure(draft_text: &str) -> Result<(), String> {
     if !(text.contains("reset") || text.contains("リセット")) {
         return Err("the draft lacks the Reset button".to_owned());
     }
-    if !["5~7秒", "5秒~7秒", "5秒から7秒", "5から7秒"]
+    if !PRESS_RANGE_SEPARATORS
         .iter()
-        .any(|form| text.contains(form))
+        .any(|sep| text.contains(&format!("5{sep}7秒")) || text.contains(&format!("5秒{sep}7秒")))
     {
         return Err("the draft lacks the 5〜7秒 press duration".to_owned());
     }
+    Ok(())
+}
 
+/// The steps run Reset button, ADC-V724 Wi-Fi, 192.168.1.1, SSID in that order.
+fn check_led_step_order(text: &str) -> Result<(), String> {
     let button = [text.find("reset"), text.find("リセット")]
         .into_iter()
         .flatten()
         .min()
         .ok_or_else(|| "the draft lacks the Reset button".to_owned())?;
-    let order = find_after(&text, "adc-v724", button)
-        .and_then(|at| find_after(&text, "192.168.1.1", at))
+    let order = find_after(text, "adc-v724", button)
+        .and_then(|at| find_after(text, "192.168.1.1", at))
         .and_then(|at| {
             [
-                find_after(&text, "ssid", at),
-                find_after(&text, "パスワード", at),
+                find_after(text, "ssid", at),
+                find_after(text, "パスワード", at),
             ]
             .into_iter()
             .flatten()
@@ -1986,36 +2069,48 @@ fn check_led_procedure(draft_text: &str) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    Ok(())
+}
 
-    let sentences: Vec<String> = draft_text
+/// The sentences of the draft (split on 。！？!? and newlines, so a bullet line is a sentence), normalized.
+fn led_sentences(draft_text: &str) -> Vec<String> {
+    draft_text
         .split(['。', '\n', '！', '!', '？', '?'])
         .map(normalize_for_match)
         .filter(|sentence| !sentence.is_empty())
-        .collect();
-    let long_press: Vec<&String> = sentences.iter().filter(|s| s.contains("15秒")).collect();
-    if !long_press
+        .collect()
+}
+
+fn led_mentions_any(sentence: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| sentence.contains(needle))
+}
+
+/// The warning not to hold the button for 15秒, structurally and fail-closed: every sentence that
+/// mentions the 15-second press or the factory reset and also instructs the customer (a request
+/// form or a te-form press) must carry a prohibition marker; declarative consequences pass.
+fn check_led_warning_polarity(draft_text: &str) -> Result<(), String> {
+    let sentences = led_sentences(draft_text);
+    if !sentences
         .iter()
-        .any(|s| PROHIBITION.iter().any(|marker| s.contains(marker)))
+        .any(|s| s.contains("15秒") && led_mentions_any(s, &LED_PROHIBITION))
     {
         return Err("the draft lacks the warning not to hold the button for 15秒".to_owned());
     }
-    if let Some(sentence) = long_press.iter().find(|s| {
-        !PROHIBITION
-            .iter()
-            .chain(CONSEQUENCE.iter())
-            .any(|marker| s.contains(marker))
-    }) {
-        return Err(format!(
-            "a sentence mentions 15秒 without a prohibition or consequence: {sentence:?}"
-        ));
-    }
-    if let Some(sentence) = sentences
-        .iter()
-        .find(|s| s.contains("初期化") && !RESET_SAFE.iter().any(|marker| s.contains(marker)))
-    {
-        return Err(format!(
-            "a sentence mentions 初期化 without a prohibition or consequence: {sentence:?}"
-        ));
+    for sentence in &sentences {
+        let press = sentence.contains("15秒");
+        let reset = led_mentions_any(sentence, &LED_RESET_CONCEPT);
+        let instructs = led_mentions_any(sentence, &LED_REQUEST_FORMS)
+            || led_mentions_any(sentence, &LED_PRESS_TE_FORMS);
+        if (press || reset) && instructs && !led_mentions_any(sentence, &LED_PROHIBITION) {
+            let targets = [(press, "15秒"), (reset, "初期化")]
+                .into_iter()
+                .filter_map(|(hit, name)| hit.then_some(name))
+                .collect::<Vec<_>>()
+                .join("・");
+            return Err(format!(
+                "a sentence instructs {targets} without a prohibition: {sentence:?}"
+            ));
+        }
     }
     Ok(())
 }
@@ -2074,13 +2169,32 @@ async fn run_kr_riding_advisory_case(
     ctx: &super::RequestContext,
     fixture: &[rules::KnownResolution],
 ) {
-    use super::signal::SignalNormalizer;
-
     let label = "f: 保存期間 KR に解約の取次が同乗する";
     let warns_before = warn_count();
     println!("===== KR smoke case {label} =====");
     println!("utterance: {KR_RIDING_UTTERANCE}");
+    use super::signal::SignalNormalizer;
     let signals = fx.lexicon.normalize(KR_RIDING_UTTERANCE);
+    let kr_turn = select_kr_riding_turn(fx, ctx, fixture, &signals, label, warns_before).await;
+    let kr = kr_turn
+        .applicable_known_resolution
+        .as_ref()
+        .expect("select_kr_riding_turn asserted a selection");
+    let final_reply = draft_and_assemble_kr_riding_reply(fx, &kr_turn, label).await;
+    println!("--- final reply ({label}) ---\n{final_reply}");
+    assert_kr_riding_final_reply(kr, &final_reply, label);
+    assert_no_new_warns(label, warns_before);
+}
+
+/// Case f, selection step: the judge must select the retention KR for the riding utterance.
+async fn select_kr_riding_turn<'a>(
+    fx: &Fixture,
+    ctx: &super::RequestContext,
+    fixture: &[rules::KnownResolution],
+    signals: &'a signal::SignalSet,
+    label: &str,
+    warns_before: usize,
+) -> super::KrTurn<'a> {
     let policy = ReplyDraftPolicy::SkipWhenUnused {
         response_allowlist: &fx.allowlist,
         already_escalated: false,
@@ -2092,8 +2206,8 @@ async fn run_kr_riding_advisory_case(
             ctx,
             fixture.to_vec(),
             &policy,
-            &signals,
-            &signals,
+            signals,
+            signals,
             &fx.prohibited_domains,
             KR_RIDING_UTTERANCE,
             KR_RIDING_UTTERANCE,
@@ -2107,7 +2221,15 @@ async fn run_kr_riding_advisory_case(
         .unwrap_or_else(|| panic!("case {label}: the judge selected no known resolution"));
     println!("selected id: {:?}", kr.id);
     assert_eq!(kr.id, KR_RETENTION, "case {label}");
+    kr_turn
+}
 
+/// Case f, decide / plan / draft / assemble step: returns the final reply.
+async fn draft_and_assemble_kr_riding_reply(
+    fx: &Fixture,
+    kr_turn: &super::KrTurn<'_>,
+    label: &str,
+) -> String {
     let turn = decide_kr_riding_turn(
         &fx.config,
         &fx.lexicon,
@@ -2120,60 +2242,53 @@ async fn run_kr_riding_advisory_case(
         &kr_turn.stakes_input,
     );
     assert_kr_riding_turn(&turn, &fx.escalation_rules, kr_turn.decide_signals);
-    let labels: Vec<String> = turn.items.iter().map(|item| item.label.clone()).collect();
-    let draft = fx
-        .harness
-        .draft_customer_reply(
-            KR_RIDING_UTTERANCE,
-            "kr-smoke-request-id",
-            &turn.decision,
-            &[],
-            &kr_turn.resolutions,
-            &[],
-            false,
-            &fx.allowlist,
-            &labels,
-            turn.plan.partial_answer_ok,
-        )
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "case {label}: draft_customer_reply generated no draft (plan.generate={}, \
-                 plan.partial_answer_ok={})",
-                turn.plan.generate, turn.plan.partial_answer_ok
-            )
-        });
-    println!("--- draft ({label}) ---\n{}", draft.text);
-    assert_draft_accepted(
-        fx,
-        &draft,
-        turn.plan.partial_answer_ok,
+    assert_partial_answer_plan(&plan_draft(
+        &fx.allowlist,
+        false,
+        &turn.decision,
         &turn.items,
-        &format!("case {label}"),
-    );
-    let final_reply = assemble_and_assert_handoff_reply(
+        extraction::ExtractionMode::Hybrid,
+        None,
+        &fx.thresholds,
+        fx.config.harness.customer_reply_draft_enabled,
+    ));
+    let labels: Vec<String> = turn.items.iter().map(|item| item.label.clone()).collect();
+    let draft_text = draft_accepted_text(
         fx,
-        &draft.text,
+        &turn.decision,
+        extraction::ExtractionMode::Hybrid,
+        &turn.items,
+        KR_RIDING_UTTERANCE,
+        &[],
+        None,
+        &[],
+        KR_RIDING_CASE_INDEX,
+        KR_RIDING_CASE_INDEX,
+        &kr_turn.resolutions,
+    )
+    .await;
+    println!("--- draft ({label}) ---\n{draft_text}");
+    assemble_and_assert_handoff_reply(
+        fx,
+        &draft_text,
         &labels,
         KR_RIDING_UTTERANCE,
         KR_RIDING_CASE_INDEX,
         KR_RIDING_CASE_INDEX,
-    );
-    println!("--- final reply ({label}) ---\n{final_reply}");
-    let reply_numbers = digit_runs(&final_reply);
-    let missing: Vec<String> = digit_runs(&kr.answer)
-        .into_iter()
-        .filter(|number| !reply_numbers.contains(number))
-        .collect();
+    )
+}
+
+/// Case f, final-reply assertions: the KR's numbers survive and the clip-count basis is named.
+fn assert_kr_riding_final_reply(kr: &rules::KnownResolution, final_reply: &str, label: &str) {
+    let missing = missing_numbers(&kr.answer, final_reply);
     assert!(
         missing.is_empty(),
         "case {label}: the final reply dropped numbers of the known resolution {missing:?}:\n{final_reply}"
     );
     assert!(
-        normalize_for_match(&final_reply).contains("クリップ"),
+        normalize_for_match(final_reply).contains("クリップ"),
         "case {label}: the final reply does not state the clip-count basis of the known resolution:\n{final_reply}"
     );
-    assert_no_new_warns(label, warns_before);
 }
 
 async fn run_kr_case(
@@ -2224,8 +2339,8 @@ async fn run_kr_case(
         case.label, case.utterance
     );
 
-    if case.draft_keeps_numbers {
-        assert_draft_keeps_numbers(fx, case, turn).await;
+    if case.draft_follows_kr {
+        assert_draft_follows_kr(fx, case, turn).await;
         assert_no_new_warns(case.label, warns_before);
     }
 }
@@ -2238,7 +2353,7 @@ fn assert_no_new_warns(label: &str, warns_before: usize) {
     );
 }
 
-async fn assert_draft_keeps_numbers(
+async fn assert_draft_follows_kr(
     fx: &Fixture,
     case: &KrCase,
     turn: super::kr_selection::KrTurn<'_>,
@@ -2247,19 +2362,17 @@ async fn assert_draft_keeps_numbers(
         .applicable_known_resolution
         .as_ref()
         .expect("selected id was asserted above");
-    let decision = decision::decide(&DecisionInput {
-        question_signals: turn.decide_signals,
-        question_raw: case.utterance,
-        rules: &fx.escalation_rules,
-        domains: &fx.prohibited_domains,
-        resolutions: &turn.resolutions,
-        best_manual_score: None,
-        best_manual_sections: &[],
-        stakes_input: turn.stakes_input,
-        thresholds: &fx.thresholds,
-        default_route: &fx.config.harness.default_escalation_route,
-        known_resolution: turn.applicable_known_resolution.as_ref(),
-    });
+    let decision = decide_kr_turn(
+        &fx.config,
+        &fx.escalation_rules,
+        &fx.prohibited_domains,
+        &fx.thresholds,
+        turn.decide_signals,
+        case.utterance,
+        &turn.resolutions,
+        turn.applicable_known_resolution.as_ref(),
+        &turn.stakes_input,
+    );
     let draft = fx
         .harness
         .draft_customer_reply(
@@ -2290,7 +2403,6 @@ async fn assert_draft_keeps_numbers(
         &format!("case {} ({:?})", case.label, case.utterance),
     );
     if kr.id == KR_LED {
-        // The LED record's numbers are mostly list markers; its fidelity is the procedure check.
         if let Err(reason) = check_led_procedure(&draft.text) {
             panic!(
                 "case {}: the draft does not keep the known resolution's procedure: {reason}:\n{}",
@@ -2299,11 +2411,7 @@ async fn assert_draft_keeps_numbers(
         }
         return;
     }
-    let draft_numbers = digit_runs(&draft.text);
-    let missing: Vec<String> = digit_runs(&kr.answer)
-        .into_iter()
-        .filter(|number| !draft_numbers.contains(number))
-        .collect();
+    let missing = missing_numbers(&kr.answer, &draft.text);
     assert!(
         missing.is_empty(),
         "case {}: the draft dropped numbers of the known resolution {missing:?}:\n{}",
@@ -2402,6 +2510,33 @@ fn led_procedure_check_accepts_a_faithful_draft_with_varied_wording() {
 }
 
 #[test]
+fn led_procedure_check_accepts_faithful_paraphrases() {
+    let cases = [
+        ("行わず", "初期化はせず", "初期化は行わず"),
+        ("不要です", "初期化はせず", "初期化は不要です"),
+        (
+            "必要はありません",
+            "初期化はせず",
+            "初期化する必要はありません",
+        ),
+        ("hyphen", "５～７秒", "5-7秒"),
+        ("full-width hyphen", "５～７秒", "5－7秒"),
+        ("long vowel mark", "５～７秒", "5ー7秒"),
+        ("em dash", "５～７秒", "5—7秒"),
+        ("en dash", "５～７秒", "5–7秒"),
+        ("seconds on both sides", "５～７秒", "5秒〜7秒"),
+    ];
+    for (label, from, to) in cases {
+        assert!(
+            LED_GOOD_DRAFT.contains(from),
+            "{label}: sample no longer contains {from:?}"
+        );
+        let draft = LED_GOOD_DRAFT.replace(from, to);
+        assert_eq!(check_led_procedure(&draft), Ok(()), "{label}: {draft}");
+    }
+}
+
+#[test]
 fn led_procedure_check_rejects_drafts_that_change_the_procedure() {
     let cases = [
         (
@@ -2446,6 +2581,105 @@ fn led_procedure_check_rejects_drafts_that_change_the_procedure() {
     }
 }
 
+const LED_FULL_ANSWER_PARAPHRASE: &str = "ADC-V724Xの赤い点滅は「起動中」の表示です（Wi-Fi未接続は赤の点灯です）。\n数分待っても点滅が続いて繋がらない場合は、初期化はせず、APモードでWi-Fiを設定し直してください（Wi-Fiを変更した場合は新しいWi-Fiを選びます）。\n1. カメラの電源は入れたままにする\n2. 背面のWPS/Resetボタンを5〜7秒長押しし、白く点滅したら離す\n3. スマホのWi-Fi設定で「ADC-V724/724X（XX:XX:XX）」に接続する\n4. ブラウザで 192.168.1.1 を開く\n5. 接続したいWi-FiのSSIDを選び、パスワードを入力する\n6. カメラのLEDが緑の点灯になれば完了です\n⚠ ボタンを15秒以上押さないでください。15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。";
+
+#[test]
+fn led_procedure_check_accepts_the_sample_answer_and_its_paraphrase() {
+    assert_eq!(check_led_procedure(LED_FULL_ANSWER_PARAPHRASE), Ok(()));
+    let paraphrase = LED_FULL_ANSWER_PARAPHRASE.replace(
+        "15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます",
+        "15秒以上押し続けると工場出荷時の設定に戻り、設定が消えてしまいます",
+    );
+    assert_eq!(check_led_procedure(&paraphrase), Ok(()), "{paraphrase}");
+}
+
+#[test]
+fn led_procedure_check_accepts_varied_prohibition_wordings() {
+    for warning in [
+        "ボタンを15秒以上押さないでください。",
+        "15秒以上は押さないようご注意ください。",
+        "15秒以上の長押しはお控えください。",
+        "15秒以上の長押しは避けてください。",
+        "15秒以上の長押しは禁止です。",
+    ] {
+        let draft = LED_GOOD_DRAFT.replace("⚠ ボタンを15秒以上押さないでください。", warning);
+        assert_ne!(draft, LED_GOOD_DRAFT, "{warning}");
+        assert_eq!(check_led_procedure(&draft), Ok(()), "{draft}");
+    }
+}
+
+#[test]
+fn led_procedure_check_accepts_declarative_consequences() {
+    for extra in [
+        "\n15秒以上押すと初期化されます。",
+        "\n15秒以上押すと工場出荷時の設定に戻ります。",
+        "\n15秒以上押すと設定がリセットされます。",
+        "\n15秒以上で工場出荷状態に初期化され、設定が消えます。",
+    ] {
+        let draft = format!("{LED_GOOD_DRAFT}{extra}");
+        assert_eq!(check_led_procedure(&draft), Ok(()), "{draft}");
+    }
+}
+
+#[test]
+fn led_procedure_check_rejects_an_instruction_without_a_prohibition() {
+    let cases = [
+        (
+            "bare 戻り after a te-form press",
+            "改善しない場合は15秒長押しして工場出荷状態に戻り、再設定してください。",
+            "15秒",
+        ),
+        (
+            "transitive reset request",
+            "15秒長押しして初期化してください。",
+            "15秒",
+        ),
+        (
+            "te-form press with a declarative end",
+            "15秒長押しして初期化します。",
+            "15秒",
+        ),
+        (
+            "label does not whitewash",
+            "注意：15秒長押ししてください。",
+            "15秒",
+        ),
+        (
+            "reset requested without 15秒",
+            "初期化してから再設定してください。",
+            "初期化",
+        ),
+        (
+            "request behind a warning mark",
+            "⚠ 15秒長押ししてみてください。",
+            "15秒",
+        ),
+    ];
+    for (label, extra, expected_mention) in cases {
+        let draft = format!("{LED_GOOD_DRAFT}\n{extra}");
+        match check_led_procedure(&draft) {
+            Err(message) => {
+                assert!(
+                    message.contains(expected_mention),
+                    "{label}: error must mention {expected_mention:?}, got {message:?}"
+                );
+            }
+            Ok(()) => panic!("{label}: expected the check to fail"),
+        }
+    }
+}
+
+#[test]
+fn led_procedure_check_rejects_a_draft_without_a_15_second_prohibition() {
+    let draft = LED_GOOD_DRAFT.replace(
+        "⚠ ボタンを15秒以上押さないでください。15秒以上押すと工場出荷状態に初期化され、設定が消えます。",
+        "15秒以上押すと工場出荷状態に初期化されます。",
+    );
+    assert_ne!(draft, LED_GOOD_DRAFT);
+    let message = check_led_procedure(&draft).expect_err("no prohibition sentence");
+    assert!(message.contains("15秒"), "{message}");
+}
+
 #[test]
 fn kr_riding_advisory_turn_escalates_with_the_kr_and_plans_a_partial_answer() {
     use super::signal::SignalNormalizer;
@@ -2486,4 +2720,14 @@ fn kr_riding_advisory_turn_escalates_with_the_kr_and_plans_a_partial_answer() {
         },
     );
     assert_kr_riding_turn(&turn, &escalation_rules, &signals);
+    assert_partial_answer_plan(&plan_draft(
+        &ProductAllowlist::from_models(seed_product_models()),
+        false,
+        &turn.decision,
+        &turn.items,
+        extraction::ExtractionMode::Hybrid,
+        None,
+        &thresholds,
+        config.harness.customer_reply_draft_enabled,
+    ));
 }
