@@ -2142,7 +2142,7 @@ fn parse_led_safety(raw: &str) -> Result<LedSafety, String> {
     let body = crate::llm::strip_markdown_fence(raw);
     serde_json::from_str(body).map_err(|err| {
         format!(
-            "invalid LED judge output (category={:?} line={} column={} len={} chars)",
+            "invalid LED judge output: category={:?} line={} column={} len={} chars",
             err.classify(),
             err.line(),
             err.column(),
