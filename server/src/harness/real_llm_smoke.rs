@@ -1762,8 +1762,9 @@ struct KrCase {
     candidate_ids: &'static [&'static str],
     expected: Option<&'static str>,
     draft_follows_kr: bool,
-    /// Replaces every candidate's `applicability` with one identical scope-only string, so the judge
-    /// must decide on the answer and the signal descriptions instead of a topic-naming applicability.
+    /// Replaces the `applicability` of every record in the fixture (not only the candidates) with one
+    /// identical scope-only string (see `kr_fixture_for_case`), so the judge must decide on the answer
+    /// and the signal descriptions instead of a topic-naming applicability.
     scope_only_applicability: bool,
 }
 
@@ -1980,7 +1981,7 @@ fn normalize_for_match(text: &str) -> String {
     text.chars()
         .filter(|ch| !ch.is_whitespace())
         .map(|ch| match ch {
-            '０'..='９' => char::from_u32(ch as u32 - '０' as u32 + '0' as u32).unwrap_or(ch),
+            '０'..='９' => char::from(b'0' + (ch as u32 - '０' as u32) as u8),
             '〜' | '～' => '~',
             other => other,
         })
@@ -2012,13 +2013,17 @@ const LED_PROHIBITION: [&str; 10] = [
     "必要はありません",
 ];
 /// Request or command forms that make a sentence an instruction to the customer.
-const LED_REQUEST_FORMS: [&str; 6] = [
+const LED_REQUEST_FORMS: [&str; 10] = [
     "ください",
     "て下さい",
     "ましょう",
     "お願いします",
     "ること",
     "お試し",
+    "いただ",
+    "必要です",
+    "推奨",
+    "おすすめ",
 ];
 /// Te-form presses (`長押しして`): a sentence that chains the press into another action instructs it.
 const LED_PRESS_TE_FORMS: [&str; 4] = ["押して", "長押しして", "押し続けて", "押したまま"];
@@ -2095,31 +2100,56 @@ fn led_mentions_any(sentence: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| sentence.contains(needle))
 }
 
-/// The warning not to hold the button for 15秒, structurally and fail-closed: every sentence that
-/// mentions the 15-second press or the factory reset and also instructs the customer (a request
-/// form or a te-form press) must carry a prohibition marker; declarative consequences pass.
+/// Index of the first mention of the 15-second press or the reset concept in `clause`.
+fn led_first_target(clause: &str) -> Option<usize> {
+    std::iter::once("15秒")
+        .chain(LED_RESET_CONCEPT)
+        .filter_map(|target| clause.find(target))
+        .min()
+}
+
+/// Whether a prohibition marker appears at or after byte `from` of `text`.
+fn led_prohibited_after(text: &str, from: usize) -> bool {
+    led_mentions_any(&text[from..], &LED_PROHIBITION)
+}
+
+/// The warning not to hold the button for 15秒, structurally and fail-closed. A sentence that
+/// instructs the customer (a request form or a te-form press) is split into clauses on 、 / ， / `,`,
+/// and every clause that mentions the 15-second press or the factory reset must carry a prohibition
+/// marker after its first such mention (`初期化はせず`); a marker earlier in the sentence or in
+/// another clause (`改善しないようなら、15秒長押しして…`) does not excuse it. Declarative
+/// consequences pass. The draft must also hold a 15秒 sentence with a prohibition after the mention.
 fn check_led_warning_polarity(draft_text: &str) -> Result<(), String> {
     let sentences = led_sentences(draft_text);
     if !sentences
         .iter()
-        .any(|s| s.contains("15秒") && led_mentions_any(s, &LED_PROHIBITION))
+        .any(|s| s.find("15秒").is_some_and(|at| led_prohibited_after(s, at)))
     {
         return Err("the draft lacks the warning not to hold the button for 15秒".to_owned());
     }
     for sentence in &sentences {
-        let press = sentence.contains("15秒");
-        let reset = led_mentions_any(sentence, &LED_RESET_CONCEPT);
         let instructs = led_mentions_any(sentence, &LED_REQUEST_FORMS)
             || led_mentions_any(sentence, &LED_PRESS_TE_FORMS);
-        if (press || reset) && instructs && !led_mentions_any(sentence, &LED_PROHIBITION) {
-            let targets = [(press, "15秒"), (reset, "初期化")]
+        if !instructs {
+            continue;
+        }
+        for clause in sentence.split(['、', '，', ',']) {
+            let Some(at) = led_first_target(clause) else {
+                continue;
+            };
+            if !led_prohibited_after(clause, at) {
+                let targets = [
+                    ("15秒", clause.contains("15秒")),
+                    ("初期化", led_mentions_any(clause, &LED_RESET_CONCEPT)),
+                ]
                 .into_iter()
-                .filter_map(|(hit, name)| hit.then_some(name))
+                .filter_map(|(name, hit)| hit.then_some(name))
                 .collect::<Vec<_>>()
                 .join("・");
-            return Err(format!(
-                "a sentence instructs {targets} without a prohibition: {sentence:?}"
-            ));
+                return Err(format!(
+                    "a clause instructs {targets} without a prohibition after it: {clause:?} (sentence {sentence:?})"
+                ));
+            }
         }
     }
     Ok(())
@@ -2610,6 +2640,7 @@ fn led_procedure_check_accepts_varied_prohibition_wordings() {
         "15秒以上の長押しはお控えください。",
         "15秒以上の長押しは避けてください。",
         "15秒以上の長押しは禁止です。",
+        "15秒以上の長押しは行わず、そのままお待ちください。",
     ] {
         let draft = LED_GOOD_DRAFT.replace("⚠ ボタンを15秒以上押さないでください。", warning);
         assert_ne!(draft, LED_GOOD_DRAFT, "{warning}");
@@ -2662,6 +2693,26 @@ fn led_procedure_check_rejects_an_instruction_without_a_prohibition() {
             "request behind a warning mark",
             "⚠ 15秒長押ししてみてください。",
             "15秒",
+        ),
+        (
+            "prohibition marker before the target in the same clause",
+            "改善しないようなら、15秒長押しして初期化してください。",
+            "15秒",
+        ),
+        (
+            "prohibition marker earlier in the sentence",
+            "それでも改善せず繋がらない場合は15秒長押しして初期化してください。",
+            "15秒",
+        ),
+        (
+            "reset required",
+            "改善しない場合は初期化が必要です。",
+            "初期化",
+        ),
+        (
+            "reset asked politely",
+            "初期化していただけますでしょうか。",
+            "初期化",
         ),
     ];
     for (label, extra, expected_mention) in cases {
