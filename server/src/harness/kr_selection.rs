@@ -3,7 +3,7 @@ use super::{
     DecisionBasis, Harness, ReplyDraftPolicy, RequestContext,
 };
 
-const KR_CANDIDATE_LIMIT: usize = 3;
+pub(super) const KR_CANDIDATE_LIMIT: usize = 3;
 
 pub(super) struct KrTurn<'a> {
     pub(super) resolutions: Vec<rules::KnownResolution>,

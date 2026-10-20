@@ -392,6 +392,47 @@ struct Fixture {
     hours_label: String,
 }
 
+static WARN_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct WarnCounter;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() <= tracing::Level::WARN {
+            WARN_EVENTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+fn warn_count() -> usize {
+    WARN_EVENTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn init_warn_subscriber() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer as _;
+
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stdout)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            )
+            .with(WarnCounter)
+            .try_init()
+            .expect(
+                "the warn subscriber could not be installed because another global subscriber exists; run this smoke alone as in the module doc command",
+            );
+    });
+}
+
 fn load_config_and_client() -> (AppConfig, AnthropicClient) {
     let config = AppConfig::load(&server_path("config.cloudrun.toml"))
         .expect("load server/config.cloudrun.toml");
@@ -653,6 +694,36 @@ fn assert_decision_matches(
     }
 }
 
+fn assert_draft_accepted(
+    fx: &Fixture,
+    draft: &crate::llm::ReplyDraft,
+    partial_answer_ok: bool,
+    items: &[handoff_items::HandoffItem],
+    context: &str,
+) {
+    if let Err(reason) =
+        handoff_items::accept_draft(&draft.text, partial_answer_ok, items, &fx.lexicon)
+    {
+        panic!("{context}: draft was not accepted: {reason}");
+    }
+    assert!(
+        !draft.truncated,
+        "{context}: draft was truncated at the generation \
+         limit; production's partial_answer_draft_for_escalation discards it and falls back to \
+         the acknowledgement text instead of using it:\n{}",
+        draft.text
+    );
+    // api.rs の `gate_customer_reply_draft`（private）§3.5(1) と同じ判定。
+    // 本番ならこの下書きは捨てられる。
+    let out_of_scope = fx.allowlist.out_of_scope_mentions(&draft.text);
+    assert!(
+        out_of_scope.is_empty(),
+        "{context}: draft mentions out-of-scope models \
+         {out_of_scope:?} (production would discard it):\n{}",
+        draft.text
+    );
+}
+
 /// 下書きを生成し、本番と同じ採否判定（`accept_draft`、truncated 判定、取扱外型番ゲート）を
 /// 通して本文を返す。`merged_hits` / `merged_best_score` は `run_once` が design doc §10.2 の
 /// 条件で確定した下書き材料（取次候補のときは質問文検索と補助検索を
@@ -715,26 +786,12 @@ async fn draft_accepted_text(
             plan.generate, plan.partial_answer_ok
         )
     };
-    if let Err(reason) =
-        handoff_items::accept_draft(&draft.text, plan.partial_answer_ok, items, &fx.lexicon)
-    {
-        panic!("case {case_index}/{total_cases} ({question:?}): draft was not accepted: {reason}");
-    }
-    assert!(
-        !draft.truncated,
-        "case {case_index}/{total_cases} ({question:?}): draft was truncated at the generation \
-         limit; production's partial_answer_draft_for_escalation discards it and falls back to \
-         the acknowledgement text instead of using it:\n{}",
-        draft.text
-    );
-    // api.rs の `gate_customer_reply_draft`（private）§3.5(1) と同じ判定。
-    // 本番ならこの下書きは捨てられる。
-    let out_of_scope = fx.allowlist.out_of_scope_mentions(&draft.text);
-    assert!(
-        out_of_scope.is_empty(),
-        "case {case_index}/{total_cases} ({question:?}): draft mentions out-of-scope models \
-         {out_of_scope:?} (production would discard it):\n{}",
-        draft.text
+    assert_draft_accepted(
+        fx,
+        &draft,
+        plan.partial_answer_ok,
+        items,
+        &format!("case {case_index}/{total_cases} ({question:?})"),
     );
     println!("draft: accepted");
     draft.text
@@ -1325,13 +1382,7 @@ fn assert_final_reply(
             signal-guided supplementary search); see design doc \
             2026-10-07-partial-answer-with-handoff-design.md §10.3, §10.5"]
 async fn real_llm_partial_answer_smoke() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(std::io::stdout)
-        .try_init()
-        .expect(
-            "the warn subscriber could not be installed because another global subscriber exists; run this smoke alone as in the module doc command",
-        );
+    init_warn_subscriber();
     let (config, client) = load_config_and_client();
     let cases = load_verify_cases();
 
@@ -1550,4 +1601,392 @@ fn verify_case_followup_fields_are_validated_against_expect() {
             }
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureKnownResolution {
+    signals: Vec<String>,
+    applicability: String,
+    answer: String,
+    rationale_text: String,
+}
+
+fn parse_kr_fixture(body: &str) -> Result<Vec<rules::KnownResolution>, String> {
+    let records: Vec<FixtureKnownResolution> = serde_json::from_str(body)
+        .map_err(|err| format!("failed to parse known resolution fixture: {err}"))?;
+    if records.is_empty() {
+        return Err("invalid known resolution fixture: no records".to_owned());
+    }
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let id = format!("sample-{}", index + 1);
+            if record.signals.is_empty() || record.signals.iter().any(|s| s.trim().is_empty()) {
+                return Err(format!(
+                    "invalid known resolution fixture record {index} field \"signals\": empty or blank entry"
+                ));
+            }
+            for (field, value) in [
+                ("applicability", &record.applicability),
+                ("answer", &record.answer),
+                ("rationale_text", &record.rationale_text),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!(
+                        "invalid known resolution fixture record {index} field \"{field}\": blank"
+                    ));
+                }
+            }
+            Ok(rules::KnownResolution {
+                signal_set: record
+                    .signals
+                    .into_iter()
+                    .map(signal::Signal::new)
+                    .collect(),
+                applicability: record.applicability,
+                answer: record.answer,
+                origin: "known-resolutions.sample.json".to_owned(),
+                ..crate::test_support::kr_fixture(&id, "")
+            })
+        })
+        .collect()
+}
+
+fn load_kr_fixture() -> Vec<rules::KnownResolution> {
+    let path = server_path("data/urtect/known-resolutions.sample.json");
+    let body = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to load known resolution fixture {path:?}: {err}"));
+    parse_kr_fixture(&body)
+        .unwrap_or_else(|err| panic!("failed to load known resolution fixture {path:?}: {err}"))
+}
+
+#[test]
+fn kr_fixture_parse_rejects_invalid_records() {
+    let record = |overrides: &[(&str, &str)]| {
+        let mut fields = vec![
+            ("signals", r#"["a"]"#),
+            ("applicability", r#""app""#),
+            ("answer", r#""ans""#),
+            ("rationale_text", r#""why""#),
+        ];
+        fields.retain(|(name, _)| !overrides.iter().any(|(o, _)| o == name));
+        fields.extend(overrides.iter().filter(|(_, v)| !v.is_empty()).copied());
+        let body = fields
+            .iter()
+            .map(|(name, value)| format!("\"{name}\": {value}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{{{body}}}]")
+    };
+    assert!(parse_kr_fixture(&record(&[])).is_ok());
+    let cases = [
+        ("empty array", "[]".to_owned(), "no records"),
+        ("unknown field", record(&[("extra", "1")]), "extra"),
+        ("empty signals", record(&[("signals", "[]")]), "signals"),
+        (
+            "blank signal entry",
+            record(&[("signals", r#"["a", " "]"#)]),
+            "signals",
+        ),
+        (
+            "blank applicability",
+            record(&[("applicability", r#""  ""#)]),
+            "applicability",
+        ),
+        ("blank answer", record(&[("answer", r#""  ""#)]), "answer"),
+        (
+            "blank rationale_text",
+            record(&[("rationale_text", r#""  ""#)]),
+            "rationale_text",
+        ),
+        (
+            "missing rationale_text",
+            record(&[("rationale_text", "")]),
+            "rationale_text",
+        ),
+    ];
+    for (label, body, field) in cases {
+        match parse_kr_fixture(&body) {
+            Err(message) => assert!(
+                message.contains(field),
+                "{label}: error must name {field:?}, got {message:?}"
+            ),
+            Ok(_) => panic!("{label}: expected an error"),
+        }
+    }
+}
+
+struct KrCase {
+    label: &'static str,
+    utterance: &'static str,
+    candidate_ids: &'static [&'static str],
+    expected: Option<&'static str>,
+    draft_keeps_numbers: bool,
+}
+
+const KR_RETENTION: &str = "sample-2";
+const KR_LED: &str = "sample-4";
+const KR_ALWAYS_ON: &str = "sample-1";
+
+fn kr_applicability_cases() -> [KrCase; 5] {
+    [
+        KrCase {
+            label: "a: 録画が止まっている相談は保存期間 KR を選ばない",
+            utterance: "録画が何日も止まっています",
+            candidate_ids: &[KR_RETENTION],
+            expected: None,
+            draft_keeps_numbers: false,
+        },
+        KrCase {
+            label: "b: 保存期間の質問は保存期間 KR を選び、下書きが数字を保つ",
+            utterance: "クラウドの保存期間は何日ですか？",
+            candidate_ids: &[KR_RETENTION],
+            expected: Some(KR_RETENTION),
+            draft_keeps_numbers: true,
+        },
+        KrCase {
+            label: "c: 赤い点滅の質問は LED KR を選ぶ",
+            utterance: "ADC-V724X のランプが赤く点滅しています",
+            candidate_ids: &[KR_LED],
+            expected: Some(KR_LED),
+            draft_keeps_numbers: false,
+        },
+        KrCase {
+            label: "d: 全モデル KR が 2 件候補でも関連する 1 件だけを選ぶ",
+            utterance: "常時録画の設定は済んでいます。クラウドの保存期間は何日ですか？",
+            candidate_ids: &[KR_ALWAYS_ON, KR_RETENTION],
+            expected: Some(KR_RETENTION),
+            draft_keeps_numbers: false,
+        },
+        KrCase {
+            label: "e: どちらにも答えていなければ選ばない",
+            utterance: "常時録画にしています。画質の設定はどこで変えられますか？動画の保存期間は気にしていません。",
+            candidate_ids: &[KR_ALWAYS_ON, KR_RETENTION],
+            expected: None,
+            draft_keeps_numbers: false,
+        },
+    ]
+}
+
+fn digit_runs(text: &str) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if ch == ',' && !current.is_empty() {
+            continue;
+        } else if !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+#[tokio::test]
+#[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
+async fn real_llm_kr_applicability_smoke() {
+    use super::kr_applicability::{AnthropicKrApplicability, JudgeKrApplicability};
+
+    init_warn_subscriber();
+
+    let (config, client) = load_config_and_client();
+    let lexicon = Arc::new(
+        signal::LexiconNormalizer::from_path(&resolve_server_path(
+            &config.harness.signal_lexicon_path,
+        ))
+        .expect("production signal lexicon must load and parse"),
+    );
+    let dir =
+        TempDir(std::env::temp_dir().join(format!("real-llm-smoke-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&dir.0).expect("create temp dir for the harness worm audit log/queue");
+
+    let mut harness = build_harness(&config, client.clone(), &lexicon, &dir.0);
+    harness.kr_applicability =
+        Some(Arc::new(AnthropicKrApplicability::new(client)) as Arc<dyn JudgeKrApplicability>);
+    let fx = build_fixture(config, harness, lexicon);
+    let fixture = load_kr_fixture();
+    let ctx = super::RequestContext {
+        actor: authn::Actor {
+            sub: "google-sub:kr-smoke".to_string(),
+            email: "kr-smoke@sivira.co".to_string(),
+            role: authn::Role::Supervisor,
+            allowed_schemas: vec!["urtect".to_string()],
+        },
+        scope: super::scope::AccessScope {
+            allowed_schemas: vec!["urtect".to_string()],
+            max_sensitivity: None,
+            label_allowlist: None,
+        },
+        schema: "urtect".to_string(),
+        request_id: "kr-smoke-request-id".to_string(),
+        manual_schema: crate::config::ManualSchemaKind::ManualV1,
+    };
+
+    for case in kr_applicability_cases() {
+        run_kr_case(&fx, &ctx, &fixture, &case).await;
+    }
+}
+
+async fn run_kr_case(
+    fx: &Fixture,
+    ctx: &super::RequestContext,
+    fixture: &[rules::KnownResolution],
+    case: &KrCase,
+) {
+    use super::signal::SignalNormalizer;
+
+    let warns_before = warn_count();
+    println!("===== KR smoke case {} =====", case.label);
+    println!("utterance: {}", case.utterance);
+    let signals = fx.lexicon.normalize(case.utterance);
+    let candidates: Vec<String> = rules::known_resolution_candidates(
+        fixture,
+        &signals,
+        super::kr_selection::KR_CANDIDATE_LIMIT,
+    )
+    .into_iter()
+    .map(|kr| kr.id.clone())
+    .collect();
+    println!("candidate ids: {candidates:?}");
+    let turn = fx
+        .harness
+        .prepare_kr_turn(
+            ctx,
+            fixture.to_vec(),
+            &ReplyDraftPolicy::Always,
+            &signals,
+            &signals,
+            &fx.prohibited_domains,
+            case.utterance,
+            case.utterance,
+            extraction::ExtractionMode::Hybrid,
+        )
+        .await;
+    assert_no_new_warns(case.label, warns_before);
+    let selected = turn
+        .applicable_known_resolution
+        .as_ref()
+        .map(|kr| kr.id.as_str());
+    println!("selected id: {selected:?}");
+    assert_eq!(
+        selected, case.expected,
+        "case {}: selected known resolution differs for {:?}",
+        case.label, case.utterance
+    );
+
+    if case.draft_keeps_numbers {
+        assert_draft_keeps_numbers(fx, case, turn).await;
+        assert_no_new_warns(case.label, warns_before);
+    }
+}
+
+fn assert_no_new_warns(label: &str, warns_before: usize) {
+    assert_eq!(
+        warn_count(),
+        warns_before,
+        "case {label}: WARN events were emitted (a judge failure is turned into `None` plus a WARN); read the WARN lines above"
+    );
+}
+
+async fn assert_draft_keeps_numbers(
+    fx: &Fixture,
+    case: &KrCase,
+    turn: super::kr_selection::KrTurn<'_>,
+) {
+    let kr = turn
+        .applicable_known_resolution
+        .as_ref()
+        .expect("selected id was asserted above");
+    let decision = decision::decide(&DecisionInput {
+        question_signals: turn.decide_signals,
+        question_raw: case.utterance,
+        rules: &fx.escalation_rules,
+        domains: &fx.prohibited_domains,
+        resolutions: &turn.resolutions,
+        best_manual_score: None,
+        best_manual_sections: &[],
+        stakes_input: turn.stakes_input,
+        thresholds: &fx.thresholds,
+        default_route: &fx.config.harness.default_escalation_route,
+        known_resolution: turn.applicable_known_resolution.as_ref(),
+    });
+    let draft = fx
+        .harness
+        .draft_customer_reply(
+            case.utterance,
+            "kr-smoke-request-id",
+            &decision,
+            &[],
+            &turn.resolutions,
+            &[],
+            false,
+            &fx.allowlist,
+            &[],
+            false,
+        )
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "case {}: draft_customer_reply generated no draft for the selected known resolution",
+                case.label
+            )
+        });
+    println!("--- final draft ({}) ---\n{}", case.label, draft.text);
+    assert_draft_accepted(
+        fx,
+        &draft,
+        false,
+        &[],
+        &format!("case {} ({:?})", case.label, case.utterance),
+    );
+    let draft_numbers = digit_runs(&draft.text);
+    let missing: Vec<String> = digit_runs(&kr.answer)
+        .into_iter()
+        .filter(|number| !draft_numbers.contains(number))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "case {}: the draft dropped numbers of the known resolution {missing:?}:\n{}",
+        case.label,
+        draft.text
+    );
+}
+
+#[test]
+fn kr_smoke_cases_produce_the_intended_candidates() {
+    use super::signal::SignalNormalizer;
+
+    let lexicon =
+        signal::LexiconNormalizer::from_path(&server_path("data/urtect/signal-lexicon.json"))
+            .expect("bundled signal lexicon must load");
+    let fixture = load_kr_fixture();
+    for case in kr_applicability_cases() {
+        let signals = lexicon.normalize(case.utterance);
+        let mut actual: Vec<&str> = rules::known_resolution_candidates(
+            &fixture,
+            &signals,
+            super::kr_selection::KR_CANDIDATE_LIMIT,
+        )
+        .into_iter()
+        .map(|kr| kr.id.as_str())
+        .collect();
+        actual.sort_unstable();
+        let mut expected = case.candidate_ids.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "case {}", case.label);
+    }
+}
+
+#[test]
+fn digit_runs_ignore_thousands_separators() {
+    assert_eq!(
+        digit_runs("1,000クリップと30秒、2〜5分"),
+        ["1000", "30", "2", "5"]
+    );
 }
