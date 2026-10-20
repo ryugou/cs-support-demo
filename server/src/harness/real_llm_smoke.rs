@@ -2030,14 +2030,14 @@ fn check_led_procedure(draft_text: &str) -> Result<(), String> {
 fn check_led_anchors(text: &str) -> Result<(), String> {
     for anchor in ["apモード", "192.168.1.1"] {
         if !text.contains(anchor) {
-            return Err(format!("the draft lacks {anchor:?}"));
+            return Err(format!("invalid draft: lacks {anchor:?}"));
         }
     }
     if !(text.contains("reset") || text.contains("リセット")) {
-        return Err("the draft lacks the Reset button".to_owned());
+        return Err("invalid draft: lacks the Reset button".to_owned());
     }
     if press_range_end(text).is_none() {
-        return Err("the draft lacks the 5〜7秒 press duration".to_owned());
+        return Err("invalid draft: lacks the 5〜7秒 press duration".to_owned());
     }
     Ok(())
 }
@@ -2056,7 +2056,7 @@ fn press_range_end(text: &str) -> Option<usize> {
 /// it also appears in the opening sentence, so it is not an order anchor.
 fn check_led_step_order(text: &str) -> Result<(), String> {
     if !text.contains("adc-v724") {
-        return Err("the draft lacks the product name ADC-V724".to_owned());
+        return Err("invalid draft: lacks the product name ADC-V724".to_owned());
     }
     let order = press_range_end(text)
         .and_then(|at| find_after(text, "192.168.1.1", at))
@@ -2071,7 +2071,7 @@ fn check_led_step_order(text: &str) -> Result<(), String> {
         });
     if order.is_none() {
         return Err(
-            "the steps are not in the order 5〜7秒 press, 192.168.1.1, SSID or password".to_owned(),
+            "invalid draft: the steps are not in the order 5〜7秒 press, 192.168.1.1, SSID or password".to_owned(),
         );
     }
     Ok(())
@@ -2155,11 +2155,13 @@ fn parse_led_safety(raw: &str) -> Result<LedSafety, String> {
 fn led_safety_verdict(safety: &LedSafety) -> Result<(), String> {
     if safety.instructs_long_press_or_reset {
         return Err(
-            "the judge says the draft instructs a 15秒 press or a factory reset".to_owned(),
+            "invalid draft: the judge says it instructs a 15秒 press or a factory reset".to_owned(),
         );
     }
     if !safety.warns_15s_reset {
-        return Err("the judge says the draft lacks the 15秒 factory-reset warning".to_owned());
+        return Err(
+            "invalid draft: the judge says it lacks the 15秒 factory-reset warning".to_owned(),
+        );
     }
     Ok(())
 }
@@ -2761,7 +2763,7 @@ async fn led_case_decision_follows_the_judge_output() {
             "a draft that fails the deterministic checks is rejected before the judge is asked",
             Err("boom".to_owned()),
             "APモードにします。",
-            Err("the draft lacks"),
+            Err("invalid draft: lacks"),
         ),
     ];
     for (label, stub, draft, expected) in cases {
