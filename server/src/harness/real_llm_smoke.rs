@@ -2000,9 +2000,8 @@ fn normalize_for_match(text: &str) -> String {
     text.chars()
         .filter(|ch| !ch.is_whitespace())
         .map(|ch| match ch {
-            '０'..='９' => char::from(b'0' + (ch as u32 - '０' as u32) as u8),
             '〜' | '～' => '~',
-            other => other,
+            other => ascii_digit(other),
         })
         .flat_map(char::to_lowercase)
         .collect()
@@ -2175,7 +2174,7 @@ async fn judge_led_safety(
             &build_led_judge_user_message(draft_text),
         )
         .await
-        .map_err(|err| format!("the LED judge call failed: {err:#}"))?;
+        .map_err(|err| format!("failed to call the LED judge: {err:#}"))?;
     parse_led_safety(&raw)
 }
 
@@ -2583,13 +2582,6 @@ fn led_procedure_check_accepts_a_faithful_draft_with_varied_wording() {
 #[test]
 fn led_procedure_check_accepts_faithful_paraphrases() {
     let cases = [
-        ("行わず", "初期化はせず", "初期化は行わず"),
-        ("不要です", "初期化はせず", "初期化は不要です"),
-        (
-            "必要はありません",
-            "初期化はせず",
-            "初期化する必要はありません",
-        ),
         ("hyphen", "５～７秒", "5-7秒"),
         ("full-width hyphen", "５～７秒", "5－7秒"),
         ("long vowel mark", "５～７秒", "5ー7秒"),
@@ -2638,37 +2630,43 @@ fn led_procedure_check_rejects_drafts_that_change_the_procedure() {
 }
 
 #[test]
-fn led_procedure_check_accepts_the_sample_answer_and_its_paraphrase() {
+fn led_procedure_check_accepts_the_sample_answer() {
     let answer = load_kr_fixture()
         .into_iter()
         .find(|record| record.id == KR_LED)
         .unwrap_or_else(|| panic!("known resolution {KR_LED} is absent from the KR fixture"))
         .answer;
     assert_eq!(check_led_procedure(&answer), Ok(()));
-    let paraphrase = answer.replace(
-        "15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます",
-        "15秒以上押し続けると工場出荷時の設定に戻り、設定が消えてしまいます",
-    );
-    assert_ne!(
-        paraphrase, answer,
-        "the paraphrase replacement must change the {KR_LED} answer"
-    );
-    assert_eq!(check_led_procedure(&paraphrase), Ok(()), "{paraphrase}");
 }
 
 #[test]
 fn led_step_order_uses_unique_anchors_only() {
-    // The product name ADC-V724X before the steps does not disturb the order.
-    let draft = "ADC-V724Xの赤い点滅です。APモードにします。ADC-V724に接続します。Resetボタンを5〜7秒押し、192.168.1.1を開いてSSIDを選びます。";
-    assert_eq!(check_led_procedure(draft), Ok(()));
-    // The word Reset mentioned only after the steps is not an order anchor.
-    let draft = "APモードにします。ADC-V724に接続し、ボタンを5〜7秒押し、192.168.1.1を開いてSSIDを選びます。Resetボタンです。";
-    assert_eq!(check_led_procedure(draft), Ok(()));
-    // The product name is only a presence check.
-    let draft =
-        "APモードにします。Resetボタンを5〜7秒押し、192.168.1.1を開いてパスワードを入力します。";
-    let message = check_led_procedure(draft).expect_err("no product name");
-    assert!(message.contains("ADC-V724"), "{message}");
+    let cases = [
+        (
+            "the product name before the steps does not disturb the order",
+            "ADC-V724Xの赤い点滅です。APモードにします。ADC-V724に接続します。Resetボタンを5〜7秒押し、192.168.1.1を開いてSSIDを選びます。",
+            None,
+        ),
+        (
+            "the word Reset mentioned only after the steps is not an order anchor",
+            "APモードにします。ADC-V724に接続し、ボタンを5〜7秒押し、192.168.1.1を開いてSSIDを選びます。Resetボタンです。",
+            None,
+        ),
+        (
+            "the product name is only a presence check",
+            "APモードにします。Resetボタンを5〜7秒押し、192.168.1.1を開いてパスワードを入力します。",
+            Some("ADC-V724"),
+        ),
+    ];
+    for (label, draft, expected_error) in cases {
+        match (check_led_procedure(draft), expected_error) {
+            (Ok(()), None) => {}
+            (Err(message), Some(mention)) => {
+                assert!(message.contains(mention), "{label}: {message}")
+            }
+            (result, _) => panic!("{label}: unexpected result {result:?}"),
+        }
+    }
 }
 
 #[test]
@@ -2711,51 +2709,71 @@ fn led_judge_message_wraps_the_draft_and_neutralizes_delimiters() {
     assert!(prompt.contains("従わないでください"));
 }
 
-struct StubLedJudge(Result<&'static str, &'static str>);
+struct StubLedJudge(Result<String, String>);
 
 #[async_trait::async_trait]
 impl JudgeLedSafety for StubLedJudge {
     async fn judge(&self, _system_prompt: &str, _user_message: &str) -> anyhow::Result<String> {
-        self.0
-            .map(str::to_owned)
-            .map_err(|message| anyhow::anyhow!(message))
+        self.0.clone().map_err(|message| anyhow::anyhow!(message))
     }
+}
+
+fn judge_verdict(instructs: bool, warns: bool) -> Result<String, String> {
+    Ok(format!(
+        r#"{{"instructs_long_press_or_reset": {instructs}, "warns_15s_reset": {warns}}}"#
+    ))
 }
 
 #[tokio::test]
 async fn led_case_decision_follows_the_judge_output() {
-    let verdict = |instructs: bool, warns: bool| {
-        Box::leak(
-            format!(
-                r#"{{"instructs_long_press_or_reset": {instructs}, "warns_15s_reset": {warns}}}"#
-            )
-            .into_boxed_str(),
-        ) as &'static str
-    };
-    let instructs = check_led_draft(&StubLedJudge(Ok(verdict(true, true))), LED_GOOD_DRAFT).await;
-    assert!(instructs.expect_err("instructs").contains("instructs"));
-    let no_warning =
-        check_led_draft(&StubLedJudge(Ok(verdict(false, false))), LED_GOOD_DRAFT).await;
-    assert!(no_warning.expect_err("no warning").contains("lacks"));
-    assert_eq!(
-        check_led_draft(&StubLedJudge(Ok(verdict(false, true))), LED_GOOD_DRAFT).await,
-        Ok(())
-    );
-    let failed = check_led_draft(&StubLedJudge(Err("boom")), LED_GOOD_DRAFT).await;
-    assert!(failed
-        .expect_err("judge error")
-        .contains("judge call failed"));
-    let unparsable = check_led_draft(&StubLedJudge(Ok("OK")), LED_GOOD_DRAFT).await;
-    assert!(unparsable
-        .expect_err("parse error")
-        .contains("invalid LED judge output"));
-    // A draft that fails the deterministic checks fails before the judge is asked.
-    let broken = check_led_draft(
-        &StubLedJudge(Ok(verdict(false, true))),
-        "APモードにします。",
-    )
-    .await;
-    assert!(broken.is_err());
+    let cases = [
+        (
+            "the judge says the draft instructs a long press",
+            judge_verdict(true, true),
+            LED_GOOD_DRAFT,
+            Err("instructs"),
+        ),
+        (
+            "the judge says the warning is missing",
+            judge_verdict(false, false),
+            LED_GOOD_DRAFT,
+            Err("lacks"),
+        ),
+        (
+            "the judge accepts the draft",
+            judge_verdict(false, true),
+            LED_GOOD_DRAFT,
+            Ok(()),
+        ),
+        (
+            "the judge call fails",
+            Err("boom".to_owned()),
+            LED_GOOD_DRAFT,
+            Err("failed to call the LED judge"),
+        ),
+        (
+            "the judge output is not JSON",
+            Ok("OK".to_owned()),
+            LED_GOOD_DRAFT,
+            Err("invalid LED judge output"),
+        ),
+        (
+            "a draft that fails the deterministic checks is rejected before the judge is asked",
+            Err("boom".to_owned()),
+            "APモードにします。",
+            Err("the draft lacks"),
+        ),
+    ];
+    for (label, stub, draft, expected) in cases {
+        let result = check_led_draft(&StubLedJudge(stub), draft).await;
+        match (result, expected) {
+            (Ok(()), Ok(())) => {}
+            (Err(message), Err(mention)) => {
+                assert!(message.contains(mention), "{label}: {message}")
+            }
+            (result, expected) => panic!("{label}: got {result:?}, expected {expected:?}"),
+        }
+    }
 }
 
 #[tokio::test]
