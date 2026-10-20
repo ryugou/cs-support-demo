@@ -2029,6 +2029,14 @@ const LED_REQUEST_FORMS: [&str; 10] = [
 const LED_PRESS_TE_FORMS: [&str; 4] = ["押して", "長押しして", "押し続けて", "押したまま"];
 /// The factory-reset concept; the bare Reset button is not it.
 const LED_RESET_CONCEPT: [&str; 3] = ["初期化", "工場出荷", "リセットされ"];
+/// Chaining te-form presses (`押して`): the press is followed by another action, so a later prohibition negates that action, not the press.
+const LED_CHAINING_TE_FORMS: [&str; 3] = ["押して", "押しして", "押し続けて"];
+/// Clause breaks (`、`): a prohibition after one negates a later clause, not the press before it.
+const LED_CLAUSE_BREAKS: [&str; 3] = ["、", "，", ","];
+/// Result forms of a declarative reset consequence (`初期化され`, `戻ります`, `消えます`).
+const LED_RESET_RESULTS: [&str; 3] = ["され", "戻", "消え"];
+/// Conditional markers that, after a 15秒 mention, introduce its consequence (`押すと`, `以上で`).
+const LED_CONDITIONAL_MARKERS: [&str; 2] = ["と", "で"];
 
 /// The procedure of the LED known resolution (sample-4) as the draft must keep it: the AP-mode
 /// route, the 5-7 second press, the order of the steps, and the warning that holding the button
@@ -2100,25 +2108,114 @@ fn led_mentions_any(sentence: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| sentence.contains(needle))
 }
 
-/// Index of the first mention of the 15-second press or the reset concept in `clause`.
-fn led_first_target(clause: &str) -> Option<usize> {
-    std::iter::once("15秒")
-        .chain(LED_RESET_CONCEPT)
-        .filter_map(|target| clause.find(target))
-        .min()
-}
-
 /// Whether a prohibition marker appears at or after byte `from` of `text`.
 fn led_prohibited_after(text: &str, from: usize) -> bool {
     led_mentions_any(&text[from..], &LED_PROHIBITION)
 }
 
-/// The warning not to hold the button for 15秒, structurally and fail-closed. A sentence that
-/// instructs the customer (a request form or a te-form press) is split into clauses on 、 / ， / `,`,
-/// and every clause that mentions the 15-second press or the factory reset must carry a prohibition
-/// marker after its first such mention (`初期化はせず`); a marker earlier in the sentence or in
-/// another clause (`改善しないようなら、15秒長押しして…`) does not excuse it. Declarative
-/// consequences pass. The draft must also hold a 15秒 sentence with a prohibition after the mention.
+/// Every mention of the 15-second press (`15秒`) or the reset concept (`初期化`) in `sentence`, as sorted (start index, name).
+fn led_raw_mentions(sentence: &str) -> Vec<(usize, &'static str)> {
+    let mut mentions: Vec<(usize, &'static str)> = sentence
+        .match_indices("15秒")
+        .map(|(at, _)| (at, "15秒"))
+        .collect();
+    for concept in LED_RESET_CONCEPT {
+        mentions.extend(
+            sentence
+                .match_indices(concept)
+                .map(|(at, _)| (at, "初期化")),
+        );
+    }
+    mentions.sort_unstable();
+    mentions
+}
+
+/// Whether `text` holds a request form, a chaining te-form or a prohibition marker.
+fn led_breaks_a_mention(text: &str) -> bool {
+    led_mentions_any(text, &LED_REQUEST_FORMS)
+        || led_mentions_any(text, &LED_CHAINING_TE_FORMS)
+        || led_mentions_any(text, &LED_PROHIBITION)
+}
+
+/// The mentions of `sentence`, with consecutive reset mentions joined into one when nothing that breaks a mention lies between them.
+fn led_mentions(sentence: &str) -> Vec<(usize, &'static str)> {
+    let mut merged: Vec<(usize, &'static str)> = Vec::new();
+    for (at, name) in led_raw_mentions(sentence) {
+        let joins = merged.last().is_some_and(|&(last, last_name)| {
+            last_name == "初期化" && name == "初期化" && !led_breaks_a_mention(&sentence[last..at])
+        });
+        if !joins {
+            merged.push((at, name));
+        }
+    }
+    merged
+}
+
+/// A segment is prohibited when it holds a prohibition marker and neither a chaining te-form nor a clause break precedes the first one.
+fn led_segment_prohibited(segment: &str) -> bool {
+    let first_marker = LED_PROHIBITION
+        .iter()
+        .filter_map(|marker| segment.find(marker))
+        .min();
+    first_marker.is_some_and(|at| {
+        let before = &segment[..at];
+        !led_mentions_any(before, &LED_CHAINING_TE_FORMS)
+            && !led_mentions_any(before, &LED_CLAUSE_BREAKS)
+    })
+}
+
+/// Whether `segment` has no request form, chaining te-form or te-form press.
+fn led_segment_plain(segment: &str) -> bool {
+    !led_mentions_any(segment, &LED_REQUEST_FORMS)
+        && !led_mentions_any(segment, &LED_CHAINING_TE_FORMS)
+        && !led_mentions_any(segment, &LED_PRESS_TE_FORMS)
+}
+
+/// A reset segment is a consequence when it states a result and is plain.
+fn led_reset_consequence(segment: &str) -> bool {
+    led_mentions_any(segment, &LED_RESET_RESULTS) && led_segment_plain(segment)
+}
+
+/// A 15秒 segment is a consequence when it is plain and holds a conditional marker (`と`, `で`) after the 15秒 mention.
+fn led_press_consequence(segment: &str) -> bool {
+    led_segment_plain(segment)
+        && led_mentions_any(&segment["15秒".len()..], &LED_CONDITIONAL_MARKERS)
+}
+
+/// The name of the first mention in `sentence` that is neither prohibited nor a consequence.
+fn led_failing_mention(sentence: &str) -> Option<&'static str> {
+    let mentions = led_mentions(sentence);
+    let segment = |index: usize| {
+        let end = mentions
+            .get(index + 1)
+            .map_or(sentence.len(), |next| next.0);
+        &sentence[mentions[index].0..end]
+    };
+    mentions.iter().enumerate().find_map(|(index, &(_, name))| {
+        let text = segment(index);
+        let passes = led_segment_prohibited(text)
+            || if name == "初期化" {
+                led_reset_consequence(text)
+            } else {
+                led_press_consequence(text)
+                    && mentions.get(index + 1).is_some_and(|&(_, next)| {
+                        next == "初期化" && led_reset_consequence(segment(index + 1))
+                    })
+            };
+        (!passes).then_some(name)
+    })
+}
+
+/// The warning not to hold the button for 15秒, as an allowlist that fails closed. Every sentence
+/// is segmented by its mentions of `15秒` and of the factory-reset concept (consecutive reset
+/// mentions with no request form, chaining te-form or prohibition marker between them count as
+/// one); a segment runs from its mention to the next mention or the sentence end. Each mention
+/// must be prohibited (its segment holds a prohibition marker and neither a chaining te-form such as
+/// `押して` nor a clause break `、` before the first one) or a consequence. A reset consequence has a result form
+/// (`され`, `戻`, `消え`) and no request form, chaining te-form or te-form press. A 15秒
+/// consequence is plain in the same way, contains `と` or `で` anywhere after the 15秒
+/// mention, and is followed by a reset mention that is itself a consequence. Anything else fails, a harmless
+/// sentence included (accepted cost). The draft must also hold a 15秒 sentence with a prohibition after the mention.
 fn check_led_warning_polarity(draft_text: &str) -> Result<(), String> {
     let sentences = led_sentences(draft_text);
     if !sentences
@@ -2128,28 +2225,10 @@ fn check_led_warning_polarity(draft_text: &str) -> Result<(), String> {
         return Err("the draft lacks the warning not to hold the button for 15秒".to_owned());
     }
     for sentence in &sentences {
-        let instructs = led_mentions_any(sentence, &LED_REQUEST_FORMS)
-            || led_mentions_any(sentence, &LED_PRESS_TE_FORMS);
-        if !instructs {
-            continue;
-        }
-        for clause in sentence.split(['、', '，', ',']) {
-            let Some(at) = led_first_target(clause) else {
-                continue;
-            };
-            if !led_prohibited_after(clause, at) {
-                let targets = [
-                    ("15秒", clause.contains("15秒")),
-                    ("初期化", led_mentions_any(clause, &LED_RESET_CONCEPT)),
-                ]
-                .into_iter()
-                .filter_map(|(name, hit)| hit.then_some(name))
-                .collect::<Vec<_>>()
-                .join("・");
-                return Err(format!(
-                    "a clause instructs {targets} without a prohibition after it: {clause:?} (sentence {sentence:?})"
-                ));
-            }
+        if let Some(target) = led_failing_mention(sentence) {
+            return Err(format!(
+                "a sentence mentions {target} without a prohibition or a declarative consequence: {sentence:?}"
+            ));
         }
     }
     Ok(())
@@ -2712,6 +2791,66 @@ fn led_procedure_check_rejects_an_instruction_without_a_prohibition() {
         (
             "reset asked politely",
             "初期化していただけますでしょうか。",
+            "初期化",
+        ),
+        (
+            "later reset request after an earlier prohibition",
+            "15秒長押しはせず初期化してください。",
+            "初期化",
+        ),
+        (
+            "press chained by a bare stem into a request",
+            "15秒長押しし、初期化してください。",
+            "15秒",
+        ),
+        (
+            "stem press before a clause break, prohibition negates the next action",
+            "15秒長押しし、電源を切らないでください。",
+            "15秒",
+        ),
+        (
+            "15秒 consequence whose reset mention is absent",
+            "Resetボタンを15秒押すと完了です。",
+            "15秒",
+        ),
+        (
+            "press clause inherits the instruction of its sentence",
+            "15秒長押ししたうえで、手順を進めてください。",
+            "15秒",
+        ),
+        (
+            "prohibition after the last target excuses an earlier instructed reset",
+            "初期化して15秒以上押さないでください。",
+            "初期化",
+        ),
+        (
+            "conditional reason clause chain ends in a request",
+            "15秒長押しすると、初期化されますので、お試しください。",
+            "15秒",
+        ),
+        (
+            "conditional press clause then a bare request",
+            "15秒長押ししたら、そのままお待ちください。",
+            "15秒",
+        ),
+        (
+            "noun-ending press step",
+            "Resetボタンを15秒長押し。",
+            "15秒",
+        ),
+        (
+            "procedural masu-form press step",
+            "Resetボタンを15秒長押しします。",
+            "15秒",
+        ),
+        (
+            "negation of a later action does not negate the press",
+            "15秒長押しして電源を切らないでください。",
+            "15秒",
+        ),
+        (
+            "press causing a requested reset",
+            "15秒長押しで初期化してください。",
             "初期化",
         ),
     ];
