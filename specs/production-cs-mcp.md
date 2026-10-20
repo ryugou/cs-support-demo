@@ -125,7 +125,7 @@ vegapunk / PunkRecord
 - **特徴**: マッチしたら問答無用で確定ルーティング、回答生成に進ませない（第1層 advisory に KR が選定されているターンを除く。下記「KR 同乗の取次」）。数は多くなくてよい。
 - **学習**: 効かせない。固定ルール。メモ化対象外。
 - **ルール属性 `customer_ack`（Issue #76）**: ルールは任意で顧客向けの受け止め文を宣言できる。`decide` に渡した signal 集合（会話単位の累積 signal 集合。取次済み `/api/reply` のターンでは今ターンの signal のみ。`docs/superpowers/specs/2026-10-14-answer-after-escalation-design.md` §2）にマッチする第 1 層ルールがちょうど 1 件で、そのルールが宣言を持つときだけ、`/{project_id}/api/reply` は LLM で受け止め文を生成せず宣言文をそのまま使う（NG 表現ゲート・取扱製品ゲートは通す。2 件以上マッチしたときは宣言を使わず LLM が作る。並び順・読み込み順には依存しない）。`binding` による抑止は無い（mandatory のルールも宣言できる。`hearing` 属性とは異なる扱い）。型・検証・伝搬経路の正本は `docs/superpowers/specs/2026-10-05-initial-cost-handoff-design.md`。
-- **KR 同乗の取次**: 第1層 advisory ルールと選定済みの KR が同時に当たるターンは `Escalate`（`layer: 1`）で、`known_resolution_id` に KR の id を持つ。返信は、部分回答の条件（`hearing` 宣言なし・取り次ぐ項目が1つ以上・部分回答と下書きが有効）を満たすときは KR の回答に取次の一文を足したもので、満たさないときは `known_resolution_id` は付くが通常の取次または聞き返しの返信になり KR の回答は載らない。第1層 mandatory と第2層に当たるターンでは `decide` が選定済みの KR を持ち込まず、`known_resolution_id` は付かない。材料・部分回答の関連度条件・監査の扱いは設計 §8（`docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md`）に従う。選定は下記 S1-3「`evaluate` の KR 選定」。
+- **KR 同乗の取次**: 第1層 advisory ルールと選定済みの KR が同時に当たるターンは `Escalate`（`layer: 1`）で、`known_resolution_id` に KR の id を持つ。部分回答の条件（設計 §8 と `docs/superpowers/specs/2026-10-07-partial-answer-with-handoff-design.md` §3.1）を満たし、返信が聞き返しにならず、部分回答の下書きが載ったときだけ、返信は KR の回答に取次の一文を足したものになる。それ以外のときは、`known_resolution_id` は付くが返信は通常の取次または聞き返しになり、KR の回答は載らない。第1層 mandatory と第2層に当たるターンでは `decide` が選定済みの KR を持ち込まず、`known_resolution_id` は付かない。材料・部分回答の関連度条件・監査の扱いは設計 §8（`docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md`）に従う。選定は下記 S1-3「`evaluate` の KR 選定」。
 
 ### 第2層 — 禁止領域
 
