@@ -344,7 +344,9 @@ pub struct HarnessConfig {
     /// 文面の正本は client 側という spec の結論は変わらない（`harness::reply` の doc を参照）。
     #[serde(default)]
     pub customer_reply_draft_enabled: bool,
-    /// Ids of known resolutions excluded from matching. Defaults to empty.
+    /// Ids of known resolutions excluded from the known-resolution selection of `evaluate` and
+    /// from `search_known_resolutions`; the advisor's own match (`match_advisor_known_resolution`)
+    /// does not apply it. Defaults to empty.
     #[serde(default)]
     pub excluded_known_resolution_ids: Vec<String>,
     /// 返信文下書きの `max_tokens`。signal 抽出用（`[llm] max_tokens`、既定 600）とは別枠。
