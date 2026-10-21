@@ -191,6 +191,8 @@ pub struct KnownResolution {
     pub rejection_count: u32,
     pub approver_set: Vec<String>,
     pub origin: String,
+    /// Registration time of the record; `None` when the node's `verified_at` attribute is missing or empty, which ranks as the oldest in tie-breaks.
+    pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
     // --- 予約フィールド（Step 1 は既定値のまま。S1-3）---
     pub binding: Binding,
     pub registration_trigger: String,
@@ -223,10 +225,33 @@ pub fn match_layer1<'a>(
     rules: &'a [EscalationRule],
     question: &SignalSet,
 ) -> Option<&'a EscalationRule> {
+    match_layer1_mandatory(rules, question).or_else(|| match_layer1_advisory(rules, question))
+}
+
+fn match_layer1_with_binding<'a>(
+    rules: &'a [EscalationRule],
+    question: &SignalSet,
+    binding: Binding,
+) -> Option<&'a EscalationRule> {
     rules
         .iter()
-        .find(|rule| rule_matches(rule, question) && rule.binding == Binding::Mandatory)
-        .or_else(|| rules.iter().find(|rule| rule_matches(rule, question)))
+        .find(|rule| rule.binding == binding && rule_matches(rule, question))
+}
+
+/// Returns the first rule in array order whose binding is `Binding::Mandatory` and whose non-empty condition is a subset of `question`.
+pub fn match_layer1_mandatory<'a>(
+    rules: &'a [EscalationRule],
+    question: &SignalSet,
+) -> Option<&'a EscalationRule> {
+    match_layer1_with_binding(rules, question, Binding::Mandatory)
+}
+
+/// Returns the first rule in array order whose binding is `Binding::Advisory` and whose non-empty condition is a subset of `question`.
+pub fn match_layer1_advisory<'a>(
+    rules: &'a [EscalationRule],
+    question: &SignalSet,
+) -> Option<&'a EscalationRule> {
+    match_layer1_with_binding(rules, question, Binding::Advisory)
 }
 
 /// 第1層でマッチする全ルールの参照（binding を問わない）。マッチ条件は `match_layer1` と同一
@@ -320,6 +345,38 @@ pub fn match_known_resolution<'a>(
     KrMatch::None
 }
 
+/// Returns `resolutions` without the records whose `id` is in `excluded`, keeping input order.
+pub fn exclude_known_resolutions(
+    resolutions: Vec<KnownResolution>,
+    excluded: &[String],
+) -> Vec<KnownResolution> {
+    resolutions
+        .into_iter()
+        .filter(|kr| !excluded.contains(&kr.id))
+        .collect()
+}
+
+/// Returns the known resolutions whose non-empty signal set is a subset of `signals`, ordered by
+/// larger signal set, newer `verified_at`, then smaller id, truncated to `limit`.
+pub fn known_resolution_candidates<'a>(
+    resolutions: &'a [KnownResolution],
+    signals: &SignalSet,
+    limit: usize,
+) -> Vec<&'a KnownResolution> {
+    let mut candidates: Vec<&KnownResolution> = resolutions
+        .iter()
+        .filter(|kr| !kr.signal_set.is_empty() && kr.signal_set.is_subset(signals))
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.signal_specificity()
+            .cmp(&a.signal_specificity())
+            .then_with(|| b.verified_at.cmp(&a.verified_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    candidates.truncate(limit);
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +399,7 @@ mod tests {
             rejection_count: 0,
             approver_set: Vec::new(),
             origin: "test".to_string(),
+            verified_at: None,
             binding: Binding::Advisory,
             registration_trigger: "single_ruling".to_string(),
             knowledge_class: "commercial".to_string(),
@@ -767,5 +825,98 @@ mod tests {
             match_known_resolution(&resolutions, &signals(&["expiry_question"])),
             KrMatch::None
         ));
+    }
+
+    fn kr_at(id: &str, set: &[&str], verified_at: Option<&str>) -> KnownResolution {
+        let mut resolution = kr(id, set, "a");
+        resolution.verified_at = verified_at.map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        });
+        resolution
+    }
+
+    #[test]
+    fn exclude_known_resolutions_drops_only_listed_ids() {
+        let all = vec![kr("a", &["s"], "a"), kr("b", &["s"], "a")];
+        let kept = exclude_known_resolutions(all.clone(), &["a".to_string()]);
+        assert_eq!(
+            kept.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+        let same = exclude_known_resolutions(all, &[]);
+        assert_eq!(
+            same.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn match_layer1_is_mandatory_then_advisory() {
+        let rules = vec![
+            rule_with("advisory-first", &["x"], Binding::Advisory),
+            rule_with("mandatory-second", &["y"], Binding::Mandatory),
+        ];
+        let question = signals(&["x", "y"]);
+        assert_eq!(
+            match_layer1_mandatory(&rules, &question).map(|r| r.id.as_str()),
+            Some("mandatory-second")
+        );
+        assert_eq!(
+            match_layer1_advisory(&rules, &question).map(|r| r.id.as_str()),
+            Some("advisory-first")
+        );
+        assert_eq!(
+            match_layer1(&rules, &question).map(|r| r.id.as_str()),
+            Some("mandatory-second")
+        );
+    }
+
+    #[test]
+    fn known_resolution_candidates_rank_by_size_then_recency_then_id() {
+        let resolutions = vec![
+            kr_at("kr-b", &["a"], Some("2026-10-01T00:00:00Z")),
+            kr_at("kr-a", &["a"], Some("2026-10-01T00:00:00Z")),
+            kr_at("kr-new", &["a"], Some("2026-10-10T00:00:00Z")),
+            kr_at("kr-none", &["a"], None),
+            kr_at("kr-big", &["a", "b"], None),
+            kr_at("kr-other", &["c"], None),
+        ];
+        let ids: Vec<&str> = known_resolution_candidates(&resolutions, &signals(&["a", "b"]), 10)
+            .iter()
+            .map(|k| k.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["kr-big", "kr-new", "kr-a", "kr-b", "kr-none"]);
+    }
+
+    #[test]
+    fn known_resolution_candidates_truncates_to_the_limit() {
+        let resolutions = vec![
+            kr("k1", &["a"], "x"),
+            kr("k2", &["a"], "x"),
+            kr("k3", &["a"], "x"),
+            kr("k4", &["a"], "x"),
+        ];
+        assert_eq!(
+            known_resolution_candidates(&resolutions, &signals(&["a"]), 3).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn known_resolution_candidates_never_include_an_empty_signal_set() {
+        let resolutions = vec![kr("empty", &[], "x")];
+        assert!(known_resolution_candidates(&resolutions, &signals(&["a"]), 3).is_empty());
+    }
+
+    #[test]
+    fn known_resolution_candidates_allow_left_over_signals_but_not_missing_ones() {
+        let resolutions = vec![kr("sub", &["a"], "x"), kr("super", &["a", "z"], "x")];
+        let ids: Vec<&str> = known_resolution_candidates(&resolutions, &signals(&["a", "b"]), 3)
+            .iter()
+            .map(|k| k.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["sub"]);
     }
 }

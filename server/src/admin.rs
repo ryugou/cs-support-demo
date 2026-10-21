@@ -1615,6 +1615,8 @@ mod tests {
             reply_draft_max_tokens: 700,
             product_gate: None,
             jev_client: None,
+            kr_applicability: None,
+            excluded_known_resolution_ids: Vec::new(),
         };
         AdminState {
             schema: "urtect".to_string(),

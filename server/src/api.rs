@@ -1901,6 +1901,7 @@ async fn reply_handler(
         .evaluate(
             &ctx,
             &req.message,
+            &req.message,
             None,
             eval_case_id,
             &state.tools,
@@ -2592,6 +2593,7 @@ mod tests {
             }],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -2611,6 +2613,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -2626,6 +2629,7 @@ mod tests {
             missing: vec![],
             hearing: Some(crate::harness::rules::HearingContract::ProductAndSymptom),
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -2643,6 +2647,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -2659,6 +2664,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: Some(customer_ack.to_string()),
+            known_resolution_id: None,
         }
     }
 
@@ -2710,6 +2716,7 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
+            known_resolution: None,
         });
         assert!(
             matches!(decision, AnswerDecision::Escalate { layer: 1, .. }),
@@ -2751,6 +2758,7 @@ mod tests {
             handoff_items: Vec::new(),
             partial_answer: false,
             decision_basis: crate::harness::DecisionBasis::Accumulated,
+            applicable_known_resolution: None,
         }
     }
 
@@ -3215,6 +3223,7 @@ mod tests {
             missing: Vec::new(),
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
         let outcome = base_outcome(decision, false);
         let conv = default_conv_state();
@@ -3242,6 +3251,7 @@ mod tests {
             }],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
         let outcome = base_outcome(decision, true);
         let conv = default_conv_state();
@@ -6053,6 +6063,8 @@ mod tests {
                 ]),
             )),
             jev_client: None,
+            kr_applicability: None,
+            excluded_known_resolution_ids: Vec::new(),
         }
     }
 

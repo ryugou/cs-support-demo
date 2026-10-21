@@ -698,14 +698,29 @@ fn known_resolutions_from_nodes(
         .map(|node| {
             let attrs = &node.attributes;
             let get = |key: &str| attrs.get(key).cloned().unwrap_or_default();
+            let kr_id = attrs
+                .get("kr_id")
+                .cloned()
+                .ok_or_else(|| anyhow!("KnownResolution missing kr_id"))?;
+            let answer = attrs
+                .get("answer_text")
+                .filter(|v| !v.trim().is_empty())
+                .cloned()
+                .ok_or_else(|| anyhow!("invalid answer_text: empty (kr_id={kr_id})"))?;
+            let verified_at = attrs
+                .get("verified_at")
+                .filter(|v| !v.is_empty())
+                .map(|raw| {
+                    chrono::DateTime::parse_from_rfc3339(raw)
+                        .map(|at| at.with_timezone(&chrono::Utc))
+                        .map_err(|err| anyhow!("invalid verified_at: {err} (kr_id={kr_id})"))
+                })
+                .transpose()?;
             Ok(KnownResolution {
-                id: attrs
-                    .get("kr_id")
-                    .cloned()
-                    .ok_or_else(|| anyhow!("KnownResolution missing kr_id"))?,
+                id: kr_id,
                 signal_set: kr_signals.remove(&node.node_id).unwrap_or_default(),
                 applicability: get("applicability"),
-                answer: get("answer_text"),
+                answer,
                 source_authority: match get("source_authority").as_str() {
                     "non_authoritative" => SourceAuthority::NonAuthoritative,
                     _ => SourceAuthority::Authoritative,
@@ -719,6 +734,7 @@ fn known_resolutions_from_nodes(
                 rejection_count: get("rejection_count").parse().unwrap_or(0),
                 approver_set: csv_list(&get("approver_set")),
                 origin: get("origin"),
+                verified_at,
                 binding: parse_binding(
                     "known_resolution",
                     attrs.get("kr_id").map_or("", String::as_str),
@@ -2754,6 +2770,76 @@ mod tests {
             resolutions[0].signal_set,
             [Signal::new("power_failure")].into_iter().collect()
         );
+    }
+
+    fn kr_node_with_verified_at(verified_at: Option<&str>) -> crate::proto::graphrag::NodeResult {
+        let mut pairs = vec![
+            ("kr_id", "kr-1"),
+            ("answer_text", "電源ケーブルをご確認ください。"),
+            ("applicability", "全モデル"),
+            ("grade", "approval_required"),
+        ];
+        if let Some(raw) = verified_at {
+            pairs.push(("verified_at", raw));
+        }
+        crate::proto::graphrag::NodeResult {
+            node_id: "urtect:gen1:KnownResolution:kr-1".to_string(),
+            node_type: "KnownResolution".to_string(),
+            attributes: attrs(&pairs),
+        }
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_parses_verified_at() {
+        let node = kr_node_with_verified_at(Some("2026-10-15T09:30:00+09:00"));
+        let resolutions = known_resolutions_from_nodes(vec![node], HashMap::new()).expect("builds");
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-10-15T00:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(resolutions[0].verified_at, Some(expected));
+        assert_eq!(resolutions[0].answer, "電源ケーブルをご確認ください。");
+        assert_eq!(resolutions[0].applicability, "全モデル");
+        assert_eq!(
+            resolutions[0].grade,
+            Grade::parse_label("approval_required")
+        );
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_treats_a_missing_or_empty_verified_at_as_none() {
+        for input in [None, Some("")] {
+            let node = kr_node_with_verified_at(input);
+            let resolutions =
+                known_resolutions_from_nodes(vec![node], HashMap::new()).expect("builds");
+            assert_eq!(resolutions[0].verified_at, None, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_rejects_an_unparseable_verified_at() {
+        let node = kr_node_with_verified_at(Some("yesterday"));
+        let err = known_resolutions_from_nodes(vec![node], HashMap::new())
+            .expect_err("must reject")
+            .to_string();
+        assert!(err.contains("invalid verified_at"), "{err}");
+        assert!(err.contains("kr_id=kr-1"), "{err}");
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_rejects_a_missing_or_blank_answer_text() {
+        for answer in [None, Some(""), Some("  \n\t")] {
+            let mut node = kr_node_with_verified_at(None);
+            match answer {
+                Some(raw) => node
+                    .attributes
+                    .insert("answer_text".to_string(), raw.to_string()),
+                None => node.attributes.remove("answer_text"),
+            };
+            let err = known_resolutions_from_nodes(vec![node], HashMap::new())
+                .expect_err("must reject")
+                .to_string();
+            assert_eq!(err, "invalid answer_text: empty (kr_id=kr-1)", "{answer:?}");
+        }
     }
 
     #[test]

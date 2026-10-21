@@ -725,6 +725,7 @@ impl CsSupportRmcpServer {
             .evaluate(
                 &ctx,
                 &req.question,
+                &req.question,
                 req.product_key.as_deref(),
                 req.case_id.as_deref(),
                 &self.tools,
@@ -782,30 +783,11 @@ impl CsSupportRmcpServer {
             .await
             .map_err(to_error)?;
         // 照合は Rust 集合演算（rules::match_known_resolution）。tool は結果を返すだけ。
-        let (match_kind, resolution, leftover) =
-            match crate::harness::rules::match_known_resolution(&resolutions, &question_signals) {
-                KrMatch::Applicable(kr) => (
-                    "applicable".to_string(),
-                    Some(KnownResolutionView {
-                        kr_id: kr.id.clone(),
-                        signals: kr
-                            .signal_set
-                            .iter()
-                            .map(|s| s.as_str().to_string())
-                            .collect(),
-                        answer: kr.answer.clone(),
-                        applicability: kr.applicability.clone(),
-                        grade: kr.grade.as_str().to_string(),
-                    }),
-                    Vec::new(),
-                ),
-                KrMatch::BlockedByAddedSignal { leftover } => (
-                    "blocked_by_added_signal".to_string(),
-                    None,
-                    leftover.iter().map(|s| s.as_str().to_string()).collect(),
-                ),
-                KrMatch::None => ("none".to_string(), None, Vec::new()),
-            };
+        let (match_kind, resolution, leftover) = excluding_known_resolution_view(
+            resolutions,
+            &self.harness.excluded_known_resolution_ids,
+            &question_signals,
+        );
         let retrieved = resolution
             .iter()
             .map(|r| {
@@ -1243,6 +1225,46 @@ impl ServerHandler for CsSupportRmcpServer {
     }
 }
 
+fn excluding_known_resolution_view(
+    resolutions: Vec<crate::harness::rules::KnownResolution>,
+    excluded: &[String],
+    question_signals: &crate::harness::signal::SignalSet,
+) -> (String, Option<KnownResolutionView>, Vec<String>) {
+    let resolutions = crate::harness::rules::exclude_known_resolutions(resolutions, excluded);
+    known_resolution_match_view(crate::harness::rules::match_known_resolution(
+        &resolutions,
+        question_signals,
+    ))
+}
+
+fn known_resolution_match_view(
+    matched: KrMatch<'_>,
+) -> (String, Option<KnownResolutionView>, Vec<String>) {
+    match matched {
+        KrMatch::Applicable(kr) => (
+            "applicable".to_string(),
+            Some(KnownResolutionView {
+                kr_id: kr.id.clone(),
+                signals: kr
+                    .signal_set
+                    .iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect(),
+                answer: kr.answer.clone(),
+                applicability: kr.applicability.clone(),
+                grade: kr.grade.as_str().to_string(),
+            }),
+            Vec::new(),
+        ),
+        KrMatch::BlockedByAddedSignal { leftover } => (
+            "blocked_by_added_signal".to_string(),
+            None,
+            leftover.iter().map(|s| s.as_str().to_string()).collect(),
+        ),
+        KrMatch::None => ("none".to_string(), None, Vec::new()),
+    }
+}
+
 fn to_error(error: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
 }
@@ -1250,6 +1272,50 @@ fn to_error(error: impl std::fmt::Display) -> ErrorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_known_resolutions_still_reports_blocked_by_added_signal() {
+        use crate::harness::rules::{match_known_resolution, KnownResolution};
+        use crate::harness::signal::{Signal, SignalSet};
+        let signals =
+            |values: &[&str]| -> SignalSet { values.iter().map(|v| Signal::new(*v)).collect() };
+        let kr = KnownResolution {
+            signal_set: signals(&["a"]),
+            ..crate::test_support::kr_fixture("kr1", "answer")
+        };
+        let resolutions = [kr];
+        let (status, resolution, leftover) = known_resolution_match_view(match_known_resolution(
+            &resolutions,
+            &signals(&["a", "b"]),
+        ));
+        assert_eq!(status, "blocked_by_added_signal");
+        assert!(resolution.is_none());
+        assert_eq!(leftover, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn search_known_resolutions_view_ignores_an_excluded_resolution() {
+        use crate::harness::signal::{Signal, SignalSet};
+        let question: SignalSet = [Signal::new("a")].into_iter().collect();
+        let kr = crate::harness::rules::KnownResolution {
+            signal_set: question.clone(),
+            ..crate::test_support::kr_fixture("kr1", "answer")
+        };
+        let cases: [(Vec<String>, &str, bool); 2] = [
+            (vec!["kr1".to_string()], "none", false),
+            (vec![], "applicable", true),
+        ];
+        for (excluded, expected_status, expected_resolved) in cases {
+            let (status, resolution, _) =
+                excluding_known_resolution_view(vec![kr.clone()], &excluded, &question);
+            assert_eq!(status, expected_status, "excluded: {excluded:?}");
+            assert_eq!(
+                resolution.is_some(),
+                expected_resolved,
+                "excluded: {excluded:?}"
+            );
+        }
+    }
 
     // ---- ProductReferenceJson::from（Issue #28 Suggestion 3） ----
 
@@ -1339,6 +1405,7 @@ mod tests {
             handoff_items,
             partial_answer,
             decision_basis: crate::harness::DecisionBasis::Accumulated,
+            applicable_known_resolution: None,
         }
     }
 
@@ -1353,6 +1420,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
         let outcome = evaluation_outcome_with_handoff_items(
             decision,
@@ -1411,6 +1479,7 @@ mod tests {
             missing: vec![],
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
         let allowed = || crate::harness::decision::AnswerDecision::Allowed {
             source: crate::harness::decision::AnswerSource::Manual,

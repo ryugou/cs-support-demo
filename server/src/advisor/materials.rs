@@ -1370,6 +1370,7 @@ mod tests {
             rejection_count: 0,
             approver_set: Vec::new(),
             origin: "test".to_string(),
+            verified_at: None,
             binding: Binding::Advisory,
             registration_trigger: "single_ruling".to_string(),
             knowledge_class: "commercial".to_string(),

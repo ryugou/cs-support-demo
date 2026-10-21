@@ -1,6 +1,6 @@
 use crate::harness::rules::{
-    count_layer1_matches, match_known_resolution, match_layer1, match_layer2, Binding,
-    EscalationRule, HearingContract, KnownResolution, KrMatch, ProhibitedDomain,
+    count_layer1_matches, match_known_resolution, match_layer1_advisory, match_layer1_mandatory,
+    match_layer2, EscalationRule, HearingContract, KnownResolution, KrMatch, ProhibitedDomain,
 };
 use crate::harness::signal::SignalSet;
 use serde::Serialize;
@@ -160,7 +160,26 @@ pub enum AnswerDecision {
         /// 通す）。`hearing` と同じ理由で MCP の出力契約には載せない（`#[serde(skip)]`）。
         #[serde(skip)]
         customer_ack: Option<String>,
+        /// Applicable known resolution carried by a layer-1 advisory escalation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        known_resolution_id: Option<String>,
     },
+}
+
+impl AnswerDecision {
+    /// Returns the known resolution id this decision carries (`Allowed` answers it, `Escalate` only carries it).
+    pub fn known_resolution_id(&self) -> Option<&str> {
+        match self {
+            Self::Allowed {
+                known_resolution_id,
+                ..
+            }
+            | Self::Escalate {
+                known_resolution_id,
+                ..
+            } => known_resolution_id.as_deref(),
+        }
+    }
 }
 
 pub struct DecisionInput<'a> {
@@ -169,6 +188,8 @@ pub struct DecisionInput<'a> {
     pub rules: &'a [EscalationRule],
     pub domains: &'a [ProhibitedDomain],
     pub resolutions: &'a [KnownResolution],
+    /// Known resolution pre-selected by the applicability judge, applied after layer 2: carried as `known_resolution_id` on a layer-1 advisory escalation, otherwise answered as an `Allowed` known resolution.
+    pub known_resolution: Option<&'a KnownResolution>,
     pub best_manual_score: Option<f32>,
     pub best_manual_sections: &'a [String],
     pub stakes_input: StakesInput,
@@ -177,74 +198,29 @@ pub struct DecisionInput<'a> {
     pub default_route: &'a str,
 }
 
-/// (B) 3 層判定の decision function。LLM 非介在・同じ入力なら必ず同じ判定（純関数）。
-/// 先に止まった層で確定し、後段は評価しない。第1・2層にメモ化を適用しない。
+/// Pure, LLM-free decision function: the same input always yields the same decision. The first
+/// stage that fires decides, and later stages are not evaluated.
 ///
-/// 第1層のルール選択（`match_layer1` 呼び出し）は `rules.json` の配列順ではなく binding を
-/// 優先する（`Binding::Mandatory` が `Binding::Advisory` より必ず優先される。詳細は
-/// `rules::match_layer1` の doc コメント）。累積 signal が advisory ルールと mandatory ルールの
-/// 両方にマッチしたターンでも mandatory が選ばれ、下記の「mandatory は常に `missing:
-/// Vec::new()`」という契約がルールの並び順に依存せず成り立つ（reviewer Stage 2 codex レビュー
-/// Critical 1）。
+/// Order:
+/// 1. A layer-1 `Binding::Mandatory` rule escalates immediately (`missing` empty, no known
+///    resolution id).
+/// 2. A layer-2 prohibited domain escalates (`missing` empty, no known resolution id).
+/// 3. A layer-1 `Binding::Advisory` rule escalates; `missing` comes from `evidence_sufficient`,
+///    and the pre-selected `known_resolution`, if any, is carried as `known_resolution_id`.
+/// 4. A pre-selected `known_resolution` is `Allowed` with `AnswerSource::KnownResolution`.
+/// 5. Layer 3: sufficient manual evidence is `Allowed`, otherwise it escalates.
 ///
-/// Issue #54: stakes/threshold の算出は副作用の無い純関数のため、第1層判定より前に計算しても
-/// 「先に止まった層で確定する」という上記の原則は壊れない。第1層（明示エスカレーションルール）
-/// マッチ時、**`rule.binding == Binding::Advisory` のときだけ** `evidence_sufficient` で情報
-/// 充足度を評価し、不足していれば `missing` を積む（`clarification_allowed` 側がこれを見て
-/// 聞き返し可否を決める）。`Binding::Mandatory` は「問答無用で確定ルーティングする」という
-/// 拘束度そのもの（specs/production-cs-mcp.md の第1層定義）であり、情報の有無に関わらず常に
-/// `missing: Vec::new()` にする（reviewer 一次レビュー Critical 1: mandatory まで聞き返しに
-/// 開放すると、担当者取次（human-handoff, mandatory）が聞き返しループへ吸収され脱出手段として
-/// 機能しなくなる自己矛盾が起きる。また hazard signal で stakes が上がるほど threshold も
-/// 上がり、危険度が高い mandatory 事象ほど evidence_sufficient が Insufficient になりやすいと
-/// いう反転も生む）。第2層（禁止ドメイン）は fail-closed の核であり、この分岐の対象外
-/// （常に `missing: Vec::new()` の即時エスカレーションのまま変更しない）。
-///
-/// Issue #58: 第1層マッチ時、`hearing` には**マッチしたルール自身が宣言した**ヒアリング契約
-/// だけを載せる（`EscalationRule::hearing_contract`。mandatory は宣言があっても `None`）。Jev の
-/// 聞き返し判定へ流すかは `api.rs` がこの宣言だけで決める。binding では決めない: advisory の
-/// `contract-billing` は型番も症状も関係なく、`has_enough_info`（製品と症状が分かるか）で測ると
-/// 無関係なヒアリングへ流れるため。`missing`（マニュアル材料のカバレッジ）は従来どおり binding
-/// だけで決まり、この宣言とは独立。
-///
-/// Issue #76: `customer_ack` は、第1層でマッチしたルールが**ちょうど1件**のときだけ、そのルールの
-/// 宣言を運ぶ（`count_layer1_matches`）。累積 signal 集合（会話単位）で2件以上マッチしたときは、選ばれたルールが宣言を持って
-/// いても `None`（LLM が受け止め文を作る）。取次の可否・route・`missing`・`hearing` は変えない。
+/// `hearing` is the matched rule's own declaration (`EscalationRule::hearing_contract`, always
+/// `None` for mandatory). `customer_ack` is carried only when exactly one layer-1 rule matches
+/// (`count_layer1_matches`). `resolutions` is never applied as an answer here; it only supplies
+/// the layer-3 escalation reason through the strict `match_known_resolution`.
 pub fn decide(input: &DecisionInput) -> AnswerDecision {
     let stakes = classify_stakes(&input.stakes_input);
     let threshold = answerability_threshold(input.thresholds, stakes);
 
-    // 第1層: 明示エスカレーションルール
-    if let Some(rule) = match_layer1(input.rules, input.question_signals) {
-        let missing = match rule.binding {
-            Binding::Mandatory => Vec::new(),
-            Binding::Advisory => match evidence_sufficient(threshold, input.best_manual_score) {
-                Sufficiency::Sufficient => Vec::new(),
-                Sufficiency::Insufficient { missing } => missing,
-            },
-        };
-        return AnswerDecision::Escalate {
-            reason: EscalateReason::RegulatedOrSafety,
-            layer: 1,
-            route_to: rule.route.clone(),
-            disclosure_scope: DisclosureScope::ConfirmingWithTeam,
-            audit_required: true,
-            missing,
-            // mandatory では宣言があっても `None`（`hearing_contract` の doc）。
-            hearing: rule.hearing_contract(),
-            // Issue #76: `hearing_contract()` と異なり binding による抑止は無い。mandatory の
-            // 取次ルールも顧客向けの受け止め文を宣言できる。ただしマッチした第1層ルールが
-            // ちょうど1件のときだけ有効（複合発話では宣言文が主題と食い違うため、LLM の受け止め文
-            // に任せる）。件数で決めるので、ルールの並び順に依存しない（design doc
-            // `2026-10-05-initial-cost-handoff-design.md` §3.3）。
-            customer_ack: if count_layer1_matches(input.rules, input.question_signals) == 1 {
-                rule.customer_ack.clone()
-            } else {
-                None
-            },
-        };
+    if let Some(rule) = match_layer1_mandatory(input.rules, input.question_signals) {
+        return layer1_escalate(input, rule, Vec::new(), None);
     }
-    // 第2層: 禁止領域（変更しない。fail-closed の核。missing は常に空・情報の有無を問わない）
     if let Some(domain) = match_layer2(input.domains, input.question_signals, input.question_raw) {
         return AnswerDecision::Escalate {
             reason: EscalateReason::RegulatedOrSafety,
@@ -255,11 +231,22 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             missing: Vec::new(),
             hearing: None,
             customer_ack: None,
+            known_resolution_id: None,
         };
     }
-    // 第3層: 回答可能性
-    let kr_match = match_known_resolution(input.resolutions, input.question_signals);
-    if let KrMatch::Applicable(kr) = kr_match {
+    if let Some(rule) = match_layer1_advisory(input.rules, input.question_signals) {
+        let missing = match evidence_sufficient(threshold, input.best_manual_score) {
+            Sufficiency::Sufficient => Vec::new(),
+            Sufficiency::Insufficient { missing } => missing,
+        };
+        return layer1_escalate(
+            input,
+            rule,
+            missing,
+            input.known_resolution.map(|kr| kr.id.clone()),
+        );
+    }
+    if let Some(kr) = input.known_resolution {
         return AnswerDecision::Allowed {
             source: AnswerSource::KnownResolution,
             evidence_section_keys: Vec::new(),
@@ -268,6 +255,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             threshold,
         };
     }
+    let kr_match = match_known_resolution(input.resolutions, input.question_signals);
     match evidence_sufficient(threshold, input.best_manual_score) {
         Sufficiency::Sufficient => AnswerDecision::Allowed {
             source: AnswerSource::Manual,
@@ -291,8 +279,32 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
                 missing,
                 hearing: None,
                 customer_ack: None,
+                known_resolution_id: None,
             }
         }
+    }
+}
+
+fn layer1_escalate(
+    input: &DecisionInput,
+    rule: &EscalationRule,
+    missing: Vec<EvidenceRequirement>,
+    known_resolution_id: Option<String>,
+) -> AnswerDecision {
+    AnswerDecision::Escalate {
+        reason: EscalateReason::RegulatedOrSafety,
+        layer: 1,
+        route_to: rule.route.clone(),
+        disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+        audit_required: true,
+        missing,
+        hearing: rule.hearing_contract(),
+        customer_ack: if count_layer1_matches(input.rules, input.question_signals) == 1 {
+            rule.customer_ack.clone()
+        } else {
+            None
+        },
+        known_resolution_id,
     }
 }
 
@@ -300,8 +312,8 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
 mod tests {
     use super::*;
     use crate::harness::rules::{
-        Binding, EscalationRule, Grade, HearingContract, KnownResolution, ProhibitedDomain,
-        RootCause, SourceAuthority,
+        match_layer1, Binding, EscalationRule, Grade, HearingContract, KnownResolution,
+        ProhibitedDomain, RootCause, SourceAuthority,
     };
     use crate::harness::signal::{Signal, SignalSet};
     use crate::test_support::load_bundled_escalation_rules;
@@ -331,6 +343,7 @@ mod tests {
             rejection_count: 0,
             approver_set: Vec::new(),
             origin: "test".to_string(),
+            verified_at: None,
             binding: Binding::Advisory,
             registration_trigger: "single_ruling".to_string(),
             knowledge_class: "commercial".to_string(),
@@ -348,6 +361,7 @@ mod tests {
         stakes_input: StakesInput,
         thresholds: &'a Thresholds,
         sections: &'a [String],
+        known_resolution: Option<&'a KnownResolution>,
     ) -> DecisionInput<'a> {
         DecisionInput {
             question_signals,
@@ -355,6 +369,7 @@ mod tests {
             rules,
             domains,
             resolutions,
+            known_resolution,
             best_manual_score,
             best_manual_sections: sections,
             stakes_input,
@@ -438,6 +453,237 @@ mod tests {
 
     // --- decide: 3 層短絡 ---
 
+    fn rule_with(id: &str, cond: &[&str], binding: Binding, hearing: bool) -> EscalationRule {
+        EscalationRule {
+            id: id.to_string(),
+            condition: signals(cond),
+            route: "safety_team".to_string(),
+            owner: None,
+            binding,
+            hearing: hearing.then_some(HearingContract::ProductAndSymptom),
+            customer_ack: None,
+        }
+    }
+
+    fn advisory_rule(id: &str, cond: &[&str]) -> EscalationRule {
+        rule_with(id, cond, Binding::Advisory, true)
+    }
+
+    fn mandatory_rule(id: &str, cond: &[&str]) -> EscalationRule {
+        rule_with(id, cond, Binding::Mandatory, false)
+    }
+
+    fn legal_domain() -> ProhibitedDomain {
+        ProhibitedDomain {
+            id: "d1".to_string(),
+            domain_signals: signals(&["a"]),
+            text_patterns: Vec::new(),
+            route: "legal".to_string(),
+            binding: Binding::Mandatory,
+        }
+    }
+
+    #[test]
+    fn mandatory_and_layer2_win_over_a_matching_kr() {
+        let cases: Vec<(&str, Vec<EscalationRule>, Vec<ProhibitedDomain>, u8)> = vec![
+            (
+                "mandatory rule",
+                vec![mandatory_rule("m1", &["a"])],
+                Vec::new(),
+                1,
+            ),
+            ("layer2 domain", Vec::new(), vec![legal_domain()], 2),
+        ];
+        for (name, rules, domains, layer) in cases {
+            let k = kr("kr1", &["a"]);
+            let q = signals(&["a"]);
+            let d = decide(&input(
+                &q,
+                &rules,
+                &domains,
+                &[],
+                None,
+                calm(),
+                &thresholds(),
+                &[],
+                Some(&k),
+            ));
+            assert!(
+                matches!(&d, AnswerDecision::Escalate { layer: l, .. } if *l == layer),
+                "{name}: expected layer {layer}, got {d:?}"
+            );
+            assert_eq!(d.known_resolution_id(), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn layer2_wins_over_an_advisory_rule() {
+        let rules = vec![advisory_rule("a1", &["a"])];
+        let domains = vec![legal_domain()];
+        let q = signals(&["a"]);
+        let d = decide(&input(
+            &q,
+            &rules,
+            &domains,
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+            None,
+        ));
+        assert!(matches!(d, AnswerDecision::Escalate { layer: 2, .. }));
+    }
+
+    #[test]
+    fn kr_with_advisory_escalates_with_the_kr_id() {
+        let rules = vec![advisory_rule("a1", &["a"])];
+        let k = kr("kr1", &["a"]);
+        let q = signals(&["a"]);
+        let d = decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+            Some(&k),
+        ));
+        match &d {
+            AnswerDecision::Escalate {
+                layer,
+                hearing,
+                missing,
+                ..
+            } => {
+                assert_eq!(*layer, 1);
+                assert_eq!(*hearing, rules[0].hearing_contract());
+                assert!(hearing.is_some());
+                assert!(!missing.is_empty());
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+        assert_eq!(d.known_resolution_id(), Some("kr1"));
+    }
+
+    #[test]
+    fn kr_alone_is_allowed_known_resolution() {
+        let k = kr("kr1", &["a"]);
+        let q = signals(&["a"]);
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &[],
+            None,
+            calm(),
+            &thresholds(),
+            &[],
+            Some(&k),
+        ));
+        match &d {
+            AnswerDecision::Allowed {
+                source,
+                evidence_section_keys,
+                ..
+            } => {
+                assert_eq!(*source, AnswerSource::KnownResolution);
+                assert!(evidence_section_keys.is_empty());
+            }
+            other => panic!("expected allowed via KR, got {other:?}"),
+        }
+        assert_eq!(d.known_resolution_id(), Some("kr1"));
+    }
+
+    #[test]
+    fn advisory_without_kr_keeps_missing_hearing_and_ack_rules() {
+        let mut rule = advisory_rule("a1", &["a"]);
+        rule.customer_ack = Some("ack".to_string());
+        let rules = vec![rule];
+        let q = signals(&["a"]);
+        let d = decide(&input(
+            &q,
+            &rules,
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &thresholds(),
+            &[],
+            None,
+        ));
+        match &d {
+            AnswerDecision::Escalate {
+                missing,
+                hearing,
+                customer_ack,
+                ..
+            } => {
+                assert!(!missing.is_empty());
+                assert_eq!(*hearing, Some(HearingContract::ProductAndSymptom));
+                assert_eq!(customer_ack.as_deref(), Some("ack"));
+            }
+            other => panic!("expected layer1 escalate, got {other:?}"),
+        }
+        assert_eq!(d.known_resolution_id(), None);
+    }
+
+    #[test]
+    fn decide_never_applies_a_kr_from_resolutions_alone() {
+        let cases = [
+            (
+                "exact signals",
+                &["a"][..],
+                EscalateReason::InsufficientDirectness,
+            ),
+            (
+                "added unknown signal",
+                &["a", "b"][..],
+                EscalateReason::UnknownAddedSignal,
+            ),
+        ];
+        for (name, question, reason) in cases {
+            let resolutions = vec![kr("kr1", &["a"])];
+            let q = signals(question);
+            let d = decide(&input(
+                &q,
+                &[],
+                &[],
+                &resolutions,
+                None,
+                calm(),
+                &thresholds(),
+                &[],
+                None,
+            ));
+            assert!(
+                matches!(&d, AnswerDecision::Escalate { layer: 3, reason: r, .. } if *r == reason),
+                "{name}: expected layer 3 {reason:?}, got {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn escalate_omits_a_missing_known_resolution_id_when_serialized() {
+        let build = |id: Option<&str>| AnswerDecision::Escalate {
+            reason: EscalateReason::RegulatedOrSafety,
+            layer: 1,
+            route_to: "r".to_string(),
+            disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            hearing: None,
+            customer_ack: None,
+            known_resolution_id: id.map(str::to_string),
+        };
+        let none = serde_json::to_value(build(None)).unwrap();
+        assert!(none.get("known_resolution_id").is_none());
+        let some = serde_json::to_value(build(Some("kr1"))).unwrap();
+        assert_eq!(some["known_resolution_id"], "kr1");
+    }
+
     #[test]
     fn layer1_short_circuits_everything() {
         // 第1層マッチ時は KR が完全一致でも回答に進まない（バイパス不可）
@@ -461,6 +707,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            Some(&resolutions[0]),
         ));
         match d {
             AnswerDecision::Escalate {
@@ -469,8 +716,10 @@ mod tests {
                 reason,
                 audit_required,
                 missing,
+                known_resolution_id,
                 ..
             } => {
+                assert_eq!(known_resolution_id, None);
                 assert_eq!(layer, 1);
                 assert_eq!(route_to, "safety_team");
                 assert_eq!(reason, EscalateReason::RegulatedOrSafety);
@@ -519,6 +768,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -569,6 +819,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate { layer, missing, .. } => {
@@ -604,6 +855,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate { layer, missing, .. } => {
@@ -649,6 +901,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         )) {
             AnswerDecision::Escalate { layer, hearing, .. } => {
                 assert_eq!(layer, 1);
@@ -704,6 +957,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -738,6 +992,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -788,6 +1043,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         )) {
             AnswerDecision::Escalate {
                 layer,
@@ -848,6 +1104,7 @@ mod tests {
             missing: Vec::new(),
             hearing,
             customer_ack: None,
+            known_resolution_id: None,
         }
     }
 
@@ -863,6 +1120,7 @@ mod tests {
             missing: Vec::new(),
             hearing: None,
             customer_ack,
+            known_resolution_id: None,
         }
     }
 
@@ -960,6 +1218,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -985,6 +1244,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            Some(&resolutions[0]),
         ));
         match d {
             AnswerDecision::Allowed {
@@ -1012,6 +1272,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -1041,6 +1302,7 @@ mod tests {
             calm(),
             &thresholds(),
             &sections,
+            None,
         ));
         match d {
             AnswerDecision::Allowed {
@@ -1073,6 +1335,7 @@ mod tests {
             high,
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -1097,6 +1360,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         assert!(matches!(d2, AnswerDecision::Allowed { .. }));
     }
@@ -1203,6 +1467,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -1236,6 +1501,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -1282,6 +1548,7 @@ mod tests {
             hazard_mid,
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate {
@@ -1322,6 +1589,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate { layer, missing, .. } => {
@@ -1352,6 +1620,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         match d {
             AnswerDecision::Escalate { layer, missing, .. } => {
@@ -1393,6 +1662,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         // 勝者の名指し。`decide` の結果（下）だけでは「どのルールが勝ったか」を直接は
         // 観測できないため、同じ選択ロジック `match_layer1` の結果で固定する。
@@ -1443,6 +1713,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         assert_eq!(
             match_layer1(&rules, &question).map(|rule| rule.id.as_str()),
@@ -1509,6 +1780,7 @@ mod tests {
                 calm(),
                 &thresholds(),
                 &[],
+                None,
             ));
             match d {
                 AnswerDecision::Escalate { layer, hearing, .. } => {
@@ -1546,6 +1818,7 @@ mod tests {
                 calm(),
                 &thresholds(),
                 &[],
+                None,
             ));
             match d {
                 AnswerDecision::Escalate { layer, hearing, .. } => {
@@ -2023,6 +2296,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         )) {
             AnswerDecision::Escalate {
                 layer,
@@ -2122,6 +2396,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         let b = decide(&input(
             &q,
@@ -2132,6 +2407,7 @@ mod tests {
             calm(),
             &thresholds(),
             &[],
+            None,
         ));
         assert_eq!(
             serde_json::to_string(&a).unwrap(),

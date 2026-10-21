@@ -347,6 +347,14 @@ impl LexiconNormalizer {
             .join("\n")
     }
 
+    /// Returns the vocabulary description of `signal`, or `None` when it is not registered.
+    pub fn description_of(&self, signal: &Signal) -> Option<&str> {
+        self.vocabulary
+            .iter()
+            .find(|entry| entry.signal == signal.as_str())
+            .map(|entry| entry.description.as_str())
+    }
+
     /// signal の lexicon description と(正規化前の生の) surface_forms を空白区切りで
     /// 連結した検索語を返す(design doc `2026-10-07-partial-answer-with-handoff-design.md`
     /// §10.2 の signal 誘導補助検索専用)。顧客提示には使わない内部語彙を含むため、
@@ -723,6 +731,20 @@ mod tests {
     }
 
     #[test]
+    fn description_of_returns_the_vocabulary_description() {
+        let lex = LexiconNormalizer::from_json(
+            r#"{ "signals": [ { "signal": "mold", "class": "hazard", "surface_forms": ["カビ"], "description": "カビの発生" } ] }"#,
+        )
+        .expect("lexicon parses");
+        assert_eq!(lex.description_of(&Signal::new("mold")), Some("カビの発生"));
+    }
+
+    #[test]
+    fn description_of_is_none_for_an_unknown_signal() {
+        assert_eq!(lexicon().description_of(&Signal::new("nope")), None);
+    }
+
+    #[test]
     fn normalized_surface_forms_of_returns_none_for_an_unregistered_signal() {
         let lex = lexicon();
         assert_eq!(
@@ -876,6 +898,32 @@ mod tests {
         assert!(n
             .normalize("変色して色味がおかしい")
             .contains(&Signal::new("discoloration")));
+    }
+
+    fn bundled_urtect_normalizer() -> LexiconNormalizer {
+        LexiconNormalizer::from_path(&bundled_urtect_lexicon_path()).expect("bundled lexicon loads")
+    }
+
+    #[test]
+    fn bundled_lexicon_maps_signals_to_customer_labels() {
+        let n = bundled_urtect_normalizer();
+        let cases = [
+            (
+                "cloud_storage_retention",
+                "録画の保存期間はどれくらいですか",
+                "クラウド録画の保存期間に関するご相談",
+            ),
+            (
+                "led_red_blinking",
+                "カメラが赤く点滅しています",
+                "赤いランプの点滅に関するご相談",
+            ),
+        ];
+        for (name, utterance, label) in cases {
+            let signal = Signal::new(name);
+            assert!(n.normalize(utterance).contains(&signal), "{name}");
+            assert_eq!(n.customer_label_of(&signal), Some(label), "{name}");
+        }
     }
 
     /// Critical 1 の対象は本番 Cloud Run（`urtect` schema）がサービス起動時に読む

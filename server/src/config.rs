@@ -344,6 +344,9 @@ pub struct HarnessConfig {
     /// 文面の正本は client 側という spec の結論は変わらない（`harness::reply` の doc を参照）。
     #[serde(default)]
     pub customer_reply_draft_enabled: bool,
+    /// Ids of known resolutions excluded from matching. Defaults to empty.
+    #[serde(default)]
+    pub excluded_known_resolution_ids: Vec<String>,
     /// 返信文下書きの `max_tokens`。signal 抽出用（`[llm] max_tokens`、既定 600）とは別枠。
     /// 返信文は数百字必要で、抽出用の上限では途中で切れる。
     #[serde(default = "default_reply_draft_max_tokens")]
@@ -394,6 +397,7 @@ impl Default for HarnessConfig {
             thresholds: ThresholdsConfig::default(),
             grading: GradingConfig::default(),
             customer_reply_draft_enabled: false,
+            excluded_known_resolution_ids: Vec::new(),
             customer_reply_draft_max_tokens: default_reply_draft_max_tokens(),
             default_escalation_route: default_escalation_route(),
             vector_route_enabled: false,
