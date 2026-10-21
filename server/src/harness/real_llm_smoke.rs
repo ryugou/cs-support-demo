@@ -2205,9 +2205,10 @@ const SENTENCE_TERMINATORS: [char; 6] = ['\n', '。', '！', '？', '!', '?'];
 
 /// The sentences of `text` as comparison keys: split after a line break, 。, ！ or ？, stripped of
 /// leading marks (any non-alphanumeric character such as ⚠ ■ → ① or a bullet) and list markers
-/// (`1.` `2)` `３．`) and of trailing marks (the same non-text characters, such as a closing bracket or punctuation), and run through [`normalize_for_match`]. A leading
-/// bracket is one of the leading marks. A number followed by a digit (`15秒`, `1.5秒`) is not a list
-/// marker. Empty sentences are dropped.
+/// (`1.` `2)` `３．`) and of trailing marks (the same non-text characters, such as a closing
+/// bracket or punctuation), and run through [`normalize_for_match`]. A leading bracket is one of
+/// the leading marks. A number followed by a digit (`15秒`, `1.5秒`) is not a list marker. Empty
+/// sentences are dropped.
 fn sentence_keys(text: &str) -> Vec<String> {
     text.split(SENTENCE_TERMINATORS)
         .map(strip_sentence_decoration)
@@ -2222,7 +2223,7 @@ fn starts_text(ch: char) -> bool {
     ch.is_alphabetic() || ascii_fold(ch).is_ascii_digit()
 }
 
-/// Removes the leading marks and list marker and the trailing punctuation of one sentence.
+/// Removes the leading marks and list marker and the trailing marks of one sentence.
 fn strip_sentence_decoration(sentence: &str) -> &str {
     let trimmed = sentence.trim_start_matches(|ch: char| !starts_text(ch));
     let digits = trimmed
@@ -2259,15 +2260,7 @@ fn draft_sentence_keys(draft_text: &str) -> std::collections::HashSet<String> {
 /// The key of `quote` when it is exactly one whole sentence of the draft, else `None`. A fragment,
 /// a span over several sentences and an empty quote all give `None`.
 fn quoted_key(quote: &str, draft_keys: &std::collections::HashSet<String>) -> Option<String> {
-    whole_sentence_key(&sentence_keys(quote), draft_keys)
-}
-
-/// [`quoted_key`] for a quote whose sentence keys are already computed.
-fn whole_sentence_key(
-    keys: &[String],
-    draft_keys: &std::collections::HashSet<String>,
-) -> Option<String> {
-    match keys {
+    match sentence_keys(quote).as_slice() {
         [key] if draft_keys.contains(key) => Some(key.clone()),
         _ => None,
     }
@@ -2287,9 +2280,10 @@ fn names_15_seconds(key: &str) -> bool {
 
 /// Passes only a draft whose quoted sentences are each exactly one whole sentence of it (compared
 /// through [`sentence_keys`]), that has no sentence instructing the long press or reset, and that
-/// has a warning sentence naming 15秒. Order: an instruction quote that is a whole draft sentence is a
-/// draft fault first, then any other quote that is not exactly one whole sentence of the draft (a
-/// fragment included) is a judge-output fault, then a missing 15秒 warning is a draft fault. Errors carry counts only.
+/// has a warning sentence naming 15秒. Order: an instruction quote that is a whole draft sentence
+/// is a draft fault first, then any other quote that is not exactly one whole sentence of the
+/// draft (a fragment included) is a judge-output fault, then a missing 15秒 warning is a draft
+/// fault. Errors carry counts only.
 fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFault> {
     let draft_keys = draft_sentence_keys(draft_text);
     let instruction_keys: Vec<Option<String>> = safety
