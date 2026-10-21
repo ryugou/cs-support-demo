@@ -1874,7 +1874,7 @@ fn ascii_fold(ch: char) -> char {
 
 /// Whether `chars[at]` is a comma that is followed by exactly three digits.
 fn is_thousands_separator(chars: &[char], at: usize) -> bool {
-    matches!(chars[at], ',' | '，')
+    chars[at] == ','
         && chars[at + 1..]
             .iter()
             .take_while(|ch| ch.is_ascii_digit())
@@ -1996,7 +1996,7 @@ fn assert_partial_answer_plan(plan: &super::ReplyDraftPlan) {
 }
 
 /// Lowercases, folds full-width ASCII (U+FF01-FF5E, so Ｗｉ－Ｆｉ and ５ become Wi-Fi and 5) and the
-/// Unicode hyphens and minus (U+2010-2015, U+2212, U+FF0D) to ASCII, unifies 〜/～/~ and drops
+/// Unicode hyphens and minus (U+2010-2015, U+2212) to ASCII, unifies 〜/～/~ and drops
 /// whitespace, so the fidelity checks below survive wording and notation variation of the
 /// generated draft. The long vowel mark ー (U+30FC) is kept: it is part of words such as パスワード.
 fn normalize_for_match(text: &str) -> String {
@@ -2004,7 +2004,7 @@ fn normalize_for_match(text: &str) -> String {
         .filter(|ch| !ch.is_whitespace())
         .map(|ch| match ch {
             '〜' => '~',
-            '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{ff0d}' => '-',
+            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
             other => ascii_fold(other),
         })
         .flat_map(char::to_lowercase)
@@ -2203,25 +2203,34 @@ fn parse_led_safety(raw: &str) -> Result<LedSafety, LedFault> {
 /// The characters that end a sentence for the quote check.
 const SENTENCE_TERMINATORS: [char; 6] = ['\n', '。', '！', '？', '!', '?'];
 
-/// Marks that decorate the start of a sentence without being part of it.
-const LEADING_MARKS: [char; 9] = ['⚠', '\u{fe0f}', '※', '・', '●', '▶', '•', '*', '-'];
+/// Brackets dropped from a sentence key, so a 。 inside brackets does not change what a sentence is.
+const BRACKETS: [char; 12] = [
+    '「', '」', '『', '』', '（', '）', '(', ')', '【', '】', '[', ']',
+];
 
 /// The sentences of `text` as comparison keys: split after a line break, 。, ！ or ？, stripped of
-/// leading list markers (`1.` `2)` `３．`), ⚠ and bullets and of trailing punctuation, then run
-/// through [`normalize_for_match`]. A number followed by a digit (`15秒`, `1.5秒`) is not a list
+/// leading marks (any non-alphanumeric character such as ⚠ ■ → ① or a bullet) and list markers
+/// (`1.` `2)` `３．`) and of trailing punctuation, run through [`normalize_for_match`] and stripped of
+/// brackets. A number followed by a digit (`15秒`, `1.5秒`) is not a list
 /// marker. Empty sentences are dropped.
 fn sentence_keys(text: &str) -> Vec<String> {
     text.split(SENTENCE_TERMINATORS)
         .map(strip_sentence_decoration)
         .map(normalize_for_match)
+        .map(|key| key.replace(BRACKETS, ""))
         .filter(|key| !key.is_empty())
         .collect()
 }
 
+/// Whether `ch` can start the text of a sentence: a letter (CJK and kana included) or a decimal digit.
+/// Circled digits such as ① are marks, not text.
+fn starts_text(ch: char) -> bool {
+    ch.is_alphabetic() || ascii_fold(ch).is_ascii_digit()
+}
+
 /// Removes the leading marks and list marker and the trailing punctuation of one sentence.
 fn strip_sentence_decoration(sentence: &str) -> &str {
-    let trimmed =
-        sentence.trim_start_matches(|ch: char| ch.is_whitespace() || LEADING_MARKS.contains(&ch));
+    let trimmed = sentence.trim_start_matches(|ch: char| !starts_text(ch));
     let digits = trimmed
         .chars()
         .take_while(|&ch| ascii_fold(ch).is_ascii_digit())
@@ -2244,7 +2253,7 @@ fn strip_sentence_decoration(sentence: &str) -> &str {
         _ => trimmed,
     };
     after_marker
-        .trim_start_matches(|ch: char| ch.is_whitespace() || LEADING_MARKS.contains(&ch))
+        .trim_start_matches(|ch: char| !starts_text(ch))
         .trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '、' | ',' | '，'))
 }
 
@@ -2260,6 +2269,29 @@ fn quoted_key(quote: &str, draft_keys: &std::collections::HashSet<String>) -> Op
     (keys.len() == 1 && draft_keys.contains(&keys[0])).then(|| keys.remove(0))
 }
 
+/// Whether `quote` is one non-empty key that is a proper part of a draft sentence. Such a fragment
+/// of an instruction sentence still quotes the draft's own words, so it is a draft fault.
+fn is_sentence_fragment(quote: &str, draft_keys: &std::collections::HashSet<String>) -> bool {
+    match sentence_keys(quote).as_slice() {
+        [key] => draft_keys
+            .iter()
+            .any(|draft_key| draft_key.contains(key.as_str())),
+        _ => false,
+    }
+}
+
+/// Whether the sentence key names 15秒 (or 十五秒). A 15 that follows a digit or a dot (`115秒`,
+/// `0.15秒`) is part of another number.
+fn names_15_seconds(key: &str) -> bool {
+    key.contains("十五秒")
+        || key.match_indices("15秒").any(|(at, _)| {
+            !key[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_digit() || ch == '.')
+        })
+}
+
 /// Passes only a draft whose quoted sentences are each exactly one whole sentence of it (compared
 /// through [`sentence_keys`]), that has no sentence instructing the long press or reset, and that
 /// has a warning sentence naming 15秒. Order: a valid instruction quote is a draft fault first,
@@ -2272,7 +2304,13 @@ fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFau
         .iter()
         .map(|quote| quoted_key(quote, &draft_keys))
         .collect();
-    let instructions = instruction_keys.iter().flatten().count();
+    let fragments = safety
+        .reset_instruction_sentences
+        .iter()
+        .zip(&instruction_keys)
+        .filter(|(quote, key)| key.is_none() && is_sentence_fragment(quote, &draft_keys))
+        .count();
+    let instructions = instruction_keys.iter().flatten().count() + fragments;
     if instructions > 0 {
         return Err(LedFault::Draft(format!(
             "invalid draft: the judge quotes {instructions} sentence(s) that instruct a 15秒 press or a factory reset"
@@ -2296,7 +2334,7 @@ fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFau
     if !warning_keys
         .iter()
         .flatten()
-        .any(|key| key.contains("15秒") || key.contains("十五秒"))
+        .any(|key| names_15_seconds(key))
     {
         return Err(LedFault::Draft(
             "invalid draft: no quoted warning sentence mentions 15秒, so it lacks the 15秒 factory-reset warning"
@@ -3074,7 +3112,7 @@ fn the_verdict_validates_instructions_first_then_warnings_then_15() {
         assert!(message.contains("instruct"), "{label}: {message}");
     }
     let malformed_instruction = LedSafety {
-        reset_instruction_sentences: sentences(&["初期化"]),
+        reset_instruction_sentences: sentences(&["工場出荷"]),
         reset_warning_sentences: sentences(&["ボタンを15秒以上押さないでください。"]),
     };
     judge_fault_message(
@@ -3520,4 +3558,95 @@ fn kr_riding_advisory_turn_escalates_with_the_kr_and_plans_a_partial_answer() {
         &thresholds,
         config.harness.customer_reply_draft_enabled,
     ));
+}
+
+#[test]
+fn a_fragment_of_a_draft_sentence_quoted_as_an_instruction_is_a_draft_fault() {
+    let draft = "ボタンを15秒以上押さないでください。\n改善しないようなら、15秒長押しして初期化してください。";
+    let safety = LedSafety {
+        reset_instruction_sentences: sentences(&["15秒長押しして初期化してください"]),
+        reset_warning_sentences: sentences(&["ボタンを15秒以上押さないでください。"]),
+    };
+    let message = draft_fault_message(led_safety_verdict(&safety, draft), "fragment instruction");
+    assert!(message.contains("1 sentence(s)"), "{message}");
+    let unrelated = LedSafety {
+        reset_instruction_sentences: sentences(&["工場出荷状態に戻します"]),
+        reset_warning_sentences: sentences(&["ボタンを15秒以上押さないでください。"]),
+    };
+    judge_fault_message(
+        led_safety_verdict(&unrelated, draft),
+        "not in the draft at all",
+    );
+}
+
+#[test]
+fn a_15_preceded_by_a_digit_or_dot_is_not_a_15_second_warning() {
+    for (label, sentence) in [
+        ("115秒", "115秒お待ちください。"),
+        ("0.15秒", "0.15秒お待ちください。"),
+        ("full-width 1.15秒", "１．１５秒お待ちください。"),
+    ] {
+        let draft = format!("ボタンを押します。\n{sentence}");
+        let message = draft_fault_message(
+            led_safety_verdict(&warnings_only(&[sentence]), &draft),
+            label,
+        );
+        assert!(message.contains("15秒"), "{label}: {message}");
+    }
+    let draft = "ボタンを押します。\n15秒以上押さないでください。";
+    assert_eq!(
+        led_safety_verdict(&warnings_only(&["15秒以上押さないでください。"]), draft),
+        Ok(())
+    );
+}
+
+#[test]
+fn brackets_do_not_split_or_break_a_whole_sentence_quote() {
+    let draft = "ボタンを押します。\n（15秒以上押すと初期化されます。）\n「15秒以上押さないでください。」\n";
+    for quote in [
+        "（15秒以上押すと初期化されます。）",
+        "15秒以上押すと初期化されます。",
+        "「15秒以上押さないでください。」",
+        "15秒以上押さないでください。",
+    ] {
+        assert_eq!(
+            led_safety_verdict(&warnings_only(&[quote]), draft),
+            Ok(()),
+            "{quote}"
+        );
+    }
+}
+
+#[test]
+fn any_leading_non_alphanumeric_mark_is_ignored_but_digits_are_kept() {
+    let draft = "－ ボタンを15秒以上押さないでください。\n■ 設定が消えます。\n→ 注意してください。\n① 電源を確認します\n(1) 次へ進みます\n15秒以上押すと初期化されます。\n1.5秒ではありません。";
+    for quote in [
+        "ボタンを15秒以上押さないでください。",
+        "－ ボタンを15秒以上押さないでください。",
+        "◆ 設定が消えます。",
+        "注意してください。",
+        "電源を確認します",
+        "2) 次へ進みます",
+        "15秒以上押すと初期化されます。",
+        "1.5秒ではありません。",
+    ] {
+        assert_eq!(
+            led_safety_verdict(
+                &warnings_only(&[quote, "ボタンを15秒以上押さないでください。"]),
+                draft
+            ),
+            Ok(()),
+            "{quote}"
+        );
+    }
+    assert_eq!(
+        sentence_keys("15秒以上押さないでください。"),
+        vec!["15秒以上押さないでください".to_owned()]
+    );
+}
+
+#[test]
+fn full_width_comma_and_minus_fold_through_ascii_fold_alone() {
+    assert_eq!(digit_runs("１，２３４台"), vec!["1234".to_owned()]);
+    assert_eq!(normalize_for_match("Ｗｉ－Ｆｉ Wi\u{2212}Fi"), "wi-fiwi-fi");
 }
