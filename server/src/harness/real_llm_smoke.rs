@@ -2557,7 +2557,7 @@ fn assert_kr_riding_action_route(fx: &Fixture, outcome: &super::EvaluationOutcom
     assert!(
         fx.config.api.clarify_max_turns > 0,
         "case {label}: the route check needs at least one clarification turn, but the loaded \
-         config (`config.cloudrun.toml` `clarify_max_turns`) sets it to 0"
+         config (`config.cloudrun.toml` [api] `clarify_max_turns`) sets it to 0"
     );
     let first = crate::api::decide_reply_action(outcome, &conv_state(0, false), &fx.config.api);
     assert!(
