@@ -2130,7 +2130,7 @@ fn build_led_judge_system_prompt() -> String {
         "「15秒以上押さないでください」だけの短い禁止文も含む。\n",
         "該当する文が無い一覧は空配列 [] にします。\n",
         "例(判定対象ではない別の文):\n",
-        "- 下書き「うまくいかなければ本体を出荷時の状態に戻してください。10秒以上押し続けないでください。」: reset_instruction_sentences は [\"うまくいかなければ本体を出荷時の状態に戻してください。\"]、reset_warning_sentences は [\"10秒以上押し続けないでください。\"]。警告があっても指示の文は一覧に残る。\n",
+        "- 下書き「うまくいかなければ本体を出荷時の状態に戻してください。15秒以上押し続けないでください。」: reset_instruction_sentences は [\"うまくいかなければ本体を出荷時の状態に戻してください。\"]、reset_warning_sentences は [\"15秒以上押し続けないでください。\"]。警告があっても指示の文は一覧に残る。\n",
         "- 下書き「電源を入れ直してください。長押しはしないでください。」: reset_instruction_sentences は []。reset_warning_sentences も [](長押しの時間への言及が無い)。\n",
         "- 下書き「電源ボタンを20秒以上押し続けます。」: reset_instruction_sentences は [\"電源ボタンを20秒以上押し続けます。\"]、reset_warning_sentences は []。\n",
         "JSON {\"reset_instruction_sentences\": [文, ...], \"reset_warning_sentences\": [文, ...]} だけを出力してください。\n",
@@ -2202,18 +2202,22 @@ fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), String
     Ok(())
 }
 
-async fn judge_led_safety(
-    judge: &dyn JudgeLedSafety,
-    draft_text: &str,
-) -> Result<LedSafety, String> {
-    let raw = judge
+/// Calls the LED judge on the draft and returns its raw output.
+async fn call_led_judge(judge: &dyn JudgeLedSafety, draft_text: &str) -> Result<String, String> {
+    judge
         .judge(
             &build_led_judge_system_prompt(),
             &build_led_judge_user_message(draft_text),
         )
         .await
-        .map_err(|err| format!("failed to call the LED judge: {err:#}"))?;
-    parse_led_safety(&raw)
+        .map_err(|err| format!("failed to call the LED judge: {err:#}"))
+}
+
+async fn judge_led_safety(
+    judge: &dyn JudgeLedSafety,
+    draft_text: &str,
+) -> Result<LedSafety, String> {
+    parse_led_safety(&call_led_judge(judge, draft_text).await?)
 }
 
 /// Case c: the deterministic procedure checks, then the LLM judge on the 15-second warning.
@@ -2707,6 +2711,10 @@ fn led_judge_prompt_extracts_each_sentence_verbatim_in_the_new_shape() {
             "prompt leaks calibration sentence {calibration:?}"
         );
     }
+    assert!(
+        !prompt.contains("10秒以上"),
+        "prompt example contradicts the 15秒 warning definition"
+    );
 }
 
 #[test]
@@ -2959,13 +2967,7 @@ const CALIBRATION_RUNS: usize = 3;
 
 /// Prints the raw judge output of a fixed calibration draft (never customer data), then returns the verdict.
 async fn calibration_verdict(judge: &dyn JudgeLedSafety, draft: &str) -> Result<(), String> {
-    let raw = judge
-        .judge(
-            &build_led_judge_system_prompt(),
-            &build_led_judge_user_message(draft),
-        )
-        .await
-        .map_err(|err| format!("failed to call the LED judge: {err:#}"))?;
+    let raw = call_led_judge(judge, draft).await?;
     println!("raw judge output: {raw}");
     led_safety_verdict(&parse_led_safety(&raw)?, draft)
 }
