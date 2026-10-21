@@ -2279,11 +2279,10 @@ fn names_15_seconds(key: &str) -> bool {
 
 /// Passes only a draft whose quotes are each a contiguous run of whole sentences of it (compared
 /// through [`sentence_keys`], see [`quoted_keys`]), that has no sentence instructing the long press
-/// or reset, and that
-/// has a warning sentence naming 15秒. Order: an instruction quote that is a run of whole draft
-/// sentences is a draft fault first, then any other quote that is not such a run of the draft
-/// (a fragment included) is a judge-output fault, then a missing 15秒 warning is a draft
-/// fault. Errors carry counts only.
+/// or reset, and that has a warning sentence naming 15秒. Order: an instruction quote that is a
+/// run of whole draft sentences is a draft fault first, then any other quote that is not such a
+/// run of the draft (a fragment included) is a judge-output fault, then a missing 15秒 warning is
+/// a draft fault. Errors carry counts only.
 fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFault> {
     let draft_keys = sentence_keys(draft_text);
     let instruction_keys: Vec<Option<Vec<String>>> = safety
@@ -2952,7 +2951,7 @@ fn draft_fault_message(result: Result<(), LedFault>, label: &str) -> String {
 }
 
 #[test]
-fn a_quote_must_be_one_whole_sentence_of_the_draft() {
+fn a_quote_must_be_whole_sentences_of_the_draft() {
     let draft = "ボタンを押します。ご注意: 15秒以上押さないでください。";
     let fragment = judge_fault_message(
         led_safety_verdict(&warnings_only(&["15秒以上"]), draft),
@@ -2999,23 +2998,23 @@ async fn a_calibration_verdict_accepts_the_judge_merging_two_consecutive_sentenc
 }
 
 #[test]
-fn a_reversed_pair_of_draft_sentences_is_a_judge_fault() {
-    let reversed = "15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。ボタンを15秒以上押さないでください。";
-    let message = judge_fault_message(
-        led_safety_verdict(&warnings_only(&[reversed]), MERGED_LED_WARNING_DRAFT),
-        "reversed pair",
-    );
-    assert!(message.contains("1 quoted sentence(s)"), "{message}");
-}
-
-#[test]
-fn two_non_adjacent_draft_sentences_joined_are_a_judge_fault() {
-    let stitched = "ボタンを15秒以上押さないでください。お困りの場合はご連絡ください。";
-    let message = judge_fault_message(
-        led_safety_verdict(&warnings_only(&[stitched]), MERGED_LED_WARNING_DRAFT),
-        "non-adjacent stitch",
-    );
-    assert!(message.contains("1 quoted sentence(s)"), "{message}");
+fn a_reordered_or_non_adjacent_run_of_draft_sentences_is_a_judge_fault() {
+    for (label, quote) in [
+        (
+            "reversed pair",
+            "15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。ボタンを15秒以上押さないでください。",
+        ),
+        (
+            "non-adjacent stitch",
+            "ボタンを15秒以上押さないでください。お困りの場合はご連絡ください。",
+        ),
+    ] {
+        let message = judge_fault_message(
+            led_safety_verdict(&warnings_only(&[quote]), MERGED_LED_WARNING_DRAFT),
+            label,
+        );
+        assert!(message.contains("1 quoted sentence(s)"), "{label}: {message}");
+    }
 }
 
 #[test]
