@@ -2203,21 +2203,15 @@ fn parse_led_safety(raw: &str) -> Result<LedSafety, LedFault> {
 /// The characters that end a sentence for the quote check.
 const SENTENCE_TERMINATORS: [char; 6] = ['\n', '。', '！', '？', '!', '?'];
 
-/// Brackets dropped from a sentence key, so a 。 inside brackets does not change what a sentence is.
-const BRACKETS: [char; 12] = [
-    '「', '」', '『', '』', '（', '）', '(', ')', '【', '】', '[', ']',
-];
-
 /// The sentences of `text` as comparison keys: split after a line break, 。, ！ or ？, stripped of
 /// leading marks (any non-alphanumeric character such as ⚠ ■ → ① or a bullet) and list markers
-/// (`1.` `2)` `３．`) and of trailing punctuation, run through [`normalize_for_match`] and stripped of
-/// brackets. A number followed by a digit (`15秒`, `1.5秒`) is not a list
+/// (`1.` `2)` `３．`) and of trailing punctuation, and run through [`normalize_for_match`]. A leading
+/// bracket is one of the leading marks. A number followed by a digit (`15秒`, `1.5秒`) is not a list
 /// marker. Empty sentences are dropped.
 fn sentence_keys(text: &str) -> Vec<String> {
     text.split(SENTENCE_TERMINATORS)
         .map(strip_sentence_decoration)
         .map(normalize_for_match)
-        .map(|key| key.replace(BRACKETS, ""))
         .filter(|key| !key.is_empty())
         .collect()
 }
@@ -2265,14 +2259,24 @@ fn draft_sentence_keys(draft_text: &str) -> std::collections::HashSet<String> {
 /// The key of `quote` when it is exactly one whole sentence of the draft, else `None`. A fragment,
 /// a span over several sentences and an empty quote all give `None`.
 fn quoted_key(quote: &str, draft_keys: &std::collections::HashSet<String>) -> Option<String> {
-    let mut keys = sentence_keys(quote);
-    (keys.len() == 1 && draft_keys.contains(&keys[0])).then(|| keys.remove(0))
+    whole_sentence_key(&sentence_keys(quote), draft_keys)
 }
 
-/// Whether `quote` is one non-empty key that is a proper part of a draft sentence. Such a fragment
+/// [`quoted_key`] for a quote whose sentence keys are already computed.
+fn whole_sentence_key(
+    keys: &[String],
+    draft_keys: &std::collections::HashSet<String>,
+) -> Option<String> {
+    match keys {
+        [key] if draft_keys.contains(key) => Some(key.clone()),
+        _ => None,
+    }
+}
+
+/// Whether the quote's sentence `keys` are one non-empty key that is contained in a draft sentence. Such a fragment
 /// of an instruction sentence still quotes the draft's own words, so it is a draft fault.
-fn is_sentence_fragment(quote: &str, draft_keys: &std::collections::HashSet<String>) -> bool {
-    match sentence_keys(quote).as_slice() {
+fn is_sentence_fragment(keys: &[String], draft_keys: &std::collections::HashSet<String>) -> bool {
+    match keys {
         [key] => draft_keys
             .iter()
             .any(|draft_key| draft_key.contains(key.as_str())),
@@ -2281,35 +2285,34 @@ fn is_sentence_fragment(quote: &str, draft_keys: &std::collections::HashSet<Stri
 }
 
 /// Whether the sentence key names 15秒 (or 十五秒). A 15 that follows a digit or a dot (`115秒`,
-/// `0.15秒`) is part of another number.
+/// `0.15秒`), and a 十五 that follows a kanji numeral (`二十五秒`, `百十五秒`), is part of another number.
 fn names_15_seconds(key: &str) -> bool {
-    key.contains("十五秒")
-        || key.match_indices("15秒").any(|(at, _)| {
-            !key[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|ch| ch.is_ascii_digit() || ch == '.')
-        })
+    const KANJI_NUMERALS: &str = "〇一二三四五六七八九十百千万";
+    let standalone = |needle: &str, joins: fn(char) -> bool| {
+        key.match_indices(needle)
+            .any(|(at, _)| !key[..at].chars().next_back().is_some_and(joins))
+    };
+    standalone("十五秒", |ch| KANJI_NUMERALS.contains(ch))
+        || standalone("15秒", |ch| ch.is_ascii_digit() || ch == '.')
 }
 
 /// Passes only a draft whose quoted sentences are each exactly one whole sentence of it (compared
 /// through [`sentence_keys`]), that has no sentence instructing the long press or reset, and that
-/// has a warning sentence naming 15秒. Order: a valid instruction quote is a draft fault first,
-/// then any quote that is not a sentence of the draft is a judge-output fault, then a missing
-/// 15秒 warning is a draft fault. Errors carry counts only.
+/// has a warning sentence naming 15秒. Order: an instruction quote that is a whole draft sentence or a
+/// fragment of one is a draft fault first, then any other quote that is not a sentence of the draft
+/// is a judge-output fault, then a missing 15秒 warning is a draft fault. Errors carry counts only.
 fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFault> {
     let draft_keys = draft_sentence_keys(draft_text);
-    let instruction_keys: Vec<Option<String>> = safety
-        .reset_instruction_sentences
-        .iter()
-        .map(|quote| quoted_key(quote, &draft_keys))
-        .collect();
-    let fragments = safety
-        .reset_instruction_sentences
-        .iter()
-        .zip(&instruction_keys)
-        .filter(|(quote, key)| key.is_none() && is_sentence_fragment(quote, &draft_keys))
-        .count();
+    let mut instruction_keys: Vec<Option<String>> = Vec::new();
+    let mut fragments = 0;
+    for quote in &safety.reset_instruction_sentences {
+        let keys = sentence_keys(quote);
+        let key = whole_sentence_key(&keys, &draft_keys);
+        if key.is_none() && is_sentence_fragment(&keys, &draft_keys) {
+            fragments += 1;
+        }
+        instruction_keys.push(key);
+    }
     let instructions = instruction_keys.iter().flatten().count() + fragments;
     if instructions > 0 {
         return Err(LedFault::Draft(format!(
@@ -3117,7 +3120,7 @@ fn the_verdict_validates_instructions_first_then_warnings_then_15() {
     };
     judge_fault_message(
         led_safety_verdict(&malformed_instruction, draft),
-        "a malformed instruction quote",
+        "an instruction quote not in the draft",
     );
 }
 
@@ -3580,11 +3583,13 @@ fn a_fragment_of_a_draft_sentence_quoted_as_an_instruction_is_a_draft_fault() {
 }
 
 #[test]
-fn a_15_preceded_by_a_digit_or_dot_is_not_a_15_second_warning() {
+fn a_15_that_is_part_of_another_number_is_not_a_15_second_warning() {
     for (label, sentence) in [
         ("115秒", "115秒お待ちください。"),
         ("0.15秒", "0.15秒お待ちください。"),
         ("full-width 1.15秒", "１．１５秒お待ちください。"),
+        ("二十五秒", "二十五秒お待ちください。"),
+        ("百十五秒", "百十五秒お待ちください。"),
     ] {
         let draft = format!("ボタンを押します。\n{sentence}");
         let message = draft_fault_message(
@@ -3596,6 +3601,11 @@ fn a_15_preceded_by_a_digit_or_dot_is_not_a_15_second_warning() {
     let draft = "ボタンを押します。\n15秒以上押さないでください。";
     assert_eq!(
         led_safety_verdict(&warnings_only(&["15秒以上押さないでください。"]), draft),
+        Ok(())
+    );
+    let draft = "ボタンを押します。\n十五秒以上押さないでください。";
+    assert_eq!(
+        led_safety_verdict(&warnings_only(&["十五秒以上押さないでください。"]), draft),
         Ok(())
     );
 }
