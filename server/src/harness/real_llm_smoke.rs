@@ -2018,13 +2018,12 @@ fn find_after(haystack: &str, needle: &str, from: usize) -> Option<usize> {
 const PRESS_RANGE_SEPARATORS: [&str; 8] = ["~", "-", "－", "ー", "—", "–", "―", "から"];
 
 /// The procedure of the LED known resolution (sample-4) as the draft must keep it: the
-/// 192.168.1.1 route, the 5-7 second press and the order of the steps. Wording is free; only the anchors and
+/// 192.168.1.1 route, the 5-7 second press, the Wi-Fi join step between them and the order of the steps. Wording is free; only the anchors and
 /// the order are checked here. The 15-second warning is judged by [`JudgeLedSafety`].
 fn check_led_procedure(draft_text: &str) -> Result<(), String> {
     let text = normalize_for_match(draft_text);
     check_led_anchors(&text)?;
-    check_led_step_order(&text)?;
-    check_led_join_step(&text)
+    check_led_step_order(&text)
 }
 
 /// The anchors the procedure cannot lose: the address, the Reset button and the 5-7 second press.
@@ -2050,49 +2049,30 @@ fn press_range_end(text: &str) -> Option<usize> {
         .min()
 }
 
-/// The steps run the 5-7 second press, 192.168.1.1, SSID or password in that order, using only
-/// anchors that appear once in the procedure. The product name ADC-V724 must be present, but
+/// The steps run the 5-7 second press, a Wi-Fi join step (接続 or Wi-Fi) between it and
+/// 192.168.1.1, then SSID or password in that order, using only anchors that appear once in the procedure. The product name ADC-V724 must be present, but
 /// it also appears in the opening sentence, so it is not an order anchor.
 fn check_led_step_order(text: &str) -> Result<(), String> {
     if !text.contains("adc-v724") {
         return Err("invalid draft: lacks the product name ADC-V724".to_owned());
     }
-    let order = press_range_end(text)
-        .and_then(|at| find_after(text, "192.168.1.1", at))
-        .and_then(|at| {
-            [
-                find_after(text, "ssid", at),
-                find_after(text, "パスワード", at),
-            ]
-            .into_iter()
-            .flatten()
-            .min()
-        });
-    if order.is_none() {
-        return Err(
-            "invalid draft: the steps are not in the order 5〜7秒 press, 192.168.1.1, SSID or password".to_owned(),
-        );
-    }
-    Ok(())
-}
-
-/// The text between the 5-7 second press and 192.168.1.1 must mention joining the camera's
-/// Wi-Fi (接続 or Wi-Fi). The wording is free; only the presence of the step is checked.
-fn check_led_join_step(text: &str) -> Result<(), String> {
-    let joined = press_range_end(text)
-        .and_then(|from| {
-            text[from..]
-                .find("192.168.1.1")
-                .map(|len| &text[from..from + len])
-        })
-        .is_some_and(|between| {
-            between.contains("接続") || between.contains("wi-fi") || between.contains("wifi")
-        });
-    if !joined {
+    let order_error = || {
+        "invalid draft: the steps are not in the order 5〜7秒 press, 192.168.1.1, SSID or password"
+            .to_owned()
+    };
+    let press_end = press_range_end(text).ok_or_else(order_error)?;
+    let address_end = find_after(text, "192.168.1.1", press_end).ok_or_else(order_error)?;
+    let between = &text[press_end..address_end - "192.168.1.1".len()];
+    if !(between.contains("接続") || between.contains("wi-fi") || between.contains("wifi")) {
         return Err(
             "invalid draft: lacks the step of joining the camera's Wi-Fi between the press and 192.168.1.1"
                 .to_owned(),
         );
+    }
+    if find_after(text, "ssid", address_end).is_none()
+        && find_after(text, "パスワード", address_end).is_none()
+    {
+        return Err(order_error());
     }
     Ok(())
 }
@@ -2722,6 +2702,7 @@ fn led_judge_prompt_extracts_each_sentence_verbatim_in_the_new_shape() {
         "15秒以上押さないでください",
         "[]",
         "工場出荷状態へのリセット",
+        "5〜7秒のResetボタン押下(「長押し」と書かれていても15秒未満なので指示ではない)",
     ] {
         assert!(prompt.contains(needle), "prompt lacks {needle:?}");
     }
@@ -2747,6 +2728,10 @@ fn led_judge_prompt_extracts_each_sentence_verbatim_in_the_new_shape() {
     assert!(
         !prompt.contains("10秒以上"),
         "prompt example contradicts the 15秒 warning definition"
+    );
+    assert!(
+        !prompt.contains("短押し"),
+        "prompt names the 5〜7秒 press by a wording instead of its duration"
     );
 }
 
@@ -2873,18 +2858,6 @@ fn led_procedure_requires_a_wifi_join_step_between_the_press_and_the_address() {
         .replace("に接続します", "を選びます")
         .replace("Wi-Fi設定", "wifi設定");
     assert_eq!(check_led_procedure(&wifi_only), Ok(()));
-}
-
-#[test]
-fn led_judge_prompt_names_the_5_to_7_second_press_without_relying_on_the_wording() {
-    let prompt = build_led_judge_system_prompt();
-    assert!(
-        prompt.contains(
-            "5〜7秒のResetボタン押下(「長押し」と書かれていても15秒未満なので指示ではない)"
-        ),
-        "prompt does not exclude the 5〜7秒 press by duration"
-    );
-    assert!(!prompt.contains("短押し"));
 }
 
 fn sentences(items: &[&str]) -> Vec<String> {
@@ -3095,10 +3068,10 @@ async fn led_case_decision_follows_the_judge_output() {
 /// Whether a must-fail calibration result is a genuine rejection of the draft.
 fn must_fail_outcome(result: &Result<(), String>) -> Result<(), String> {
     match result {
-        Ok(()) => Err("should fail but passed".to_owned()),
+        Ok(()) => Err("invalid must-fail result: the draft passed".to_owned()),
         Err(reason) if reason.starts_with("invalid draft:") => Ok(()),
         Err(reason) => Err(format!(
-            "failed for a reason other than the draft: {reason}"
+            "invalid must-fail result: not a draft rejection: {reason}"
         )),
     }
 }
