@@ -2014,12 +2014,16 @@ fn find_after(haystack: &str, needle: &str, from: usize) -> Option<usize> {
         .map(|offset| from + offset + needle.len())
 }
 
+/// The camera setup address the LED procedure sends the user to.
+const LED_ADDRESS: &str = "192.168.1.1";
+
 /// Notations that join the two ends of the 5-7 second press (the text is already normalized, so 〜/～ are `~`).
 const PRESS_RANGE_SEPARATORS: [&str; 8] = ["~", "-", "－", "ー", "—", "–", "―", "から"];
 
 /// The procedure of the LED known resolution (sample-4) as the draft must keep it: the
-/// 192.168.1.1 route, the 5-7 second press, the Wi-Fi join step between them and the order of the steps. Wording is free; only the anchors and
-/// the order are checked here. The 15-second warning is judged by [`JudgeLedSafety`].
+/// 192.168.1.1 route, the 5-7 second press, the Wi-Fi join step between the press and
+/// 192.168.1.1, and the order of the steps. Wording is free; only the anchors and the order
+/// are checked here. The 15-second warning is judged by [`JudgeLedSafety`].
 fn check_led_procedure(draft_text: &str) -> Result<(), String> {
     let text = normalize_for_match(draft_text);
     check_led_anchors(&text)?;
@@ -2050,8 +2054,9 @@ fn press_range_end(text: &str) -> Option<usize> {
 }
 
 /// The steps run the 5-7 second press, a Wi-Fi join step (接続 or Wi-Fi) between it and
-/// 192.168.1.1, then SSID or password in that order, using only anchors that appear once in the procedure. The product name ADC-V724 must be present, but
-/// it also appears in the opening sentence, so it is not an order anchor.
+/// 192.168.1.1, then SSID or password in that order, using only anchors that appear once
+/// in the procedure. The product name ADC-V724 must be present, but it also appears in the
+/// opening sentence, so it is not an order anchor.
 fn check_led_step_order(text: &str) -> Result<(), String> {
     if !text.contains("adc-v724") {
         return Err("invalid draft: lacks the product name ADC-V724".to_owned());
@@ -2061,8 +2066,12 @@ fn check_led_step_order(text: &str) -> Result<(), String> {
             .to_owned()
     };
     let press_end = press_range_end(text).ok_or_else(order_error)?;
-    let address_end = find_after(text, "192.168.1.1", press_end).ok_or_else(order_error)?;
-    let between = &text[press_end..address_end - "192.168.1.1".len()];
+    let address_start = press_end
+        + text[press_end..]
+            .find(LED_ADDRESS)
+            .ok_or_else(order_error)?;
+    let address_end = address_start + LED_ADDRESS.len();
+    let between = &text[press_end..address_start];
     if !(between.contains("接続") || between.contains("wi-fi") || between.contains("wifi")) {
         return Err(
             "invalid draft: lacks the step of joining the camera's Wi-Fi between the press and 192.168.1.1"
