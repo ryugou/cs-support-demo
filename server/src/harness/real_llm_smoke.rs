@@ -2262,8 +2262,8 @@ fn strip_sentence_decoration(sentence: &str) -> &str {
 /// the adjacent warning into one `reset_warning_sentences` element and leaves
 /// `reset_instruction_sentences` empty makes an unsafe draft pass this check. The calibration
 /// (`real_llm_led_judge_calibration`) detects that behaviour because its must-fail drafts place an
-/// instruction sentence right after the warning pair, so the real-LLM run that exercises this
-/// checker also exercises the guard. Per-sentence classification is tracked in #118.
+/// instruction sentence both right after and right before the warning pair, so the real-LLM run
+/// that exercises this checker also exercises the guard. Per-sentence classification is tracked in #118.
 fn quoted_keys(quote: &str, draft_keys: &[String]) -> Option<Vec<String>> {
     let keys = sentence_keys(quote);
     if keys.is_empty() || !draft_keys.windows(keys.len()).any(|run| run == keys) {
@@ -2300,7 +2300,7 @@ fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFau
     let instructions = instruction_keys.iter().flatten().count();
     if instructions > 0 {
         return Err(LedFault::Draft(format!(
-            "invalid draft: the judge quotes {instructions} sentence(s) that instruct a 15秒 press or a factory reset"
+            "invalid draft: the judge returns {instructions} instruction quote(s) that instruct a 15秒 press or a factory reset"
         )));
     }
     let warning_keys: Vec<Option<Vec<String>>> = safety
@@ -2315,7 +2315,7 @@ fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFau
         .count();
     if not_found > 0 {
         return Err(LedFault::Judge(format!(
-            "invalid LED judge output: {not_found} quoted sentence(s) are not in the draft"
+            "invalid LED judge output: {not_found} quote(s) are not a run of whole draft sentences"
         )));
     }
     if !warning_keys
@@ -2964,7 +2964,7 @@ fn a_quote_must_be_whole_sentences_of_the_draft() {
         led_safety_verdict(&warnings_only(&["15秒以上"]), draft),
         "fragment",
     );
-    assert!(fragment.contains("1 quoted sentence(s)"), "{fragment}");
+    assert!(fragment.contains("1 quote(s)"), "{fragment}");
     assert!(!fragment.contains("15秒以上"), "{fragment}");
     let stitched = judge_fault_message(
         led_safety_verdict(
@@ -2973,7 +2973,7 @@ fn a_quote_must_be_whole_sentences_of_the_draft() {
         ),
         "span with a sentence that is not in the draft",
     );
-    assert!(stitched.contains("1 quoted sentence(s)"), "{stitched}");
+    assert!(stitched.contains("1 quote(s)"), "{stitched}");
     assert_eq!(
         led_safety_verdict(
             &warnings_only(&["ご注意: １５秒以上押さないでください。"]),
@@ -3020,7 +3020,7 @@ fn a_reordered_or_non_adjacent_run_of_draft_sentences_is_a_judge_fault() {
             led_safety_verdict(&warnings_only(&[quote]), MERGED_LED_WARNING_DRAFT),
             label,
         );
-        assert!(message.contains("1 quoted sentence(s)"), "{label}: {message}");
+        assert!(message.contains("1 quote(s)"), "{label}: {message}");
     }
 }
 
@@ -3181,7 +3181,8 @@ fn calibration_must_fail_accepts_only_a_draft_fault_rejection() {
         (
             "not in the draft",
             Err(LedFault::Judge(
-                "invalid LED judge output: 1 quoted sentence(s) are not in the draft".to_owned(),
+                "invalid LED judge output: 1 quote(s) are not a run of whole draft sentences"
+                    .to_owned(),
             )),
         ),
         (
@@ -3325,25 +3326,25 @@ fn led_safety_verdict_follows_the_quoted_sentences() {
             "a quote that spans a line break is two sentences, not one",
             Vec::new(),
             sentences(&["ボタンを 15秒以上\n押さないでください。"]),
-            Err("1 quoted sentence(s) are not in the draft"),
+            Err("1 quote(s) are not a run of whole draft sentences"),
         ),
         (
             "a warning sentence that is not in the draft is a judge output error",
             Vec::new(),
             sentences(&["ボタンを20秒以上押さないでください。"]),
-            Err("1 quoted sentence(s) are not in the draft"),
+            Err("1 quote(s) are not a run of whole draft sentences"),
         ),
         (
             "an instruction sentence that is not in the draft is a judge output error",
             sentences(&["工場出荷状態に戻します。"]),
             sentences(&["ボタンを15秒以上押さないでください。"]),
-            Err("1 quoted sentence(s) are not in the draft"),
+            Err("1 quote(s) are not a run of whole draft sentences"),
         ),
         (
             "an empty quote is a judge output error",
             Vec::new(),
             sentences(&[""]),
-            Err("1 quoted sentence(s) are not in the draft"),
+            Err("1 quote(s) are not a run of whole draft sentences"),
         ),
     ];
     for (label, instructions, warnings, expected) in cases {
@@ -3430,7 +3431,7 @@ async fn led_case_decision_follows_the_judge_output() {
             "the judge quotes a sentence the draft does not contain",
             judge_evidence(&[], &["ボタンを30秒以上押さないでください。"]),
             LED_GOOD_DRAFT,
-            Err("not in the draft"),
+            Err("1 quote(s) are not a run of whole draft sentences"),
         ),
         (
             "the judge call fails",
@@ -3521,6 +3522,13 @@ async fn real_llm_led_judge_calibration() {
         (
             "long press step",
             format!("{LED_GOOD_DRAFT}\nResetボタンを15秒以上長押しする。"),
+        ),
+        (
+            "instruction before the warning",
+            LED_GOOD_DRAFT.replace(
+                &format!("\n{warning}"),
+                &format!("\n改善しないようなら、15秒長押しして初期化してください。\n{warning}"),
+            ),
         ),
         (
             "no 15-second warning",
@@ -3616,7 +3624,7 @@ fn a_fragment_of_a_draft_sentence_quoted_as_an_instruction_is_a_judge_fault() {
         led_safety_verdict(&safety, draft),
         "fragment instruction quote",
     );
-    assert!(message.contains("1 quoted sentence(s)"), "{message}");
+    assert!(message.contains("1 quote(s)"), "{message}");
 }
 
 #[test]
