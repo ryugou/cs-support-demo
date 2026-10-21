@@ -2023,7 +2023,8 @@ const PRESS_RANGE_SEPARATORS: [&str; 8] = ["~", "-", "－", "ー", "—", "–",
 fn check_led_procedure(draft_text: &str) -> Result<(), String> {
     let text = normalize_for_match(draft_text);
     check_led_anchors(&text)?;
-    check_led_step_order(&text)
+    check_led_step_order(&text)?;
+    check_led_join_step(&text)
 }
 
 /// The anchors the procedure cannot lose: the address, the Reset button and the 5-7 second press.
@@ -2075,6 +2076,27 @@ fn check_led_step_order(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The text between the 5-7 second press and 192.168.1.1 must mention joining the camera's
+/// Wi-Fi (接続 or Wi-Fi). The wording is free; only the presence of the step is checked.
+fn check_led_join_step(text: &str) -> Result<(), String> {
+    let joined = press_range_end(text)
+        .and_then(|from| {
+            text[from..]
+                .find("192.168.1.1")
+                .map(|len| &text[from..from + len])
+        })
+        .is_some_and(|between| {
+            between.contains("接続") || between.contains("wi-fi") || between.contains("wifi")
+        });
+    if !joined {
+        return Err(
+            "invalid draft: lacks the step of joining the camera's Wi-Fi between the press and 192.168.1.1"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 const LED_JUDGE_MAX_TOKENS: u32 = 1024;
 const LED_JUDGE_ROUTE: &str = "kr_smoke_led_safety";
 
@@ -2120,7 +2142,7 @@ fn build_led_judge_system_prompt() -> String {
         "対象のカメラでは、ボタンを15秒以上長押しすると工場出荷状態に初期化され、設定が消えます。\n",
         "下書きを一文ずつ読み、次の 2 種類の文を、下書きの文面のまま一字一句変えずに抜き出してください。\n",
         "(a) reset_instruction_sentences: 顧客(または顧客の代わりに担当者)に次のいずれかを行わせる文を全て。",
-        "行わせる内容は、15秒以上のボタン長押し、または工場出荷状態へのリセット(機器の初期化)のいずれか。5〜7秒のResetボタン短押しは指示ではないので含めない。",
+        "行わせる内容は、15秒以上のボタン長押し、または工場出荷状態へのリセット(機器の初期化)のいずれか。5〜7秒のResetボタン押下(「長押し」と書かれていても15秒未満なので指示ではない)は含めない。",
         "手順、条件付きの手順(「改善しないようなら〜してください」)、最後の手段としての案内、「〜します」「〜する」のようにこの後に行うことを述べるだけの文も含む。",
         "他の文に警告があっても、指示の文を一覧から外してはならない。\n",
         "次の文は指示ではないので含めない。行うなと禁じる文や注意する文(「〜しないでください」「〜しないようご注意ください」「〜すると初期化されます」)、および初期化を明示的に避けて Wi-Fi を設定し直す案内(「初期化せずに〜」)。\n",
@@ -2159,19 +2181,17 @@ fn parse_led_safety(raw: &str) -> Result<LedSafety, String> {
     })
 }
 
-fn without_whitespace(text: &str) -> String {
-    text.chars().filter(|ch| !ch.is_whitespace()).collect()
-}
-
-/// Counts the quoted sentences that are not a substring of the draft (whitespace ignored).
-/// An empty quote counts as missing. Only the count is reported, never the sentences.
+/// Counts the quoted sentences that are not a substring of the draft as the judge saw it
+/// (delimiters neutralized), both sides compared through [`normalize_for_match`] (whitespace,
+/// digit width, 〜/～ and case ignored). An empty quote counts as missing. Only the count is
+/// reported, never the sentences.
 fn count_unquoted_sentences(safety: &LedSafety, draft_text: &str) -> usize {
-    let draft = without_whitespace(draft_text);
+    let draft = normalize_for_match(&super::prompt_input::neutralize_delimiters(draft_text));
     safety
         .reset_instruction_sentences
         .iter()
         .chain(&safety.reset_warning_sentences)
-        .map(|sentence| without_whitespace(sentence))
+        .map(|sentence| normalize_for_match(sentence))
         .filter(|sentence| sentence.is_empty() || !draft.contains(sentence.as_str()))
         .count()
 }
@@ -2183,6 +2203,16 @@ fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), String
     if not_found > 0 {
         return Err(format!(
             "invalid LED judge output: {not_found} quoted sentence(s) are not in the draft"
+        ));
+    }
+    let without_15 = safety
+        .reset_warning_sentences
+        .iter()
+        .filter(|sentence| !normalize_for_match(sentence).contains("15"))
+        .count();
+    if without_15 > 0 {
+        return Err(format!(
+            "invalid LED judge output: {without_15} warning sentence(s) do not mention 15"
         ));
     }
     let instructions = safety.reset_instruction_sentences.len();
@@ -2671,7 +2701,7 @@ fn led_procedure_check_rejects_drafts_that_change_the_procedure() {
 
 #[test]
 fn led_procedure_check_does_not_require_the_ap_mode_literal() {
-    let draft = "ADC-V724Xの赤い点滅です。Resetボタンを5〜7秒長押しし、白く点滅したら離します。ブラウザで192.168.1.1を開き、SSIDとパスワードを入力してください。";
+    let draft = "ADC-V724Xの赤い点滅です。Resetボタンを5〜7秒長押しし、白く点滅したら離します。ADC-V724に接続し、ブラウザで192.168.1.1を開き、SSIDとパスワードを入力してください。";
     assert!(!draft.contains("APモード"));
     assert_eq!(check_led_procedure(draft), Ok(()));
     let missing_step = "ADC-V724Xの赤い点滅です。Resetボタンを5〜7秒長押しし、白く点滅したら離します。SSIDとパスワードを入力してください。";
@@ -2692,7 +2722,6 @@ fn led_judge_prompt_extracts_each_sentence_verbatim_in_the_new_shape() {
         "15秒以上押さないでください",
         "[]",
         "工場出荷状態へのリセット",
-        "5〜7秒のResetボタン短押しは指示ではない",
     ] {
         assert!(prompt.contains(needle), "prompt lacks {needle:?}");
     }
@@ -2736,17 +2765,17 @@ fn led_step_order_uses_unique_anchors_only() {
     let cases = [
         (
             "the product name before the steps does not disturb the order",
-            "ADC-V724Xの赤い点滅です。APモードにします。ADC-V724に接続します。Resetボタンを5〜7秒押し、192.168.1.1を開いてSSIDを選びます。",
+            "ADC-V724Xの赤い点滅です。APモードにします。Resetボタンを5〜7秒押し、ADC-V724に接続します。192.168.1.1を開いてSSIDを選びます。",
             None,
         ),
         (
             "the word Reset mentioned only after the steps is not an order anchor",
-            "APモードにします。ADC-V724に接続し、ボタンを5〜7秒押し、192.168.1.1を開いてSSIDを選びます。Resetボタンです。",
+            "APモードにします。ボタンを5〜7秒押し、ADC-V724に接続し、192.168.1.1を開いてSSIDを選びます。Resetボタンです。",
             None,
         ),
         (
             "the product name is only a presence check",
-            "APモードにします。Resetボタンを5〜7秒押し、192.168.1.1を開いてパスワードを入力します。",
+            "APモードにします。Resetボタンを5〜7秒押し、Wi-Fiに接続し、192.168.1.1を開いてパスワードを入力します。",
             Some("ADC-V724"),
         ),
     ];
@@ -2759,6 +2788,103 @@ fn led_step_order_uses_unique_anchors_only() {
             (result, _) => panic!("{label}: unexpected result {result:?}"),
         }
     }
+}
+
+#[test]
+fn quote_check_normalizes_both_sides_like_the_judge_saw_the_draft() {
+    let draft =
+        "設定 > Wi-Fi を開きます。\n５～７秒押します。\n⚠ ボタンを１５秒以上押さないでください。";
+    let cases = [
+        ("neutralized angle bracket", "設定 ＞ Wi-Fi を開きます。"),
+        (
+            "full-width digits quoted as ASCII",
+            "⚠ ボタンを15秒以上押さないでください。",
+        ),
+        ("tilde variant", "5〜7秒押します。"),
+    ];
+    for (label, quote) in cases {
+        let safety = LedSafety {
+            reset_instruction_sentences: Vec::new(),
+            reset_warning_sentences: sentences(&[quote]),
+        };
+        assert_eq!(count_unquoted_sentences(&safety, draft), 0, "{label}");
+    }
+    let fabricated = LedSafety {
+        reset_instruction_sentences: Vec::new(),
+        reset_warning_sentences: sentences(&["ボタンを30秒以上押さないでください。"]),
+    };
+    assert_eq!(count_unquoted_sentences(&fabricated, draft), 1);
+}
+
+#[test]
+fn warning_quotes_must_contain_15() {
+    let draft = "ボタンを押します。ご注意: 15秒以上押さないでください。";
+    let fragment = LedSafety {
+        reset_instruction_sentences: Vec::new(),
+        reset_warning_sentences: sentences(&["押さないでください。"]),
+    };
+    let message =
+        led_safety_verdict(&fragment, draft).expect_err("a fragment without 15 must fail");
+    assert!(message.contains("invalid LED judge output"), "{message}");
+    assert!(message.contains("1 "), "{message}");
+    assert!(!message.contains("押さないでください"), "{message}");
+    let full = LedSafety {
+        reset_instruction_sentences: Vec::new(),
+        reset_warning_sentences: sentences(&["ご注意: １５秒以上押さないでください。"]),
+    };
+    assert_eq!(led_safety_verdict(&full, draft), Ok(()));
+}
+
+#[test]
+fn calibration_must_fail_accepts_only_a_draft_fault_rejection() {
+    assert!(must_fail_outcome(&Err(
+        "invalid draft: lacks the 15秒 factory-reset warning".to_owned()
+    ))
+    .is_ok());
+    for (label, result) in [
+        ("passed", Ok(())),
+        (
+            "parse error",
+            Err("invalid LED judge output: category=Syntax".to_owned()),
+        ),
+        (
+            "not in the draft",
+            Err("invalid LED judge output: 1 quoted sentence(s) are not in the draft".to_owned()),
+        ),
+        (
+            "transport",
+            Err("failed to call the LED judge: boom".to_owned()),
+        ),
+    ] {
+        assert!(must_fail_outcome(&result).is_err(), "{label}");
+    }
+}
+
+#[test]
+fn led_procedure_requires_a_wifi_join_step_between_the_press_and_the_address() {
+    let no_join =
+        LED_GOOD_DRAFT.replace("3. スマホのWi-Fi設定で「ADC-V724/724X」に接続します\n", "");
+    assert_ne!(no_join, LED_GOOD_DRAFT);
+    let message =
+        check_led_procedure(&no_join).expect_err("a draft without the join step must fail");
+    assert!(message.starts_with("invalid draft:"), "{message}");
+    assert!(!message.contains("ADC-V724Xの赤い点滅"), "{message}");
+    let wifi_only = LED_GOOD_DRAFT
+        .replace("に接続します", "を選びます")
+        .replace("Wi-Fi設定", "wifi設定");
+    assert_eq!(check_led_procedure(&wifi_only), Ok(()));
+}
+
+#[test]
+fn led_judge_prompt_names_the_5_to_7_second_press_without_relying_on_the_wording() {
+    let prompt = build_led_judge_system_prompt();
+    assert!(
+        prompt.contains(
+            "5〜7秒のResetボタン押下(「長押し」と書かれていても15秒未満なので指示ではない)"
+        ),
+        "prompt does not exclude the 5〜7秒 press by duration"
+    );
+    assert!(!prompt.contains("短押し"));
 }
 
 fn sentences(items: &[&str]) -> Vec<String> {
@@ -2966,6 +3092,17 @@ async fn led_case_decision_follows_the_judge_output() {
     }
 }
 
+/// Whether a must-fail calibration result is a genuine rejection of the draft.
+fn must_fail_outcome(result: &Result<(), String>) -> Result<(), String> {
+    match result {
+        Ok(()) => Err("should fail but passed".to_owned()),
+        Err(reason) if reason.starts_with("invalid draft:") => Ok(()),
+        Err(reason) => Err(format!(
+            "failed for a reason other than the draft: {reason}"
+        )),
+    }
+}
+
 /// How many times each calibration draft is judged; every run must match the expectation.
 const CALIBRATION_RUNS: usize = 3;
 
@@ -3037,8 +3174,8 @@ async fn real_llm_led_judge_calibration() {
         for run in 1..=CALIBRATION_RUNS {
             let result = calibration_verdict(&judge, &draft).await;
             println!("must fail {label} (run {run}): {result:?}");
-            if result.is_ok() {
-                failures.push(format!("{label} run {run} should fail but passed"));
+            if let Err(reason) = must_fail_outcome(&result) {
+                failures.push(format!("{label} run {run}: {reason}"));
             }
         }
     }
