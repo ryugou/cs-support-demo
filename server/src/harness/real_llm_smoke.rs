@@ -2258,12 +2258,9 @@ fn strip_sentence_decoration(sentence: &str) -> &str {
 /// whole sentences carries no fragment risk. A fragment, a reordered or non-adjacent stitch, a
 /// key that is not in the draft and an empty quote all give `None`.
 ///
-/// Accepted risk (PR #117 review, finding C1): a judge that merges an instruction sentence with
-/// the adjacent warning into one `reset_warning_sentences` element and leaves
-/// `reset_instruction_sentences` empty makes an unsafe draft pass this check. The calibration
-/// (`real_llm_led_judge_calibration`) detects that behaviour because its must-fail drafts place an
-/// instruction sentence both right after and right before the warning pair, so the real-LLM run
-/// that exercises this checker also exercises the guard. Per-sentence classification is tracked in #118.
+/// A judge that merges an instruction sentence with the adjacent warning into one
+/// `reset_warning_sentences` element and leaves `reset_instruction_sentences` empty makes an
+/// unsafe draft pass this check.
 fn quoted_keys(quote: &str, draft_keys: &[String]) -> Option<Vec<String>> {
     let keys = sentence_keys(quote);
     if keys.is_empty() || !draft_keys.windows(keys.len()).any(|run| run == keys) {
