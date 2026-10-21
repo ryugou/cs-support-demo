@@ -1994,14 +1994,18 @@ fn assert_partial_answer_plan(plan: &super::ReplyDraftPlan) {
     );
 }
 
-/// Lowercases, maps full-width digits to ASCII, unifies 〜/～/~ and drops whitespace, so the
-/// fidelity checks below survive wording and notation variation of the generated draft.
+/// Lowercases, folds full-width ASCII (U+FF01-FF5E, so Ｗｉ－Ｆｉ and ５ become Wi-Fi and 5) and the
+/// Unicode hyphens and minus (U+2010-2015, U+2212, U+FF0D) to ASCII, unifies 〜/～/~ and drops
+/// whitespace, so the fidelity checks below survive wording and notation variation of the
+/// generated draft. The long vowel mark ー (U+30FC) is kept: it is part of words such as パスワード.
 fn normalize_for_match(text: &str) -> String {
     text.chars()
         .filter(|ch| !ch.is_whitespace())
         .map(|ch| match ch {
-            '〜' | '～' => '~',
-            other => ascii_digit(other),
+            '〜' => '~',
+            '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{ff0d}' => '-',
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(ch as u32 - 0xfee0).unwrap_or(ch),
+            other => other,
         })
         .flat_map(char::to_lowercase)
         .collect()
@@ -2014,32 +2018,61 @@ fn find_after(haystack: &str, needle: &str, from: usize) -> Option<usize> {
         .map(|offset| from + offset + needle.len())
 }
 
+/// Why a LED draft or the judge's evidence on it was rejected. The variant, not the message text,
+/// tells a faulty draft from a faulty judge output; messages carry counts only, never draft or
+/// model text.
+#[derive(Debug, PartialEq, Eq)]
+enum LedFault {
+    /// The draft itself breaks the procedure or the 15秒 safety contract.
+    Draft(String),
+    /// The judge call or its output is unusable, so the draft was not judged.
+    Judge(String),
+}
+
+impl std::fmt::Display for LedFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Draft(message) | Self::Judge(message) => f.write_str(message),
+        }
+    }
+}
+
 /// The camera setup address the LED procedure sends the user to.
 const LED_ADDRESS: &str = "192.168.1.1";
 
-/// Notations that join the two ends of the 5-7 second press (the text is already normalized, so 〜/～ are `~`).
-const PRESS_RANGE_SEPARATORS: [&str; 8] = ["~", "-", "－", "ー", "—", "–", "―", "から"];
+/// Notations that join the two ends of the 5-7 second press. The text is already normalized, so
+/// 〜/～ are `~` and every hyphen or dash variant is `-`.
+const PRESS_RANGE_SEPARATORS: [&str; 4] = ["~", "-", "ー", "から"];
+
+/// The camera's own Wi-Fi network name (normalized), which the join step must name.
+const LED_CAMERA_SSID: &str = "adc-v724";
 
 /// The procedure of the LED known resolution (sample-4) as the draft must keep it: the
-/// 192.168.1.1 route, the 5-7 second press, the Wi-Fi join step between the press and
-/// 192.168.1.1, and the order of the steps. Wording is free; only the anchors and the order
+/// 192.168.1.1 route, the 5-7 second press, the step that joins the camera's network
+/// (ADC-V724) between the press and 192.168.1.1, and the order of the steps. Wording is free; only the anchors and the order
 /// are checked here. The 15-second warning is judged by [`JudgeLedSafety`].
-fn check_led_procedure(draft_text: &str) -> Result<(), String> {
+fn check_led_procedure(draft_text: &str) -> Result<(), LedFault> {
     let text = normalize_for_match(draft_text);
     check_led_anchors(&text)?;
     check_led_step_order(&text)
 }
 
 /// The anchors the procedure cannot lose: the address, the Reset button and the 5-7 second press.
-fn check_led_anchors(text: &str) -> Result<(), String> {
-    if !text.contains("192.168.1.1") {
-        return Err("invalid draft: lacks \"192.168.1.1\"".to_owned());
+fn check_led_anchors(text: &str) -> Result<(), LedFault> {
+    if !text.contains(LED_ADDRESS) {
+        return Err(LedFault::Draft(format!(
+            "invalid draft: lacks \"{LED_ADDRESS}\""
+        )));
     }
     if !(text.contains("reset") || text.contains("リセット")) {
-        return Err("invalid draft: lacks the Reset button".to_owned());
+        return Err(LedFault::Draft(
+            "invalid draft: lacks the Reset button".to_owned(),
+        ));
     }
     if press_range_end(text).is_none() {
-        return Err("invalid draft: lacks the 5〜7秒 press duration".to_owned());
+        return Err(LedFault::Draft(
+            "invalid draft: lacks the 5〜7秒 press duration".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2053,17 +2086,15 @@ fn press_range_end(text: &str) -> Option<usize> {
         .min()
 }
 
-/// The steps run the 5-7 second press, a Wi-Fi join step (接続 or Wi-Fi) between it and
-/// 192.168.1.1, then SSID or password in that order, using only anchors that appear once
-/// in the procedure. The product name ADC-V724 must be present, but it also appears in the
-/// opening sentence, so it is not an order anchor.
-fn check_led_step_order(text: &str) -> Result<(), String> {
-    if !text.contains("adc-v724") {
-        return Err("invalid draft: lacks the product name ADC-V724".to_owned());
-    }
+/// The steps run the 5-7 second press, a join step that names the camera's network ADC-V724
+/// between the press and 192.168.1.1, then SSID or password after the address. The network name
+/// is searched only inside the window between the press and the address, so its mention in the
+/// opening sentence of the draft does not count as the join step.
+fn check_led_step_order(text: &str) -> Result<(), LedFault> {
     let order_error = || {
-        "invalid draft: the steps are not in the order 5〜7秒 press, 192.168.1.1, SSID or password"
-            .to_owned()
+        LedFault::Draft(format!(
+            "invalid draft: the steps are not in the order 5〜7秒 press, {LED_ADDRESS}, SSID or password"
+        ))
     };
     let press_end = press_range_end(text).ok_or_else(order_error)?;
     let address_start = press_end
@@ -2071,12 +2102,10 @@ fn check_led_step_order(text: &str) -> Result<(), String> {
             .find(LED_ADDRESS)
             .ok_or_else(order_error)?;
     let address_end = address_start + LED_ADDRESS.len();
-    let between = &text[press_end..address_start];
-    if !(between.contains("接続") || between.contains("wi-fi") || between.contains("wifi")) {
-        return Err(
-            "invalid draft: lacks the step of joining the camera's Wi-Fi between the press and 192.168.1.1"
-                .to_owned(),
-        );
+    if !text[press_end..address_start].contains(LED_CAMERA_SSID) {
+        return Err(LedFault::Draft(format!(
+            "invalid draft: lacks the step of joining the camera's Wi-Fi (ADC-V724) between the press and {LED_ADDRESS}"
+        )));
     }
     if find_after(text, "ssid", address_end).is_none()
         && find_after(text, "パスワード", address_end).is_none()
@@ -2138,6 +2167,7 @@ fn build_led_judge_system_prompt() -> String {
         "(b) reset_warning_sentences: 15秒以上押さないよう伝える文、または15秒以上押すと機器が初期化される(設定が消える)と注意する文を全て。",
         "「15秒以上押さないでください」だけの短い禁止文も含む。\n",
         "該当する文が無い一覧は空配列 [] にします。\n",
+        "各要素は下書きのちょうど 1 文(改行、「。」「！」「？」までの 1 文)を、下書きの文面のまま写したものです。複数の文を 1 つにまとめたり、文の一部だけを抜き出したりしないでください。\n",
         "例(判定対象ではない別の文):\n",
         "- 下書き「うまくいかなければ本体を出荷時の状態に戻してください。15秒以上押し続けないでください。」: reset_instruction_sentences は [\"うまくいかなければ本体を出荷時の状態に戻してください。\"]、reset_warning_sentences は [\"15秒以上押し続けないでください。\"]。警告があっても指示の文は一覧に残る。\n",
         "- 下書き「電源を入れ直してください。長押しはしないでください。」: reset_instruction_sentences は []。reset_warning_sentences も [](長押しの時間への言及が無い)。\n",
@@ -2157,88 +2187,145 @@ fn build_led_judge_user_message(draft_text: &str) -> String {
 }
 
 /// Parses the judge output strictly. The error names only the failure category, never the model output.
-fn parse_led_safety(raw: &str) -> Result<LedSafety, String> {
+fn parse_led_safety(raw: &str) -> Result<LedSafety, LedFault> {
     let body = crate::llm::strip_markdown_fence(raw);
     serde_json::from_str(body).map_err(|err| {
-        format!(
+        LedFault::Judge(format!(
             "invalid LED judge output: category={:?} line={} column={} len={} chars",
             err.classify(),
             err.line(),
             err.column(),
             body.chars().count()
-        )
+        ))
     })
 }
 
-/// Counts the quoted sentences that are not a substring of the draft as the judge saw it
-/// (delimiters neutralized), both sides compared through [`normalize_for_match`] (whitespace,
-/// digit width, 〜/～ and case ignored). An empty quote counts as missing. Only the count is
-/// reported, never the sentences.
-fn count_unquoted_sentences(safety: &LedSafety, draft_text: &str) -> usize {
-    let draft = normalize_for_match(&super::prompt_input::neutralize_delimiters(draft_text));
-    safety
-        .reset_instruction_sentences
-        .iter()
-        .chain(&safety.reset_warning_sentences)
-        .map(|sentence| normalize_for_match(sentence))
-        .filter(|sentence| sentence.is_empty() || !draft.contains(sentence.as_str()))
-        .count()
+/// The characters that end a sentence for the quote check.
+const SENTENCE_TERMINATORS: [char; 6] = ['\n', '。', '！', '？', '!', '?'];
+
+/// Marks that decorate the start of a sentence without being part of it.
+const LEADING_MARKS: [char; 9] = ['⚠', '\u{fe0f}', '※', '・', '●', '▶', '•', '*', '-'];
+
+/// The sentences of `text` as comparison keys: delimiters neutralized as the judge saw the draft,
+/// split after a line break, 。, ！ or ？, stripped of leading list markers (`1.` `2)` `３．`),
+/// ⚠ and bullets and of trailing punctuation, then run through [`normalize_for_match`]. A number
+/// followed by a digit (`15秒`, `1.5秒`) is not a list marker. Empty sentences are dropped.
+fn sentence_keys(text: &str) -> Vec<String> {
+    super::prompt_input::neutralize_delimiters(text)
+        .split(SENTENCE_TERMINATORS)
+        .map(strip_sentence_decoration)
+        .map(normalize_for_match)
+        .filter(|key| !key.is_empty())
+        .collect()
 }
 
-/// Passes only a draft whose quoted sentences all come from it, that has no sentence instructing
-/// the long press or reset, and that has at least one warning sentence. Errors carry counts only.
-fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), String> {
-    let not_found = count_unquoted_sentences(safety, draft_text);
-    if not_found > 0 {
-        return Err(format!(
-            "invalid LED judge output: {not_found} quoted sentence(s) are not in the draft"
-        ));
+/// Removes the leading marks and list marker and the trailing punctuation of one sentence.
+fn strip_sentence_decoration(sentence: &str) -> &str {
+    let trimmed =
+        sentence.trim_start_matches(|ch: char| ch.is_whitespace() || LEADING_MARKS.contains(&ch));
+    let digits = trimmed
+        .chars()
+        .take_while(|&ch| ascii_digit(ch).is_ascii_digit())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let mut rest = trimmed[digits..].chars();
+    let after_marker = match (digits, rest.next()) {
+        (1.., Some('.' | ')' | '．' | '）')) => {
+            let tail = rest.as_str();
+            let next_is_digit = tail
+                .chars()
+                .next()
+                .is_some_and(|ch| ascii_digit(ch).is_ascii_digit());
+            if next_is_digit {
+                trimmed
+            } else {
+                tail
+            }
+        }
+        _ => trimmed,
+    };
+    after_marker
+        .trim_start_matches(|ch: char| ch.is_whitespace() || LEADING_MARKS.contains(&ch))
+        .trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '、' | ',' | '，'))
+}
+
+/// The key set of the draft's sentences, computed once per verdict.
+fn draft_sentence_keys(draft_text: &str) -> std::collections::HashSet<String> {
+    sentence_keys(draft_text).into_iter().collect()
+}
+
+/// The key of `quote` when it is exactly one whole sentence of the draft, else `None`. A fragment,
+/// a span over several sentences and an empty quote all give `None`.
+fn quoted_key(quote: &str, draft_keys: &std::collections::HashSet<String>) -> Option<String> {
+    let mut keys = sentence_keys(quote);
+    (keys.len() == 1 && draft_keys.contains(&keys[0])).then(|| keys.remove(0))
+}
+/// Passes only a draft whose quoted sentences are each exactly one whole sentence of it (compared
+/// through [`sentence_keys`]), that has no sentence instructing the long press or reset, and that
+/// has a warning sentence naming 15秒. Order: a valid instruction quote is a draft fault first,
+/// then any quote that is not a sentence of the draft is a judge-output fault, then a missing
+/// 15秒 warning is a draft fault. Errors carry counts only.
+fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFault> {
+    let draft_keys = draft_sentence_keys(draft_text);
+    let instruction_keys: Vec<Option<String>> = safety
+        .reset_instruction_sentences
+        .iter()
+        .map(|quote| quoted_key(quote, &draft_keys))
+        .collect();
+    let instructions = instruction_keys.iter().flatten().count();
+    if instructions > 0 {
+        return Err(LedFault::Draft(format!(
+            "invalid draft: the judge quotes {instructions} sentence(s) that instruct a 15秒 press or a factory reset"
+        )));
     }
-    let without_15 = safety
+    let warning_keys: Vec<Option<String>> = safety
         .reset_warning_sentences
         .iter()
-        .filter(|sentence| !normalize_for_match(sentence).contains("15"))
+        .map(|quote| quoted_key(quote, &draft_keys))
+        .collect();
+    let not_found = instruction_keys
+        .iter()
+        .chain(&warning_keys)
+        .filter(|key| key.is_none())
         .count();
-    if without_15 > 0 {
-        return Err(format!(
-            "invalid LED judge output: {without_15} warning sentence(s) do not mention 15"
-        ));
+    if not_found > 0 {
+        return Err(LedFault::Judge(format!(
+            "invalid LED judge output: {not_found} quoted sentence(s) are not in the draft"
+        )));
     }
-    let instructions = safety.reset_instruction_sentences.len();
-    if instructions > 0 {
-        return Err(format!(
-            "invalid draft: the judge quotes {instructions} sentence(s) that instruct a 15秒 press or a factory reset"
-        ));
-    }
-    if safety.reset_warning_sentences.is_empty() {
-        return Err(
-            "invalid draft: the judge quotes no sentence, so it lacks the 15秒 factory-reset warning"
+    if !warning_keys
+        .iter()
+        .flatten()
+        .any(|key| key.contains("15秒") || key.contains("十五秒"))
+    {
+        return Err(LedFault::Draft(
+            "invalid draft: no quoted warning sentence mentions 15秒, so it lacks the 15秒 factory-reset warning"
                 .to_owned(),
-        );
+        ));
     }
     Ok(())
 }
 
 /// Calls the LED judge on the draft and returns its raw output.
-async fn call_led_judge(judge: &dyn JudgeLedSafety, draft_text: &str) -> Result<String, String> {
+async fn call_led_judge(judge: &dyn JudgeLedSafety, draft_text: &str) -> Result<String, LedFault> {
     judge
         .judge(
             &build_led_judge_system_prompt(),
             &build_led_judge_user_message(draft_text),
         )
         .await
-        .map_err(|err| format!("failed to call the LED judge: {err:#}"))
+        .map_err(|err| LedFault::Judge(format!("failed to call the LED judge: {err:#}")))
 }
 
 async fn judge_led_safety(
     judge: &dyn JudgeLedSafety,
     draft_text: &str,
-) -> Result<LedSafety, String> {
+) -> Result<LedSafety, LedFault> {
     parse_led_safety(&call_led_judge(judge, draft_text).await?)
 }
 
 /// Case c: the deterministic procedure checks, then the LLM judge on the 15-second warning.
-async fn check_led_draft(judge: &dyn JudgeLedSafety, draft_text: &str) -> Result<(), String> {
+async fn check_led_draft(judge: &dyn JudgeLedSafety, draft_text: &str) -> Result<(), LedFault> {
     check_led_procedure(draft_text)?;
     led_safety_verdict(&judge_led_safety(judge, draft_text).await?, draft_text)
 }
@@ -2678,7 +2765,7 @@ fn led_procedure_check_rejects_drafts_that_change_the_procedure() {
         ),
     ];
     for (label, draft, expected_mention) in cases {
-        match check_led_procedure(draft) {
+        match check_led_procedure(draft).map_err(|fault| fault.to_string()) {
             Err(message) => assert!(
                 message.contains(expected_mention),
                 "{label}: error must mention {expected_mention:?}, got {message:?}"
@@ -2694,7 +2781,9 @@ fn led_procedure_check_does_not_require_the_ap_mode_literal() {
     assert!(!draft.contains("APモード"));
     assert_eq!(check_led_procedure(draft), Ok(()));
     let missing_step = "ADC-V724Xの赤い点滅です。Resetボタンを5〜7秒長押しし、白く点滅したら離します。SSIDとパスワードを入力してください。";
-    let message = check_led_procedure(missing_step).expect_err("missing address must fail");
+    let message = check_led_procedure(missing_step)
+        .expect_err("missing address must fail")
+        .to_string();
     assert!(message.contains("192.168.1.1"), "{message}");
 }
 
@@ -2706,6 +2795,7 @@ fn led_judge_prompt_extracts_each_sentence_verbatim_in_the_new_shape() {
         "reset_warning_sentences",
         "一文ずつ",
         "一字一句変えず",
+        "各要素は下書きのちょうど 1 文",
         "他の文に警告があっても、指示の文を一覧から外してはならない",
         "「〜します」",
         "15秒以上押さないでください",
@@ -2755,6 +2845,20 @@ fn led_procedure_check_accepts_the_sample_answer() {
 }
 
 #[test]
+fn led_verdict_accepts_the_sample_answer_with_its_two_warning_sentences() {
+    let answer = load_kr_fixture()
+        .into_iter()
+        .find(|record| record.id == KR_LED)
+        .unwrap_or_else(|| panic!("known resolution {KR_LED} is absent from the KR fixture"))
+        .answer;
+    let safety = warnings_only(&[
+        "⚠ ボタンを15秒以上押さないでください。",
+        "15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。",
+    ]);
+    assert_eq!(led_safety_verdict(&safety, &answer), Ok(()));
+}
+
+#[test]
 fn led_step_order_uses_unique_anchors_only() {
     let cases = [
         (
@@ -2776,7 +2880,8 @@ fn led_step_order_uses_unique_anchors_only() {
     for (label, draft, expected_error) in cases {
         match (check_led_procedure(draft), expected_error) {
             (Ok(()), None) => {}
-            (Err(message), Some(mention)) => {
+            (Err(fault), Some(mention)) => {
+                let message = fault.to_string();
                 assert!(message.contains(mention), "{label}: {message}")
             }
             (result, _) => panic!("{label}: unexpected result {result:?}"),
@@ -2788,8 +2893,10 @@ fn led_step_order_uses_unique_anchors_only() {
 fn quote_check_normalizes_both_sides_like_the_judge_saw_the_draft() {
     let draft =
         "設定 > Wi-Fi を開きます。\n５～７秒押します。\n⚠ ボタンを１５秒以上押さないでください。";
+    let keys = draft_sentence_keys(draft);
     let cases = [
         ("neutralized angle bracket", "設定 ＞ Wi-Fi を開きます。"),
+        ("ASCII angle bracket", "設定 > Wi-Fi を開きます。"),
         (
             "full-width digits quoted as ASCII",
             "⚠ ボタンを15秒以上押さないでください。",
@@ -2797,57 +2904,209 @@ fn quote_check_normalizes_both_sides_like_the_judge_saw_the_draft() {
         ("tilde variant", "5〜7秒押します。"),
     ];
     for (label, quote) in cases {
-        let safety = LedSafety {
-            reset_instruction_sentences: Vec::new(),
-            reset_warning_sentences: sentences(&[quote]),
-        };
-        assert_eq!(count_unquoted_sentences(&safety, draft), 0, "{label}");
+        assert!(quoted_key(quote, &keys).is_some(), "{label}");
     }
-    let fabricated = LedSafety {
+    assert!(quoted_key("ボタンを30秒以上押さないでください。", &keys).is_none());
+}
+
+fn warnings_only(items: &[&str]) -> LedSafety {
+    LedSafety {
         reset_instruction_sentences: Vec::new(),
-        reset_warning_sentences: sentences(&["ボタンを30秒以上押さないでください。"]),
-    };
-    assert_eq!(count_unquoted_sentences(&fabricated, draft), 1);
+        reset_warning_sentences: sentences(items),
+    }
+}
+
+fn judge_fault_message(result: Result<(), LedFault>, label: &str) -> String {
+    match result {
+        Err(LedFault::Judge(message)) => message,
+        other => panic!("{label}: expected a judge-output fault, got {other:?}"),
+    }
+}
+
+fn draft_fault_message(result: Result<(), LedFault>, label: &str) -> String {
+    match result {
+        Err(LedFault::Draft(message)) => message,
+        other => panic!("{label}: expected a draft fault, got {other:?}"),
+    }
 }
 
 #[test]
-fn warning_quotes_must_contain_15() {
+fn a_quote_must_be_one_whole_sentence_of_the_draft() {
     let draft = "ボタンを押します。ご注意: 15秒以上押さないでください。";
-    let fragment = LedSafety {
-        reset_instruction_sentences: Vec::new(),
-        reset_warning_sentences: sentences(&["押さないでください。"]),
+    let fragment = judge_fault_message(
+        led_safety_verdict(&warnings_only(&["15秒以上"]), draft),
+        "fragment",
+    );
+    assert!(fragment.contains("1 quoted sentence(s)"), "{fragment}");
+    assert!(!fragment.contains("15秒以上"), "{fragment}");
+    let span = judge_fault_message(
+        led_safety_verdict(
+            &warnings_only(&["ボタンを押します。ご注意: 15秒以上押さないでください。"]),
+            draft,
+        ),
+        "span over two sentences",
+    );
+    assert!(span.contains("1 quoted sentence(s)"), "{span}");
+    assert_eq!(
+        led_safety_verdict(
+            &warnings_only(&["ご注意: １５秒以上押さないでください。"]),
+            draft
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn an_extra_warning_without_15_is_harmless_beside_a_15_second_warning() {
+    let draft = "ボタンを押します。\n⚠ ボタンを15秒以上押さないでください。\n設定が消えますのでご注意ください。";
+    let safety = warnings_only(&[
+        "ボタンを15秒以上押さないでください。",
+        "設定が消えますのでご注意ください。",
+    ]);
+    assert_eq!(led_safety_verdict(&safety, draft), Ok(()));
+    let message = draft_fault_message(
+        led_safety_verdict(
+            &warnings_only(&["設定が消えますのでご注意ください。"]),
+            draft,
+        ),
+        "only a warning without 15秒",
+    );
+    assert!(message.contains("15秒"), "{message}");
+}
+
+#[test]
+fn list_markers_and_warning_marks_do_not_change_a_sentence() {
+    let draft = "1. カメラの電源は入れたままにします\n⚠ ボタンを15秒以上押さないでください。\n15秒以上押すと初期化されます。\n1.5秒ではありません。";
+    for (label, quote) in [
+        ("without the ⚠ mark", "ボタンを15秒以上押さないでください。"),
+        ("with the ⚠ mark", "⚠ ボタンを15秒以上押さないでください。"),
+        (
+            "a leading 15秒 is not a marker",
+            "15秒以上押すと初期化されます。",
+        ),
+        (
+            "without the terminator",
+            "ボタンを15秒以上押さないでください",
+        ),
+    ] {
+        assert_eq!(
+            led_safety_verdict(&warnings_only(&[quote]), draft),
+            Ok(()),
+            "{label}"
+        );
+    }
+    let decimal = warnings_only(&[
+        "1.5秒ではありません。",
+        "ボタンを15秒以上押さないでください。",
+    ]);
+    assert_eq!(
+        led_safety_verdict(&decimal, draft),
+        Ok(()),
+        "a decimal is not a marker"
+    );
+    for (label, quote) in [
+        ("numbered step", "1. カメラの電源は入れたままにします"),
+        (
+            "numbered step without the number",
+            "カメラの電源は入れたままにします",
+        ),
+    ] {
+        let safety = LedSafety {
+            reset_instruction_sentences: sentences(&[quote]),
+            reset_warning_sentences: sentences(&["ボタンを15秒以上押さないでください。"]),
+        };
+        draft_fault_message(led_safety_verdict(&safety, draft), label);
+    }
+}
+
+#[test]
+fn angle_brackets_match_on_both_sides() {
+    let ascii = "設定 > Wi-Fi を開きます。\n⚠ ボタンを15秒以上押さないでください。";
+    let full = "設定 ＞ Wi-Fi を開きます。\n⚠ ボタンを15秒以上押さないでください。";
+    for draft in [ascii, full] {
+        for quote in ["設定 > Wi-Fi を開きます。", "設定 ＞ Wi-Fi を開きます。"] {
+            let safety = warnings_only(&["ボタンを15秒以上押さないでください。", quote]);
+            assert_eq!(
+                led_safety_verdict(&safety, draft),
+                Ok(()),
+                "{draft} / {quote}"
+            );
+        }
+    }
+    let tags = "手順は<下書き>の外です。\n⚠ ボタンを15秒以上押さないでください。";
+    let safety = warnings_only(&[
+        "手順は＜下書き＞の外です。",
+        "ボタンを15秒以上押さないでください。",
+    ]);
+    assert_eq!(led_safety_verdict(&safety, tags), Ok(()));
+}
+
+#[test]
+fn the_verdict_validates_instructions_first_then_warnings_then_15() {
+    let draft = "改善しないなら、初期化します。\n設定が消えますのでご注意ください。\n⚠ ボタンを15秒以上押さないでください。";
+    let instruction = "改善しないなら、初期化します。";
+    let cases = [
+        (
+            "an instruction beside a warning without 15",
+            LedSafety {
+                reset_instruction_sentences: sentences(&[instruction]),
+                reset_warning_sentences: sentences(&["設定が消えますのでご注意ください。"]),
+            },
+        ),
+        (
+            "an instruction beside a malformed warning quote",
+            LedSafety {
+                reset_instruction_sentences: sentences(&[instruction]),
+                reset_warning_sentences: sentences(&["15秒以上"]),
+            },
+        ),
+        (
+            "an instruction beside no warning",
+            LedSafety {
+                reset_instruction_sentences: sentences(&[instruction]),
+                reset_warning_sentences: Vec::new(),
+            },
+        ),
+    ];
+    for (label, safety) in cases {
+        let message = draft_fault_message(led_safety_verdict(&safety, draft), label);
+        assert!(message.contains("instruct"), "{label}: {message}");
+    }
+    let malformed_instruction = LedSafety {
+        reset_instruction_sentences: sentences(&["初期化"]),
+        reset_warning_sentences: sentences(&["ボタンを15秒以上押さないでください。"]),
     };
-    let message =
-        led_safety_verdict(&fragment, draft).expect_err("a fragment without 15 must fail");
-    assert!(message.contains("invalid LED judge output"), "{message}");
-    assert!(message.contains("1 "), "{message}");
-    assert!(!message.contains("押さないでください"), "{message}");
-    let full = LedSafety {
-        reset_instruction_sentences: Vec::new(),
-        reset_warning_sentences: sentences(&["ご注意: １５秒以上押さないでください。"]),
-    };
-    assert_eq!(led_safety_verdict(&full, draft), Ok(()));
+    judge_fault_message(
+        led_safety_verdict(&malformed_instruction, draft),
+        "a malformed instruction quote",
+    );
 }
 
 #[test]
 fn calibration_must_fail_accepts_only_a_draft_fault_rejection() {
-    assert!(must_fail_outcome(&Err(
+    assert!(must_fail_outcome(&Err(LedFault::Draft(
         "invalid draft: lacks the 15秒 factory-reset warning".to_owned()
-    ))
+    )))
     .is_ok());
     for (label, result) in [
         ("passed", Ok(())),
         (
             "parse error",
-            Err("invalid LED judge output: category=Syntax".to_owned()),
+            Err(LedFault::Judge(
+                "invalid LED judge output: category=Syntax".to_owned(),
+            )),
         ),
         (
             "not in the draft",
-            Err("invalid LED judge output: 1 quoted sentence(s) are not in the draft".to_owned()),
+            Err(LedFault::Judge(
+                "invalid LED judge output: 1 quoted sentence(s) are not in the draft".to_owned(),
+            )),
         ),
         (
             "transport",
-            Err("failed to call the LED judge: boom".to_owned()),
+            Err(LedFault::Judge(
+                "failed to call the LED judge: boom".to_owned(),
+            )),
         ),
     ] {
         assert!(must_fail_outcome(&result).is_err(), "{label}");
@@ -2859,14 +3118,53 @@ fn led_procedure_requires_a_wifi_join_step_between_the_press_and_the_address() {
     let no_join =
         LED_GOOD_DRAFT.replace("3. スマホのWi-Fi設定で「ADC-V724/724X」に接続します\n", "");
     assert_ne!(no_join, LED_GOOD_DRAFT);
-    let message =
-        check_led_procedure(&no_join).expect_err("a draft without the join step must fail");
-    assert!(message.starts_with("invalid draft:"), "{message}");
+    let fault = check_led_procedure(&no_join).expect_err("a draft without the join step must fail");
+    assert!(matches!(fault, LedFault::Draft(_)), "{fault}");
+    let message = fault.to_string();
     assert!(!message.contains("ADC-V724Xの赤い点滅"), "{message}");
     let wifi_only = LED_GOOD_DRAFT
         .replace("に接続します", "を選びます")
         .replace("Wi-Fi設定", "wifi設定");
     assert_eq!(check_led_procedure(&wifi_only), Ok(()));
+}
+
+#[test]
+fn the_join_step_names_the_camera_network_between_the_press_and_the_address() {
+    for (label, draft) in [
+        (
+            "a Wi-Fi mode wording without the network name",
+            "ADC-V724Xの赤い点滅です。Resetボタンを5〜7秒長押ししてWi-Fi設定モードにし、ブラウザで192.168.1.1を開き、SSIDを選びます。",
+        ),
+        (
+            "a connection warning without the network name",
+            "ADC-V724Xの赤い点滅です。Resetボタンを5〜7秒押します（接続は一度切れます）。192.168.1.1を開き、SSIDを選びます。",
+        ),
+    ] {
+        let message = draft_fault_message(check_led_procedure(draft), label);
+        assert!(message.contains("ADC-V724"), "{label}: {message}");
+    }
+    for (label, from, to) in [
+        (
+            "full-width Latin and hyphen",
+            "「ADC-V724/724X」",
+            "「ＡＤＣ－Ｖ７２４/７２４Ｘ」",
+        ),
+        (
+            "non-breaking hyphen",
+            "「ADC-V724/724X」",
+            "「ADC\u{2011}V724/724X」",
+        ),
+        (
+            "minus sign",
+            "「ADC-V724/724X」",
+            "「ADC\u{2212}V724/724X」",
+        ),
+        ("full-width Wi-Fi", "Wi-Fi設定で", "Ｗｉ－Ｆｉ設定で"),
+    ] {
+        assert!(LED_GOOD_DRAFT.contains(from), "{label}");
+        let draft = LED_GOOD_DRAFT.replace(from, to);
+        assert_eq!(check_led_procedure(&draft), Ok(()), "{label}: {draft}");
+    }
 }
 
 fn sentences(items: &[&str]) -> Vec<String> {
@@ -2906,7 +3204,9 @@ fn led_judge_output_parses_strictly() {
             r#"{"instructs_long_press_or_reset": false, "warns_15s_reset": true}"#,
         ),
     ] {
-        let message = parse_led_safety(raw).expect_err(label);
+        let fault = parse_led_safety(raw).expect_err(label);
+        assert!(matches!(fault, LedFault::Judge(_)), "{label}: {fault}");
+        let message = fault.to_string();
         assert!(!message.contains(raw), "{label}: must not echo the output");
     }
 }
@@ -2936,8 +3236,14 @@ fn led_safety_verdict_follows_the_quoted_sentences() {
         (
             "whitespace differences are ignored when locating a sentence",
             Vec::new(),
-            sentences(&["ボタンを 15秒以上\n押さないでください。"]),
+            sentences(&["ボタンを 15秒以上 押さないでください。"]),
             Ok(()),
+        ),
+        (
+            "a quote that spans a line break is two sentences, not one",
+            Vec::new(),
+            sentences(&["ボタンを 15秒以上\n押さないでください。"]),
+            Err("1 quoted sentence(s) are not in the draft"),
         ),
         (
             "a warning sentence that is not in the draft is a judge output error",
@@ -2965,7 +3271,8 @@ fn led_safety_verdict_follows_the_quoted_sentences() {
         };
         match (led_safety_verdict(&safety, draft), expected) {
             (Ok(()), Ok(())) => {}
-            (Err(message), Err(mention)) => {
+            (Err(fault), Err(mention)) => {
+                let message = fault.to_string();
                 assert!(message.contains(mention), "{label}: {message}");
                 for quoted in safety
                     .reset_instruction_sentences
@@ -3066,7 +3373,8 @@ async fn led_case_decision_follows_the_judge_output() {
         let result = check_led_draft(&StubLedJudge(stub), draft).await;
         match (result, expected) {
             (Ok(()), Ok(())) => {}
-            (Err(message), Err(mention)) => {
+            (Err(fault), Err(mention)) => {
+                let message = fault.to_string();
                 assert!(message.contains(mention), "{label}: {message}")
             }
             (result, expected) => panic!("{label}: got {result:?}, expected {expected:?}"),
@@ -3075,10 +3383,10 @@ async fn led_case_decision_follows_the_judge_output() {
 }
 
 /// Whether a must-fail calibration result is a genuine rejection of the draft.
-fn must_fail_outcome(result: &Result<(), String>) -> Result<(), String> {
+fn must_fail_outcome(result: &Result<(), LedFault>) -> Result<(), String> {
     match result {
         Ok(()) => Err("invalid must-fail result: the draft passed".to_owned()),
-        Err(reason) if reason.starts_with("invalid draft:") => Ok(()),
+        Err(LedFault::Draft(_)) => Ok(()),
         Err(reason) => Err(format!(
             "invalid must-fail result: not a draft rejection: {reason}"
         )),
@@ -3089,7 +3397,7 @@ fn must_fail_outcome(result: &Result<(), String>) -> Result<(), String> {
 const CALIBRATION_RUNS: usize = 3;
 
 /// Prints the raw judge output of a fixed calibration draft (never customer data), then returns the verdict.
-async fn calibration_verdict(judge: &dyn JudgeLedSafety, draft: &str) -> Result<(), String> {
+async fn calibration_verdict(judge: &dyn JudgeLedSafety, draft: &str) -> Result<(), LedFault> {
     let raw = call_led_judge(judge, draft).await?;
     println!("raw judge output: {raw}");
     led_safety_verdict(&parse_led_safety(&raw)?, draft)
