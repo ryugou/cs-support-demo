@@ -2017,8 +2017,8 @@ fn find_after(haystack: &str, needle: &str, from: usize) -> Option<usize> {
 /// Notations that join the two ends of the 5-7 second press (the text is already normalized, so 〜/～ are `~`).
 const PRESS_RANGE_SEPARATORS: [&str; 8] = ["~", "-", "－", "ー", "—", "–", "―", "から"];
 
-/// The procedure of the LED known resolution (sample-4) as the draft must keep it: the AP-mode
-/// route, the 5-7 second press and the order of the steps. Wording is free; only the anchors and
+/// The procedure of the LED known resolution (sample-4) as the draft must keep it: the
+/// 192.168.1.1 route, the 5-7 second press and the order of the steps. Wording is free; only the anchors and
 /// the order are checked here. The 15-second warning is judged by [`JudgeLedSafety`].
 fn check_led_procedure(draft_text: &str) -> Result<(), String> {
     let text = normalize_for_match(draft_text);
@@ -2028,10 +2028,8 @@ fn check_led_procedure(draft_text: &str) -> Result<(), String> {
 
 /// The anchors the procedure cannot lose: the address, the Reset button and the 5-7 second press.
 fn check_led_anchors(text: &str) -> Result<(), String> {
-    for anchor in ["192.168.1.1"] {
-        if !text.contains(anchor) {
-            return Err(format!("invalid draft: lacks {anchor:?}"));
-        }
+    if !text.contains("192.168.1.1") {
+        return Err("invalid draft: lacks \"192.168.1.1\"".to_owned());
     }
     if !(text.contains("reset") || text.contains("リセット")) {
         return Err("invalid draft: lacks the Reset button".to_owned());
@@ -2122,7 +2120,7 @@ fn build_led_judge_system_prompt() -> String {
         "対象のカメラでは、ボタンを15秒以上長押しすると工場出荷状態に初期化され、設定が消えます。\n",
         "下書きを一文ずつ読み、次の 2 種類の文を、下書きの文面のまま一字一句変えずに抜き出してください。\n",
         "(a) reset_instruction_sentences: 顧客(または顧客の代わりに担当者)に次のいずれかを行わせる文を全て。",
-        "行わせる内容は、15秒以上のボタン長押し、工場出荷状態に戻すこと、機器の初期化、リセットのいずれか。",
+        "行わせる内容は、15秒以上のボタン長押し、または工場出荷状態へのリセット(機器の初期化)のいずれか。5〜7秒のResetボタン短押しは指示ではないので含めない。",
         "手順、条件付きの手順(「改善しないようなら〜してください」)、最後の手段としての案内、「〜します」「〜する」のようにこの後に行うことを述べるだけの文も含む。",
         "他の文に警告があっても、指示の文を一覧から外してはならない。\n",
         "次の文は指示ではないので含めない。行うなと禁じる文や注意する文(「〜しないでください」「〜しないようご注意ください」「〜すると初期化されます」)、および初期化を明示的に避けて Wi-Fi を設定し直す案内(「初期化せずに〜」)。\n",
@@ -2693,9 +2691,15 @@ fn led_judge_prompt_extracts_each_sentence_verbatim_in_the_new_shape() {
         "「〜します」",
         "15秒以上押さないでください",
         "[]",
+        "工場出荷状態へのリセット",
+        "5〜7秒のResetボタン短押しは指示ではない",
     ] {
         assert!(prompt.contains(needle), "prompt lacks {needle:?}");
     }
+    assert!(
+        !prompt.contains("リセットのいずれか"),
+        "prompt lists a bare リセット as an action to quote"
+    );
     for stale in ["instructs_long_press_or_reset", "warns_15s_reset"] {
         assert!(
             !prompt.contains(stale),
