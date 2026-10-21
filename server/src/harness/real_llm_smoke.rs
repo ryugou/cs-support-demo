@@ -1845,7 +1845,7 @@ fn missing_numbers(answer: &str, text: &str) -> Vec<String> {
 }
 
 fn digit_runs(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().map(ascii_digit).collect();
+    let chars: Vec<char> = text.chars().map(ascii_fold).collect();
     let mut runs = Vec::new();
     let mut current = String::new();
     for (at, &ch) in chars.iter().enumerate() {
@@ -1863,10 +1863,11 @@ fn digit_runs(text: &str) -> Vec<String> {
     runs
 }
 
-/// Maps a full-width digit to its ASCII digit and leaves every other character as it is.
-fn ascii_digit(ch: char) -> char {
+/// Maps a full-width ASCII character (U+FF01-FF5E) to its ASCII form and leaves any other
+/// character as it is.
+fn ascii_fold(ch: char) -> char {
     match ch {
-        '０'..='９' => char::from(b'0' + (ch as u32 - '０' as u32) as u8),
+        '！'..='～' => char::from(b'!' + (ch as u32 - '！' as u32) as u8),
         other => other,
     }
 }
@@ -2004,8 +2005,7 @@ fn normalize_for_match(text: &str) -> String {
         .map(|ch| match ch {
             '〜' => '~',
             '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{ff0d}' => '-',
-            '\u{ff01}'..='\u{ff5e}' => char::from_u32(ch as u32 - 0xfee0).unwrap_or(ch),
-            other => other,
+            other => ascii_fold(other),
         })
         .flat_map(char::to_lowercase)
         .collect()
@@ -2206,13 +2206,12 @@ const SENTENCE_TERMINATORS: [char; 6] = ['\n', '。', '！', '？', '!', '?'];
 /// Marks that decorate the start of a sentence without being part of it.
 const LEADING_MARKS: [char; 9] = ['⚠', '\u{fe0f}', '※', '・', '●', '▶', '•', '*', '-'];
 
-/// The sentences of `text` as comparison keys: delimiters neutralized as the judge saw the draft,
-/// split after a line break, 。, ！ or ？, stripped of leading list markers (`1.` `2)` `３．`),
-/// ⚠ and bullets and of trailing punctuation, then run through [`normalize_for_match`]. A number
-/// followed by a digit (`15秒`, `1.5秒`) is not a list marker. Empty sentences are dropped.
+/// The sentences of `text` as comparison keys: split after a line break, 。, ！ or ？, stripped of
+/// leading list markers (`1.` `2)` `３．`), ⚠ and bullets and of trailing punctuation, then run
+/// through [`normalize_for_match`]. A number followed by a digit (`15秒`, `1.5秒`) is not a list
+/// marker. Empty sentences are dropped.
 fn sentence_keys(text: &str) -> Vec<String> {
-    super::prompt_input::neutralize_delimiters(text)
-        .split(SENTENCE_TERMINATORS)
+    text.split(SENTENCE_TERMINATORS)
         .map(strip_sentence_decoration)
         .map(normalize_for_match)
         .filter(|key| !key.is_empty())
@@ -2225,7 +2224,7 @@ fn strip_sentence_decoration(sentence: &str) -> &str {
         sentence.trim_start_matches(|ch: char| ch.is_whitespace() || LEADING_MARKS.contains(&ch));
     let digits = trimmed
         .chars()
-        .take_while(|&ch| ascii_digit(ch).is_ascii_digit())
+        .take_while(|&ch| ascii_fold(ch).is_ascii_digit())
         .map(char::len_utf8)
         .sum::<usize>();
     let mut rest = trimmed[digits..].chars();
@@ -2235,7 +2234,7 @@ fn strip_sentence_decoration(sentence: &str) -> &str {
             let next_is_digit = tail
                 .chars()
                 .next()
-                .is_some_and(|ch| ascii_digit(ch).is_ascii_digit());
+                .is_some_and(|ch| ascii_fold(ch).is_ascii_digit());
             if next_is_digit {
                 trimmed
             } else {
@@ -2260,6 +2259,7 @@ fn quoted_key(quote: &str, draft_keys: &std::collections::HashSet<String>) -> Op
     let mut keys = sentence_keys(quote);
     (keys.len() == 1 && draft_keys.contains(&keys[0])).then(|| keys.remove(0))
 }
+
 /// Passes only a draft whose quoted sentences are each exactly one whole sentence of it (compared
 /// through [`sentence_keys`]), that has no sentence instructing the long press or reset, and that
 /// has a warning sentence naming 15秒. Order: a valid instruction quote is a draft fault first,
@@ -2834,23 +2834,24 @@ fn led_judge_prompt_extracts_each_sentence_verbatim_in_the_new_shape() {
     );
 }
 
-#[test]
-fn led_procedure_check_accepts_the_sample_answer() {
-    let answer = load_kr_fixture()
+/// The answer text of the LED known resolution in the KR fixture.
+fn led_sample_answer() -> String {
+    load_kr_fixture()
         .into_iter()
         .find(|record| record.id == KR_LED)
         .unwrap_or_else(|| panic!("known resolution {KR_LED} is absent from the KR fixture"))
-        .answer;
+        .answer
+}
+
+#[test]
+fn led_procedure_check_accepts_the_sample_answer() {
+    let answer = led_sample_answer();
     assert_eq!(check_led_procedure(&answer), Ok(()));
 }
 
 #[test]
 fn led_verdict_accepts_the_sample_answer_with_its_two_warning_sentences() {
-    let answer = load_kr_fixture()
-        .into_iter()
-        .find(|record| record.id == KR_LED)
-        .unwrap_or_else(|| panic!("known resolution {KR_LED} is absent from the KR fixture"))
-        .answer;
+    let answer = led_sample_answer();
     let safety = warnings_only(&[
         "⚠ ボタンを15秒以上押さないでください。",
         "15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。",
@@ -3408,11 +3409,7 @@ async fn calibration_verdict(judge: &dyn JudgeLedSafety, draft: &str) -> Result<
 async fn real_llm_led_judge_calibration() {
     let (_, client) = load_config_and_client();
     let judge = AnthropicLedSafety { client };
-    let sample_answer = load_kr_fixture()
-        .into_iter()
-        .find(|record| record.id == KR_LED)
-        .unwrap_or_else(|| panic!("known resolution {KR_LED} is absent from the KR fixture"))
-        .answer;
+    let sample_answer = led_sample_answer();
     let warning = "⚠ ボタンを15秒以上押さないでください。15秒以上押すと工場出荷状態に初期化され、設定が消えます。";
     let faithful =
         LED_GOOD_DRAFT.replace(warning, "15秒以上押すと初期化されますのでご注意ください。");
