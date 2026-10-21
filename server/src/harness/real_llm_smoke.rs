@@ -2399,11 +2399,11 @@ async fn real_llm_kr_applicability_smoke() {
     run_kr_riding_advisory_case(&fx, &ctx, &fixture).await;
 }
 
-/// Case f: the retention KR rides along with the advisory rule `contract-billing`. Walks the
-/// production order (select, decide, plan, draft, accept, assemble) and checks that the final
-/// reply keeps the KR's number, names the clip-count basis and still carries the handoff. The
-/// handoff reply rides after the clarification turns are exhausted, not on the first turn (the
-/// first turn is `Clarify`; `assert_kr_riding_action_route` pins both routes).
+/// Case f: the retention KR rides along with the advisory rule `contract-billing`. Follows
+/// select, decide, plan, draft and accept, then checks the production action route (first turn
+/// `Clarify`, exhausted turns `EscalationReply`) and assembles the reply production sends after
+/// the clarification turns are exhausted. The final reply must keep the KR's number, name the
+/// clip-count basis and still carry the handoff.
 async fn run_kr_riding_advisory_case(
     fx: &Fixture,
     ctx: &super::RequestContext,
@@ -2554,6 +2554,11 @@ fn build_kr_riding_outcome(
 /// missing information, so `decide_reply_action` hears first (`Clarify`); the handoff reply is
 /// sent only once the clarification turns are exhausted (`EscalationReply`).
 fn assert_kr_riding_action_route(fx: &Fixture, outcome: &super::EvaluationOutcome, label: &str) {
+    assert!(
+        fx.config.api.clarify_max_turns > 0,
+        "case {label}: the route check needs at least one clarification turn, but the loaded \
+         config (`config.cloudrun.toml` `clarify_max_turns`) sets it to 0"
+    );
     let first = crate::api::decide_reply_action(outcome, &conv_state(0, false), &fx.config.api);
     assert!(
         matches!(first, crate::api::ReplyAction::Clarify),
