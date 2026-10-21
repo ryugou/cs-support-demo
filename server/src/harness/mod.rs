@@ -95,7 +95,8 @@ pub struct Harness {
     /// Judges which known-resolution candidates apply to the inquiry. `None` when `[llm] enabled = false`,
     /// in which case no known resolution is ever applied.
     pub kr_applicability: Option<Arc<dyn kr_applicability::JudgeKrApplicability>>,
-    /// Known-resolution ids that are never offered to the judge (`config.harness.excluded_known_resolution_ids`).
+    /// Known-resolution ids that are never offered to the judge, to `decide`, or to
+    /// `search_known_resolutions` (`config.harness.excluded_known_resolution_ids`).
     pub excluded_known_resolution_ids: Vec<String>,
 }
 

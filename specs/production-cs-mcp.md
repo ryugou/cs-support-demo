@@ -98,16 +98,18 @@ vegapunk / PunkRecord
 
 ## 判定アーキテクチャ：3 層構造
 
-質問は上から順に各層を通り、**先に止まった層で確定**する。後段は評価しない。安全に関わる層（1・2）を必ず先に置き、再利用が効く層（3）を最後に置く。この順序自体が安全保証である。
+質問は上から順に各層を通り、**先に止まった層で確定**する。後段は評価しない。安全に関わる層（1・2）を必ず先に置き、再利用が効く層（3）を最後に置く。この順序自体が安全保証である。第1層 advisory ルールに該当し、かつ known_resolution（KR）が選定されているターンだけは、KR と第1層 advisory の両方が確定に関与する（取次を確定し、KR の回答を同乗させる。下記「KR 同乗の取次」）。第1層 advisory と第2層が同時に当たる入力は第2層の取次である。
 
 ```text
 質問
  ↓
-[第1層] 明示エスカレーションルール（具体条件 → 具体ルーティング）
+[第1層] mandatory の明示エスカレーションルール（具体条件 → 具体ルーティング）
  ↓ 該当しない
 [第2層] 禁止領域（健康・身体症状など、面で答えを禁止）
  ↓ 触れていない
-[第3層] 回答可能性判定（known_resolution 再利用 → マニュアル直接性 → グレーは保留）
+[第1層] advisory の明示エスカレーションルール（選定済みの KR があれば回答を同乗）
+ ↓ 該当しない
+[第3層] 回答可能性判定（選定済みの known_resolution 再利用 → マニュアル直接性 → グレーは保留）
  ↓ 直接答えられる
 回答
 ```
@@ -120,9 +122,10 @@ vegapunk / PunkRecord
 - **判定の向き**: ブラックリスト（危険・要確認の具体条件を列挙）。
 - **振り先**: ルールごとに固有（安全担当、品証、特定部署など）。
 - **例**: health_food で異常申告 → 安全担当 / 化粧品で肌反応 + 継続可否 → 皮膚科リエゾン。
-- **特徴**: マッチしたら問答無用で確定ルーティング、回答生成に進ませない。数は多くなくてよい。
+- **特徴**: マッチしたら問答無用で確定ルーティング、回答生成に進ませない（第1層 advisory に KR が選定されているターンを除く。下記「KR 同乗の取次」）。数は多くなくてよい。
 - **学習**: 効かせない。固定ルール。メモ化対象外。
 - **ルール属性 `customer_ack`（Issue #76）**: ルールは任意で顧客向けの受け止め文を宣言できる。`decide` に渡した signal 集合（会話単位の累積 signal 集合。取次済み `/api/reply` のターンでは今ターンの signal のみ。`docs/superpowers/specs/2026-10-14-answer-after-escalation-design.md` §2）にマッチする第 1 層ルールがちょうど 1 件で、そのルールが宣言を持つときだけ、`/{project_id}/api/reply` は LLM で受け止め文を生成せず宣言文をそのまま使う（NG 表現ゲート・取扱製品ゲートは通す。2 件以上マッチしたときは宣言を使わず LLM が作る。並び順・読み込み順には依存しない）。`binding` による抑止は無い（mandatory のルールも宣言できる。`hearing` 属性とは異なる扱い）。型・検証・伝搬経路の正本は `docs/superpowers/specs/2026-10-05-initial-cost-handoff-design.md`。
+- **KR 同乗の取次**: 第1層 advisory ルールと選定済みの KR が同時に当たるターンは `Escalate`（`layer: 1`）で、`known_resolution_id` に KR の id を持つ。`/{project_id}/api/reply` では、部分回答が成立し（条件は `docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md`（以下 hearing-first）§7.3・§8 と `docs/superpowers/specs/2026-10-07-partial-answer-with-handoff-design.md`（以下 partial-answer）§3.1 に従う。`hearing` を宣言したルールに当たったターンは成立しない）、返信が聞き返しにならず、部分回答の下書きが返信に載ったときだけ、返信は KR の回答だけを材料にした下書きに取次の一文を足したものになる（合成は partial-answer §3.3。取次済み case の文面は `docs/superpowers/specs/2026-10-14-answer-after-escalation-design.md` §4）。それ以外のときは、`known_resolution_id` は付くが返信は通常の取次または聞き返しになり、KR の回答は載らない。MCP `evaluate_answerability` には聞き返しが無く、部分回答の下書きができたときは `customer_reply_draft` に KR の回答だけを材料にした同じ下書きが入る（`NO_ANSWER` や partial-answer §3.5 の歯止めで捨てられたときは入らない。`partial_answer`・`handoff_items` は partial-answer §3.4）。第1層 mandatory と第2層に当たるターンでは `decide` が選定済みの KR を持ち込まず、`known_resolution_id` は付かない。材料・部分回答の関連度条件・監査の扱いは hearing-first §8 に従う。選定は下記 S1-3「`evaluate` の KR 選定」。
 
 ### 第2層 — 禁止領域
 
@@ -179,18 +182,17 @@ vegapunk / PunkRecord
 
 詳細は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7（Jev へ渡す state・閾値・フォールバック・監査を含む）。他の層・質問への拡張（実会話記録による較正確認後の判定置き換え検討）は同 design doc §6 を参照。
 
-### 追記: 全ルールのヒアリング先行化（Issue #109、2026-10-17、設計承認済み・実装前）
+### 追記: 全ルールのヒアリング先行化（Issue #109、2026-10-17、設計承認済み・実装中）
 
-**設計の正本は `docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md`。** 実装は 4 本の PR（同 §12。子 Issue #103 / #110 / #111 / #112）に分かれ、**各 PR がそれぞれ挙動を変える**。本書の記述は、下表の PR が main に入った時点でその PR が置き換える（各 PR が同じ PR 内で本書を更新する）。該当 PR が入るまでは現行記述が実装と一致している。
+**設計の正本は `docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md`。** 実装は 4 本の PR（同 §12。子 Issue #103 / #110 / #111 / #112）に分かれ、**各 PR がそれぞれ挙動を変える**。本書の記述は、下表の PR が main に入った時点でその PR が置き換える（各 PR が同じ PR 内で本書を更新する）。該当 PR が入るまでは現行記述が実装と一致している。PR 1（#103）の置き換えは本書に反映済みのため、下表は PR 2〜4 のみを載せる。
 
 | PR（子 Issue） | 変わる挙動 | 置き換わる本書の記述 |
 | --- | --- | --- |
-| PR 1（#103） | KnownResolution の選定を変える。`signals` が decide の signal 集合（取次前は会話の累積、取次後は今ターン。main の現行と同じ集合）に含まれる候補を最大 3 件選び、LLM の適用可否判定で 1 件に絞る（設計 §8）。main の判定順（第1層に一致すれば advisory でも KR を見る前に取次が確定し、`Escalate` は `known_resolution_id` を持たない）に対し、PR 1 は #103 設計の「KR 同乗の取次」を導入する。第1層 advisory と KR が同時に当たるターンは「KR の回答 + 取次の一文」（`Escalate.known_resolution_id`、材料は KR 本文のみ、部分回答の関連度条件は「`known_resolution_id` を持つ、または `best_manual_score >= thresholds.low`」、監査の `retrieved_node_ids` / `governing_norm_ids` に KR）になる。判定順は第1層 mandatory → 第2層 → KR → 第1層 advisory → 第3層に変わり（PR 2 がさらに第2層を第1層 mandatory より先に移す）、第1層 advisory と第2層が同時に当たる入力は第2層の取次になる（従来は第1層）。MCP `evaluate_answerability` の出力と取次済み案件の返信が変わる | 上記「判定アーキテクチャ：3 層構造」の第3層「known_resolution 再利用」の扱い、下記「非採用」の「条件が増える方向（既存ルールに未知の追加 signal が乗った質問）で既存ルールを再利用する。」、下記「S1-3. known_resolution 型（フィールド予約込み・グラフ表現）」の「照合アルゴリズム（Rust・決定論）」の「未知の追加条件があれば適用不可」、同節の「いずれの経路でも、最終の適用可否は下の Rust 集合演算が決める（検索は候補出しにすぎない）。」、同節の「軸2（条件増減「変色≠変色＋カビ」の区別）＝ `match_known_resolution`（Rust 集合演算）」、上記「判定アーキテクチャ：3 層構造」の本文「質問は上から順に各層を通り、**先に止まった層で確定**する。後段は評価しない。」（KR 同乗の取次は KR と第1層 advisory の両方が確定に関与する例外）と図（第1層 advisory が第2層・第3層より先）、下記「例: `search_manual`」の「9. 第1層 → 第2層 → 第3層 の順に判定する」（第1層 advisory と第2層の順序について。PR 2 の行と同じ記述を両 PR が置き換える）、下記「制約」の「known_resolution は第1層・第2層を **バイパスできない**。照合順序がそのまま安全保証。」（mandatory と第2層に限る旨に改める。第1層 advisory には KR 同乗の取次が先行するため）、下記「S1-1. パイプライン（Step 1 の確定フロー）」末尾の「第1層・第2層に GMR / メモ化を適用しない（毎回フル評価）。known_resolution は第1層・第2層をバイパスできない。この短絡順序自体が安全保証。」（同上の限定。第1層・第2層に GMR を適用しない部分は変えない）と、同節のフロー図「第1層 escalation_rule 照合 → マッチ: 固有ルーティングで確定」「第2層 prohibited_domain 照合 → 触れた: 領域の受け皿へエスカレーション」「(a) known_resolution 適用条件内（Δ=なし・包含方向のみ）→ 回答候補」の並び（MCP の第1層 advisory について。第1層 advisory は KR より後、第2層は第1層 advisory より先。PR 2・PR 3 の行が置き換える同節の第1層・第2層の順序・「マッチしたら問答無用で確定ルーティング」と同じ範囲） （いずれも `evaluate` の KR 選定について。`search_known_resolutions` とアドバイザは従来の厳密な照合のまま） |
-| PR 2（#110） | 第2層（禁止領域）を第1層 mandatory より先に評価する。`electrical-work` はパターン（「電気工事」「高所作業」）のみで発火する。MCP でも、これらのパターンを含む工事の質問の監査ラベルが `construction-risk` から `electrical-work` に変わる（設計 §2.3）。`electrical-work` の取次は取り次ぐ項目を持たなくなるため、部分回答が付かない（設計 §2.3） | 上記「判定アーキテクチャ：3 層構造」の層の順序の図と「安全に関わる層（1・2）を必ず先に置き」、下記「例: `search_manual`」の「9. 第1層 → 第2層 → 第3層 の順に判定する」、下記「S1-1. パイプライン（Step 1 の確定フロー）」の第1層・第2層の順序 |
+| PR 2（#110） | 第2層（禁止領域）を第1層 mandatory より先に評価する。`electrical-work` はパターン（「電気工事」「高所作業」）のみで発火する。MCP でも、これらのパターンを含む工事の質問の監査ラベルが `construction-risk` から `electrical-work` に変わる（設計 §2.3）。`electrical-work` の取次は取り次ぐ項目を持たなくなるため、部分回答が付かない（設計 §2.3） | 上記「判定アーキテクチャ：3 層構造」の層の順序の図と「安全に関わる層（1・2）を必ず先に置き」、下記「例: `search_manual`」の「9. 第1層 mandatory → 第2層 → 第1層 advisory → 第3層 の順に判定する」（PR 2 はこの項目と上記 3 層の図で第2層を第1層 mandatory より先に移す）、下記「S1-1. パイプライン（Step 1 の確定フロー）」の第1層・第2層の順序 |
 | PR 3（#111） | `/{project_id}/api/reply` で第1層ルールにマッチすると、advisory・mandatory を問わず「ヒアリング → 材料で回答 → 解決確認」の取り扱い（handling）に入る。ヒアリング後すぐ取り次ぐのは `after_hearing = handoff` のルール（`initial-cost-quote`）だけで、ほかは答えられない・解決しない場合、または回答の回数上限に達した場合に取り次ぐ（聞き返しの回数上限に達したときは、聞き取れた範囲で回答に進み、材料で答えられなければ取り次ぐ）。`human-handoff` もまず用件を聞く（同じ発話で具体的なルールの signal が出ていれば、そのルールの取り扱いに入る）。取り扱いからの取次の受け止め文は取り扱い中ルールの `customer_ack`。Jev（TypeSafe）へは全ルールのヒアリングと解決確認で顧客発話を送る（assistant 発話は送らない。`[jev] enabled = false` で全停止）。`ingest_rules` は mandatory への `hearing` 宣言を受理し、`hearing` / `hearing_items_ja` / `after_hearing` を必須にする（設計 §3〜§7.3、§9） | 上記「第1層 — 明示エスカレーションルール」の「マッチしたら問答無用で確定ルーティング、回答生成に進ませない」と `customer_ack` の「ちょうど 1 件」の条件（取り扱いからの取次について）、上記「追記: Jev（TypeSafe System One）の適用範囲（Issue #56 / #58、2026-09-21）」の適用対象・第三者への送信範囲・「mandatory の即時エスカレーション契約は不変」・投入前の検証、下記「課題 3: 確実なエスカレーション」の「該当したら問答無用でそこへ振る（第1層）」と回答生成への経路を閉じる記述と「第1層・第2層で回答生成への経路が閉じるという本 spec の判定思想」（第1層について）、下記「追記: 会話フロー v1.1（聞き返し・営業時間・希望時間帯、Issue #17）」の冒頭の「`/api/reply` 経路に限り、応答決定を「即答 / 聞き返し（最大3ターン）/ 文脈化エスカレーション」の3値へ拡張し、…」（第1層マッチ時は取り扱いの「ヒアリング → 回答 → 解決確認」になることについて）と Issue #54 改訂、下記「S1-1. パイプライン（Step 1 の確定フロー）」の「第1層 escalation_rule 照合 → マッチ: 固有ルーティングで確定」、インターフェース層「LINE アダプタは判断ゼロ」項の「会話履歴は原則…判定には使わない」と `warranty-failure` 限定の Jev 例外、ロードマップ「フルリプレイス回避 — Step 1 実装への遵守事項（追加）」1 の「会話履歴の言質は判定入力にしない」の例外注記、インターフェース層の「判定・応答文生成・egress_gate はすべて `Harness::evaluate()`（本ドキュメントが定義する decision ハーネス）に閉じる。」「`/api/reply` はその薄い HTTP アダプタであり、…判定ロジックを持たない。」「3 層判定・signal 抽出・escalation 判定・grade 運用は、…**同一**で、この節による変更はない。」「`/api/reply` は `evaluate()` を経路として追加しただけで、判定層・会話層に変更を加えていない。」、「Escalate では内部マニュアル本文を LLM に渡さない。」の項（「答える材料をそもそも渡さない」構造の担保）とその 2026-10-07 改訂注記の「条件を満たさない `Escalate` では本節の記述どおり材料を渡さない。」（PR 3 の取り扱いの回答ステップ `draft_handling_answer` が材料を渡すことについて。`build_reply_brief` 自体と MCP 経路は変わらない）、「経路ごとの生成方針（Issue #78）」の「`/api/reply` とアドバイザ経由（homesec）は判定が取次のとき、…には生成しない（取次では受け止め文と決定的ブロック・または聞き返しで応答を組み立て、…）」（第1層の取り扱いでは返信を回答ステップが作ることについて。`evaluate` 自身の下書きを生成しない点は変わらない）（いずれも `/api/reply` の会話層について） |
 | PR 4（#112） | 取次時に取次サマリ（見出し「用件」「聞き取った内容」「案内した対処」「結果」）を生成し、管理画面のスレッド詳細に表示する。PR 3 から PR 4 までの間はサマリが無い（設計 §7.1） | なし（追加のみ） |
 
-MCP `evaluate_answerability` は取り扱いを持たない。MCP に及ぶ変更は、PR 1 の KR 選定、PR 2 の第2層の評価順・`electrical-work`・監査ラベル、ルール順序の決定論化（`order` 属性）、PR 3 の `Escalate.hearing` の扱い（legacy ではないルールでは付かなくなるため、`warranty-failure` の取次でも部分回答の `HearingDeclared` 除外が外れ、部分回答の対象になる）。MCP の `clarification_allowed` の算出式（`server/src/harness/mod.rs` の `clarification_allowed`）は変わらない。ただし PR 1 で確定する判定が変わる入力では、値もその判定に従って変わる。1 つは判定順で、第1層 advisory と第2層が同時に当たり `missing` が残る入力は、従来の第1層の `true` から第2層の `false` になる。もう 1 つは KR 選定（設計 §8）で、選定された KR の有無により第3層グレー（`UnknownAddedSignal` / `InsufficientDirectness`）の `true` と `Allowed` の `false` が入れ替わる（マニュアル根拠が `evidence_sufficient` を満たさない入力に限る。根拠が十分な入力は KR の有無にかかわらず `Allowed` の `false` のまま。新たに KR が選ばれれば `true` から `false`、従来は適用されていた KR が適用可否判定で外れるか判定が失敗すれば `false` から `true`）。PR 2 の判定順の変更では値は変わらない（第1層 mandatory は `missing` が常に空で、第2層と同じ `false`）。
+MCP `evaluate_answerability` は取り扱いを持たない。MCP に及ぶ今後の変更は、PR 2 の第2層の評価順・`electrical-work`・監査ラベル、ルール順序の決定論化（`order` 属性）、PR 3 の `Escalate.hearing` の扱い（legacy ではないルールでは付かなくなるため、`warranty-failure` の取次でも部分回答の `HearingDeclared` 除外が外れ、部分回答の対象になる）。MCP の `clarification_allowed` の算出式（`server/src/harness/mod.rs` の `clarification_allowed`）は変わらない。判定に従って値が決まる入力は 2 つある。1 つは判定順で、第1層 advisory と第2層が同時に当たる入力は第2層の取次になり、`clarification_allowed` は第2層を常に `false` にする（`_` の腕）。もう 1 つは KR 選定（設計 §8）で、第1層に当たらない入力では、選定された KR の有無により第3層グレー（`UnknownAddedSignal` / `InsufficientDirectness`）の `true` と `Allowed` の `false` が入れ替わる（マニュアル根拠が `evidence_sufficient` を満たさない入力に限る。根拠が十分な入力は KR の有無にかかわらず `Allowed` の `false` である）。KR が選ばれれば `false`、選ばれなければ（適用可否判定が失敗した場合を含む）`true` である。第1層 advisory に当たる入力では、`missing` がマニュアル根拠だけで決まるため、KR の有無は値を変えない。PR 2 の判定順の変更では値は変わらない（第1層 mandatory は `missing` が常に空で、第2層と同じ `false`）。
 
 ユーザー承認済みの本番挙動の変更（2026-10-18）: 安全注意文 2 件と解決時の返信文は固定文、`initial-cost-quote` は部分回答を付けずにヒアリング後に取り次ぐ、`warranty-failure` は取次済み案件と MCP で部分回答の対象になる、`data/rules.sample.json` のエスカレーションルール 2 件を削除する。
 
@@ -219,8 +221,8 @@ GMR が前提にする「同じ入力なら同じ答えでよい」は CS では
 
 例: 「変色」に対し「自然変色なので食べて OK」が検証済みルールとして存在する。
 
-- 大前提（崩してはいけない）: 「変色 + カビ」は「変色」より条件が多く、既存ルールの射程外。**専用ルールが無い限り必ずエスカレーションする。** 「変色」の蓄積が何件あっても「+カビ」がある時点で「変色ルール」を適用してはならない。
-- 進化: 「変色 + カビ」は最初エスカレーションされ、担当者が「変色 + カビ → 廃棄」という **新しいルールを追加** する。次回からは専用ルールがヒットし、エスカレーションせず答えられる。これが GMR の進化＝決定済み部分グラフに枝が 1 本増えること。
+- 大前提（崩してはいけない）: 「変色 + カビ」は「変色」より条件が多く、「変色」の既存ルールの射程が及ぶか自明でない。厳密な集合照合の経路（`search_known_resolutions`・`match_advisor_known_resolution`・第3層の理由判定）では、未知の追加条件が 1 つでもあれば既存ルールを適用しない。`evaluate` では、蓄積 signal に危険 signal があれば KR を選定せず、無ければ LLM の適用可否判定が、KR の適用範囲が追加条件を含むかを決める（S1-3「`evaluate` の KR 選定」、設計 §8）。
+- 進化: 「変色 + カビ」に専用の known_resolution が無い場合、担当者が「変色 + カビ → 廃棄」という **新しいルールを追加** すると、次回からは厳密な集合照合の経路では専用ルールがより具体的な KR として適用される。`evaluate` では、危険 signal が無ければ専用ルールが具体度の高い候補として先頭に並び、LLM の適用可否判定が選定を決める（S1-3「`evaluate` の KR 選定」）。これが GMR の進化＝決定済み部分グラフに枝が 1 本増えること。
 
 知識ベースの操作は「上書き」「否定」ではなく **「より具体的な条件を持つルールの追加（insert）」**。既存の一般ルールは無傷のまま、隣に例外ルールが生える。照合時は **条件がより具体的に一致するルール（例外ルール）が優先** される。
 
@@ -233,11 +235,11 @@ GMR が前提にする「同じ入力なら同じ答えでよい」は CS では
 区別すべき 2 軸:
 
 - **軸1: 表現のゆれ（同じ意味か）** — 「変色」「色が変わった」「色味がおかしい」は同じ条件。意味で吸収して一致させる。文字列完全一致は不可。**→ LLM（意味的正規化）**。
-- **軸2: 条件の増減（射程の問題）** — 「変色」と「変色 + カビ」は違う条件。カビという追加条件を厳密に区別する。**→ Rust（signal 集合の集合演算）**。
+- **軸2: 条件の増減（射程の問題）** — 「変色」と「変色 + カビ」は違う条件。カビという追加条件を厳密に区別する。**→ Rust（signal 集合の集合演算）**。この厳密な照合は `search_known_resolutions`・ホームセキュリティアドバイザ自身の KR 照合（`match_advisor_known_resolution`、`advisor/materials.rs`）・`evaluate` の第3層の理由判定で使う。アドバイザの CS サポートモードは `evaluate` を通るため、`evaluate` の KR 選定に従う。`evaluate` の KR 選定は残余 signal を許す候補抽出（Rust）と LLM の適用可否判定で行う（S1-3「`evaluate` の KR 選定」）。
 
 正規化＝自然文を標準化された条件語（signal）の集合に落とすこと。これが「signal 抽出」の正体。
 
-照合の既定:
+厳密な集合照合の経路（`search_known_resolutions`・`match_advisor_known_resolution`・第3層の理由判定）の照合の既定（`evaluate` の KR 選定は S1-3「`evaluate` の KR 選定」に従う）:
 
 ```text
 質問を signal 集合に正規化する（表現ゆれは意味で吸収、疑わしい語は必ず signal として立てる）
@@ -246,7 +248,7 @@ GMR が前提にする「同じ入力なら同じ答えでよい」は CS では
  → 候補が複数あれば、条件具体度（signal 数）が最大のルール（最も具体的な一致）を選ぶ
 ```
 
-急所: 正規化（LLM）が signal を取りこぼすと、危険な追加条件を見落として誤マッチする。軸2 の Rust 照合がどれだけ厳密でも、入力 signal 集合が不完全なら防げない。よって **正規化は「signal を取りこぼさない」ことを最優先** とし、疑わしい語は必ず signal として立てる（立てれば追加条件として残り安全側に倒れる）。
+急所: 正規化（LLM）が signal を取りこぼすと、危険な追加条件を見落として誤マッチする。軸2 の照合（厳密な Rust 照合も、`evaluate` の候補抽出と適用可否判定も）は、入力 signal 集合が不完全なら防げない。よって **正規化は「signal を取りこぼさない」ことを最優先** とし、疑わしい語は必ず signal として立てる（立てれば追加条件として残る。厳密な照合の経路では KR が適用不可になり、`evaluate` では危険 signal なら KR を選定せず、それ以外は適用可否判定が残余 signal を評価する）。
 
 ### 「正しい判断の保証」は機械単体では不可能、という割り切り
 
@@ -273,7 +275,7 @@ GMR が前提にする「同じ入力なら同じ答えでよい」は CS では
 初期: 全件 (3)。AI 草案、人が承認。安全最優先で蓄積開始。
 中期: 承認回数・却下率・承認者多様性が閾値を超えた known_resolution を
       「自動回答 + 事後監査」に格上げ。担当者は格上げ済みパターンから解放。
-常時: 未経験パターン・条件が増えた質問は、何があっても (3) に戻る（承認必須）。自動化しない。
+常時: 未経験パターンは、何があっても (3) に戻る（承認必須）。自動化しない。条件が増えた質問は、厳密な集合照合の経路では適用不可、`evaluate` では危険 signal があれば KR を選定せず、無ければ LLM の適用可否判定に従う（S1-3「`evaluate` の KR 選定」）。
 監査: 自動回答へ格上げ済みでも、却下が一定数出たら承認必須へ降格。一方通行にしない。
 ```
 
@@ -321,7 +323,7 @@ GMR が前提にする「同じ入力なら同じ答えでよい」は CS では
 - 過去回答は、適用条件・権限条件・根拠・outcome と一緒に扱う。
 - 生の `answer_attempt` を学習済み正解として扱わない。人が承認した `known_resolution` のみ自動回答の根拠になる。
 - 参照できる過去事例も actor の access scope で制限する。known_resolution 自体にも scope / sensitivity を持たせ、(A) の filter を通す（actor A が見られない事例由来の知識が actor A への回答に漏れない）。
-- known_resolution は第1層・第2層を **バイパスできない**。照合順序がそのまま安全保証。
+- known_resolution は第1層 mandatory・第2層を **バイパスできない**。判定順序がそのまま安全保証。第1層 advisory には取次を確定したうえで KR の回答を同乗させる（上記「KR 同乗の取次」）。
 - ノウハウ record と audit record は相互参照可能にする。
 - 回答改善に使った record を後から監査できるようにする。
 
@@ -493,7 +495,7 @@ Production tool は全て Harness 経由で実行する。tool handler が直接
 6. vegapunk / PunkRecord を検索する（scope filter 注入済み）
 7. 未許可 evidence を除外する
 8. 質問を signal 集合に正規化する（LLM 抽出、取りこぼさない側に倒す）
-9. 第1層 → 第2層 → 第3層 の順に判定する（B、Rust）
+9. 第1層 mandatory → 第2層 → 第1層 advisory → 第3層 の順に判定する（B、Rust）。選定済みの KR は第1層 advisory に同乗するか、第3層で回答する
 10. 回答可能なら許可 evidence と audit id を、不可なら escalation decision を返す
 ```
 
@@ -516,7 +518,7 @@ PunkRecord 側の Step 1 実装方針は別紙『PunkRecord Step 1 前方互換�
 - アクセスできない情報を取得してから回答生成時に隠す。
 - 過去回答文を無条件に正解として再利用する。
 - 第1層・第2層（禁止線）に GMR / メモ化を適用する。
-- 条件が増える方向（既存ルールに未知の追加 signal が乗った質問）で既存ルールを再利用する。
+- `search_known_resolutions` とホームセキュリティアドバイザ自身の KR 照合（`match_advisor_known_resolution`）で、条件が増える方向（既存ルールに未知の追加 signal が乗った質問）の既存ルールを再利用する（この 2 経路は厳密な集合照合を保つ。アドバイザの CS サポートモードは `evaluate` を通る。`evaluate` の KR 選定は残余 signal を許し、LLM の適用可否判定を必ず通す。S1-3 参照）。
 - `evidence_sufficient` を「根拠の数」で判定する。
 - `evidence_sufficient` を Cedar 等の認可エンジンで表現する。
 - 第3層のホワイトリスト（答えてよい質問の事前列挙）を主設計にする。
@@ -631,13 +633,14 @@ MCP request（認証情報付き）
 [正規化] normalize_to_signals(question) → SignalSet
          （LLM 抽出。取りこぼさない側に倒す＝疑わしい語は signal を立てる）
  ↓
-[(B) 3 層判定]  ← 先に止まった層で確定、後段は評価しない
-   第1層 escalation_rule 照合 → マッチ: 固有ルーティングで確定
+[(B) 3 層判定]  ← 先に止まった層で確定、後段は評価しない（第1層 advisory で KR が選定されたターンを除く。KR が同乗する。判定アーキテクチャ参照）
+   第1層 mandatory の escalation_rule 照合 → マッチ: 固有ルーティングで確定
    第2層 prohibited_domain 照合 → 触れた: 領域の受け皿へエスカレーション
+   第1層 advisory の escalation_rule 照合 → マッチ: 固有ルーティングで確定（選定済みの KR があれば回答を同乗）
    第3層 answerability
        stakes = classify_stakes(SignalSet, binding, owner)     // low/mid/high
        threshold = answerability_threshold(stakes)             // 3 段（将来 Π 連続）
-       (a) known_resolution 適用条件内（Δ=なし・包含方向のみ）→ 回答候補
+       (a) 選定済みの known_resolution（signals ⊆ decide の signal 集合・LLM の適用可否判定を通過）→ 回答候補
        (b) manual 記載が質問に直接対応（直接性 ≥ threshold）→ 回答候補
        どちらでもない（グレー）→ エスカレーション（学習の入口）
  ↓
@@ -655,7 +658,7 @@ MCP request（認証情報付き）
 [記録] answer_attempt / audit_event（WORM）を書く
 ```
 
-第1層・第2層に GMR / メモ化を適用しない（毎回フル評価）。known_resolution は第1層・第2層をバイパスできない。この短絡順序自体が安全保証。
+第1層・第2層に GMR / メモ化を適用しない（毎回フル評価）。known_resolution は第1層 mandatory・第2層をバイパスできない。この短絡順序自体が安全保証。
 
 ## S1-2. record type（Step 1）と格納先
 
@@ -712,9 +715,9 @@ known_resolution {
 - グラフ経路: `Signal` ノード一致 → `HAS_SIGNAL` 逆辺で `KnownResolution` を引く（QueryNodes traverse）。L/Λ ネイティブ形。
 - ベクトル経路: 質問 signal テキストを embed し `KnownResolution` / `Signal` の近傍取得（新オペレータ不要）。
 
-いずれの経路でも、最終の適用可否は下の Rust 集合演算が決める（検索は候補出しにすぎない）。
+`search_known_resolutions` とホームセキュリティアドバイザ自身の KR 照合（`match_advisor_known_resolution`）では、最終の適用可否は下の Rust 集合演算が決める（検索は候補出しにすぎない）。`evaluate` の KR 選定は下の「`evaluate` の KR 選定」に従う。
 
-照合アルゴリズム（Rust・決定論）:
+照合アルゴリズム（Rust・決定論。`search_known_resolutions`・`match_advisor_known_resolution` の適用可否と、`evaluate` の第3層の理由判定）:
 
 ```text
 match_known_resolution(question_signals: SignalSet) -> Option<known_resolution>:
@@ -728,7 +731,12 @@ match_known_resolution(question_signals: SignalSet) -> Option<known_resolution>:
 軸の分担（前段の合意）:
 
 - 軸1（表現ゆれ「変色≒色が変わった」の吸収）＝ `normalize_to_signals`（LLM）
-- 軸2（条件増減「変色≠変色＋カビ」の区別）＝ `match_known_resolution`（Rust 集合演算）
+- 軸2（条件増減「変色≠変色＋カビ」の区別）＝ `match_known_resolution`（Rust 集合演算。`search_known_resolutions`・`match_advisor_known_resolution`・`evaluate` の第3層の理由判定）。`evaluate` の KR 選定では、Rust 集合演算が候補（包含方向）を決め、残余 signal を含む適用範囲と質問への関連は LLM の適用可否判定が決める
+
+`evaluate` の KR 選定（MCP `evaluate_answerability` を含む。正本は `docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md` §8）:
+
+- 概要: `excluded_known_resolution_ids` を除き、`signals` が decide の signal 集合に含まれる KR（残余 signal は許す）を最大 3 件選び、LLM の適用可否判定（`kr_applicability`）で高々 1 件に絞る。蓄積 signal に含まれる危険 signal（取次後もターンをまたいで効く）・lexicon フォールバック・判定器未設定・判定失敗では選定しない。順位・失敗時の扱いは設計 §8。
+- 第3層の理由: `decide` は `match_known_resolution` を、`UnknownAddedSignal` と `InsufficientDirectness` の選択にだけ使い、この呼び出しで KR を適用することはない。
 
 ## S1-4. 出口ゲート（egress_gate）
 
@@ -801,7 +809,7 @@ answerability_threshold(stakes) -> Threshold   # 3 段の階段関数
 
 ## S1-8. Step 1 完了の定義（Done 条件）
 
-1. 3 層判定が短絡順序で動き、第1・2層に GMR を適用しない。
+1. 3 層判定が短絡順序で動き（第1層 advisory で KR が選定されたターンを除く。KR が同乗する。判定アーキテクチャ参照）、第1・2層に GMR を適用しない。
 2. egress_gate が AI 製・人間製の全 outbound（自動送信チャネル）を通し、NG 辞書ヒットを block、暗示リスクを abstain にする。
 3. source_authority=non_authoritative の訂正が永続層に一切書き込まれない。
 4. root_cause=retrieval_miss が known_resolution を増やさず検索改善キューへ回る。
@@ -1011,7 +1019,7 @@ Step 3 で新設するもの（逐次処理系＋実行系。既存音声エー�
 
 S1-0 の三原則に加え、Step 2 / Step 3 を無改修で載せるために Step 1 実装で守ること:
 
-1. **会話層を Step 1 から持つ**。マルチターンの累積 signal 集合を維持し、毎ターン累積集合で判定層を再判定する（条件が増えたら——変色→変色+カビ——再判定で自動的にエスカレーションへ倒れる。照合原則の変更は不要）。聞き返し（clarification）を第一級の会話行為として持つ。判定の根拠は常に「累積 signal 集合 + known_resolution」であり、会話履歴の言質（「さっき OK と言った」）は判定入力にしない（`/api/reply` 限定の例外は S1-11 節の注記を参照）。判定層は純関数を保ち、この再判定呼び出しに耐える形にする。
+1. **会話層を Step 1 から持つ**。マルチターンの累積 signal 集合を維持し、毎ターン累積集合で判定層を再判定する（条件が増えたら——変色→変色+カビ——累積集合で再判定し、危険 signal があれば KR を選定せず、無ければ LLM の適用可否判定が追加条件への適用可否を決める。照合原則の変更は不要）。聞き返し（clarification）を第一級の会話行為として持つ。判定の根拠は常に「累積 signal 集合 + known_resolution」であり、会話履歴の言質（「さっき OK と言った」）は判定入力にしない（`/api/reply` 限定の例外は S1-11 節の注記を参照）。判定層は純関数を保ち、この再判定呼び出しに耐える形にする。
 2. **egress_gate の入力単位を「全文」に固定しない**。シグネチャは任意のテキスト断片（全文でも文単位でも）を受けられる形にする。Step 1・2 は全文で呼び、Step 3 は文単位で呼ぶ。中身の差し替え（辞書→C′）とは独立に、呼び出し粒度の自由を最初から確保する。
 3. **known_resolution の `grade` を Step 1 から運用する**。`auto_answer_audited` への昇格・降格（S1-3）は Step 2 の「顧客直に即答してよいか」の判定にそのまま直結する。Step 1 で昇格制度を回さないと Step 2 に移行できない。
 4. **応答の「折り返し変換」を decision の語彙に含める**。Escalate 時の disclosure_scope（既定）に、顧客直チャネル向けの「確認して折り返します」系の応答方針が乗ることを想定し、チャネル種別（operator / customer_chat / customer_voice）を EmitContext に最初から持たせる（Step 1 は operator 固定でよい）。
