@@ -2403,7 +2403,9 @@ async fn real_llm_kr_applicability_smoke() {
 
 /// Case f: the retention KR rides along with the advisory rule `contract-billing`. Walks the
 /// production order (select, decide, plan, draft, accept, assemble) and checks that the final
-/// reply keeps the KR's number, names the clip-count basis and still carries the handoff.
+/// reply keeps the KR's number, names the clip-count basis and still carries the handoff. The
+/// handoff reply rides after the clarification turns are exhausted, not on the first turn (the
+/// first turn is `Clarify`; `assert_kr_riding_action_route` pins both routes).
 async fn run_kr_riding_advisory_case(
     fx: &Fixture,
     ctx: &super::RequestContext,
@@ -2504,6 +2506,8 @@ async fn draft_and_assemble_kr_riding_reply(
     )
     .await;
     println!("--- draft ({label}) ---\n{draft_text}");
+    let outcome = build_kr_riding_outcome(&turn.decision, kr_turn, draft_text.clone());
+    assert_kr_riding_action_route(fx, &outcome, label);
     assemble_and_assert_handoff_reply(
         fx,
         &draft_text,
@@ -2512,6 +2516,64 @@ async fn draft_and_assemble_kr_riding_reply(
         KR_RIDING_CASE_INDEX,
         KR_RIDING_CASE_INDEX,
     )
+}
+
+/// Case f: the outcome production would hand to `decide_reply_action` for the accepted draft
+/// (no extraction result exists in this case, so the fields are taken from the decision and the
+/// KR turn directly).
+fn build_kr_riding_outcome(
+    decision: &AnswerDecision,
+    kr_turn: &super::KrTurn<'_>,
+    draft_text: String,
+) -> super::EvaluationOutcome {
+    super::EvaluationOutcome {
+        decision: decision.clone(),
+        signals: kr_turn.decide_signals.clone(),
+        accumulated_signals: kr_turn.decide_signals.clone(),
+        case_id: "case-smoketest".to_owned(),
+        clarification_allowed: super::clarification_allowed(decision),
+        hits: Vec::new(),
+        audit_event_id: String::new(),
+        related_cases: Vec::new(),
+        extraction_mode: extraction::ExtractionMode::Hybrid,
+        customer_reply_draft: Some(draft_text),
+        customer_reply_draft_truncated: false,
+        product_references: Vec::new(),
+        new_signals: kr_turn.decide_signals.clone(),
+        handoff_items: Vec::new(),
+        partial_answer: false,
+        decision_basis: super::DecisionBasis::TurnOnly,
+        applicable_known_resolution: kr_turn.applicable_known_resolution.clone(),
+    }
+}
+
+/// Case f: pins the production route. On the first turn the advisory decision still has
+/// missing information, so `decide_reply_action` hears first (`Clarify`); the handoff reply is
+/// sent only once the clarification turns are exhausted (`EscalationReply`).
+fn assert_kr_riding_action_route(fx: &Fixture, outcome: &super::EvaluationOutcome, label: &str) {
+    let conv = |clarify_turns: u32| super::CaseConvState {
+        clarify_turns,
+        awaiting_time_pref: false,
+        time_pref_false_count: 0,
+        preferred_contact_time: None,
+        time_pref_extraction_error_count: 0,
+        escalation_confirmed: false,
+    };
+    let first = crate::api::decide_reply_action(outcome, &conv(0), &fx.config.api);
+    assert!(
+        matches!(first, crate::api::ReplyAction::Clarify),
+        "case {label}: the first turn must hear first (Clarify), got {first:?}"
+    );
+    let exhausted = crate::api::decide_reply_action(
+        outcome,
+        &conv(fx.config.api.clarify_max_turns),
+        &fx.config.api,
+    );
+    assert!(
+        matches!(exhausted, crate::api::ReplyAction::EscalationReply),
+        "case {label}: with the clarification turns exhausted the handoff reply must be sent \
+         (EscalationReply), got {exhausted:?}"
+    );
 }
 
 /// Case f, final-reply assertions: the KR's numbers survive and the clip-count basis is named.
