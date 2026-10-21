@@ -1263,14 +1263,7 @@ async fn run_escalated_followup_case(
             basis: super::DecisionBasis::TurnOnly,
         },
     );
-    let conv = super::CaseConvState {
-        clarify_turns: 0,
-        awaiting_time_pref: false,
-        time_pref_false_count: 0,
-        preferred_contact_time: None,
-        time_pref_extraction_error_count: 0,
-        escalation_confirmed: true,
-    };
+    let conv = conv_state(0, true);
     let action = crate::api::decide_reply_action(&outcome, &conv, &fx.config.api);
     let text = match action {
         crate::api::ReplyAction::Answer(text) => text,
@@ -1320,6 +1313,18 @@ fn build_single_turn_outcome(
     )
 }
 
+/// The conversation state of a case with the given clarification count and escalation flag.
+fn conv_state(clarify_turns: u32, escalation_confirmed: bool) -> super::CaseConvState {
+    super::CaseConvState {
+        clarify_turns,
+        awaiting_time_pref: false,
+        time_pref_false_count: 0,
+        preferred_contact_time: None,
+        time_pref_extraction_error_count: 0,
+        escalation_confirmed,
+    }
+}
+
 fn build_outcome(
     decision: &AnswerDecision,
     extracted: &extraction::ExtractionResult,
@@ -1360,14 +1365,7 @@ fn assert_final_reply(
     case_index: usize,
     total_cases: usize,
 ) -> String {
-    let conv = super::CaseConvState {
-        clarify_turns: 0,
-        awaiting_time_pref: false,
-        time_pref_false_count: 0,
-        preferred_contact_time: None,
-        time_pref_extraction_error_count: 0,
-        escalation_confirmed: false,
-    };
+    let conv = conv_state(0, false);
     let action = crate::api::decide_reply_action(outcome, &conv, &fx.config.api);
     let final_reply = match (expect, action) {
         (CaseExpectation::Handoff, crate::api::ReplyAction::EscalationReply) => {
@@ -2480,7 +2478,7 @@ async fn draft_and_assemble_kr_riding_reply(
         &kr_turn.stakes_input,
     );
     assert_kr_riding_turn(&turn, &fx.escalation_rules, kr_turn.decide_signals);
-    assert_partial_answer_plan(&plan_draft(
+    let plan = plan_draft(
         &fx.allowlist,
         false,
         &turn.decision,
@@ -2489,7 +2487,8 @@ async fn draft_and_assemble_kr_riding_reply(
         None,
         &fx.thresholds,
         fx.config.harness.customer_reply_draft_enabled,
-    ));
+    );
+    assert_partial_answer_plan(&plan);
     let labels: Vec<String> = turn.items.iter().map(|item| item.label.clone()).collect();
     let draft_text = draft_accepted_text(
         fx,
@@ -2506,7 +2505,8 @@ async fn draft_and_assemble_kr_riding_reply(
     )
     .await;
     println!("--- draft ({label}) ---\n{draft_text}");
-    let outcome = build_kr_riding_outcome(&turn.decision, kr_turn, draft_text.clone());
+    let outcome =
+        build_kr_riding_outcome(&turn.decision, kr_turn, &plan, &labels, draft_text.clone());
     assert_kr_riding_action_route(fx, &outcome, label);
     assemble_and_assert_handoff_reply(
         fx,
@@ -2518,32 +2518,35 @@ async fn draft_and_assemble_kr_riding_reply(
     )
 }
 
-/// Case f: the outcome production would hand to `decide_reply_action` for the accepted draft
-/// (no extraction result exists in this case, so the fields are taken from the decision and the
-/// KR turn directly).
+/// Case f: the outcome production would hand to `decide_reply_action` for the accepted draft.
+/// The fields shared with every other case come from `build_outcome`; the KR, the handoff item
+/// labels and the partial-answer flag are what this case adds.
 fn build_kr_riding_outcome(
     decision: &AnswerDecision,
     kr_turn: &super::KrTurn<'_>,
+    plan: &super::ReplyDraftPlan,
+    labels: &[String],
     draft_text: String,
 ) -> super::EvaluationOutcome {
+    let partial_answer = super::is_partial_answer_draft(plan.partial_answer_ok, Some(&draft_text));
     super::EvaluationOutcome {
-        decision: decision.clone(),
-        signals: kr_turn.decide_signals.clone(),
-        accumulated_signals: kr_turn.decide_signals.clone(),
-        case_id: "case-smoketest".to_owned(),
-        clarification_allowed: super::clarification_allowed(decision),
-        hits: Vec::new(),
-        audit_event_id: String::new(),
-        related_cases: Vec::new(),
-        extraction_mode: extraction::ExtractionMode::Hybrid,
-        customer_reply_draft: Some(draft_text),
-        customer_reply_draft_truncated: false,
-        product_references: Vec::new(),
-        new_signals: kr_turn.decide_signals.clone(),
-        handoff_items: Vec::new(),
-        partial_answer: false,
-        decision_basis: super::DecisionBasis::TurnOnly,
         applicable_known_resolution: kr_turn.applicable_known_resolution.clone(),
+        handoff_items: labels.to_vec(),
+        partial_answer,
+        ..build_outcome(
+            decision,
+            &extraction::ExtractionResult {
+                signals: kr_turn.decide_signals.clone(),
+                mode: extraction::ExtractionMode::Hybrid,
+            },
+            &[],
+            draft_text,
+            TurnSignals {
+                accumulated: kr_turn.decide_signals.clone(),
+                new_signals: kr_turn.decide_signals.clone(),
+                basis: kr_turn.decision_basis,
+            },
+        )
     }
 }
 
@@ -2551,22 +2554,14 @@ fn build_kr_riding_outcome(
 /// missing information, so `decide_reply_action` hears first (`Clarify`); the handoff reply is
 /// sent only once the clarification turns are exhausted (`EscalationReply`).
 fn assert_kr_riding_action_route(fx: &Fixture, outcome: &super::EvaluationOutcome, label: &str) {
-    let conv = |clarify_turns: u32| super::CaseConvState {
-        clarify_turns,
-        awaiting_time_pref: false,
-        time_pref_false_count: 0,
-        preferred_contact_time: None,
-        time_pref_extraction_error_count: 0,
-        escalation_confirmed: false,
-    };
-    let first = crate::api::decide_reply_action(outcome, &conv(0), &fx.config.api);
+    let first = crate::api::decide_reply_action(outcome, &conv_state(0, false), &fx.config.api);
     assert!(
         matches!(first, crate::api::ReplyAction::Clarify),
         "case {label}: the first turn must hear first (Clarify), got {first:?}"
     );
     let exhausted = crate::api::decide_reply_action(
         outcome,
-        &conv(fx.config.api.clarify_max_turns),
+        &conv_state(fx.config.api.clarify_max_turns, false),
         &fx.config.api,
     );
     assert!(
