@@ -24,7 +24,10 @@
 //! `#[tokio::test]` は既定で current-thread ランタイムなので、`.await` をまたいでも同一
 //! スレッド上で実行される限り成立する。
 
-use crate::harness::rules::{Binding, EscalationRule, HearingContract, ProhibitedDomain};
+use crate::harness::rules::{
+    Binding, EscalationRule, Grade, HearingContract, KnownResolution, ProhibitedDomain, RootCause,
+    SourceAuthority,
+};
 use crate::harness::signal::Signal;
 use std::cell::RefCell;
 use std::sync::Once;
@@ -272,6 +275,27 @@ pub(crate) fn filter_warn_and_error_lines(raw: &str) -> String {
         .filter(|line| matches!(line.split_whitespace().nth(1), Some("WARN") | Some("ERROR")))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub(crate) fn kr_fixture(id: &str, answer: &str) -> KnownResolution {
+    KnownResolution {
+        id: id.to_string(),
+        signal_set: Default::default(),
+        applicability: "全ロット".to_string(),
+        answer: answer.to_string(),
+        source_authority: SourceAuthority::Authoritative,
+        root_cause: RootCause::KnowledgeError,
+        grade: Grade::ApprovalRequired,
+        approval_count: 0,
+        rejection_count: 0,
+        approver_set: Vec::new(),
+        origin: "test".to_string(),
+        verified_at: None,
+        binding: Binding::Advisory,
+        registration_trigger: "single_ruling".to_string(),
+        knowledge_class: "commercial".to_string(),
+        outcome_ref: Vec::new(),
+    }
 }
 
 #[cfg(test)]

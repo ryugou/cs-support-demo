@@ -166,6 +166,22 @@ pub enum AnswerDecision {
     },
 }
 
+impl AnswerDecision {
+    /// Returns the known resolution id this decision carries (`Allowed` answers it, `Escalate` only carries it).
+    pub fn known_resolution_id(&self) -> Option<&str> {
+        match self {
+            Self::Allowed {
+                known_resolution_id,
+                ..
+            }
+            | Self::Escalate {
+                known_resolution_id,
+                ..
+            } => known_resolution_id.as_deref(),
+        }
+    }
+}
+
 pub struct DecisionInput<'a> {
     pub question_signals: &'a SignalSet,
     pub question_raw: &'a str,
@@ -457,19 +473,6 @@ mod tests {
         rule_with(id, cond, Binding::Mandatory, false)
     }
 
-    fn known_resolution_id_of(d: &AnswerDecision) -> Option<&str> {
-        match d {
-            AnswerDecision::Escalate {
-                known_resolution_id,
-                ..
-            }
-            | AnswerDecision::Allowed {
-                known_resolution_id,
-                ..
-            } => known_resolution_id.as_deref(),
-        }
-    }
-
     fn legal_domain() -> ProhibitedDomain {
         ProhibitedDomain {
             id: "d1".to_string(),
@@ -509,7 +512,7 @@ mod tests {
                 matches!(&d, AnswerDecision::Escalate { layer: l, .. } if *l == layer),
                 "{name}: expected layer {layer}, got {d:?}"
             );
-            assert_eq!(known_resolution_id_of(&d), None, "{name}");
+            assert_eq!(d.known_resolution_id(), None, "{name}");
         }
     }
 
@@ -562,7 +565,7 @@ mod tests {
             }
             other => panic!("expected layer1 escalate, got {other:?}"),
         }
-        assert_eq!(known_resolution_id_of(&d), Some("kr1"));
+        assert_eq!(d.known_resolution_id(), Some("kr1"));
     }
 
     #[test]
@@ -591,7 +594,7 @@ mod tests {
             }
             other => panic!("expected allowed via KR, got {other:?}"),
         }
-        assert_eq!(known_resolution_id_of(&d), Some("kr1"));
+        assert_eq!(d.known_resolution_id(), Some("kr1"));
     }
 
     #[test]
@@ -624,7 +627,7 @@ mod tests {
             }
             other => panic!("expected layer1 escalate, got {other:?}"),
         }
-        assert_eq!(known_resolution_id_of(&d), None);
+        assert_eq!(d.known_resolution_id(), None);
     }
 
     #[test]

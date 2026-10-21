@@ -13,6 +13,7 @@ pub mod hours;
 pub mod knowledge;
 /// Judge that selects the known resolution applicable to a question from the signal-matched candidates.
 pub mod kr_applicability;
+mod kr_selection;
 pub mod product_gate;
 pub(crate) mod prompt_input;
 #[cfg(test)]
@@ -24,6 +25,7 @@ pub mod signal;
 mod supplementary_search;
 pub mod time_pref;
 
+use self::kr_selection::KrTurn;
 use crate::config::AppConfig;
 use crate::mcp::ToolService;
 use crate::model::SectionHit;
@@ -90,6 +92,11 @@ pub struct Harness {
     /// `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）の聞き返し判定にのみ使う
     /// （他の呼び出し経路からは一切参照されない、shadow-only のまま）。
     pub jev_client: Option<crate::jev::JevClient>,
+    /// Judges which known-resolution candidates apply to the inquiry. `None` when `[llm] enabled = false`,
+    /// in which case no known resolution is ever applied.
+    pub kr_applicability: Option<Arc<dyn kr_applicability::JudgeKrApplicability>>,
+    /// Known-resolution ids that are never offered to the judge (`config.harness.excluded_known_resolution_ids`).
+    pub excluded_known_resolution_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +171,8 @@ pub struct EvaluationOutcome {
     pub handoff_items: Vec<String>,
     pub partial_answer: bool,
     pub decision_basis: DecisionBasis,
+    /// The known resolution the applicability judge selected this turn, if any.
+    pub applicable_known_resolution: Option<rules::KnownResolution>,
 }
 
 /// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
@@ -694,6 +703,16 @@ fn already_escalated_for_policy(policy: &ReplyDraftPolicy<'_>) -> bool {
     }
 }
 
+/// §10.2 の signal 誘導補助検索を行うかどうか。既知解決（KR）を載せた取次では、材料が KR の
+/// 回答だけで補助検索の結果は使われないため行わない。
+fn should_search_handoff_signals(
+    decision: &decision::AnswerDecision,
+    handoff_items: &[handoff_items::HandoffItem],
+) -> bool {
+    decision.known_resolution_id().is_none()
+        && handoff_items::is_partial_answer_candidate(decision, handoff_items)
+}
+
 fn partial_answer_enabled_for_policy(policy: &ReplyDraftPolicy<'_>) -> bool {
     match policy {
         ReplyDraftPolicy::Always => true,
@@ -702,6 +721,28 @@ fn partial_answer_enabled_for_policy(policy: &ReplyDraftPolicy<'_>) -> bool {
             ..
         } => *partial_answer_enabled,
     }
+}
+
+fn audit_node_ids(
+    schema: &str,
+    decision: &decision::AnswerDecision,
+    manual_ids: Vec<String>,
+    case_id: &str,
+    related_case_ids: &[&str],
+) -> (Vec<String>, Vec<String>) {
+    let mut retrieved = manual_ids;
+    retrieved.push(knowledge::harness_node_id(schema, "support_case", case_id));
+    retrieved.extend(
+        related_case_ids
+            .iter()
+            .map(|id| knowledge::harness_node_id(schema, "support_case", id)),
+    );
+    let mut governing = Vec::new();
+    if let Some(kr_id) = decision.known_resolution_id() {
+        retrieved.push(knowledge::harness_node_id(schema, "KnownResolution", kr_id));
+        governing.push(kr_id.to_string());
+    }
+    (governing, retrieved)
 }
 
 fn decide_signals_for_policy<'a>(
@@ -873,6 +914,10 @@ impl Harness {
         } else {
             None
         };
+        let kr_applicability = anthropic_client.clone().map(|client| {
+            Arc::new(kr_applicability::AnthropicKrApplicability::new(client))
+                as Arc<dyn kr_applicability::JudgeKrApplicability>
+        });
         let llm_classifier: Option<Arc<dyn extraction::ClassifyLlm>> =
             anthropic_client.clone().map(|client| {
                 Arc::new(extraction::AnthropicSignalClassifier::new(
@@ -932,7 +977,31 @@ impl Harness {
             reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
             product_gate: Some(product_gate::ProductGate::new(client)),
             jev_client,
+            kr_applicability,
+            excluded_known_resolution_ids: config.harness.excluded_known_resolution_ids.clone(),
         })
+    }
+
+    fn stakes_input_for_turn(
+        &self,
+        domains: &[rules::ProhibitedDomain],
+        accumulated: &signal::SignalSet,
+        question: &str,
+    ) -> decision::StakesInput {
+        let mandatory_domains: Vec<rules::ProhibitedDomain> = domains
+            .iter()
+            .filter(|d| d.binding == rules::Binding::Mandatory)
+            .cloned()
+            .collect();
+        decision::StakesInput {
+            mandatory_domain_near: rules::match_layer2(&mandatory_domains, accumulated, question)
+                .is_some(),
+            ng_near_hit: self.ng.near_hit(question),
+            hazard_signal_count: accumulated
+                .iter()
+                .filter(|s| self.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
+                .count(),
+        }
     }
 
     fn knowledge(&self) -> Result<&knowledge::KnowledgeStore> {
@@ -1389,6 +1458,9 @@ impl Harness {
                 "permission_denied: add_known_resolution requires supervisor or admin role"
             );
         }
+        if answer.trim().is_empty() {
+            anyhow::bail!("invalid answer: empty");
+        }
         // legacy schema (sivira) には Rationale ノード型が無いため、rationale_text を
         // サイレントに落とすのではなく admission 側で拒否する（build 側は無視するだけになる）。
         if ctx.manual_schema == crate::config::ManualSchemaKind::LegacySection
@@ -1632,6 +1704,7 @@ impl Harness {
         &self,
         ctx: &RequestContext,
         question: &str,
+        context_text: &str,
         product_key: Option<&str>,
         case_id: Option<&str>,
         tools: &ToolService,
@@ -1830,22 +1903,6 @@ impl Harness {
         knowledge
             .append_case_signals(&ctx.schema, &case_id, &new_signals)
             .await?;
-        // stakes 入力の決定論算出（累積集合に対して）。
-        // mandatory 領域だけに絞って match_layer2 を 1 回呼ぶ（質問文の再正規化を N 回しない）。
-        let mandatory_domains: Vec<rules::ProhibitedDomain> = domains
-            .iter()
-            .filter(|d| d.binding == rules::Binding::Mandatory)
-            .cloned()
-            .collect();
-        let stakes_input = decision::StakesInput {
-            mandatory_domain_near: rules::match_layer2(&mandatory_domains, &accumulated, question)
-                .is_some(),
-            ng_near_hit: self.ng.near_hit(question),
-            hazard_signal_count: accumulated
-                .iter()
-                .filter(|s| self.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
-                .count(),
-        };
         // manual 取得を manual_schema で分岐する。ManualV1 は ManualStore（signal 絞り込み(A) +
         // body 全文(B) の max）、LegacySection は従来の tools.search_manual_with_snapshot。
         // 判定へは共通の best_manual_score / best_manual_sections に落とし、
@@ -1863,7 +1920,7 @@ impl Harness {
         let (section_hits, retrieved_manual_ids): (Vec<SectionHit>, Vec<String>) = self
             .manual_search_hits(
                 ctx,
-                question,
+                context_text,
                 &accumulated,
                 product_key,
                 manual_corpus.as_deref(),
@@ -1882,8 +1939,25 @@ impl Harness {
         let best_manual_score = best.map(|h| h.score);
         let section_keys: Vec<String> =
             section_hits.iter().map(|h| h.section_key.clone()).collect();
-        let (decide_signals, decision_basis) =
-            decide_signals_for_policy(&policy, &signals, &accumulated);
+        let KrTurn {
+            resolutions,
+            decide_signals,
+            decision_basis,
+            stakes_input,
+            applicable_known_resolution,
+        } = self
+            .prepare_kr_turn(
+                ctx,
+                resolutions,
+                &policy,
+                &signals,
+                &accumulated,
+                &domains,
+                question,
+                context_text,
+                extraction_mode,
+            )
+            .await;
         let decision_result = decision::decide(&decision::DecisionInput {
             question_signals: decide_signals,
             question_raw: question,
@@ -1895,7 +1969,7 @@ impl Harness {
             stakes_input,
             thresholds: &self.thresholds,
             default_route: &self.default_route,
-            known_resolution: None,
+            known_resolution: applicable_known_resolution.as_ref(),
         });
         let handoff_items = handoff_items::handoff_items_for_decision(
             &decision_result,
@@ -1914,7 +1988,7 @@ impl Harness {
         // 済みの入力を使っており、ここでは `section_hits` / `best_manual_score` /
         // `retrieved_manual_ids` の 3 束縛だけを後続処理向けにシャドーイングする）。
         let (section_hits, best_manual_score, retrieved_manual_ids) =
-            if handoff_items::is_partial_answer_candidate(&decision_result, &handoff_items) {
+            if should_search_handoff_signals(&decision_result, &handoff_items) {
                 let signal_results = self
                     .search_handoff_signals(
                         ctx,
@@ -2052,32 +2126,16 @@ impl Harness {
             last_decision: case.last_decision,
         })
         .collect();
-        let mut retrieved_node_ids: Vec<String> = retrieved_manual_ids;
-        retrieved_node_ids.push(knowledge::harness_node_id(
+        let (governing_norm_ids, retrieved_node_ids) = audit_node_ids(
             &ctx.schema,
-            "support_case",
+            &decision_result,
+            retrieved_manual_ids,
             &case_id,
-        ));
-        for related in &related_cases {
-            retrieved_node_ids.push(knowledge::harness_node_id(
-                &ctx.schema,
-                "support_case",
-                &related.case_id,
-            ));
-        }
-        let mut governing_norm_ids = Vec::new();
-        if let decision::AnswerDecision::Allowed {
-            known_resolution_id: Some(kr_id),
-            ..
-        } = &decision_result
-        {
-            retrieved_node_ids.push(knowledge::harness_node_id(
-                &ctx.schema,
-                "KnownResolution",
-                kr_id,
-            ));
-            governing_norm_ids.push(kr_id.clone());
-        }
+            &related_cases
+                .iter()
+                .map(|related| related.case_id.as_str())
+                .collect::<Vec<_>>(),
+        );
         let audit_event_id = self
             .audit_with_nodes(
                 ctx,
@@ -2144,6 +2202,7 @@ impl Harness {
         let reply_draft = if generate {
             self.draft_customer_reply(
                 question,
+                &ctx.request_id,
                 &decision_result,
                 &section_hits,
                 &resolutions,
@@ -2209,6 +2268,7 @@ impl Harness {
             handoff_items: handoff_item_labels,
             partial_answer,
             decision_basis,
+            applicable_known_resolution,
         })
     }
 
@@ -2242,6 +2302,7 @@ impl Harness {
     async fn draft_customer_reply(
         &self,
         question: &str,
+        request_id: &str,
         decision: &decision::AnswerDecision,
         hits: &[SectionHit],
         resolutions: &[rules::KnownResolution],
@@ -2252,18 +2313,21 @@ impl Harness {
         partial_answer_ok: bool,
     ) -> Option<crate::llm::ReplyDraft> {
         let drafter = self.reply_drafter.as_ref()?;
-        // KR 由来 Allowed は evidence_section_keys が空なので、承認済み回答本文を材料として
-        // 引いて渡す（引けなければ材料ゼロのまま = でっち上げない。reply.rs の doc を参照）。
-        let kr_answer = match decision {
-            decision::AnswerDecision::Allowed {
-                source: decision::AnswerSource::KnownResolution,
-                known_resolution_id: Some(kr_id),
-                ..
-            } => resolutions
-                .iter()
-                .find(|kr| &kr.id == kr_id)
-                .map(|kr| kr.answer.as_str()),
-            _ => None,
+        let kr_answer = match decision.known_resolution_id() {
+            None => None,
+            Some(id) => match resolutions.iter().find(|kr| kr.id == id) {
+                Some(kr) => Some(kr.answer.as_str()),
+                None => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        kr_id = %id,
+                        "known_resolution_id of the decision is not in the loaded known resolutions; \
+                         no draft is generated. Check that the known resolution still exists and \
+                         was not excluded between selection and drafting"
+                    );
+                    return None;
+                }
+            },
         };
         let brief =
             reply::build_reply_brief_with_resolution(decision, hits, kr_answer, partial_answer_ok);
@@ -2861,6 +2925,8 @@ mod tests {
             // Jev はデモ用で既定 off。判定そのものを見るテストは常に無効（Issue #58 の
             // wiremock 統合テストは `api.rs` 側で専用の Harness を組み立てる）。
             jev_client: None,
+            kr_applicability: None,
+            excluded_known_resolution_ids: Vec::new(),
         }
     }
 
@@ -3930,6 +3996,44 @@ mod tests {
     }
 
     #[test]
+    fn admit_known_resolution_rejects_a_blank_answer() {
+        let harness = harness_for_test_with_lexicon(
+            r#"{ "signals": [
+                { "signal": "mold", "class": "hazard", "surface_forms": ["カビ"] }
+            ] }"#,
+        );
+        let ctx = RequestContext {
+            actor: authn::Actor {
+                sub: "sup-001".to_string(),
+                email: "sup@sivira.co".to_string(),
+                role: authn::Role::Supervisor,
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+            },
+            scope: scope::AccessScope {
+                allowed_schemas: vec!["sivira-cs-demo".to_string()],
+                max_sensitivity: None,
+                label_allowlist: None,
+            },
+            schema: "sivira-cs-demo".to_string(),
+            request_id: "req-test".to_string(),
+            manual_schema: crate::config::ManualSchemaKind::LegacySection,
+        };
+        let anchors = ["sec#a".to_string()];
+        for blank in ["", "   ", "\n\t "] {
+            let err = harness
+                .admit_known_resolution(&ctx, &["mold".to_string()], blank, None, &anchors)
+                .expect_err("blank answer must be rejected");
+            assert!(
+                err.to_string().contains("invalid answer: empty"),
+                "unexpected error: {err}"
+            );
+        }
+        harness
+            .admit_known_resolution(&ctx, &["mold".to_string()], "answer", None, &anchors)
+            .expect("a non-blank answer must be admitted");
+    }
+
+    #[test]
     fn begin_rejects_out_of_scope_project() {
         let harness = harness_for_test();
         assert!(harness
@@ -4066,25 +4170,9 @@ mod tests {
         }
     }
 
-    /// stub LLM に `draft_text` をそのまま返させ、`draft_customer_reply` の結果と、stub が
-    /// 実際に受け取った生リクエスト（`RequestLog`）を返す。
-    ///
-    /// `is_continuation` は `draft_customer_reply` へそのまま渡す。呼び出し側が `evaluate()` →
-    /// `draft_customer_reply()` → `build_reply_system_prompt()` の素通し配線を検証できるよう、
-    /// stub 到達済みの生リクエスト（system prompt を含む）を返す
-    /// （`clarify.rs::draft_clarify_question_via_stub` と同じパターン）。
-    ///
-    /// `AnthropicClient` のフィールドは `llm.rs` で private なので `from_config` 経由で組む。
-    /// API キーは env `CS_SUPPORT_LLM_API_KEY` が優先されるが、未設定の環境でも構築できるよう
-    /// 一時ファイルを置く（stub は鍵を検証しない。ここで必要なのは「鍵が解決できて client が
-    /// 構築されること」だけ）。env を書き換えないのは、並行テストと競合させないため。
-    async fn draft_customer_reply_via_stub(
+    async fn stub_reply_harness(
         draft_text: &str,
-        is_continuation: bool,
-    ) -> (
-        Option<crate::llm::ReplyDraft>,
-        crate::llm::test_support::RequestLog,
-    ) {
+    ) -> (Harness, crate::llm::test_support::RequestLog) {
         let body = serde_json::json!({
             "stop_reason": "end_turn",
             "content": [{"type": "text", "text": draft_text}],
@@ -4110,6 +4198,29 @@ mod tests {
             ng: egress::production_ng_dictionary(),
             ..harness_for_test()
         };
+        (harness, log)
+    }
+
+    /// stub LLM に `draft_text` をそのまま返させ、`draft_customer_reply` の結果と、stub が
+    /// 実際に受け取った生リクエスト（`RequestLog`）を返す。
+    ///
+    /// `is_continuation` は `draft_customer_reply` へそのまま渡す。呼び出し側が `evaluate()` →
+    /// `draft_customer_reply()` → `build_reply_system_prompt()` の素通し配線を検証できるよう、
+    /// stub 到達済みの生リクエスト（system prompt を含む）を返す
+    /// （`clarify.rs::draft_clarify_question_via_stub` と同じパターン）。
+    ///
+    /// `AnthropicClient` のフィールドは `llm.rs` で private なので `from_config` 経由で組む。
+    /// API キーは env `CS_SUPPORT_LLM_API_KEY` が優先されるが、未設定の環境でも構築できるよう
+    /// 一時ファイルを置く（stub は鍵を検証しない。ここで必要なのは「鍵が解決できて client が
+    /// 構築されること」だけ）。env を書き換えないのは、並行テストと競合させないため。
+    async fn draft_customer_reply_via_stub(
+        draft_text: &str,
+        is_continuation: bool,
+    ) -> (
+        Option<crate::llm::ReplyDraft>,
+        crate::llm::test_support::RequestLog,
+    ) {
+        let (harness, log) = stub_reply_harness(draft_text).await;
         let decision = decision::AnswerDecision::Allowed {
             source: decision::AnswerSource::Manual,
             evidence_section_keys: vec!["sec-a".to_string()],
@@ -4135,6 +4246,7 @@ mod tests {
         let draft = harness
             .draft_customer_reply(
                 "カメラが反応しません",
+                "test-request-id",
                 &decision,
                 &hits,
                 &[],
@@ -4244,6 +4356,7 @@ mod tests {
             harness
                 .draft_customer_reply(
                     "導入にどれくらいの費用がかかるの？",
+                    "test-request-id",
                     decision,
                     &hits,
                     &[],
@@ -4269,6 +4382,16 @@ mod tests {
             .is_ok()
         });
         (draft, log)
+    }
+
+    #[test]
+    fn handoff_signal_search_is_skipped_when_a_known_resolution_rides_the_escalation() {
+        let items = handoff_items_fixture();
+        let plain =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        assert!(should_search_handoff_signals(&plain, &items));
+        let [_, riding] = kr_decisions("kr1");
+        assert!(!should_search_handoff_signals(&riding, &items));
     }
 
     #[tokio::test]
@@ -4523,6 +4646,118 @@ mod tests {
         );
     }
 
+    use crate::test_support::kr_fixture;
+
+    fn kr_decisions(kr_id: &str) -> [decision::AnswerDecision; 2] {
+        let allowed = decision::AnswerDecision::Allowed {
+            source: decision::AnswerSource::KnownResolution,
+            evidence_section_keys: Vec::new(),
+            known_resolution_id: Some(kr_id.to_string()),
+            stakes: decision::Stakes::Low,
+            threshold: 0.6,
+        };
+        let mut riding =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        if let decision::AnswerDecision::Escalate {
+            known_resolution_id,
+            ..
+        } = &mut riding
+        {
+            *known_resolution_id = Some(kr_id.to_string());
+        }
+        [allowed, riding]
+    }
+
+    async fn draft_with_kr_via_stub(
+        draft_text: &str,
+        decision: &decision::AnswerDecision,
+        resolutions: &[rules::KnownResolution],
+    ) -> (
+        Option<crate::llm::ReplyDraft>,
+        crate::llm::test_support::RequestLog,
+    ) {
+        let (harness, log) = stub_reply_harness(draft_text).await;
+        let hits = vec![SectionHit {
+            section_key: "sec-a".to_string(),
+            title_ja: "タイトル".to_string(),
+            body_ja: Some("マニュアル本文".to_string()),
+            body_en: None,
+            translation_status: None,
+            breadcrumb: Vec::new(),
+            score: 0.9,
+            source_url: None,
+        }];
+        let draft = harness
+            .draft_customer_reply(
+                "カメラが反応しません",
+                "test-request-id",
+                decision,
+                &hits,
+                resolutions,
+                &[],
+                false,
+                &response_allowlist_fixture(),
+                &["初期費用・設置工事費に関するご質問".to_string()],
+                true,
+            )
+            .await;
+        (draft, log)
+    }
+
+    #[tokio::test]
+    async fn draft_customer_reply_uses_the_kr_answer_for_a_kr_riding_handoff() {
+        let [_, riding] = kr_decisions("k");
+        let resolutions = [kr_fixture("k", "1. 電源を抜く\n2. 30秒待つ")];
+        let (draft, log) = draft_with_kr_via_stub("本文です。", &riding, &resolutions).await;
+        assert!(draft.is_some());
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("1. 電源を抜く"));
+        assert!(requests[0].contains(reply::KNOWN_RESOLUTION_SOURCE_LABEL));
+        assert!(!requests[0].contains("マニュアル本文"));
+    }
+
+    #[tokio::test]
+    async fn draft_customer_reply_returns_none_when_the_kr_id_is_missing() {
+        for decision in kr_decisions("ghost") {
+            let resolutions = [kr_fixture("other", "回答")];
+            let (draft, log) = draft_with_kr_via_stub("本文です。", &decision, &resolutions).await;
+            assert!(draft.is_none());
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "the drafter must not be called"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kr_draft_blocked_by_egress_is_none() {
+        let term = egress::production_ng_dictionary()
+            .block_terms
+            .first()
+            .expect("the production NG dictionary must have a block term")
+            .clone();
+        let drafted = format!("手順です。「{term}」とご案内しております。");
+        let [allowed, riding] = kr_decisions("k");
+        let resolutions = [kr_fixture("k", "回答")];
+        for decision in [allowed, riding] {
+            let (draft, _log) = draft_with_kr_via_stub(&drafted, &decision, &resolutions).await;
+            assert!(draft.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn kr_draft_rejected_by_accept_draft_is_null() {
+        let [_, riding] = kr_decisions("k");
+        let resolutions = [kr_fixture("k", "回答")];
+        let (draft, _log) =
+            draft_with_kr_via_stub(reply::NO_ANSWER_TOKEN, &riding, &resolutions).await;
+        let draft = draft.expect("the token passes egress; the adoption gate must reject it");
+        let items = handoff_items_fixture();
+        let lexicon = harness_for_test().lexicon;
+        assert!(handoff_items::accept_draft(&draft.text, true, &items, &lexicon).is_err());
+    }
+
     /// design doc §3 配線テスト: `is_continuation` が `evaluate()` → `draft_customer_reply()` →
     /// `build_reply_system_prompt()` まで素通しされていることを確認する。純関数の単体テスト
     /// （`reply.rs` の `system_prompt_adds_continuation_opener_rule_when_a_continuation` 等）
@@ -4695,7 +4930,7 @@ mod tests {
         }
     }
 
-    fn contract_test_kr(id: &str, set: &[&str]) -> rules::KnownResolution {
+    pub(super) fn contract_test_kr(id: &str, set: &[&str]) -> rules::KnownResolution {
         rules::KnownResolution {
             id: id.to_string(),
             signal_set: contract_test_signals(set),
@@ -5849,5 +6084,233 @@ mod tests {
         // 運用者が次に何を見ればよいか分かる情報: どの case か・どの schema か。
         assert!(message.contains("case-missing"), "{message}");
         assert!(message.contains("urtect"), "{message}");
+    }
+
+    pub(super) struct KrStubJudge {
+        reply: std::result::Result<String, String>,
+        calls: std::sync::atomic::AtomicUsize,
+        pub(super) offered: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl KrStubJudge {
+        pub(super) fn new(reply: std::result::Result<&str, &str>) -> Arc<Self> {
+            Arc::new(Self {
+                reply: reply.map(str::to_string).map_err(str::to_string),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                offered: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        pub(super) fn selecting(ids: &[&str]) -> Arc<Self> {
+            let json = serde_json::json!({ "applicable_ids": ids }).to_string();
+            Self::new(Ok(&json))
+        }
+
+        pub(super) fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub(super) fn offered_to(&self, id: &str) -> bool {
+            self.offered
+                .lock()
+                .expect("offered lock")
+                .iter()
+                .any(|message| message.contains(&format!("### id: {id}\n")))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl kr_applicability::JudgeKrApplicability for KrStubJudge {
+        async fn judge(&self, _system_prompt: &str, user_message: &str) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.offered
+                .lock()
+                .expect("offered lock")
+                .push(user_message.to_string());
+            match &self.reply {
+                Ok(text) => Ok(text.clone()),
+                Err(message) => Err(anyhow!(message.clone())),
+            }
+        }
+    }
+
+    pub(super) fn kr_selection_harness(
+        judge: Option<Arc<KrStubJudge>>,
+        excluded: &[&str],
+    ) -> Harness {
+        Harness {
+            kr_applicability: judge.map(|j| j as Arc<dyn kr_applicability::JudgeKrApplicability>),
+            excluded_known_resolution_ids: excluded.iter().map(|s| s.to_string()).collect(),
+            ..harness_for_test_with_lexicon(
+                r#"{"signals":[
+                    {"signal":"a","class":"context","surface_forms":["エー"],"description":"signal a"},
+                    {"signal":"b","class":"context","surface_forms":["ビー"],"description":"signal b"},
+                    {"signal":"adv","class":"context","surface_forms":["アドバイザリ"],"description":"advisory trigger"},
+                    {"signal":"hz","class":"hazard","surface_forms":["危険"],"description":"hazard"}
+                ]}"#,
+            )
+        }
+    }
+
+    pub(super) const CUSTOMER_TEXT: &str = "カメラが反応しません";
+    pub(super) const HYBRID: extraction::ExtractionMode = extraction::ExtractionMode::Hybrid;
+
+    fn kr_ctx() -> RequestContext {
+        supervisor_ctx("urtect", crate::config::ManualSchemaKind::ManualV1)
+    }
+
+    fn advisory_rule(signal: &str) -> rules::EscalationRule {
+        rules::EscalationRule {
+            id: "r-adv".to_string(),
+            condition: contract_test_signals(&[signal]),
+            route: "triage".to_string(),
+            owner: None,
+            binding: rules::Binding::Advisory,
+            hearing: None,
+            customer_ack: None,
+        }
+    }
+
+    pub(super) struct KrTurnCase<'a> {
+        pub(super) signals: &'a [&'a str],
+        pub(super) accumulated: &'a [&'a str],
+        pub(super) escalated: bool,
+        pub(super) mode: extraction::ExtractionMode,
+        pub(super) context_text: &'a str,
+        pub(super) question: &'a str,
+    }
+
+    impl<'a> KrTurnCase<'a> {
+        pub(super) fn new(signals: &'a [&'a str], accumulated: &'a [&'a str]) -> Self {
+            Self {
+                signals,
+                accumulated,
+                escalated: false,
+                mode: HYBRID,
+                context_text: CUSTOMER_TEXT,
+                question: CUSTOMER_TEXT,
+            }
+        }
+    }
+
+    pub(super) async fn run_kr_turn(
+        harness: &Harness,
+        case: &KrTurnCase<'_>,
+        resolutions: &[rules::KnownResolution],
+    ) -> (Option<String>, Vec<String>) {
+        let allowlist = product_gate::ProductAllowlist::from_models(Vec::new());
+        let policy = if case.escalated {
+            ReplyDraftPolicy::SkipWhenUnused {
+                response_allowlist: &allowlist,
+                already_escalated: true,
+                partial_answer_enabled: false,
+            }
+        } else {
+            ReplyDraftPolicy::Always
+        };
+        let signals = contract_test_signals(case.signals);
+        let accumulated = contract_test_signals(case.accumulated);
+        let turn = harness
+            .prepare_kr_turn(
+                &kr_ctx(),
+                resolutions.to_vec(),
+                &policy,
+                &signals,
+                &accumulated,
+                &[],
+                case.question,
+                case.context_text,
+                case.mode,
+            )
+            .await;
+        (
+            turn.applicable_known_resolution.map(|kr| kr.id),
+            turn.resolutions.into_iter().map(|kr| kr.id).collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn decide_turn_applies_kr_in_an_escalated_case_with_a_previous_advisory_signal() {
+        let harness = kr_selection_harness(Some(KrStubJudge::selecting(&["kr_a"])), &[]);
+        let allowlist = product_gate::ProductAllowlist::from_models(Vec::new());
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allowlist,
+            already_escalated: true,
+            partial_answer_enabled: false,
+        };
+        let krs = [contract_test_kr("kr_a", &["a"])];
+        let signals = contract_test_signals(&["a"]);
+        let accumulated = contract_test_signals(&["adv", "a"]);
+        let turn = harness
+            .prepare_kr_turn(
+                &kr_ctx(),
+                krs.to_vec(),
+                &policy,
+                &signals,
+                &accumulated,
+                &[],
+                CUSTOMER_TEXT,
+                CUSTOMER_TEXT,
+                HYBRID,
+            )
+            .await;
+        let decision = decision::decide(&decision::DecisionInput {
+            question_signals: turn.decide_signals,
+            question_raw: CUSTOMER_TEXT,
+            rules: &[advisory_rule("adv")],
+            domains: &[],
+            resolutions: &turn.resolutions,
+            best_manual_score: Some(1.0),
+            best_manual_sections: &[],
+            stakes_input: turn.stakes_input,
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+            known_resolution: turn.applicable_known_resolution.as_ref(),
+        });
+        assert!(matches!(
+            decision,
+            decision::AnswerDecision::Allowed {
+                source: decision::AnswerSource::KnownResolution,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn decide_turn_ignores_an_excluded_kr() {
+        let judge = KrStubJudge::selecting(&["kr1", "kr2"]);
+        let harness = kr_selection_harness(Some(judge.clone()), &["kr1"]);
+        let krs = [
+            contract_test_kr("kr1", &["a"]),
+            contract_test_kr("kr2", &["a"]),
+        ];
+        let case = KrTurnCase::new(&["a"], &["a"]);
+        let (selected, kept) = run_kr_turn(&harness, &case, &krs).await;
+        assert_eq!(selected.as_deref(), Some("kr2"));
+        assert_eq!(kept, vec!["kr2".to_string()]);
+        assert!(!judge.offered_to("kr1"));
+    }
+
+    #[test]
+    fn escalate_with_a_kr_audits_the_kr_node_and_id() {
+        let mut riding =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        if let decision::AnswerDecision::Escalate {
+            known_resolution_id,
+            ..
+        } = &mut riding
+        {
+            *known_resolution_id = Some("k".to_string());
+        }
+        let plain =
+            escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
+        let kr_node = knowledge::harness_node_id("s", "KnownResolution", "k");
+        let case_node = knowledge::harness_node_id("s", "support_case", "c");
+        let (governing, retrieved) = audit_node_ids("s", &riding, vec!["m".to_string()], "c", &[]);
+        assert_eq!(governing, vec!["k".to_string()]);
+        assert_eq!(retrieved, vec!["m".to_string(), case_node.clone(), kr_node]);
+        let (governing, retrieved) = audit_node_ids("s", &plain, vec!["m".to_string()], "c", &[]);
+        assert!(governing.is_empty());
+        assert_eq!(retrieved, vec!["m".to_string(), case_node]);
     }
 }

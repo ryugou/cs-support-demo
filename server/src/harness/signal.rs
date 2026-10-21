@@ -900,6 +900,32 @@ mod tests {
             .contains(&Signal::new("discoloration")));
     }
 
+    fn bundled_urtect_normalizer() -> LexiconNormalizer {
+        LexiconNormalizer::from_path(&bundled_urtect_lexicon_path()).expect("bundled lexicon loads")
+    }
+
+    #[test]
+    fn bundled_lexicon_maps_signals_to_customer_labels() {
+        let n = bundled_urtect_normalizer();
+        let cases = [
+            (
+                "cloud_storage_retention",
+                "録画の保存期間はどれくらいですか",
+                "クラウド録画の保存期間に関するご相談",
+            ),
+            (
+                "led_red_blinking",
+                "カメラが赤く点滅しています",
+                "赤いランプの点滅に関するご相談",
+            ),
+        ];
+        for (name, utterance, label) in cases {
+            let signal = Signal::new(name);
+            assert!(n.normalize(utterance).contains(&signal), "{name}");
+            assert_eq!(n.customer_label_of(&signal), Some(label), "{name}");
+        }
+    }
+
     /// Critical 1 の対象は本番 Cloud Run（`urtect` schema）がサービス起動時に読む
     /// `data/urtect/signal-lexicon.json`。`data/signal-lexicon.json`（拡張子直下、
     /// `loads_bundled_lexicon_file` が使う）は現行サンプル実装（旧 sivira-cs-demo）の

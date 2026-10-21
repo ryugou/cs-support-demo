@@ -83,7 +83,8 @@ pub enum PartialAnswerSkipReason {
     HearingDeclared,
     /// 取り次ぐ項目が1つも無い。
     NoHandoffItems,
-    /// 材料の関連度が `thresholds.low` 未満（または取得不可）。
+    /// The best manual score is below `thresholds.low` (or unavailable) and the decision carries
+    /// no known resolution id; a known resolution id makes the relevance sufficient.
     InsufficientRelevance,
     PartialAnswerDisabled,
     /// 下書き生成そのものが無効（`customer_reply_draft_enabled = false`、または LLM 未設定）。
@@ -168,7 +169,8 @@ fn partial_answer_eligibility(
             PartialAnswerSkipReason::DraftGenerationDisabled,
         );
     }
-    if best_manual_score.is_some_and(|score| score >= thresholds.low) {
+    let has_kr = decision.known_resolution_id().is_some();
+    if has_kr || best_manual_score.is_some_and(|score| score >= thresholds.low) {
         PartialAnswerEligibility::Eligible
     } else {
         PartialAnswerEligibility::Ineligible(PartialAnswerSkipReason::InsufficientRelevance)
@@ -699,6 +701,46 @@ mod tests {
         }
     }
 
+    fn escalate_carrying_kr() -> AnswerDecision {
+        let mut decision = escalate(None);
+        if let AnswerDecision::Escalate {
+            known_resolution_id,
+            ..
+        } = &mut decision
+        {
+            *known_resolution_id = Some("k".to_string());
+        }
+        decision
+    }
+
+    #[test]
+    fn can_draft_partial_answer_is_true_with_a_known_resolution_even_without_manual_score() {
+        assert!(can_draft_partial_answer(
+            &escalate_carrying_kr(),
+            &handoff_items_fixture(),
+            None,
+            &thresholds(),
+            true,
+            true
+        ));
+        assert!(!can_draft_partial_answer(
+            &escalate(None),
+            &handoff_items_fixture(),
+            None,
+            &thresholds(),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_kr_riding_handoff_is_a_partial_answer_candidate() {
+        assert!(is_partial_answer_candidate(
+            &escalate_carrying_kr(),
+            &handoff_items_fixture()
+        ));
+    }
+
     #[test]
     fn partial_answer_skip_reason_is_none_for_an_allowed_decision() {
         assert_eq!(
@@ -1215,6 +1257,70 @@ mod tests {
             assert!(
                 handoff_items_for_decision(&decision, &rules, &[], &accumulated, "q", &lex)
                     .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_items_for_decision_uses_only_domain_signals_when_advisory_and_layer2_both_match() {
+        use crate::harness::decision::{decide, DecisionInput, StakesInput, Thresholds};
+        use crate::harness::rules::match_layer1_mandatory;
+        let lexicon =
+            LexiconNormalizer::from_json(include_str!("../../data/urtect/signal-lexicon.json"))
+                .unwrap();
+        let rules = crate::test_support::load_bundled_escalation_rules();
+        let advisory = rules
+            .iter()
+            .find(|r| r.id == "warranty-failure")
+            .expect("bundled advisory rule warranty-failure");
+        let domain = crate::test_support::load_bundled_prohibited_domains()
+            .into_iter()
+            .find(|d| {
+                match_layer1_mandatory(&rules, &d.domain_signals).is_none()
+                    && !derive_handoff_items(&lexicon, &d.domain_signals).is_empty()
+            })
+            .expect("a bundled layer-2 domain with handoff labels");
+        let question: SignalSet = advisory
+            .condition
+            .union(&domain.domain_signals)
+            .cloned()
+            .collect();
+        let thresholds = Thresholds {
+            low: 0.6,
+            mid: 0.8,
+            high: 0.95,
+        };
+        let domains = [domain.clone()];
+        let decision = decide(&DecisionInput {
+            question_signals: &question,
+            question_raw: "質問",
+            rules: &rules,
+            domains: &domains,
+            resolutions: &[],
+            known_resolution: None,
+            best_manual_score: Some(0.1),
+            best_manual_sections: &[],
+            stakes_input: StakesInput {
+                mandatory_domain_near: false,
+                ng_near_hit: false,
+                hazard_signal_count: 0,
+            },
+            thresholds: &thresholds,
+            default_route: "triage",
+        });
+        assert!(
+            matches!(decision, AnswerDecision::Escalate { layer: 2, .. }),
+            "{decision:?}"
+        );
+        let items =
+            handoff_items_for_decision(&decision, &rules, &domains, &question, "質問", &lexicon);
+        let expected = derive_handoff_items(&lexicon, &domain.domain_signals);
+        assert_eq!(labels_of(&items), labels_of(&expected));
+        let advisory_labels = labels_of(&derive_handoff_items(&lexicon, &advisory.condition));
+        for label in advisory_labels {
+            assert!(
+                !labels_of(&items).contains(&label),
+                "advisory label {label} must not leak into a layer-2 handoff"
             );
         }
     }

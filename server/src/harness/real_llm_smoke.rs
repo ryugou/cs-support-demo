@@ -10,7 +10,7 @@
 //!
 //! 言い回しによって判定が `Escalate`（取次）と `Allowed`（回答のみ）に割れる（§10.5）。各ケースは
 //! `expect` で自分がどちらになるはずかを宣言し、本テストは本番 `evaluate()` と同じ条件
-//! （`handoff_items::is_partial_answer_candidate`）でだけ補助検索を併合し、`expect` ごとに
+//! （`super::should_search_handoff_signals`）でだけ補助検索を併合し、`expect` ごとに
 //! 異なる最終応答文の形（取次の一文・受付番号あり、または下書きそのまま）を確認する。
 //!
 //! `#[ignore]`: 実 API キー・ネットワーク到達性・`CS_VERIFY_CASES_JSON`（本番 MCP
@@ -21,7 +21,7 @@
 //! ```
 //! API キーは env からのみ読み（`llm::AnthropicClient::from_config`）、ファイル・ログには書かない。
 
-use super::decision::{self, AnswerDecision, DecisionInput, StakesInput, Thresholds};
+use super::decision::{self, AnswerDecision, DecisionInput, Thresholds};
 use super::extraction::{
     self, AnthropicProductReferenceClassifier, AnthropicSignalClassifier, ClassifyLlm,
     ClassifyProductReferences, HybridExtractor, ProductReferenceExtractor,
@@ -387,7 +387,6 @@ struct Fixture {
     lexicon: Arc<signal::LexiconNormalizer>,
     escalation_rules: Vec<rules::EscalationRule>,
     prohibited_domains: Vec<rules::ProhibitedDomain>,
-    mandatory_domains: Vec<rules::ProhibitedDomain>,
     thresholds: Thresholds,
     allowlist: ProductAllowlist,
     hours_label: String,
@@ -475,6 +474,8 @@ fn build_harness(
         reply_draft_max_tokens: config.harness.customer_reply_draft_max_tokens,
         product_gate: None,
         jev_client: None,
+        kr_applicability: None,
+        excluded_known_resolution_ids: Vec::new(),
     }
 }
 
@@ -484,11 +485,6 @@ fn build_fixture(
     lexicon: Arc<signal::LexiconNormalizer>,
 ) -> Fixture {
     let prohibited_domains = load_bundled_prohibited_domains();
-    let mandatory_domains: Vec<rules::ProhibitedDomain> = prohibited_domains
-        .iter()
-        .filter(|d| d.binding == rules::Binding::Mandatory)
-        .cloned()
-        .collect();
     let thresholds: Thresholds = (&config.harness.thresholds).into();
     let hours_label = hours::business_hours_label(&config.api.business_hours);
     Fixture {
@@ -496,7 +492,6 @@ fn build_fixture(
         lexicon,
         escalation_rules: load_bundled_escalation_rules(),
         prohibited_domains,
-        mandatory_domains,
         thresholds,
         allowlist: ProductAllowlist::from_models(seed_product_models()),
         hours_label,
@@ -552,15 +547,9 @@ fn decide_on_signals(
     case_index: usize,
     total_cases: usize,
 ) -> (AnswerDecision, Vec<String>) {
-    let stakes_input = StakesInput {
-        mandatory_domain_near: rules::match_layer2(&fx.mandatory_domains, accumulated, question)
-            .is_some(),
-        ng_near_hit: fx.harness.ng.near_hit(question),
-        hazard_signal_count: accumulated
-            .iter()
-            .filter(|s| fx.lexicon.class_of(s) == Some(signal::SignalClass::Hazard))
-            .count(),
-    };
+    let stakes_input =
+        fx.harness
+            .stakes_input_for_turn(&fx.prohibited_domains, accumulated, question);
     let top_hit = question_hits.first().unwrap_or_else(|| {
         panic!(
             "case {case_index}/{total_cases} ({question:?}): question_hits is empty (the \
@@ -704,6 +693,7 @@ async fn draft_accepted_text(
         fx.harness
             .draft_customer_reply(
                 question,
+                "smoke-request-id",
                 decision,
                 merged_hits,
                 &[],
@@ -806,7 +796,7 @@ fn assert_allowed_final_reply(
 }
 
 /// design doc §10.2・本番 `evaluate()`（`server/src/harness/mod.rs` の
-/// `handoff_items::is_partial_answer_candidate` 分岐）と同じ条件: 取次候補
+/// `should_search_handoff_signals` 分岐）と同じ条件: 取次候補
 /// （第1・2層 Escalate かつ取り次ぐ項目が1つ以上、hearing宣言なし）のときだけ、マッチした signal
 /// の lexicon 語彙で引いた補助検索を質問文検索の結果と併合する。それ以外（Allowed・第3層）は
 /// 質問文検索の結果（取扱外型番は既に除外済み）をそのまま下書きの材料にする（検索回数を増やさ
@@ -822,7 +812,7 @@ fn select_material_hits(
     case_index: usize,
     total_cases: usize,
 ) -> (Vec<SectionHit>, Option<f32>) {
-    if handoff_items::is_partial_answer_candidate(decision, items) {
+    if super::should_search_handoff_signals(decision, items) {
         let item_signals: std::collections::BTreeSet<&signal::Signal> =
             items.iter().flat_map(|item| item.signals.iter()).collect();
         let covered = signal::Signal::new(SUPPLEMENTARY_SEARCH_SIGNAL);
@@ -1265,6 +1255,7 @@ fn build_outcome(
         handoff_items: Vec::new(),
         partial_answer: false,
         decision_basis: turn.basis,
+        applicable_known_resolution: None,
     }
 }
 
