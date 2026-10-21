@@ -2252,18 +2252,17 @@ fn strip_sentence_decoration(sentence: &str) -> &str {
         .trim_end_matches(|ch: char| !starts_text(ch))
 }
 
-/// The key set of the draft's sentences, computed once per verdict.
-fn draft_sentence_keys(draft_text: &str) -> std::collections::HashSet<String> {
-    sentence_keys(draft_text).into_iter().collect()
-}
-
-/// The key of `quote` when it is exactly one whole sentence of the draft, else `None`. A fragment,
-/// a span over several sentences and an empty quote all give `None`.
-fn quoted_key(quote: &str, draft_keys: &std::collections::HashSet<String>) -> Option<String> {
-    match sentence_keys(quote).as_slice() {
-        [key] if draft_keys.contains(key) => Some(key.clone()),
-        _ => None,
+/// The keys of `quote` when they are a non-empty, ordered, contiguous run of the draft's sentence
+/// keys, else `None`. One whole sentence is the common case. The checker tolerates a run because
+/// the judge merges consecutive sentences into one element despite the instruction, and a run of
+/// whole sentences carries no fragment risk. A fragment, a reordered or non-adjacent stitch, a
+/// key that is not in the draft and an empty quote all give `None`.
+fn quoted_keys(quote: &str, draft_keys: &[String]) -> Option<Vec<String>> {
+    let keys = sentence_keys(quote);
+    if keys.is_empty() || !draft_keys.windows(keys.len()).any(|run| run == keys) {
+        return None;
     }
+    Some(keys)
 }
 
 /// Whether the sentence key names 15秒 (or 十五秒). A 15 that follows a digit or a dot (`115秒`,
@@ -2278,18 +2277,19 @@ fn names_15_seconds(key: &str) -> bool {
         || standalone("15秒", |ch| ch.is_ascii_digit() || ch == '.')
 }
 
-/// Passes only a draft whose quoted sentences are each exactly one whole sentence of it (compared
-/// through [`sentence_keys`]), that has no sentence instructing the long press or reset, and that
-/// has a warning sentence naming 15秒. Order: an instruction quote that is a whole draft sentence
-/// is a draft fault first, then any other quote that is not exactly one whole sentence of the
-/// draft (a fragment included) is a judge-output fault, then a missing 15秒 warning is a draft
+/// Passes only a draft whose quotes are each a contiguous run of whole sentences of it (compared
+/// through [`sentence_keys`], see [`quoted_keys`]), that has no sentence instructing the long press
+/// or reset, and that
+/// has a warning sentence naming 15秒. Order: an instruction quote that is a run of whole draft
+/// sentences is a draft fault first, then any other quote that is not such a run of the draft
+/// (a fragment included) is a judge-output fault, then a missing 15秒 warning is a draft
 /// fault. Errors carry counts only.
 fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFault> {
-    let draft_keys = draft_sentence_keys(draft_text);
-    let instruction_keys: Vec<Option<String>> = safety
+    let draft_keys = sentence_keys(draft_text);
+    let instruction_keys: Vec<Option<Vec<String>>> = safety
         .reset_instruction_sentences
         .iter()
-        .map(|quote| quoted_key(quote, &draft_keys))
+        .map(|quote| quoted_keys(quote, &draft_keys))
         .collect();
     let instructions = instruction_keys.iter().flatten().count();
     if instructions > 0 {
@@ -2297,10 +2297,10 @@ fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFau
             "invalid draft: the judge quotes {instructions} sentence(s) that instruct a 15秒 press or a factory reset"
         )));
     }
-    let warning_keys: Vec<Option<String>> = safety
+    let warning_keys: Vec<Option<Vec<String>>> = safety
         .reset_warning_sentences
         .iter()
-        .map(|quote| quoted_key(quote, &draft_keys))
+        .map(|quote| quoted_keys(quote, &draft_keys))
         .collect();
     let not_found = instruction_keys
         .iter()
@@ -2314,6 +2314,7 @@ fn led_safety_verdict(safety: &LedSafety, draft_text: &str) -> Result<(), LedFau
     }
     if !warning_keys
         .iter()
+        .flatten()
         .flatten()
         .any(|key| names_15_seconds(key))
     {
@@ -2913,7 +2914,7 @@ fn led_step_order_uses_unique_anchors_only() {
 fn quote_check_normalizes_both_sides_like_the_judge_saw_the_draft() {
     let draft =
         "設定 > Wi-Fi を開きます。\n５～７秒押します。\n⚠ ボタンを１５秒以上押さないでください。";
-    let keys = draft_sentence_keys(draft);
+    let keys = sentence_keys(draft);
     let cases = [
         ("neutralized angle bracket", "設定 ＞ Wi-Fi を開きます。"),
         ("ASCII angle bracket", "設定 > Wi-Fi を開きます。"),
@@ -2924,9 +2925,9 @@ fn quote_check_normalizes_both_sides_like_the_judge_saw_the_draft() {
         ("tilde variant", "5〜7秒押します。"),
     ];
     for (label, quote) in cases {
-        assert!(quoted_key(quote, &keys).is_some(), "{label}");
+        assert!(quoted_keys(quote, &keys).is_some(), "{label}");
     }
-    assert!(quoted_key("ボタンを30秒以上押さないでください。", &keys).is_none());
+    assert!(quoted_keys("ボタンを30秒以上押さないでください。", &keys).is_none());
 }
 
 fn warnings_only(items: &[&str]) -> LedSafety {
@@ -2959,14 +2960,14 @@ fn a_quote_must_be_one_whole_sentence_of_the_draft() {
     );
     assert!(fragment.contains("1 quoted sentence(s)"), "{fragment}");
     assert!(!fragment.contains("15秒以上"), "{fragment}");
-    let span = judge_fault_message(
+    let stitched = judge_fault_message(
         led_safety_verdict(
-            &warnings_only(&["ボタンを押します。ご注意: 15秒以上押さないでください。"]),
+            &warnings_only(&["ボタンを押します。ご注意: 30秒以上押さないでください。"]),
             draft,
         ),
-        "span over two sentences",
+        "span with a sentence that is not in the draft",
     );
-    assert!(span.contains("1 quoted sentence(s)"), "{span}");
+    assert!(stitched.contains("1 quoted sentence(s)"), "{stitched}");
     assert_eq!(
         led_safety_verdict(
             &warnings_only(&["ご注意: １５秒以上押さないでください。"]),
@@ -2974,6 +2975,61 @@ fn a_quote_must_be_one_whole_sentence_of_the_draft() {
         ),
         Ok(())
     );
+}
+
+const MERGED_LED_WARNING_DRAFT: &str = "ボタンを押します。\n⚠ ボタンを15秒以上押さないでください。15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。\nお困りの場合はご連絡ください。";
+const MERGED_LED_WARNING: &str = "ボタンを15秒以上押さないでください。15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。";
+
+#[test]
+fn two_consecutive_draft_sentences_quoted_as_one_warning_are_accepted() {
+    let safety = warnings_only(&[MERGED_LED_WARNING]);
+    assert_eq!(
+        led_safety_verdict(&safety, MERGED_LED_WARNING_DRAFT),
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn a_calibration_verdict_accepts_the_judge_merging_two_consecutive_sentences() {
+    let judge = StubLedJudge(judge_evidence(&[], &[MERGED_LED_WARNING]));
+    assert_eq!(
+        calibration_verdict(&judge, MERGED_LED_WARNING_DRAFT).await,
+        Ok(())
+    );
+}
+
+#[test]
+fn a_reversed_pair_of_draft_sentences_is_a_judge_fault() {
+    let reversed = "15秒以上で工場出荷状態に初期化され（LEDが赤と緑の点滅）、設定が消えます。ボタンを15秒以上押さないでください。";
+    let message = judge_fault_message(
+        led_safety_verdict(&warnings_only(&[reversed]), MERGED_LED_WARNING_DRAFT),
+        "reversed pair",
+    );
+    assert!(message.contains("1 quoted sentence(s)"), "{message}");
+}
+
+#[test]
+fn two_non_adjacent_draft_sentences_joined_are_a_judge_fault() {
+    let stitched = "ボタンを15秒以上押さないでください。お困りの場合はご連絡ください。";
+    let message = judge_fault_message(
+        led_safety_verdict(&warnings_only(&[stitched]), MERGED_LED_WARNING_DRAFT),
+        "non-adjacent stitch",
+    );
+    assert!(message.contains("1 quoted sentence(s)"), "{message}");
+}
+
+#[test]
+fn a_run_that_includes_an_instruction_sentence_labeled_as_instruction_is_a_draft_fault() {
+    let draft =
+        "ボタンを押します。改善しないなら15秒長押しして初期化してください。ご連絡ください。";
+    let safety = LedSafety {
+        reset_instruction_sentences: sentences(&[
+            "ボタンを押します。改善しないなら15秒長押しして初期化してください。",
+        ]),
+        reset_warning_sentences: Vec::new(),
+    };
+    let message = draft_fault_message(led_safety_verdict(&safety, draft), "instruction run");
+    assert!(message.contains("instruct"), "{message}");
 }
 
 #[test]
