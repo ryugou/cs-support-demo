@@ -683,17 +683,21 @@ enough_info_threshold = 0.42
     }
 
     #[test]
-    fn cloudrun_reply_draft_max_tokens_fits_long_step_materials() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.cloudrun.toml");
-        let cfg = AppConfig::load(std::path::Path::new(path))
-            .unwrap_or_else(|err| panic!("{path} must load: {err}"));
+    fn production_reply_draft_max_tokens_fit_long_step_materials() {
         assert_eq!(default_reply_draft_max_tokens(), 700);
-        assert!(
-            cfg.harness.customer_reply_draft_max_tokens >= 1500,
-            "{path} [harness] customer_reply_draft_max_tokens must be >= 1500 so that a \
-             20-step known resolution is not cut at the generation limit (got {})",
-            cfg.harness.customer_reply_draft_max_tokens
-        );
+        for path in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.cloudrun.toml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.homesec.toml"),
+        ] {
+            let cfg = AppConfig::load(std::path::Path::new(path))
+                .unwrap_or_else(|err| panic!("{path} must load: {err}"));
+            assert!(
+                cfg.harness.customer_reply_draft_max_tokens >= 1500,
+                "{path} [harness] customer_reply_draft_max_tokens must be >= 1500 so that a \
+                 20-step known resolution is not cut at the generation limit (got {})",
+                cfg.harness.customer_reply_draft_max_tokens
+            );
+        }
     }
 
     #[test]
