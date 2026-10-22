@@ -6,7 +6,7 @@ import type { CorrectionResponse } from '../../core/models';
 import { extractErrorMessage } from '../../shared/http-error';
 
 /** サーバの `reply::MAX_EXCERPT_CHARS`（server/src/harness/reply.rs）と一致させる answer 上限。 */
-export const MAX_ANSWER_CHARS = 2_500;
+const MAX_ANSWER_CHARS = 2_500;
 
 /** `CorrectionModalComponent` を開く際に渡すデータ（design doc §5「訂正登録モーダル」）。 */
 export interface CorrectionModalData {
