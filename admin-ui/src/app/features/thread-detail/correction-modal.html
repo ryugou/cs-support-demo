@@ -65,10 +65,10 @@
     </label>
     <p
       class="mt-0.5 text-xs"
-      [class.text-slate-500]="answerLength() <= maxAnswerChars"
-      [class.text-red-600]="answerLength() > maxAnswerChars"
+      [class.text-slate-500]="!overLimit()"
+      [class.text-red-600]="overLimit()"
     >
-      2,500 文字以内（現在 {{ answerLength() }} / 2,500 文字）
+      {{ maxAnswerLabel }} 文字以内（現在 {{ answerLength() }} / {{ maxAnswerLabel }} 文字）
     </p>
     <textarea
       id="correction-answer"
