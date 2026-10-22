@@ -1834,13 +1834,21 @@ fn kr_applicability_cases() -> [KrCase; 5] {
     ]
 }
 
-/// The digit runs of `answer` (a known resolution's answer) that `text` does not contain.
+/// The digit runs of `answer` (a known resolution's answer) that `text` does not contain, ignoring the
+/// digits that only number a list line in either.
 fn missing_numbers(answer: &str, text: &str) -> Vec<String> {
-    let present = digit_runs(text);
-    digit_runs(answer)
+    let present = digit_runs(&without_list_markers(text));
+    digit_runs(&without_list_markers(answer))
         .into_iter()
         .filter(|number| !present.contains(number))
         .collect()
+}
+
+fn without_list_markers(text: &str) -> String {
+    text.lines()
+        .map(strip_list_marker)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn digit_runs(text: &str) -> Vec<String> {
@@ -2871,14 +2879,46 @@ async fn draft_with_kr_answer(
     .text
 }
 
-/// Whether any line of `text` starts with a Markdown list marker (`-` / `*` / `+`) followed by a space,
-/// a full-width space, or the end of the line, which must never appear.
+/// Whether any line of `text` starts with a list marker that must never appear: a Markdown bullet
+/// (`-` `*` `+` `•` `－` `＊`) followed by a space, a full-width space, or the end of the line, or a
+/// number closed by `)` or `）`.
 fn has_markdown_list_marker(text: &str) -> bool {
     text.lines().any(|l| {
         let t = l.trim_start();
-        t.strip_prefix(['-', '*', '+'])
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\u{3000}']))
+        bullet_body(t).is_some()
+            || split_number_marker(t).is_some_and(|(_, closer, _)| matches!(closer, ')' | '）'))
     })
+}
+
+fn bullet_body(t: &str) -> Option<&str> {
+    t.strip_prefix(['-', '*', '+', '•', '－', '＊'])
+        .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\u{3000}']))
+}
+
+fn is_marker_digit(c: char) -> bool {
+    c.is_ascii_digit() || ('０'..='９').contains(&c)
+}
+
+fn split_number_marker(t: &str) -> Option<(&str, char, &str)> {
+    let digits_end = t.find(|c: char| !is_marker_digit(c))?;
+    if digits_end == 0 {
+        return None;
+    }
+    let mut after = t[digits_end..].chars();
+    let closer = after
+        .next()
+        .filter(|c| matches!(c, '.' | '．' | ')' | '）'))?;
+    let rest = after.as_str();
+    let decimal_point = matches!(closer, '.' | '．') && rest.starts_with(is_marker_digit);
+    (!decimal_point).then_some((&t[..digits_end], closer, rest))
+}
+
+fn strip_list_marker(line: &str) -> &str {
+    let t = line.trim_start();
+    if let Some(rest) = bullet_body(t).or_else(|| t.strip_prefix('・')) {
+        return rest;
+    }
+    split_number_marker(t).map_or(line, |(_, _, rest)| rest)
 }
 
 /// A deliberately lenient list-line detector for the "stays a paragraph" check: also catches full-width
@@ -2892,18 +2932,14 @@ fn looks_like_list_line(line: &str) -> bool {
     rest.len() != t.len() && rest.starts_with(['.', '．'])
 }
 
-/// The step number of a line shaped as optional indent, ASCII digits, `.`, then a space or end of line.
+/// The step number of a line shaped as optional indent, ASCII digits, `.`, then anything but a digit
+/// (so `1.5GB` is not a step).
 fn numbered_line_number(line: &str) -> Option<usize> {
-    let t = line.trim_start();
-    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 {
+    let (digits, closer, _) = split_number_marker(line.trim_start())?;
+    if closer != '.' {
         return None;
     }
-    let rest = t[digits..].strip_prefix('.')?;
-    if !(rest.is_empty() || rest.starts_with(' ')) {
-        return None;
-    }
-    t[..digits].parse().ok()
+    digits.parse().ok()
 }
 
 /// Asserts the numbered lines of `text` are exactly `1..=phrases.len()` in order (no duplicate, gap, or extra),
@@ -3028,6 +3064,69 @@ fn lenient_list_line_detector_catches_full_width_and_unspaced_numbers_and_bullet
     }
 }
 
+#[test]
+fn numbered_line_number_accepts_an_unspaced_or_full_width_space_step_and_rejects_decimals() {
+    let cases: [(&str, Option<usize>); 11] = [
+        ("1. 動画", Some(1)),
+        ("  2. 常時", Some(2)),
+        ("3.", Some(3)),
+        ("1.動画", Some(1)),
+        ("4.　カメラ", Some(4)),
+        ("12. 手順", Some(12)),
+        ("1.5GB です", None),
+        ("容量は1.5GBです", None),
+        ("1) 動画", None),
+        ("．1 動画", None),
+        ("動画", None),
+    ];
+    for (line, expected) in cases {
+        assert_eq!(numbered_line_number(line), expected, "{line:?}");
+    }
+}
+
+#[test]
+fn markdown_list_marker_detects_numbered_parenthesis_and_unicode_bullets() {
+    for marker in [
+        "1) a",
+        "２) a",
+        "1）a",
+        "• a",
+        "  •　a",
+        "－ a",
+        "＊ a",
+        "•",
+        "10) 手順",
+    ] {
+        assert!(has_markdown_list_marker(marker), "{marker:?}");
+    }
+    for not_marker in ["(1) a", "5度に設定", "ー長音", "•a", "保存は1)です"] {
+        assert!(!has_markdown_list_marker(not_marker), "{not_marker:?}");
+    }
+}
+
+#[test]
+fn missing_numbers_ignores_digits_that_are_only_list_markers() {
+    let cases: [(&str, &str, &[&str]); 7] = [
+        ("1回押す", "1. 押す", &["1"]),
+        ("1回押す", "1. 1回押す", &[]),
+        ("2回押す", "1. 2回押す\n2. 離す", &[]),
+        ("1回押す", "1) 押す", &["1"]),
+        ("1回押す", "1.押す", &["1"]),
+        ("1回押す", "- 1回押す", &[]),
+        ("1.5GB を使う", "容量は1.5GBです", &[]),
+    ];
+    for (answer, text, expected) in cases {
+        assert_eq!(missing_numbers(answer, text), expected, "{text:?}");
+    }
+}
+
+#[test]
+fn missing_numbers_does_not_require_digits_that_the_answer_only_uses_as_list_markers() {
+    assert_eq!(
+        missing_numbers("1. 開く\n2. 閉じる", "開いて閉じる"),
+        Vec::<String>::new()
+    );
+}
 #[test]
 fn kr_fixture_for_case_replaces_only_applicability() {
     let fixture = load_kr_fixture();
