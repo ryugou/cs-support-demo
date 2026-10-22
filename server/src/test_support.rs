@@ -277,6 +277,16 @@ pub(crate) fn filter_warn_and_error_lines(raw: &str) -> String {
         .join("\n")
 }
 
+pub(crate) fn test_tool_service() -> crate::mcp::ToolService {
+    let client = crate::vegapunk::VegapunkClient::connect_lazy_with_limits(
+        "http://vegapunk.invalid:6840",
+        "",
+        crate::vegapunk::GrpcLimits::default(),
+    )
+    .expect("lazy connect never touches the network");
+    crate::mcp::ToolService::new(client)
+}
+
 pub(crate) fn kr_fixture(id: &str, answer: &str) -> KnownResolution {
     KnownResolution {
         id: id.to_string(),

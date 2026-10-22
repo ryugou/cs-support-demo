@@ -70,6 +70,9 @@ const SNAPSHOT_MAX_NODES: i32 = 5000;
 /// （欠落しない。1000 は backend 側の1リクエストあたり上限）。
 const SIGNAL_TRAVERSE_PAGE_SIZE: i32 = 1000;
 
+/// `KnownResolution` の `query_nodes` 上限（ページング未実装。ちょうど到達で load warn）。
+pub(crate) const KNOWN_RESOLUTION_QUERY_LIMIT: i32 = 1000;
+
 /// `signals_from_traverse` が辿る先のノード種別（Signal ノードのみ）。呼び出し元
 /// （`load_case_signals` / `load_known_resolutions`）が値を選ぶ余地を無くし、
 /// production で "Signal" を書く場所をこの1箇所に固定するための定数（Issue #39
@@ -693,59 +696,62 @@ fn known_resolutions_from_nodes(
     kr_nodes: Vec<crate::proto::graphrag::NodeResult>,
     mut kr_signals: HashMap<String, SignalSet>,
 ) -> Result<Vec<KnownResolution>> {
-    kr_nodes
-        .into_iter()
-        .map(|node| {
-            let attrs = &node.attributes;
-            let get = |key: &str| attrs.get(key).cloned().unwrap_or_default();
-            let kr_id = attrs
-                .get("kr_id")
-                .cloned()
-                .ok_or_else(|| anyhow!("KnownResolution missing kr_id"))?;
-            let answer = attrs
-                .get("answer_text")
-                .filter(|v| !v.trim().is_empty())
-                .cloned()
-                .ok_or_else(|| anyhow!("invalid answer_text: empty (kr_id={kr_id})"))?;
-            let verified_at = attrs
-                .get("verified_at")
-                .filter(|v| !v.is_empty())
-                .map(|raw| {
-                    chrono::DateTime::parse_from_rfc3339(raw)
-                        .map(|at| at.with_timezone(&chrono::Utc))
-                        .map_err(|err| anyhow!("invalid verified_at: {err} (kr_id={kr_id})"))
-                })
-                .transpose()?;
-            Ok(KnownResolution {
-                id: kr_id,
-                signal_set: kr_signals.remove(&node.node_id).unwrap_or_default(),
-                applicability: get("applicability"),
-                answer,
-                source_authority: match get("source_authority").as_str() {
-                    "non_authoritative" => SourceAuthority::NonAuthoritative,
-                    _ => SourceAuthority::Authoritative,
-                },
-                root_cause: match get("root_cause").as_str() {
-                    "retrieval_miss" => RootCause::RetrievalMiss,
-                    _ => RootCause::KnowledgeError,
-                },
-                grade: Grade::parse_label(&get("grade")),
-                approval_count: get("approval_count").parse().unwrap_or(0),
-                rejection_count: get("rejection_count").parse().unwrap_or(0),
-                approver_set: csv_list(&get("approver_set")),
-                origin: get("origin"),
-                verified_at,
-                binding: parse_binding(
-                    "known_resolution",
-                    attrs.get("kr_id").map_or("", String::as_str),
-                    attrs.get("binding"),
-                ),
-                registration_trigger: get("registration_trigger"),
-                knowledge_class: get("knowledge_class"),
-                outcome_ref: csv_list(&get("outcome_ref")),
-            })
-        })
-        .collect()
+    let mut resolutions = Vec::with_capacity(kr_nodes.len());
+    for node in kr_nodes {
+        let attrs = &node.attributes;
+        let get = |key: &str| attrs.get(key).cloned().unwrap_or_default();
+        let kr_id = attrs
+            .get("kr_id")
+            .cloned()
+            .ok_or_else(|| anyhow!("KnownResolution missing kr_id"))?;
+        let Some(answer) = attrs
+            .get("answer_text")
+            .filter(|v| !v.trim().is_empty())
+            .cloned()
+        else {
+            tracing::warn!(kr_id = %kr_id, "known resolution skipped: blank answer_text");
+            continue;
+        };
+        let verified_at = attrs
+            .get("verified_at")
+            .filter(|v| !v.is_empty())
+            .and_then(|raw| match chrono::DateTime::parse_from_rfc3339(raw) {
+                Ok(at) => Some(at.with_timezone(&chrono::Utc)),
+                Err(err) => {
+                    tracing::warn!(
+                        kr_id = %kr_id,
+                        error = %err,
+                        "known resolution verified_at ignored: not RFC3339"
+                    );
+                    None
+                }
+            });
+        resolutions.push(KnownResolution {
+            signal_set: kr_signals.remove(&node.node_id).unwrap_or_default(),
+            applicability: get("applicability"),
+            answer,
+            source_authority: match get("source_authority").as_str() {
+                "non_authoritative" => SourceAuthority::NonAuthoritative,
+                _ => SourceAuthority::Authoritative,
+            },
+            root_cause: match get("root_cause").as_str() {
+                "retrieval_miss" => RootCause::RetrievalMiss,
+                _ => RootCause::KnowledgeError,
+            },
+            grade: Grade::parse_label(&get("grade")),
+            approval_count: get("approval_count").parse().unwrap_or(0),
+            rejection_count: get("rejection_count").parse().unwrap_or(0),
+            approver_set: csv_list(&get("approver_set")),
+            origin: get("origin"),
+            verified_at,
+            binding: parse_binding("known_resolution", &kr_id, attrs.get("binding")),
+            registration_trigger: get("registration_trigger"),
+            knowledge_class: get("knowledge_class"),
+            outcome_ref: csv_list(&get("outcome_ref")),
+            id: kr_id,
+        });
+    }
+    Ok(resolutions)
 }
 
 /// PunkRecord（vegapunk）を材料ストアとして読み書きする層。判定は載せない（I4）。
@@ -806,7 +812,6 @@ impl KnowledgeStore {
         &self,
         schema: &str,
     ) -> Result<Vec<crate::proto::graphrag::NodeResult>> {
-        const KNOWN_RESOLUTION_QUERY_LIMIT: i32 = 1000;
         let nodes = self
             .client
             .query_nodes(
@@ -2789,6 +2794,19 @@ mod tests {
         }
     }
 
+    fn kr_node_named(
+        kr_id: &str,
+        answer: &str,
+        verified_at: Option<&str>,
+    ) -> crate::proto::graphrag::NodeResult {
+        let mut node = kr_node_with_verified_at(verified_at);
+        node.attributes
+            .insert("kr_id".to_string(), kr_id.to_string());
+        node.attributes
+            .insert("answer_text".to_string(), answer.to_string());
+        node
+    }
+
     #[test]
     fn known_resolutions_from_nodes_parses_verified_at() {
         let node = kr_node_with_verified_at(Some("2026-10-15T09:30:00+09:00"));
@@ -2816,17 +2834,16 @@ mod tests {
     }
 
     #[test]
-    fn known_resolutions_from_nodes_rejects_an_unparseable_verified_at() {
+    fn known_resolutions_from_nodes_keeps_a_record_with_an_unparseable_verified_at_as_none() {
         let node = kr_node_with_verified_at(Some("yesterday"));
-        let err = known_resolutions_from_nodes(vec![node], HashMap::new())
-            .expect_err("must reject")
-            .to_string();
-        assert!(err.contains("invalid verified_at"), "{err}");
-        assert!(err.contains("kr_id=kr-1"), "{err}");
+        let resolutions = known_resolutions_from_nodes(vec![node], HashMap::new()).expect("builds");
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0].id, "kr-1");
+        assert_eq!(resolutions[0].verified_at, None);
     }
 
     #[test]
-    fn known_resolutions_from_nodes_rejects_a_missing_or_blank_answer_text() {
+    fn known_resolutions_from_nodes_skips_a_missing_or_blank_answer_text() {
         for answer in [None, Some(""), Some("  \n\t")] {
             let mut node = kr_node_with_verified_at(None);
             match answer {
@@ -2835,11 +2852,56 @@ mod tests {
                     .insert("answer_text".to_string(), raw.to_string()),
                 None => node.attributes.remove("answer_text"),
             };
-            let err = known_resolutions_from_nodes(vec![node], HashMap::new())
-                .expect_err("must reject")
-                .to_string();
-            assert_eq!(err, "invalid answer_text: empty (kr_id=kr-1)", "{answer:?}");
+            let resolutions =
+                known_resolutions_from_nodes(vec![node], HashMap::new()).expect("builds");
+            assert!(resolutions.is_empty(), "{answer:?}");
         }
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_returns_the_good_records_around_a_bad_one() {
+        let nodes = vec![
+            kr_node_named(
+                "kr-good-1",
+                "確認してください。",
+                Some("2026-10-15T09:30:00+09:00"),
+            ),
+            kr_node_named("kr-blank", "  ", Some("2026-10-15T09:30:00+09:00")),
+            kr_node_named("kr-bad-date", "再起動してください。", Some("yesterday")),
+            kr_node_named(
+                "kr-good-2",
+                "交換してください。",
+                Some("2026-10-16T00:00:00Z"),
+            ),
+        ];
+        let resolutions = known_resolutions_from_nodes(nodes, HashMap::new()).expect("builds");
+        let ids: Vec<&str> = resolutions.iter().map(|kr| kr.id.as_str()).collect();
+        assert_eq!(ids, ["kr-good-1", "kr-bad-date", "kr-good-2"]);
+        assert_eq!(resolutions[1].verified_at, None);
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_warns_with_the_kr_id_for_each_degraded_record() {
+        let blank = kr_node_named("kr-blank", " ", None);
+        let bad_date = kr_node_named("kr-bad-date", "再起動してください。", Some("yesterday"));
+        let (_, logs) = crate::test_support::capture_logs(|| {
+            known_resolutions_from_nodes(vec![blank, bad_date], HashMap::new())
+        });
+        let logs = crate::test_support::filter_warn_and_error_lines(&logs);
+        assert!(logs.contains("kr_id=kr-blank"), "{logs}");
+        assert!(logs.contains("blank answer_text"), "{logs}");
+        assert!(logs.contains("kr_id=kr-bad-date"), "{logs}");
+        assert!(logs.contains("not RFC3339"), "{logs}");
+    }
+
+    #[test]
+    fn known_resolutions_from_nodes_still_fails_on_a_missing_kr_id() {
+        let mut node = kr_node_with_verified_at(None);
+        node.attributes.remove("kr_id");
+        let err = known_resolutions_from_nodes(vec![node], HashMap::new())
+            .expect_err("must reject")
+            .to_string();
+        assert_eq!(err, "KnownResolution missing kr_id");
     }
 
     #[test]

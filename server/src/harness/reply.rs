@@ -57,7 +57,7 @@ use crate::model::SectionHit;
 /// コスト: 最大 `MAX_EXCERPTS`(3) × 2,500 = 7,500 文字。日本語で概ね 6〜8k トークン程度で、
 /// 下書き 1 件あたりのコストとして許容範囲。**これ以上伸ばすなら、冒頭固定ではなく
 /// 質問に対応する箇所を抜く実装へ変えるべき**（単に上限を上げ続けても質は上がらない）。
-const MAX_EXCERPT_CHARS: usize = 2_500;
+pub(crate) const MAX_EXCERPT_CHARS: usize = 2_500;
 
 /// LLM に渡す抜粋の最大件数。上位ヒットだけで十分な下書きは書ける。
 pub(crate) const MAX_EXCERPTS: usize = 3;

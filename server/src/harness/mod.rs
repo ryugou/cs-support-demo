@@ -98,6 +98,7 @@ pub struct Harness {
     /// Known-resolution ids that are never offered to the judge, to `decide`, or to
     /// `search_known_resolutions` (`config.harness.excluded_known_resolution_ids`).
     pub excluded_known_resolution_ids: Vec<String>,
+    pub(crate) warned_unmatched_excluded_ids: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -980,6 +981,7 @@ impl Harness {
             jev_client,
             kr_applicability,
             excluded_known_resolution_ids: config.harness.excluded_known_resolution_ids.clone(),
+            warned_unmatched_excluded_ids: Default::default(),
         })
     }
 
@@ -1402,7 +1404,7 @@ impl Harness {
         let kr = resolutions
             .iter()
             .find(|kr| kr.id == kr_id)
-            .ok_or_else(|| anyhow!("known_resolution not found: {kr_id}"))?;
+            .ok_or_else(|| anyhow!("known_resolution not found: {kr_id} (check the id; the record may also have been skipped as invalid at load, see the load warn)"))?;
         let attempts = store.load_attempts_for_kr(&ctx.schema, kr_id).await?;
         let counts = grading::derive_outcome_counts(&attempts);
         // 旧形式 actor は名寄せ不能なため昇格判定の母集団から外している（grading.rs）。
@@ -1461,6 +1463,13 @@ impl Harness {
         }
         if answer.trim().is_empty() {
             anyhow::bail!("invalid answer: empty");
+        }
+        let answer_chars = answer.chars().count();
+        if answer_chars > reply::MAX_EXCERPT_CHARS {
+            anyhow::bail!(
+                "invalid answer: exceeds {} characters (got {answer_chars})",
+                reply::MAX_EXCERPT_CHARS
+            );
         }
         // legacy schema (sivira) には Rationale ノード型が無いため、rationale_text を
         // サイレントに落とすのではなく admission 側で拒否する（build 側は無視するだけになる）。
@@ -1918,8 +1927,8 @@ impl Harness {
         // best_manual_sections（＝ evidence lineage）を同一 hit 列から coherent に導出する
         // （score は横断ページ、evidence は別ページ、という不整合を作らない）。この固定は
         // `manual_search_hits`（ManualV1 分岐）の内部に残る。
-        let (section_hits, retrieved_manual_ids): (Vec<SectionHit>, Vec<String>) = self
-            .manual_search_hits(
+        let ((section_hits, retrieved_manual_ids), kr_turn) = self
+            .search_manual_and_prepare_kr_turn(
                 ctx,
                 context_text,
                 &accumulated,
@@ -1927,6 +1936,12 @@ impl Harness {
                 manual_corpus.as_deref(),
                 &live_snapshot,
                 tools,
+                resolutions,
+                &policy,
+                &signals,
+                &domains,
+                question,
+                extraction_mode,
             )
             .await?;
         // Issue #28 codex レビュー採用1(Critical): カバレッジ判定(decide())より前に、取扱外
@@ -1946,19 +1961,7 @@ impl Harness {
             decision_basis,
             stakes_input,
             applicable_known_resolution,
-        } = self
-            .prepare_kr_turn(
-                ctx,
-                resolutions,
-                &policy,
-                &signals,
-                &accumulated,
-                &domains,
-                question,
-                context_text,
-                extraction_mode,
-            )
-            .await;
+        } = kr_turn;
         let decision_result = decision::decide(&decision::DecisionInput {
             question_signals: decide_signals,
             question_raw: question,
@@ -2928,6 +2931,7 @@ mod tests {
             jev_client: None,
             kr_applicability: None,
             excluded_known_resolution_ids: Vec::new(),
+            warned_unmatched_excluded_ids: Default::default(),
         }
     }
 
@@ -4035,6 +4039,42 @@ mod tests {
     }
 
     #[test]
+    fn admit_known_resolution_rejects_an_answer_over_the_excerpt_limit() {
+        let harness = harness_for_test_with_lexicon(
+            r#"{ "signals": [
+                { "signal": "mold", "class": "hazard", "surface_forms": ["カビ"] }
+            ] }"#,
+        );
+        let ctx = supervisor_ctx(
+            "sivira-cs-demo",
+            crate::config::ManualSchemaKind::LegacySection,
+        );
+        let anchors = ["sec#a".to_string()];
+        let limit = reply::MAX_EXCERPT_CHARS;
+        harness
+            .admit_known_resolution(
+                &ctx,
+                &["mold".to_string()],
+                &"あ".repeat(limit),
+                None,
+                &anchors,
+            )
+            .expect("an answer exactly at the limit must be admitted");
+        let err = harness
+            .admit_known_resolution(
+                &ctx,
+                &["mold".to_string()],
+                &"あ".repeat(limit + 1),
+                None,
+                &anchors,
+            )
+            .expect_err("an answer over the limit must be rejected")
+            .to_string();
+        assert!(err.contains(&limit.to_string()), "{err}");
+        assert!(err.contains(&(limit + 1).to_string()), "{err}");
+    }
+
+    #[test]
     fn begin_rejects_out_of_scope_project() {
         let harness = harness_for_test();
         assert!(harness
@@ -4911,7 +4951,7 @@ mod tests {
     // （plan Task 3 Step 1 が要求する退行防止テスト）。入力の組み立ては `decision.rs` の
     // `mod tests` にある layer1/layer2/layer3 系テストの入力例を踏襲する。
 
-    fn contract_test_signals(values: &[&str]) -> signal::SignalSet {
+    pub(super) fn contract_test_signals(values: &[&str]) -> signal::SignalSet {
         values.iter().map(|v| signal::Signal::new(*v)).collect()
     }
 
@@ -6156,7 +6196,7 @@ mod tests {
     pub(super) const CUSTOMER_TEXT: &str = "カメラが反応しません";
     pub(super) const HYBRID: extraction::ExtractionMode = extraction::ExtractionMode::Hybrid;
 
-    fn kr_ctx() -> RequestContext {
+    pub(super) fn kr_ctx() -> RequestContext {
         supervisor_ctx("urtect", crate::config::ManualSchemaKind::ManualV1)
     }
 

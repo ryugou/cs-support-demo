@@ -847,6 +847,7 @@ mod tests {
     use crate::harness::extraction::ExtractionMode;
     use crate::harness::product_gate::{ProductAllowlist, ProductGate};
     use crate::harness::signal::SignalSet;
+    use crate::test_support::test_tool_service;
 
     /// テスト用 schema。`api.rs::tests::TEST_SCHEMA` と同じ値(urtect)を使う必然性は無いが、
     /// 実データに近い値にしておく。
@@ -909,6 +910,7 @@ mod tests {
             jev_client: None,
             kr_applicability: None,
             excluded_known_resolution_ids: Vec::new(),
+            warned_unmatched_excluded_ids: Default::default(),
         }
     }
 
@@ -928,16 +930,6 @@ mod tests {
             }
             ReplyDraftPolicy::Always => panic!("expected SkipWhenUnused, got Always"),
         }
-    }
-
-    fn test_tool_service() -> ToolService {
-        let client = crate::vegapunk::VegapunkClient::connect_lazy_with_limits(
-            "http://vegapunk.invalid:6840",
-            "",
-            crate::vegapunk::GrpcLimits::default(),
-        )
-        .expect("lazy connect never touches the network");
-        ToolService::new(client)
     }
 
     fn test_identity() -> VerifiedIdentity {

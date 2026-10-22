@@ -191,7 +191,7 @@ pub struct KnownResolution {
     pub rejection_count: u32,
     pub approver_set: Vec<String>,
     pub origin: String,
-    /// Registration time of the record; `None` when the node's `verified_at` attribute is missing or empty, which ranks as the oldest in tie-breaks.
+    /// Registration time of the record; `None` when the node's `verified_at` attribute is missing, empty, or not RFC 3339, which ranks as the oldest in tie-breaks.
     pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
     // --- 予約フィールド（Step 1 は既定値のまま。S1-3）---
     pub binding: Binding,
@@ -353,6 +353,18 @@ pub fn exclude_known_resolutions(
     resolutions
         .into_iter()
         .filter(|kr| !excluded.contains(&kr.id))
+        .collect()
+}
+
+/// Returns the entries of `excluded` that match the `id` of none of `resolutions`, keeping input order.
+pub fn unmatched_excluded_known_resolution_ids(
+    resolutions: &[KnownResolution],
+    excluded: &[String],
+) -> Vec<String> {
+    excluded
+        .iter()
+        .filter(|id| !resolutions.iter().any(|kr| &kr.id == *id))
+        .cloned()
         .collect()
 }
 
@@ -835,6 +847,18 @@ mod tests {
                 .with_timezone(&chrono::Utc)
         });
         resolution
+    }
+
+    #[test]
+    fn unmatched_excluded_known_resolution_ids_reports_only_ids_matching_no_record() {
+        let all = vec![kr("a", &["s"], "a"), kr("b", &["s"], "a")];
+        let excluded = ["a".to_string(), "typo".to_string(), "other".to_string()];
+        assert_eq!(
+            unmatched_excluded_known_resolution_ids(&all, &excluded),
+            vec!["typo".to_string(), "other".to_string()]
+        );
+        assert!(unmatched_excluded_known_resolution_ids(&all, &["b".to_string()]).is_empty());
+        assert!(unmatched_excluded_known_resolution_ids(&all, &[]).is_empty());
     }
 
     #[test]
