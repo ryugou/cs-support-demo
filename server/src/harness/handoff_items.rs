@@ -1033,6 +1033,21 @@ mod tests {
     }
 
     #[test]
+    fn passes_handoff_safeguards_accepts_period_terminated_list_items() {
+        let lex = lexicon_with_surface_forms();
+        let items = items_fixture();
+        for drafted in [
+            "・月額は1台1,540円。\n・設置工事費は担当者がご案内します。",
+            "1. 月額は1台1,540円。\n2. 設置工事費は担当者がご案内します。",
+        ] {
+            assert!(
+                passes_handoff_safeguards(drafted, &items, &lex).is_ok(),
+                "{drafted:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn passes_handoff_safeguards_rejects_yen_prefixed_amounts_across_widths_separators_and_spaces()
     {
         let lex = lexicon_with_surface_forms();

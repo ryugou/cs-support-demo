@@ -49,8 +49,9 @@ pub(crate) const CLOSER_BAN_PHRASE: &str =
 /// `truncate_chars` 等の文字数カウントとの齟齬（`**` がそのまま字数を消費する等）も減るため、
 /// 両方を維持する。
 pub(crate) const MARKDOWN_BAN_RULE: &str =
-    "- Markdown 記法（太字・見出し・箇条書き記号・コードブロック・リンク記法）を使わない。\
-     プレーンテキストのみで書く。強調したい語は記号ではなく語順と文で表現する。\n";
+    "- Markdown 記法（太字 `**`・見出し `#`・行頭の `-` `*` のリスト記号・バッククォート・コードブロック・リンク記法）を使わない。\
+     プレーンテキストのみで書く。使うリスト記号は行頭の `1.` `2.` の番号と「・」だけ。各プロンプトが別に指定する番号（①② 等）はその指示どおりに書く。\
+     強調したい語は記号ではなく語順と文で表現する。\n";
 
 pub(crate) const SOURCE_MENTION_BAN_RULE: &str =
     "- 資料・マニュアル・材料・出典・承認済みの回答・ノウハウといった内部の呼び名と、\
@@ -458,6 +459,16 @@ mod tests {
         EmitContext {
             channel: egress::EmitChannel::Operator,
         }
+    }
+
+    #[test]
+    fn markdown_ban_rule_bans_markup_but_allows_plain_lists() {
+        assert!(MARKDOWN_BAN_RULE.contains("バッククォート"));
+        assert!(MARKDOWN_BAN_RULE.contains("`1.`"));
+        assert!(MARKDOWN_BAN_RULE.contains("「・」"));
+        assert!(MARKDOWN_BAN_RULE
+            .contains("各プロンプトが別に指定する番号（①② 等）はその指示どおりに書く"));
+        assert!(!MARKDOWN_BAN_RULE.contains("箇条書き記号"));
     }
 
     #[test]
