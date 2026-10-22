@@ -1834,8 +1834,6 @@ fn kr_applicability_cases() -> [KrCase; 5] {
     ]
 }
 
-/// The digit runs of `answer` (a known resolution's answer) that `text` does not contain, ignoring the
-/// digits that only number a list line in either.
 fn missing_numbers(answer: &str, text: &str) -> Vec<String> {
     let present = digit_runs(&without_list_markers(text));
     digit_runs(&without_list_markers(answer))
@@ -2879,9 +2877,6 @@ async fn draft_with_kr_answer(
     .text
 }
 
-/// Whether any line of `text` starts with a list marker that must never appear: a Markdown bullet
-/// (`-` `*` `+` `•` `－` `＊`) followed by a space, a full-width space, or the end of the line, or a
-/// number closed by `)` or `）`.
 fn has_markdown_list_marker(text: &str) -> bool {
     text.lines().any(|l| {
         let t = l.trim_start();
@@ -2921,8 +2916,6 @@ fn strip_list_marker(line: &str) -> &str {
     split_number_marker(t).map_or(line, |(_, _, rest)| rest)
 }
 
-/// A deliberately lenient list-line detector for the "stays a paragraph" check: also catches what
-/// `numbered_line_number` rejects, namely full-width digits, `．`, `・`, and a number followed by `.` and a digit.
 fn looks_like_list_line(line: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with('・') {
@@ -2932,8 +2925,6 @@ fn looks_like_list_line(line: &str) -> bool {
     rest.len() != t.len() && rest.starts_with(['.', '．'])
 }
 
-/// The step number of a line shaped as optional indent, ASCII digits, `.`, then anything but a digit
-/// (so `1.5GB` is not a step).
 fn numbered_line_number(line: &str) -> Option<usize> {
     let (digits, closer, _) = split_number_marker(line.trim_start())?;
     if closer != '.' {
