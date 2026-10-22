@@ -2921,8 +2921,8 @@ fn strip_list_marker(line: &str) -> &str {
     split_number_marker(t).map_or(line, |(_, _, rest)| rest)
 }
 
-/// A deliberately lenient list-line detector for the "stays a paragraph" check: also catches full-width
-/// digits, `．`, a number with no following space (`1.手順`), and `・`. `numbered_line_number` stays strict.
+/// A deliberately lenient list-line detector for the "stays a paragraph" check: also catches what
+/// `numbered_line_number` rejects, namely full-width digits, `．`, `・`, and a number followed by `.` and a digit.
 fn looks_like_list_line(line: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with('・') {
@@ -3045,11 +3045,37 @@ fn numbered_steps_helper_accepts_only_the_exact_ordered_steps() {
 }
 
 #[test]
-fn markdown_list_marker_detects_dash_star_plus_followed_by_space_or_end() {
-    for marker in ["  - a", "+ a", "  * a", "-　a", "-", "*  ", "+"] {
+fn markdown_list_marker_detects_bullets_and_parenthesized_numbers_but_not_prose() {
+    for marker in [
+        "  - a",
+        "+ a",
+        "  * a",
+        "-　a",
+        "-",
+        "*  ",
+        "+",
+        "1) a",
+        "２) a",
+        "1）a",
+        "• a",
+        "  •　a",
+        "－ a",
+        "＊ a",
+        "•",
+        "10) 手順",
+    ] {
         assert!(has_markdown_list_marker(marker), "{marker:?}");
     }
-    for not_marker in ["-5度", "+a", "・a\n1. b"] {
+    for not_marker in [
+        "-5度",
+        "+a",
+        "・a\n1. b",
+        "(1) a",
+        "5度に設定",
+        "ー長音",
+        "•a",
+        "保存は1)です",
+    ] {
         assert!(!has_markdown_list_marker(not_marker), "{not_marker:?}");
     }
 }
@@ -3081,26 +3107,6 @@ fn numbered_line_number_accepts_an_unspaced_or_full_width_space_step_and_rejects
     ];
     for (line, expected) in cases {
         assert_eq!(numbered_line_number(line), expected, "{line:?}");
-    }
-}
-
-#[test]
-fn markdown_list_marker_detects_numbered_parenthesis_and_unicode_bullets() {
-    for marker in [
-        "1) a",
-        "２) a",
-        "1）a",
-        "• a",
-        "  •　a",
-        "－ a",
-        "＊ a",
-        "•",
-        "10) 手順",
-    ] {
-        assert!(has_markdown_list_marker(marker), "{marker:?}");
-    }
-    for not_marker in ["(1) a", "5度に設定", "ー長音", "•a", "保存は1)です"] {
-        assert!(!has_markdown_list_marker(not_marker), "{not_marker:?}");
     }
 }
 
