@@ -50,7 +50,7 @@ pub(crate) const CLOSER_BAN_PHRASE: &str =
 /// 両方を維持する。
 pub(crate) const MARKDOWN_BAN_RULE: &str =
     "- Markdown 記法（太字 `**`・見出し `#`・行頭の `-` `*` のリスト記号・バッククォート・コードブロック・リンク記法）を使わない。\
-     プレーンテキストのみで書く。使ってよいリストは、行頭が `1.` `2.` の番号行と、行頭が「・」の箇条書き行だけ。\
+     プレーンテキストのみで書く。使うリスト記号は行頭の `1.` `2.` の番号と「・」だけ。各プロンプトが別に指定する番号（①② 等）はその指示どおりに書く。\
      強調したい語は記号ではなく語順と文で表現する。\n";
 
 pub(crate) const SOURCE_MENTION_BAN_RULE: &str =
@@ -466,6 +466,8 @@ mod tests {
         assert!(MARKDOWN_BAN_RULE.contains("バッククォート"));
         assert!(MARKDOWN_BAN_RULE.contains("`1.`"));
         assert!(MARKDOWN_BAN_RULE.contains("「・」"));
+        assert!(MARKDOWN_BAN_RULE
+            .contains("各プロンプトが別に指定する番号（①② 等）はその指示どおりに書く"));
         assert!(!MARKDOWN_BAN_RULE.contains("箇条書き記号"));
     }
 

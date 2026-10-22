@@ -2963,7 +2963,7 @@ async fn real_llm_reply_list_formatting_smoke() {
     assert!(
         !single
             .lines()
-            .any(|l| l.trim_start().starts_with("1.") || l.trim_start().starts_with('・')),
+            .any(|l| numbered_line_number(l).is_some() || l.trim_start().starts_with('・')),
         "single-fact answer must stay a paragraph:\n{single}"
     );
     assert!(!has_markdown_list_marker(&single), "{single}");
