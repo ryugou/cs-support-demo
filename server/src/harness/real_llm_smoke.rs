@@ -2886,7 +2886,10 @@ fn has_markdown_list_marker(text: &str) -> bool {
 }
 
 fn bullet_body(t: &str) -> Option<&str> {
-    t.strip_prefix(['-', '*', '+', '•', '－', '＊'])
+    if let Some(rest) = t.strip_prefix('•') {
+        return Some(rest);
+    }
+    t.strip_prefix(['-', '*', '+', '－', '＊'])
         .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\u{3000}']))
 }
 
@@ -2918,7 +2921,7 @@ fn strip_list_marker(line: &str) -> &str {
 
 fn looks_like_list_line(line: &str) -> bool {
     let t = line.trim_start();
-    if t.starts_with('・') {
+    if t.starts_with(['・', '•']) {
         return true;
     }
     let rest = t.trim_start_matches(is_marker_digit);
@@ -3053,6 +3056,8 @@ fn markdown_list_marker_detects_bullets_and_parenthesized_numbers_but_not_prose(
         "－ a",
         "＊ a",
         "•",
+        "•a",
+        "•クラウドへの録画保存期間は30日間です。",
         "10) 手順",
     ] {
         assert!(has_markdown_list_marker(marker), "{marker:?}");
@@ -3064,7 +3069,6 @@ fn markdown_list_marker_detects_bullets_and_parenthesized_numbers_but_not_prose(
         "(1) a",
         "5度に設定",
         "ー長音",
-        "•a",
         "保存は1)です",
     ] {
         assert!(!has_markdown_list_marker(not_marker), "{not_marker:?}");
@@ -3073,7 +3077,15 @@ fn markdown_list_marker_detects_bullets_and_parenthesized_numbers_but_not_prose(
 
 #[test]
 fn lenient_list_line_detector_catches_full_width_and_unspaced_numbers_and_bullets() {
-    for lenient in ["１．手順", "1.手順", "１.手順", "・手順", "  2．手順"] {
+    for lenient in [
+        "１．手順",
+        "1.手順",
+        "１.手順",
+        "・手順",
+        "  2．手順",
+        "•手順",
+        "•クラウドへの録画保存期間は30日間です。",
+    ] {
         assert!(looks_like_list_line(lenient), "{lenient:?}");
     }
     for plain in ["保存期間は30日です。", "1日あたり"] {
@@ -3103,7 +3115,7 @@ fn numbered_line_number_accepts_an_unspaced_or_full_width_space_step_and_rejects
 
 #[test]
 fn missing_numbers_ignores_digits_that_are_only_list_markers() {
-    let cases: [(&str, &str, &[&str]); 8] = [
+    let cases: [(&str, &str, &[&str]); 10] = [
         ("1. 開く\n2. 閉じる", "開いて閉じる", &[]),
         ("1回押す", "1. 押す", &["1"]),
         ("1回押す", "1. 1回押す", &[]),
@@ -3112,6 +3124,8 @@ fn missing_numbers_ignores_digits_that_are_only_list_markers() {
         ("1回押す", "1.押す", &["1"]),
         ("1回押す", "- 1回押す", &[]),
         ("1.5GB を使う", "容量は1.5GBです", &[]),
+        ("1回押す", "•1回押す", &[]),
+        ("1回押す", "•押す", &["1"]),
     ];
     for (answer, text, expected) in cases {
         assert_eq!(missing_numbers(answer, text), expected, "{text:?}");
