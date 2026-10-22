@@ -454,10 +454,10 @@ pub fn match_advisor_known_resolution<'a>(
     }
 }
 
-/// [`match_advisor_known_resolution`] の前に `excluded`(`[harness] excluded_known_resolution_ids`)
-/// を `rules::exclude_known_resolutions` で取り除く。除外 id の KR は条件が一致しても `None` になる。
-/// 未一致 id の警告は出さない: advisor は homesec schema の KR を読むため、他 schema 向けの除外 id が
-/// 常に「未一致」になり、警告が誤報になる。
+/// Returns the known resolution that [`match_advisor_known_resolution`] selects from `resolutions`
+/// after removing the records whose `id` is in `excluded`.
+///
+/// Emits no warning for entries of `excluded` that match no record.
 pub fn match_advisor_known_resolution_excluding(
     resolutions: Vec<KnownResolution>,
     excluded: &[String],
@@ -1409,29 +1409,51 @@ mod tests {
     }
 
     #[test]
-    fn match_advisor_known_resolution_excluding_table() {
+    fn match_advisor_known_resolution_excluding_drops_only_excluded_ids() {
         let conditions = vec![
             (ConditionKey::Concern, "intrusion".to_string()),
             (ConditionKey::Housing, "apartment_rented".to_string()),
         ];
-        let make = || {
-            vec![kr(
-                "kr-1",
-                &["concern:intrusion", "housing:apartment_rented"],
-                "a",
-            )]
+        let signals = ["concern:intrusion", "housing:apartment_rented"];
+        let identical_resolutions = |n: usize| {
+            (1..=n)
+                .map(|i| kr(&format!("kr-{i}"), &signals, "a"))
+                .collect::<Vec<_>>()
         };
-        let cases: [(&str, Vec<String>, Option<&str>); 3] = [
-            ("excluded id is dropped", vec!["kr-1".to_string()], None),
-            ("empty exclusion keeps it", Vec::new(), Some("kr-1")),
+        let cases: [(&str, usize, Vec<String>, Option<&str>); 6] = [
+            ("excluded id is dropped", 1, vec!["kr-1".to_string()], None),
+            ("empty exclusion keeps it", 1, Vec::new(), Some("kr-1")),
             (
                 "unrelated id keeps it",
+                1,
                 vec!["other".to_string()],
                 Some("kr-1"),
             ),
+            (
+                "two identical: empty exclusion picks the first",
+                2,
+                Vec::new(),
+                Some("kr-1"),
+            ),
+            (
+                "two identical: excluded first falls through to the second",
+                2,
+                vec!["kr-1".to_string()],
+                Some("kr-2"),
+            ),
+            (
+                "two identical: excluding both yields none",
+                2,
+                vec!["kr-1".to_string(), "kr-2".to_string()],
+                None,
+            ),
         ];
-        for (name, excluded, want) in cases {
-            let got = match_advisor_known_resolution_excluding(make(), &excluded, &conditions);
+        for (name, n, excluded, want) in cases {
+            let got = match_advisor_known_resolution_excluding(
+                identical_resolutions(n),
+                &excluded,
+                &conditions,
+            );
             assert_eq!(got.as_ref().map(|k| k.id.as_str()), want, "{name}");
         }
     }
