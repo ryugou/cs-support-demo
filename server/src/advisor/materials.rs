@@ -10,7 +10,9 @@
 //! 被害の範囲が原因に対して不釣り合いに大きい。
 
 use crate::advisor::understand::ConditionKey;
-use crate::harness::rules::{match_known_resolution, KnownResolution, KrMatch};
+use crate::harness::rules::{
+    exclude_known_resolutions, match_known_resolution, KnownResolution, KrMatch,
+};
 use crate::harness::signal::{Signal, SignalSet};
 use crate::manual::retrieval::kind_marker;
 use crate::proto::graphrag::SearchResultItem;
@@ -450,6 +452,19 @@ pub fn match_advisor_known_resolution<'a>(
         KrMatch::Applicable(kr) => Some(kr),
         KrMatch::BlockedByAddedSignal { .. } | KrMatch::None => None,
     }
+}
+
+/// Returns the known resolution that [`match_advisor_known_resolution`] selects from `resolutions`
+/// after removing the records whose `id` is in `excluded`.
+///
+/// Emits no warning for entries of `excluded` that match no record.
+pub fn match_advisor_known_resolution_excluding(
+    resolutions: Vec<KnownResolution>,
+    excluded: &[String],
+    conditions: &[(ConditionKey, String)],
+) -> Option<KnownResolution> {
+    let resolutions = exclude_known_resolutions(resolutions, excluded);
+    match_advisor_known_resolution(&resolutions, conditions).cloned()
 }
 
 /// KR がヒットしたときに材料リストの先頭へ注入する合成材料(design doc §4.4)。
@@ -1391,6 +1406,56 @@ mod tests {
         ];
         let matched = match_advisor_known_resolution(&resolutions, &conditions);
         assert_eq!(matched.map(|kr| kr.id.as_str()), Some("kr-1"));
+    }
+
+    #[test]
+    fn match_advisor_known_resolution_excluding_drops_only_excluded_ids() {
+        let conditions = vec![
+            (ConditionKey::Concern, "intrusion".to_string()),
+            (ConditionKey::Housing, "apartment_rented".to_string()),
+        ];
+        let signals = ["concern:intrusion", "housing:apartment_rented"];
+        let identical_resolutions = |n: usize| {
+            (1..=n)
+                .map(|i| kr(&format!("kr-{i}"), &signals, "a"))
+                .collect::<Vec<_>>()
+        };
+        let cases: [(&str, usize, Vec<String>, Option<&str>); 6] = [
+            ("excluded id is dropped", 1, vec!["kr-1".to_string()], None),
+            ("empty exclusion keeps it", 1, Vec::new(), Some("kr-1")),
+            (
+                "unrelated id keeps it",
+                1,
+                vec!["other".to_string()],
+                Some("kr-1"),
+            ),
+            (
+                "two identical: empty exclusion picks the first",
+                2,
+                Vec::new(),
+                Some("kr-1"),
+            ),
+            (
+                "two identical: excluded first falls through to the second",
+                2,
+                vec!["kr-1".to_string()],
+                Some("kr-2"),
+            ),
+            (
+                "two identical: excluding both yields none",
+                2,
+                vec!["kr-1".to_string(), "kr-2".to_string()],
+                None,
+            ),
+        ];
+        for (name, n, excluded, want) in cases {
+            let got = match_advisor_known_resolution_excluding(
+                identical_resolutions(n),
+                &excluded,
+                &conditions,
+            );
+            assert_eq!(got.as_ref().map(|k| k.id.as_str()), want, "{name}");
+        }
     }
 
     #[test]

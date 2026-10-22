@@ -345,10 +345,19 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub customer_reply_draft_enabled: bool,
     /// Ids of known resolutions excluded from the known-resolution selection of `evaluate` and
-    /// from `search_known_resolutions`; the advisor's own match (`match_advisor_known_resolution`)
-    /// does not apply it. The filtered list is also what `decide` sees, so a known resolution in
-    /// this list never makes `decide` return the layer-3 reason `UnknownAddedSignal`. Defaults to
-    /// empty.
+    /// from `search_known_resolutions`. The filtered list is also what `decide` sees, so a known
+    /// resolution in this list never makes `decide` return the layer-3 reason
+    /// `UnknownAddedSignal`. Defaults to empty.
+    ///
+    /// The list also applies to the homesec advisor's own match
+    /// (`match_advisor_known_resolution_excluding`), which emits no unmatched-id warning. In the
+    /// homesec binary the same list is also applied by the support harness on the support schema
+    /// (`[advisor] support_schema`), which warns for each id matching no support-schema known
+    /// resolution. So an id meant for a homesec known resolution also logs that "matches no known
+    /// resolution" warning there. That warning is expected for such an id, so it does not
+    /// distinguish a typo: the operator must check homesec ids against the homesec schema's known
+    /// resolutions, because the advisor itself never warns. An id meant for the support schema is
+    /// also applied to the advisor.
     #[serde(default)]
     pub excluded_known_resolution_ids: Vec<String>,
     /// 返信文下書きの `max_tokens`。signal 抽出用（`[llm] max_tokens`、既定 600）とは別枠。

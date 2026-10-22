@@ -593,10 +593,14 @@ async fn draft_with_materials(
             Vec::new()
         }
     };
-    let kr = materials::match_advisor_known_resolution(&resolutions, conditions);
+    let kr = materials::match_advisor_known_resolution_excluding(
+        resolutions,
+        &state.harness.excluded_known_resolution_ids,
+        conditions,
+    );
     let (searched, own_products, category_pool) =
         materials::gather_materials(&state.vegapunk, schema, search_query, conditions).await;
-    let mut composed = materials::compose_materials(kr, searched);
+    let mut composed = materials::compose_materials(kr.as_ref(), searched);
     let concern_category = materials::concern_category(conditions);
     if materials::should_guarantee_own_products(product_intent, conditions) {
         let guaranteed = materials::select_own_product_materials(&own_products, concern_category);
