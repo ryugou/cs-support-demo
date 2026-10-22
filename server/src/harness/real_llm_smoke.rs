@@ -2928,7 +2928,7 @@ fn looks_like_list_line(line: &str) -> bool {
     if t.starts_with('・') {
         return true;
     }
-    let rest = t.trim_start_matches(|c: char| c.is_ascii_digit() || ('０'..='９').contains(&c));
+    let rest = t.trim_start_matches(is_marker_digit);
     rest.len() != t.len() && rest.starts_with(['.', '．'])
 }
 
@@ -3106,7 +3106,8 @@ fn markdown_list_marker_detects_numbered_parenthesis_and_unicode_bullets() {
 
 #[test]
 fn missing_numbers_ignores_digits_that_are_only_list_markers() {
-    let cases: [(&str, &str, &[&str]); 7] = [
+    let cases: [(&str, &str, &[&str]); 8] = [
+        ("1. 開く\n2. 閉じる", "開いて閉じる", &[]),
         ("1回押す", "1. 押す", &["1"]),
         ("1回押す", "1. 1回押す", &[]),
         ("2回押す", "1. 2回押す\n2. 離す", &[]),
@@ -3120,13 +3121,6 @@ fn missing_numbers_ignores_digits_that_are_only_list_markers() {
     }
 }
 
-#[test]
-fn missing_numbers_does_not_require_digits_that_the_answer_only_uses_as_list_markers() {
-    assert_eq!(
-        missing_numbers("1. 開く\n2. 閉じる", "開いて閉じる"),
-        Vec::<String>::new()
-    );
-}
 #[test]
 fn kr_fixture_for_case_replaces_only_applicability() {
     let fixture = load_kr_fixture();
