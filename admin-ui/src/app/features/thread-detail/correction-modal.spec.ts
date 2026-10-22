@@ -130,4 +130,37 @@ describe('CorrectionModalComponent', () => {
     expect(fixture.componentInstance.errorMessage()).toBe('signals must not be empty');
     httpMock.verify();
   });
+
+  describe('answer 文字数上限（サーバの chars().count() と一致）', () => {
+    function ready(answer: string) {
+      const { fixture } = setup({ initialSignals: ['s1'] });
+      fixture.componentInstance.applicability.set('適用条件');
+      fixture.componentInstance.answer.set(answer);
+      return fixture;
+    }
+
+    it('ちょうど 2,500 文字なら送信できる', () => {
+      expect(ready('あ'.repeat(2_500)).componentInstance.canSubmit()).toBe(true);
+    });
+
+    it('2,501 文字なら送信できない', () => {
+      expect(ready('あ'.repeat(2_501)).componentInstance.canSubmit()).toBe(false);
+    });
+
+    it('サロゲートペアは 1 文字として数え、2,500 個の絵文字は送信できる', () => {
+      const fixture = ready('😀'.repeat(2_500));
+      expect(fixture.componentInstance.answerLength()).toBe(2_500);
+      expect(fixture.componentInstance.canSubmit()).toBe(true);
+    });
+
+    it('サロゲートペア 2,501 個は送信できない', () => {
+      expect(ready('😀'.repeat(2_501)).componentInstance.canSubmit()).toBe(false);
+    });
+
+    it('上限と現在の文字数を画面に表示する', () => {
+      const fixture = ready('あ'.repeat(3));
+      fixture.detectChanges();
+      expect(fixture.nativeElement.textContent).toContain('3 / 2,500 文字');
+    });
+  });
 });
