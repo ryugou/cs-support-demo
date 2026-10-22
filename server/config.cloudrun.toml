@@ -58,6 +58,10 @@ manual_scoring_v2_enabled = true
 # false にして再デプロイするだけ。文面の正本は client 側という結論は不変
 # （specs/production-cs-mcp.md「message_policy の扱い」を参照）。
 customer_reply_draft_enabled = true
+# 返信文下書きの生成上限。既定 700 だと約 20 手順の承認済み回答で下書きが途中で切れ
+# （stop_reason=max_tokens）、定型フォールバック文に倒れる（実 LLM で実測、Issue #124）。
+# 上限は出力の天井で、短い下書きの費用・遅延は変わらない。
+customer_reply_draft_max_tokens = 1500
 
 [harness.thresholds]
 low = 0.6

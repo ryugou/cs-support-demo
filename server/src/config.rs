@@ -682,6 +682,23 @@ enough_info_threshold = 0.42
             });
     }
 
+    /// Issue #124: a known resolution of ~20 steps overflows the default 700 tokens (measured with
+    /// the real LLM: the draft was cut and the fixed template was sent). Production must set a
+    /// larger cap; the shared default stays 700.
+    #[test]
+    fn cloudrun_reply_draft_max_tokens_fits_long_step_materials() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.cloudrun.toml");
+        let cfg = AppConfig::load(std::path::Path::new(path))
+            .unwrap_or_else(|err| panic!("{path} must load: {err}"));
+        assert_eq!(default_reply_draft_max_tokens(), 700);
+        assert!(
+            cfg.harness.customer_reply_draft_max_tokens >= 1500,
+            "{path} [harness] customer_reply_draft_max_tokens must be >= 1500 so that a \
+             20-step known resolution is not cut at the generation limit (got {})",
+            cfg.harness.customer_reply_draft_max_tokens
+        );
+    }
+
     #[test]
     fn project_defaults_to_legacy_section() {
         let toml = r#"
