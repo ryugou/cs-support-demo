@@ -715,7 +715,7 @@ known_resolution {
 - グラフ経路: `Signal` ノード一致 → `HAS_SIGNAL` 逆辺で `KnownResolution` を引く（QueryNodes traverse）。L/Λ ネイティブ形。
 - ベクトル経路: 質問 signal テキストを embed し `KnownResolution` / `Signal` の近傍取得（新オペレータ不要）。
 
-`search_known_resolutions` とホームセキュリティアドバイザ自身の KR 照合（`match_advisor_known_resolution`）では、最終の適用可否は下の Rust 集合演算が決める（検索は候補出しにすぎない）。どちらの経路も照合前に `rules::exclude_known_resolutions` で `excluded_known_resolution_ids` の KR を除く（アドバイザは `match_advisor_known_resolution_excluding` が除く）。この一覧はアドバイザ（homesec schema）と support schema で共有する。アドバイザは homesec の KR に一致しない id の警告を出さない。一方、ホームセキュリティアドバイザのバイナリでは support schema（`[advisor] support_schema`）の harness も同じ一覧を適用し、support schema の KR に一致しない id ごとに警告を 1 回出す。そのため homesec の KR 向けの id には、この support schema 側の警告が必ず出る。この警告は想定どおりで、タイプミスの兆候ではない。運用者は homesec の id を homesec schema の KR で確認し、この警告だけを理由に id を外さない。`evaluate` の KR 選定は下の「`evaluate` の KR 選定」に従う。
+`search_known_resolutions` とホームセキュリティアドバイザ自身の KR 照合（`match_advisor_known_resolution`）では、最終の適用可否は下の Rust 集合演算が決める（検索は候補出しにすぎない）。どちらの経路も照合前に `rules::exclude_known_resolutions` で `excluded_known_resolution_ids` の KR を除く（アドバイザは `match_advisor_known_resolution_excluding` が除く）。この一覧はアドバイザ（homesec schema）と support schema で共有する。アドバイザは homesec の KR に一致しない id の警告を出さない。一方、ホームセキュリティアドバイザのバイナリでは support schema（`[advisor] support_schema`）の harness も同じ一覧を適用し、support schema の KR に一致しない id ごとに警告を 1 回出す。そのため homesec の KR 向けの id は、support schema に同じ id の KR が無い限り、この support schema 側の警告の対象になる。この警告は想定どおりで、タイプミスの兆候ではない。運用者は homesec の id を homesec schema の KR で確認し、この警告だけを理由に id を外さない。`evaluate` の KR 選定は下の「`evaluate` の KR 選定」に従う。
 
 照合アルゴリズム（Rust・決定論。`search_known_resolutions`・`match_advisor_known_resolution` の適用可否と、`evaluate` の第3層の理由判定）:
 
