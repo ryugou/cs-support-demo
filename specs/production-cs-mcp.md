@@ -715,7 +715,7 @@ known_resolution {
 - グラフ経路: `Signal` ノード一致 → `HAS_SIGNAL` 逆辺で `KnownResolution` を引く（QueryNodes traverse）。L/Λ ネイティブ形。
 - ベクトル経路: 質問 signal テキストを embed し `KnownResolution` / `Signal` の近傍取得（新オペレータ不要）。
 
-`search_known_resolutions` とホームセキュリティアドバイザ自身の KR 照合（`match_advisor_known_resolution`）では、最終の適用可否は下の Rust 集合演算が決める（検索は候補出しにすぎない）。`match_advisor_known_resolution` は照合前に `excluded_known_resolution_ids` の KR を除く（下記「`evaluate` の KR 選定」の「アドバイザ自身の KR 照合」）。`evaluate` の KR 選定は下の「`evaluate` の KR 選定」に従う。
+`search_known_resolutions` とホームセキュリティアドバイザ自身の KR 照合（`match_advisor_known_resolution`）では、最終の適用可否は下の Rust 集合演算が決める（検索は候補出しにすぎない）。`search_known_resolutions` とアドバイザ自身の KR 照合は、どちらも照合前に `rules::exclude_known_resolutions` で `excluded_known_resolution_ids` の KR を除く（アドバイザは `match_advisor_known_resolution_excluding` を通して除く）。この一覧はアドバイザ（homesec schema）と support schema で共有する。アドバイザは homesec の KR に一致しない id の警告を出さないため、運用者は homesec の id を homesec schema で確認する。`evaluate` の KR 選定は下の「`evaluate` の KR 選定」に従う。
 
 照合アルゴリズム（Rust・決定論。`search_known_resolutions`・`match_advisor_known_resolution` の適用可否と、`evaluate` の第3層の理由判定）:
 
@@ -736,7 +736,6 @@ match_known_resolution(question_signals: SignalSet) -> Option<known_resolution>:
 `evaluate` の KR 選定（MCP `evaluate_answerability` を含む。正本は `docs/superpowers/specs/2026-10-17-hearing-first-escalation-design.md` §8）:
 
 - 概要: `excluded_known_resolution_ids` を除き、`signals` が decide の signal 集合に含まれる KR（残余 signal は許す）を最大 3 件選び、LLM の適用可否判定（`kr_applicability`）で高々 1 件に絞る。蓄積 signal に含まれる危険 signal（取次後もターンをまたいで効く）・lexicon フォールバック・判定器未設定・判定失敗では選定しない。順位・失敗時の扱いは設計 §8。
-- アドバイザ自身の KR 照合: `match_advisor_known_resolution` は照合前に `rules::exclude_known_resolutions` で `excluded_known_resolution_ids` の KR を除く。この一覧はアドバイザと support の両 schema で共有する。アドバイザは homesec の KR に一致しない id の警告を出さないため、運用者は homesec の id を homesec schema で確認する。
 - 第3層の理由: `decide` は `match_known_resolution` を、`UnknownAddedSignal` と `InsufficientDirectness` の選択にだけ使い、この呼び出しで KR を適用することはない。
 
 ## S1-4. 出口ゲート（egress_gate）
