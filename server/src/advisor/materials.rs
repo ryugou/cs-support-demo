@@ -10,7 +10,9 @@
 //! 被害の範囲が原因に対して不釣り合いに大きい。
 
 use crate::advisor::understand::ConditionKey;
-use crate::harness::rules::{match_known_resolution, KnownResolution, KrMatch};
+use crate::harness::rules::{
+    exclude_known_resolutions, match_known_resolution, KnownResolution, KrMatch,
+};
 use crate::harness::signal::{Signal, SignalSet};
 use crate::manual::retrieval::kind_marker;
 use crate::proto::graphrag::SearchResultItem;
@@ -450,6 +452,19 @@ pub fn match_advisor_known_resolution<'a>(
         KrMatch::Applicable(kr) => Some(kr),
         KrMatch::BlockedByAddedSignal { .. } | KrMatch::None => None,
     }
+}
+
+/// [`match_advisor_known_resolution`] の前に `excluded`(`[harness] excluded_known_resolution_ids`)
+/// を `rules::exclude_known_resolutions` で取り除く。除外 id の KR は条件が一致しても `None` になる。
+/// 未一致 id の警告は出さない: advisor は homesec schema の KR を読むため、他 schema 向けの除外 id が
+/// 常に「未一致」になり、警告が誤報になる。
+pub fn match_advisor_known_resolution_excluding(
+    resolutions: Vec<KnownResolution>,
+    excluded: &[String],
+    conditions: &[(ConditionKey, String)],
+) -> Option<KnownResolution> {
+    let resolutions = exclude_known_resolutions(resolutions, excluded);
+    match_advisor_known_resolution(&resolutions, conditions).cloned()
 }
 
 /// KR がヒットしたときに材料リストの先頭へ注入する合成材料(design doc §4.4)。
@@ -1391,6 +1406,34 @@ mod tests {
         ];
         let matched = match_advisor_known_resolution(&resolutions, &conditions);
         assert_eq!(matched.map(|kr| kr.id.as_str()), Some("kr-1"));
+    }
+
+    #[test]
+    fn match_advisor_known_resolution_excluding_table() {
+        let conditions = vec![
+            (ConditionKey::Concern, "intrusion".to_string()),
+            (ConditionKey::Housing, "apartment_rented".to_string()),
+        ];
+        let make = || {
+            vec![kr(
+                "kr-1",
+                &["concern:intrusion", "housing:apartment_rented"],
+                "a",
+            )]
+        };
+        let cases: [(&str, Vec<String>, Option<&str>); 3] = [
+            ("excluded id is dropped", vec!["kr-1".to_string()], None),
+            ("empty exclusion keeps it", Vec::new(), Some("kr-1")),
+            (
+                "unrelated id keeps it",
+                vec!["other".to_string()],
+                Some("kr-1"),
+            ),
+        ];
+        for (name, excluded, want) in cases {
+            let got = match_advisor_known_resolution_excluding(make(), &excluded, &conditions);
+            assert_eq!(got.as_ref().map(|k| k.id.as_str()), want, "{name}");
+        }
     }
 
     #[test]

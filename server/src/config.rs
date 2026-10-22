@@ -345,8 +345,9 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub customer_reply_draft_enabled: bool,
     /// Ids of known resolutions excluded from the known-resolution selection of `evaluate` and
-    /// from `search_known_resolutions`; the advisor's own match (`match_advisor_known_resolution`)
-    /// does not apply it. The filtered list is also what `decide` sees, so a known resolution in
+    /// from `search_known_resolutions`, and from the homesec advisor's own match
+    /// (`match_advisor_known_resolution_excluding`; it does not warn about ids matching no loaded
+    /// record, because the advisor reads its own schema). The filtered list is also what `decide` sees, so a known resolution in
     /// this list never makes `decide` return the layer-3 reason `UnknownAddedSignal`. Defaults to
     /// empty.
     #[serde(default)]
