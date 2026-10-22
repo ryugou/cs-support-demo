@@ -2414,6 +2414,7 @@ mod tests {
             jev_client: None,
             kr_applicability: None,
             excluded_known_resolution_ids: Vec::new(),
+            warned_unmatched_excluded_ids: Default::default(),
         }
     }
 
@@ -2795,6 +2796,7 @@ clarify_max_turns = 3
             jev_client: None,
             kr_applicability: None,
             excluded_known_resolution_ids: Vec::new(),
+            warned_unmatched_excluded_ids: Default::default(),
         };
         state.support_harness = Arc::new(support_harness);
         state.support_schema = support_schema.to_string();

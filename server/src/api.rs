@@ -6065,6 +6065,7 @@ mod tests {
             jev_client: None,
             kr_applicability: None,
             excluded_known_resolution_ids: Vec::new(),
+            warned_unmatched_excluded_ids: Default::default(),
         }
     }
 

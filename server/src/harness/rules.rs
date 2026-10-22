@@ -356,6 +356,18 @@ pub fn exclude_known_resolutions(
         .collect()
 }
 
+/// Returns the entries of `excluded` that match the `id` of none of `resolutions`, keeping input order.
+pub fn unmatched_excluded_known_resolution_ids(
+    resolutions: &[KnownResolution],
+    excluded: &[String],
+) -> Vec<String> {
+    excluded
+        .iter()
+        .filter(|id| !resolutions.iter().any(|kr| &kr.id == *id))
+        .cloned()
+        .collect()
+}
+
 /// Returns the known resolutions whose non-empty signal set is a subset of `signals`, ordered by
 /// larger signal set, newer `verified_at`, then smaller id, truncated to `limit`.
 pub fn known_resolution_candidates<'a>(
@@ -835,6 +847,18 @@ mod tests {
                 .with_timezone(&chrono::Utc)
         });
         resolution
+    }
+
+    #[test]
+    fn unmatched_excluded_known_resolution_ids_reports_only_ids_matching_no_record() {
+        let all = vec![kr("a", &["s"], "a"), kr("b", &["s"], "a")];
+        let excluded = ["a".to_string(), "typo".to_string(), "other".to_string()];
+        assert_eq!(
+            unmatched_excluded_known_resolution_ids(&all, &excluded),
+            vec!["typo".to_string(), "other".to_string()]
+        );
+        assert!(unmatched_excluded_known_resolution_ids(&all, &["b".to_string()]).is_empty());
+        assert!(unmatched_excluded_known_resolution_ids(&all, &[]).is_empty());
     }
 
     #[test]
