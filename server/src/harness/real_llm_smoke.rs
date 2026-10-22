@@ -2352,12 +2352,21 @@ async fn check_led_draft(judge: &dyn JudgeLedSafety, draft_text: &str) -> Result
     led_safety_verdict(&judge_led_safety(judge, draft_text).await?, draft_text)
 }
 
-#[tokio::test]
-#[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
-async fn real_llm_kr_applicability_smoke() {
-    use super::kr_applicability::{AnthropicKrApplicability, JudgeKrApplicability};
+/// Everything the two KR-based smokes share. `_dir` must live as long as the test: the harness
+/// writes its worm audit log and queue there.
+struct KrSmokeSetup {
+    _dir: TempDir,
+    fx: Fixture,
+    fixture: Vec<rules::KnownResolution>,
+    ctx: super::RequestContext,
+    client: AnthropicClient,
+}
 
-    init_warn_subscriber();
+/// Builds the harness with the real KR-applicability judge, the fixture and the request context.
+/// `label` names the actor (`google-sub:{label}`, `{label}@sivira.co`) and the request id
+/// (`{label}-request-id`).
+fn kr_smoke_setup(label: &str) -> KrSmokeSetup {
+    use super::kr_applicability::{AnthropicKrApplicability, JudgeKrApplicability};
 
     let (config, client) = load_config_and_client();
     let lexicon = Arc::new(
@@ -2369,18 +2378,15 @@ async fn real_llm_kr_applicability_smoke() {
     let dir =
         TempDir(std::env::temp_dir().join(format!("real-llm-smoke-{}", uuid::Uuid::new_v4())));
     std::fs::create_dir_all(&dir.0).expect("create temp dir for the harness worm audit log/queue");
-
     let mut harness = build_harness(&config, client.clone(), &lexicon, &dir.0);
     harness.kr_applicability =
         Some(Arc::new(AnthropicKrApplicability::new(client.clone()))
             as Arc<dyn JudgeKrApplicability>);
-    let led_judge = AnthropicLedSafety { client };
     let fx = build_fixture(config, harness, lexicon);
-    let fixture = load_kr_fixture();
     let ctx = super::RequestContext {
         actor: authn::Actor {
-            sub: "google-sub:kr-smoke".to_string(),
-            email: "kr-smoke@sivira.co".to_string(),
+            sub: format!("google-sub:{label}"),
+            email: format!("{label}@sivira.co"),
             role: authn::Role::Supervisor,
             allowed_schemas: vec!["urtect".to_string()],
         },
@@ -2390,9 +2396,75 @@ async fn real_llm_kr_applicability_smoke() {
             label_allowlist: None,
         },
         schema: "urtect".to_string(),
-        request_id: "kr-smoke-request-id".to_string(),
+        request_id: format!("{label}-request-id"),
         manual_schema: crate::config::ManualSchemaKind::ManualV1,
     };
+    KrSmokeSetup {
+        _dir: dir,
+        fx,
+        fixture: load_kr_fixture(),
+        ctx,
+        client,
+    }
+}
+
+/// Decides the turn for `utterance`, drafts the reply on the real model and requires the draft to
+/// pass `assert_draft_accepted`. `heading` titles the printed draft; `context` is the panic prefix
+/// of the acceptance check; a missing draft panics with `no_draft`.
+async fn draft_for_kr_turn(
+    fx: &Fixture,
+    turn: &super::kr_selection::KrTurn<'_>,
+    utterance: &str,
+    request_id: &str,
+    heading: &str,
+    context: &str,
+    no_draft: &str,
+) -> crate::llm::ReplyDraft {
+    let decision = decide_kr_turn(
+        &fx.config,
+        &fx.escalation_rules,
+        &fx.prohibited_domains,
+        &fx.thresholds,
+        turn.decide_signals,
+        utterance,
+        &turn.resolutions,
+        turn.applicable_known_resolution.as_ref(),
+        &turn.stakes_input,
+    );
+    let draft = fx
+        .harness
+        .draft_customer_reply(
+            utterance,
+            request_id,
+            &decision,
+            &[],
+            &turn.resolutions,
+            &[],
+            false,
+            &fx.allowlist,
+            &[],
+            false,
+        )
+        .await
+        .unwrap_or_else(|| panic!("{no_draft}"));
+    println!("--- {heading} ---\n{}\n--- end ---", draft.text);
+    assert_draft_accepted(fx, &draft, false, &[], context);
+    draft
+}
+
+#[tokio::test]
+#[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
+async fn real_llm_kr_applicability_smoke() {
+    init_warn_subscriber();
+
+    let KrSmokeSetup {
+        _dir,
+        fx,
+        fixture,
+        ctx,
+        client,
+    } = kr_smoke_setup("kr-smoke");
+    let led_judge = AnthropicLedSafety { client };
 
     for case in kr_applicability_cases() {
         run_kr_case(&fx, &ctx, &fixture, &case, &led_judge).await;
@@ -2663,46 +2735,19 @@ async fn assert_draft_follows_kr(
         .applicable_known_resolution
         .as_ref()
         .expect("selected id was asserted above");
-    let decision = decide_kr_turn(
-        &fx.config,
-        &fx.escalation_rules,
-        &fx.prohibited_domains,
-        &fx.thresholds,
-        turn.decide_signals,
-        case.utterance,
-        &turn.resolutions,
-        turn.applicable_known_resolution.as_ref(),
-        &turn.stakes_input,
-    );
-    let draft = fx
-        .harness
-        .draft_customer_reply(
-            case.utterance,
-            "kr-smoke-request-id",
-            &decision,
-            &[],
-            &turn.resolutions,
-            &[],
-            false,
-            &fx.allowlist,
-            &[],
-            false,
-        )
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "case {}: draft_customer_reply generated no draft for the selected known resolution",
-                case.label
-            )
-        });
-    println!("--- final draft ({}) ---\n{}", case.label, draft.text);
-    assert_draft_accepted(
+    let draft = draft_for_kr_turn(
         fx,
-        &draft,
-        false,
-        &[],
+        &turn,
+        case.utterance,
+        "kr-smoke-request-id",
+        &format!("final draft ({})", case.label),
         &format!("case {} ({:?})", case.label, case.utterance),
-    );
+        &format!(
+            "case {}: draft_customer_reply generated no draft for the selected known resolution",
+            case.label
+        ),
+    )
+    .await;
     if kr.id == KR_LED {
         if let Err(reason) = check_led_draft(led_judge, &draft.text).await {
             panic!(
@@ -2773,6 +2818,188 @@ fn digit_runs_split_a_comma_not_followed_by_exactly_three_digits() {
     );
 }
 
+const KR_STEPS_ANSWER: &str = "24時間録画の確認方法\n「動画」\n↓\n「SDカードへ常時録画」\n↓\n確認したいカメラを選択\n↓\nカレンダーから確認したい日付を選択\n↓\nタイムラインをご確認ください。\nタイムラインに録画が連続して表示されていれば、24時間録画ができている状態です。\n例えば「10月8日の午前10時頃」の映像を確認したい場合は、10月8日を選択し、タイムラインを10時頃まで移動して再生してください。";
+const KR_SINGLE_FACT_ANSWER: &str =
+    "クラウドへの録画保存期間は30日間です。31日目以降の映像は自動的に削除されます。";
+
+/// Issue #123 listing-format check on the real model. Runs the retention KR's selection, swaps in
+/// the given answer text (both on the selected record and in the resolutions list) and drafts a reply.
+async fn draft_with_kr_answer(
+    fx: &Fixture,
+    ctx: &super::RequestContext,
+    fixture: &[rules::KnownResolution],
+    answer: &str,
+    utterance: &str,
+    label: &str,
+) -> String {
+    use super::signal::SignalNormalizer;
+    let selection_utterance = "クラウドの保存期間は何日ですか？";
+    let signals = fx.lexicon.normalize(selection_utterance);
+    let mut turn = fx
+        .harness
+        .prepare_kr_turn(
+            ctx,
+            fixture.to_vec(),
+            &ReplyDraftPolicy::Always,
+            &signals,
+            &signals,
+            &fx.prohibited_domains,
+            selection_utterance,
+            selection_utterance,
+            extraction::ExtractionMode::Hybrid,
+        )
+        .await;
+    let kr = turn
+        .applicable_known_resolution
+        .as_mut()
+        .expect("the retention known resolution must be selected for the listing smoke");
+    kr.answer = answer.to_owned();
+    let id = kr.id.clone();
+    for r in turn.resolutions.iter_mut().filter(|r| r.id == id) {
+        r.answer = answer.to_owned();
+    }
+    draft_for_kr_turn(
+        fx,
+        &turn,
+        utterance,
+        "list-smoke-request-id",
+        &format!("draft ({label})"),
+        label,
+        &format!("{label}: no draft was generated"),
+    )
+    .await
+    .text
+}
+
+/// Whether any line of `text` starts with a Markdown list marker (`-` / `*`), which must never appear.
+fn has_markdown_list_marker(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("- ") || t.starts_with("* ")
+    })
+}
+
+/// The step number of a line shaped as optional indent, ASCII digits, `.`, then a space or end of line.
+fn numbered_line_number(line: &str) -> Option<usize> {
+    let t = line.trim_start();
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = t[digits..].strip_prefix('.')?;
+    if !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
+    }
+    t[..digits].parse().ok()
+}
+
+/// Asserts the numbered lines of `text` are exactly `1..=phrases.len()` in order (no duplicate, gap, or extra),
+/// and the k-th numbered line contains `phrases[k-1]`.
+fn assert_numbered_steps(text: &str, phrases: &[&str]) {
+    let numbered: Vec<(usize, &str)> = text
+        .lines()
+        .filter_map(|l| numbered_line_number(l).map(|n| (n, l)))
+        .collect();
+    let numbers: Vec<usize> = numbered.iter().map(|(n, _)| *n).collect();
+    let expected: Vec<usize> = (1..=phrases.len()).collect();
+    assert_eq!(
+        numbers,
+        expected,
+        "numbered lines must be exactly 1..={} in order:
+{text}",
+        phrases.len()
+    );
+    for ((n, line), phrase) in numbered.iter().zip(phrases) {
+        assert!(
+            line.contains(phrase),
+            "numbered line {n} lacks {phrase:?}:
+{text}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
+async fn real_llm_reply_list_formatting_smoke() {
+    init_warn_subscriber();
+    let KrSmokeSetup {
+        _dir,
+        fx,
+        fixture,
+        ctx,
+        client: _,
+    } = kr_smoke_setup("list-smoke");
+
+    let steps = draft_with_kr_answer(
+        &fx,
+        &ctx,
+        &fixture,
+        KR_STEPS_ANSWER,
+        "24時間録画ができているか確認する方法を教えてください",
+        "i: steps KR",
+    )
+    .await;
+    assert_numbered_steps(
+        &steps,
+        &[
+            "動画",
+            "SDカードへ常時録画",
+            "カメラ",
+            "日付",
+            "タイムライン",
+        ],
+    );
+    assert!(!has_markdown_list_marker(&steps), "{steps}");
+
+    let single = draft_with_kr_answer(
+        &fx,
+        &ctx,
+        &fixture,
+        KR_SINGLE_FACT_ANSWER,
+        "クラウドの保存期間は何日ですか？",
+        "ii: single-fact KR",
+    )
+    .await;
+    assert!(
+        !single
+            .lines()
+            .any(|l| l.trim_start().starts_with("1.") || l.trim_start().starts_with('・')),
+        "single-fact answer must stay a paragraph:\n{single}"
+    );
+    assert!(!has_markdown_list_marker(&single), "{single}");
+}
+
+#[test]
+fn numbered_steps_helper_accepts_only_the_exact_ordered_steps() {
+    let phrases = ["動画", "常時", "カメラ"];
+    let cases: [(&str, &str, bool); 7] = [
+        ("accept", "1. 動画\n2. 常時\n3. カメラ", true),
+        ("missing step", "1. 動画\n3. カメラ", false),
+        ("out of order", "1. 常時\n2. 動画\n3. カメラ", false),
+        ("extra step", "1. 動画\n2. 常時\n3. カメラ\n4. 余分", false),
+        (
+            "duplicated number",
+            "1. 動画\n2. 常時\n2. 常時\n3. カメラ",
+            false,
+        ),
+        (
+            "gap beyond N",
+            "1. 動画\n2. 常時\n3. カメラ\n5. 余分",
+            false,
+        ),
+        (
+            "non-step decimal line",
+            "1. 動画\n2. 常時\n3. カメラ\n容量は1.5GBです\n1.5GB です",
+            true,
+        ),
+    ];
+    for (label, text, accepted) in cases {
+        let result = std::panic::catch_unwind(|| assert_numbered_steps(text, &phrases));
+        assert_eq!(result.is_ok(), accepted, "{label}");
+    }
+    assert!(has_markdown_list_marker("  - a"));
+    assert!(!has_markdown_list_marker("・a\n1. b"));
+}
 #[test]
 fn kr_fixture_for_case_replaces_only_applicability() {
     let fixture = load_kr_fixture();
