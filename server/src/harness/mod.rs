@@ -1404,7 +1404,7 @@ impl Harness {
         let kr = resolutions
             .iter()
             .find(|kr| kr.id == kr_id)
-            .ok_or_else(|| anyhow!("known_resolution not found: {kr_id}"))?;
+            .ok_or_else(|| anyhow!("known_resolution not found: {kr_id} (check the id; the record may also have been skipped as invalid at load, see the load warn)"))?;
         let attempts = store.load_attempts_for_kr(&ctx.schema, kr_id).await?;
         let counts = grading::derive_outcome_counts(&attempts);
         // 旧形式 actor は名寄せ不能なため昇格判定の母集団から外している（grading.rs）。

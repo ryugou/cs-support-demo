@@ -76,7 +76,7 @@ impl Harness {
             tracing::warn!(
                 kr_id = %kr_id,
                 request_id = %ctx.request_id,
-                "configured excluded_known_resolution_ids entry matches no known resolution; check for a typo or a known resolution that has not been loaded"
+                "configured excluded_known_resolution_ids entry matches no known resolution; check for a typo, or the known resolution may have been skipped as invalid at load (see the load warn)"
             );
         }
         let resolutions =

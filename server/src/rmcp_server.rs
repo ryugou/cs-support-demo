@@ -356,7 +356,7 @@ pub struct AddKnownResolutionRequest {
     pub signals: Vec<String>,
     /// 商品/ロット/契約/時期などの適用条件。人間が明示的に書く（LLM に推測させない）
     pub applicability: String,
-    /// その条件下での正しい答え（OK 回答も NG 回答も同枠）
+    /// その条件下での正しい答え（OK 回答も NG 回答も同枠）。2,500 文字以内
     pub answer: String,
     /// どの escalation 起点か
     pub origin_escalation_id: Option<String>,
@@ -1172,7 +1172,7 @@ impl CsSupportRmcpServer {
 
     #[tool(
         name = "add_known_resolution",
-        description = "担当者による検証済みノウハウの追加（GMR の進化 = 例外ルールの離散 insert）。supervisor / admin のみ。signal は specs/signal-vocabulary.md の語彙に限る。適用条件（applicability）は人間が明示的に書くこと。"
+        description = "担当者による検証済みノウハウの追加（GMR の進化 = 例外ルールの離散 insert）。supervisor / admin のみ。signal は specs/signal-vocabulary.md の語彙に限る。適用条件（applicability）は人間が明示的に書くこと。answer は 2,500 文字以内。"
     )]
     async fn add_known_resolution(
         &self,

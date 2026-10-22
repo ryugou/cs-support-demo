@@ -191,7 +191,7 @@ pub struct KnownResolution {
     pub rejection_count: u32,
     pub approver_set: Vec<String>,
     pub origin: String,
-    /// Registration time of the record; `None` when the node's `verified_at` attribute is missing or empty, which ranks as the oldest in tie-breaks.
+    /// Registration time of the record; `None` when the node's `verified_at` attribute is missing, empty, or not RFC 3339, which ranks as the oldest in tie-breaks.
     pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
     // --- 予約フィールド（Step 1 は既定値のまま。S1-3）---
     pub binding: Binding,
