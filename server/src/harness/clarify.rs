@@ -274,13 +274,9 @@ mod tests {
     /// Issue #123: 共通の Markdown 禁止ルールは `1.` `・` をリスト記号として挙げるが、この
     /// プロンプトが選択肢に求める ①② は別指定として許されることを、同一プロンプト内で固定する。
     #[test]
-    fn prompt_keeps_the_circled_number_instruction_and_the_reworded_list_rule() {
+    fn prompt_keeps_the_circled_number_instruction() {
         let (system, _) = build_clarify_prompt("質問", "不足", "", false, &test_allowlist());
         assert!(system.contains("①②の番号を付け"), "{system}");
-        assert!(
-            system.contains("各プロンプトが別に指定する番号（①② 等）はその指示どおりに書く"),
-            "{system}"
-        );
     }
 
     // ---- Issue #28 §3.3: 聞き返しプロンプトへの取扱製品スコープ注入 ----

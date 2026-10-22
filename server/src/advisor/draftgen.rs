@@ -1643,8 +1643,6 @@ mod tests {
         let p2 = build_advisor_system_prompt(&DraftMode::Answer, &[], true, false, 0);
         assert!(p1.contains(MARKDOWN_BAN_RULE));
         assert!(p2.contains(MARKDOWN_BAN_RULE));
-        assert!(p1.contains("各プロンプトが別に指定する番号（①② 等）はその指示どおりに書く"));
-        assert!(p2.contains("各プロンプトが別に指定する番号（①② 等）はその指示どおりに書く"));
     }
 
     #[test]

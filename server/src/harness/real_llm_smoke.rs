@@ -2871,12 +2871,25 @@ async fn draft_with_kr_answer(
     .text
 }
 
-/// Whether any line of `text` starts with a Markdown list marker (`-` / `*`), which must never appear.
+/// Whether any line of `text` starts with a Markdown list marker (`-` / `*` / `+`) followed by a space,
+/// a full-width space, or the end of the line, which must never appear.
 fn has_markdown_list_marker(text: &str) -> bool {
     text.lines().any(|l| {
         let t = l.trim_start();
-        t.starts_with("- ") || t.starts_with("* ")
+        t.strip_prefix(['-', '*', '+'])
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\u{3000}']))
     })
+}
+
+/// A deliberately lenient list-line detector for the "stays a paragraph" check: also catches full-width
+/// digits, `．`, a number with no following space (`1.手順`), and `・`. `numbered_line_number` stays strict.
+fn looks_like_list_line(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with('・') {
+        return true;
+    }
+    let rest = t.trim_start_matches(|c: char| c.is_ascii_digit() || ('０'..='９').contains(&c));
+    rest.len() != t.len() && rest.starts_with(['.', '．'])
 }
 
 /// The step number of a line shaped as optional indent, ASCII digits, `.`, then a space or end of line.
@@ -2905,15 +2918,13 @@ fn assert_numbered_steps(text: &str, phrases: &[&str]) {
     assert_eq!(
         numbers,
         expected,
-        "numbered lines must be exactly 1..={} in order:
-{text}",
+        "numbered lines must be exactly 1..={} in order:\n{text}",
         phrases.len()
     );
     for ((n, line), phrase) in numbered.iter().zip(phrases) {
         assert!(
             line.contains(phrase),
-            "numbered line {n} lacks {phrase:?}:
-{text}"
+            "numbered line {n} lacks {phrase:?}:\n{text}"
         );
     }
 }
@@ -2961,9 +2972,7 @@ async fn real_llm_reply_list_formatting_smoke() {
     )
     .await;
     assert!(
-        !single
-            .lines()
-            .any(|l| numbered_line_number(l).is_some() || l.trim_start().starts_with('・')),
+        !single.lines().any(looks_like_list_line),
         "single-fact answer must stay a paragraph:\n{single}"
     );
     assert!(!has_markdown_list_marker(&single), "{single}");
@@ -2997,9 +3006,28 @@ fn numbered_steps_helper_accepts_only_the_exact_ordered_steps() {
         let result = std::panic::catch_unwind(|| assert_numbered_steps(text, &phrases));
         assert_eq!(result.is_ok(), accepted, "{label}");
     }
-    assert!(has_markdown_list_marker("  - a"));
-    assert!(!has_markdown_list_marker("・a\n1. b"));
 }
+
+#[test]
+fn markdown_list_marker_detects_dash_star_plus_followed_by_space_or_end() {
+    for marker in ["  - a", "+ a", "  * a", "-　a", "-", "*  ", "+"] {
+        assert!(has_markdown_list_marker(marker), "{marker:?}");
+    }
+    for not_marker in ["-5度", "+a", "・a\n1. b"] {
+        assert!(!has_markdown_list_marker(not_marker), "{not_marker:?}");
+    }
+}
+
+#[test]
+fn lenient_list_line_detector_catches_full_width_and_unspaced_numbers_and_bullets() {
+    for lenient in ["１．手順", "1.手順", "１.手順", "・手順", "  2．手順"] {
+        assert!(looks_like_list_line(lenient), "{lenient:?}");
+    }
+    for plain in ["保存期間は30日です。", "1日あたり"] {
+        assert!(!looks_like_list_line(plain), "{plain:?}");
+    }
+}
+
 #[test]
 fn kr_fixture_for_case_replaces_only_applicability() {
     let fixture = load_kr_fixture();

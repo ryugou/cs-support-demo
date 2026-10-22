@@ -388,7 +388,8 @@ fn excerpts_from_hits(hits: &[SectionHit], section_filter: Option<&[String]>) ->
 
 pub(crate) const KNOWN_RESOLUTION_SOURCE_LABEL: &str = "承認済みの回答（known_resolution）";
 
-const KNOWN_RESOLUTION_FIDELITY_RULE: &str = "- 承認済みの回答の手順は、番号は `1.` `2.` の形式に統一し、番号の値・順序・手順数・数値・注意書き（※ や ⚠ で始まる行を含む）は変えずに書く（番号の無い手順は順序と手順数を変えずに `1.` から番号を振る）。省略・並べ替え・言い換えで手順の意味を変えない。\n";
+const PARTIAL_ANSWER_LIST_LINE_RULE: &str = "- リストの各行は、その行だけで意味が通る一文にして文末を「。」で終える。取り次ぐ項目の名称と金額・数量を別の行に分けて書かない。\n";
+const KNOWN_RESOLUTION_FIDELITY_RULE: &str = "- 承認済みの回答の手順は、番号は `1.` `2.` の形式に統一し、既存の番号は形式を揃えて `1.` から振り直すだけで、順序・手順数・数値・注意書き（※ や ⚠ で始まる行を含む）は変えずに書く（番号の無い手順も順序と手順数を変えずに `1.` から番号を振る）。省略・並べ替え・言い換えで手順の意味を変えない。\n";
 
 /// 資料を根拠に書くときの規律。`ReplyKind::Answer` と、部分回答モードの
 /// `ReplyKind::Escalation`（材料あり）で同一文言を共有する（片方だけ文言が育つ事故を避ける）。
@@ -513,7 +514,7 @@ pub fn build_reply_system_prompt(
         ));
     }
     if partial_answer_mode {
-        p.push_str("- リストの各行は文末を「。」で終える。\n");
+        p.push_str(PARTIAL_ANSWER_LIST_LINE_RULE);
     }
     p.push_str(&format!(
         "- 材料が質問のどの部分にも答えていない場合は、本文を書かず固定トークン `{NO_ANSWER_TOKEN}` \
@@ -1190,8 +1191,11 @@ mod tests {
     }
 
     #[test]
-    fn partial_answer_prompt_requires_list_lines_to_end_with_a_period() {
-        let rule = "- リストの各行は文末を「。」で終える。";
+    fn partial_answer_prompt_requires_self_contained_list_lines_ending_with_a_period() {
+        let rule = PARTIAL_ANSWER_LIST_LINE_RULE;
+        assert!(rule.contains("その行だけで意味が通る一文"));
+        assert!(rule.contains("文末を「。」で終える"));
+        assert!(rule.contains("名称と金額・数量を別の行に分けて書かない"));
         assert!(partial_answer_prompt(None).contains(rule));
         let brief = build_reply_brief(&allowed(&["sec-a"]), &[hit("sec-a", "本文")], false);
         let p = build_reply_system_prompt(&brief, false, &test_allowlist());
@@ -1385,6 +1389,7 @@ mod tests {
                     "{p}"
                 );
                 assert!(!p.contains("番号・順序・数値・注意書き"), "{p}");
+                assert!(!p.contains("番号の値"), "{p}");
                 assert!(p.contains("行頭「・」の箇条書き"), "{p}");
                 assert!(p.contains("リストにせず短い段落"), "{p}");
                 assert!(!p.contains("箇条書きの説明は書かない"), "{p}");
