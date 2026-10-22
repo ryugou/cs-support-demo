@@ -244,3 +244,21 @@ async fn a_failed_manual_search_still_runs_the_kr_judge_once_and_returns_the_err
     );
     assert_eq!(judge.calls(), 1);
 }
+
+#[test]
+fn warn_unmatched_excluded_ids_warns_once_per_id_and_names_the_load_window() {
+    let harness = kr_selection_harness(None, &["typo-kr"]);
+    let resolutions = [contract_test_kr("kr1", &["a"])];
+    let ((), first) = crate::test_support::capture_logs(|| {
+        harness.warn_unmatched_excluded_ids("req-mcp", &resolutions)
+    });
+    let ((), second) = crate::test_support::capture_logs(|| {
+        harness.warn_unmatched_excluded_ids("req-mcp", &resolutions)
+    });
+    let first = filter_warn_and_error_lines(&first);
+    assert!(first.contains("kr_id=typo-kr"), "{first}");
+    assert!(first.contains("req-mcp"), "{first}");
+    assert!(first.contains("1000-node"), "{first}");
+    assert!(!first.contains(CUSTOMER_TEXT), "{first}");
+    assert_eq!(filter_warn_and_error_lines(&second), "");
+}

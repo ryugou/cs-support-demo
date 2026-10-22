@@ -782,6 +782,8 @@ impl CsSupportRmcpServer {
             .load_known_resolutions(&ctx.schema)
             .await
             .map_err(to_error)?;
+        self.harness
+            .warn_unmatched_excluded_ids(&ctx.request_id, &resolutions);
         // 照合は Rust 集合演算（rules::match_known_resolution）。tool は結果を返すだけ。
         let (match_kind, resolution, leftover) = excluding_known_resolution_view(
             resolutions,

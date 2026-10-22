@@ -70,6 +70,9 @@ const SNAPSHOT_MAX_NODES: i32 = 5000;
 /// （欠落しない。1000 は backend 側の1リクエストあたり上限）。
 const SIGNAL_TRAVERSE_PAGE_SIZE: i32 = 1000;
 
+/// `KnownResolution` の `query_nodes` 上限（ページング未実装。ちょうど到達で load warn）。
+pub(crate) const KNOWN_RESOLUTION_QUERY_LIMIT: i32 = 1000;
+
 /// `signals_from_traverse` が辿る先のノード種別（Signal ノードのみ）。呼び出し元
 /// （`load_case_signals` / `load_known_resolutions`）が値を選ぶ余地を無くし、
 /// production で "Signal" を書く場所をこの1箇所に固定するための定数（Issue #39
@@ -809,7 +812,6 @@ impl KnowledgeStore {
         &self,
         schema: &str,
     ) -> Result<Vec<crate::proto::graphrag::NodeResult>> {
-        const KNOWN_RESOLUTION_QUERY_LIMIT: i32 = 1000;
         let nodes = self
             .client
             .query_nodes(

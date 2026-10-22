@@ -72,13 +72,7 @@ impl Harness {
         context_text: &str,
         extraction_mode: extraction::ExtractionMode,
     ) -> KrTurn<'a> {
-        for kr_id in self.newly_unmatched_excluded_ids(&resolutions) {
-            tracing::warn!(
-                kr_id = %kr_id,
-                request_id = %ctx.request_id,
-                "configured excluded_known_resolution_ids entry matches no known resolution; check for a typo, or the known resolution may have been skipped as invalid at load (see the load warn)"
-            );
-        }
+        self.warn_unmatched_excluded_ids(&ctx.request_id, &resolutions);
         let resolutions =
             rules::exclude_known_resolutions(resolutions, &self.excluded_known_resolution_ids);
         let stakes_input = self.stakes_input_for_turn(domains, accumulated, question);
@@ -100,6 +94,24 @@ impl Harness {
             decision_basis,
             stakes_input,
             applicable_known_resolution,
+        }
+    }
+
+    /// Warns once per process per configured `excluded_known_resolution_ids` entry that matches
+    /// no loaded known resolution. Shared by evaluate and MCP `search_known_resolutions` so the
+    /// text and the dedupe are single-sourced. Carries no customer text.
+    pub(crate) fn warn_unmatched_excluded_ids(
+        &self,
+        request_id: &str,
+        resolutions: &[rules::KnownResolution],
+    ) {
+        for kr_id in self.newly_unmatched_excluded_ids(resolutions) {
+            tracing::warn!(
+                kr_id = %kr_id,
+                request_id = %request_id,
+                "configured excluded_known_resolution_ids entry matches no known resolution; check for a typo, or the known resolution may have been skipped as invalid at load (see the load warn), or the load was truncated at the {}-node query limit (see the load warn)",
+                super::knowledge::KNOWN_RESOLUTION_QUERY_LIMIT
+            );
         }
     }
 
