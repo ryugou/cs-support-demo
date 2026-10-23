@@ -130,4 +130,68 @@ describe('CorrectionModalComponent', () => {
     expect(fixture.componentInstance.errorMessage()).toBe('signals must not be empty');
     httpMock.verify();
   });
+
+  describe('answer 文字数上限（サーバの chars().count() と一致）', () => {
+    function ready(answer: string) {
+      const { fixture } = setup({ initialSignals: ['s1'] });
+      fixture.componentInstance.applicability.set('適用条件');
+      fixture.componentInstance.answer.set(answer);
+      return fixture;
+    }
+
+    it.each([
+      {
+        name: 'あ 2,500 文字は送信できる',
+        answer: 'あ'.repeat(2_500),
+        length: 2_500,
+        canSubmit: true,
+      },
+      {
+        name: 'あ 2,501 文字は送信できない',
+        answer: 'あ'.repeat(2_501),
+        length: 2_501,
+        canSubmit: false,
+      },
+      {
+        name: 'サロゲートペアは 1 文字と数え、絵文字 2,500 個は送信できる',
+        answer: '😀'.repeat(2_500),
+        length: 2_500,
+        canSubmit: true,
+      },
+      {
+        name: 'サロゲートペア 2,501 個は送信できない',
+        answer: '😀'.repeat(2_501),
+        length: 2_501,
+        canSubmit: false,
+      },
+    ])('$name', ({ answer, length, canSubmit }) => {
+      const fixture = ready(answer);
+      const { componentInstance } = fixture;
+      expect(componentInstance.answerLength()).toBe(length);
+      expect(componentInstance.canSubmit()).toBe(canSubmit);
+
+      fixture.detectChanges();
+      const submitButton = Array.from<HTMLButtonElement>(
+        fixture.nativeElement.querySelectorAll('button'),
+      ).find((b) => b.textContent?.includes('登録する'));
+      expect(submitButton).toBeDefined();
+      expect(submitButton?.disabled).toBe(!canSubmit);
+    });
+
+    it.each([
+      { name: '3 文字では警告色にしない', count: 3, label: '3', overLimit: false },
+      { name: '2,501 文字では警告色にする', count: 2_501, label: '2501', overLimit: true },
+    ])('上限と現在の文字数を画面に表示する: $name', ({ count, label, overLimit }) => {
+      const fixture = ready('あ'.repeat(count));
+      fixture.detectChanges();
+      const text: string = fixture.nativeElement.textContent;
+      expect(text).toContain('2,500 文字以内');
+      expect(text).toContain(`${label} / 2,500 文字`);
+      const helper = Array.from<HTMLElement>(fixture.nativeElement.querySelectorAll('p')).find(
+        (p) => p.textContent?.includes('文字以内'),
+      );
+      expect(helper).toBeDefined();
+      expect(helper?.classList.contains('text-rose-700')).toBe(overLimit);
+    });
+  });
 });

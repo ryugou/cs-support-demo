@@ -63,6 +63,13 @@
     <label class="block text-sm font-medium text-slate-700" for="correction-answer">
       answer（必須、訂正後の回答）
     </label>
+    <p
+      class="mt-0.5 text-xs"
+      [class.text-slate-500]="!overLimit()"
+      [class.text-rose-700]="overLimit()"
+    >
+      {{ maxAnswerLabel }} 文字以内（現在 {{ answerLength() }} / {{ maxAnswerLabel }} 文字）
+    </p>
     <textarea
       id="correction-answer"
       rows="4"

@@ -5,6 +5,9 @@ import { AdminApiService } from '../../core/admin-api.service';
 import type { CorrectionResponse } from '../../core/models';
 import { extractErrorMessage } from '../../shared/http-error';
 
+/** サーバの `reply::MAX_EXCERPT_CHARS`（server/src/harness/reply.rs）と一致させる answer 上限。 */
+const MAX_ANSWER_CHARS = 2_500;
+
 /** `CorrectionModalComponent` を開く際に渡すデータ（design doc §5「訂正登録モーダル」）。 */
 export interface CorrectionModalData {
   caseId: string;
@@ -42,11 +45,19 @@ export class CorrectionModalComponent {
   readonly submitting = signal(false);
   readonly errorMessage = signal<string | null>(null);
 
+  protected readonly maxAnswerLabel = MAX_ANSWER_CHARS.toLocaleString('en-US');
+
+  // サーバは Rust の chars().count()（Unicode scalar 数）で数えるため、UTF-16 の length ではなく
+  // コードポイント単位で数える。
+  readonly answerLength = computed(() => [...this.answer()].length);
+  protected readonly overLimit = computed(() => this.answerLength() > MAX_ANSWER_CHARS);
+
   readonly canSubmit = computed(
     () =>
       this.signals().length > 0 &&
       this.applicability().trim().length > 0 &&
       this.answer().trim().length > 0 &&
+      !this.overLimit() &&
       !this.submitting(),
   );
 
