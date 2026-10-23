@@ -63,6 +63,8 @@ default_escalation_route = "support_desk"
 vector_route_enabled = true
 manual_scoring_v2_enabled = true
 customer_reply_draft_enabled = true
+# support_harness の長い手順の下書きが出力上限で切れないよう、config.cloudrun.toml と揃える (Issue #124)。
+customer_reply_draft_max_tokens = 1500
 
 [harness.thresholds]
 low = 0.6

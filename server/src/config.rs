@@ -692,6 +692,24 @@ enough_info_threshold = 0.42
     }
 
     #[test]
+    fn production_reply_draft_max_tokens_fit_long_step_materials() {
+        assert_eq!(default_reply_draft_max_tokens(), 700);
+        for path in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.cloudrun.toml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/config.homesec.toml"),
+        ] {
+            let cfg = AppConfig::load(std::path::Path::new(path))
+                .unwrap_or_else(|err| panic!("{path} must load: {err}"));
+            assert!(
+                cfg.harness.customer_reply_draft_max_tokens >= 1500,
+                "{path} [harness] customer_reply_draft_max_tokens must be >= 1500 so that a \
+                 20-step known resolution is not cut at the generation limit (got {})",
+                cfg.harness.customer_reply_draft_max_tokens
+            );
+        }
+    }
+
+    #[test]
     fn project_defaults_to_legacy_section() {
         let toml = r#"
 bind_addr = "127.0.0.1:3443"
