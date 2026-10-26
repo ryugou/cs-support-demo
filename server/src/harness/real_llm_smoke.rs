@@ -615,6 +615,7 @@ fn decide_on_signals(
         thresholds: &fx.thresholds,
         default_route: &fx.config.harness.default_escalation_route,
         known_resolution: None,
+        product_identified: false,
     });
     let matched_layer1_rule_ids: Vec<String> =
         matching_layer1_rules(&fx.escalation_rules, question_signals)
@@ -1923,6 +1924,7 @@ fn decide_kr_turn(
         thresholds,
         default_route: &config.harness.default_escalation_route,
         known_resolution: selected,
+        product_identified: false,
     })
 }
 

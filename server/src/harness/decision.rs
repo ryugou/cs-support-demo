@@ -103,6 +103,10 @@ pub enum EscalateReason {
     RequiresHumanApproval,
     InsufficientDirectness,
     UnknownAddedSignal,
+    /// Issue #131: layer 3 where the utterance raises at least one signal but the case has no
+    /// identified handled product. The manual match score is not consulted; the reply asks the
+    /// customer to pick from the handled-product catalog.
+    ProductUnidentified,
 }
 
 /// 顧客に開示してよい情報の範囲。文面そのものは client（生成側）が作る（spec「message_policy の扱い」）。
@@ -196,6 +200,11 @@ pub struct DecisionInput<'a> {
     pub thresholds: &'a Thresholds,
     /// config 由来の既定エスカレーション route（第3層エスカレーション先）。
     pub default_route: &'a str,
+    /// Issue #131: whether the case has an identified handled product (a `Matched` product
+    /// reference this turn, or a non-empty case attribute `product_models`). Deliberately not an
+    /// `Option` and without a default: callers must state it, and `false` (unidentified) is the
+    /// fail-closed value.
+    pub product_identified: bool,
 }
 
 /// Pure, LLM-free decision function: the same input always yields the same decision. The first
@@ -257,6 +266,25 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
     }
     let kr_match = match_known_resolution(input.resolutions, input.question_signals);
     match evidence_sufficient(threshold, input.best_manual_score) {
+        // Issue #131: a layer-3 turn that raises a signal while the case has no identified
+        // handled product must not be answered from whatever material scored high (it may be
+        // for an unhandled product). A turn that raises no signal (generic question) is
+        // unaffected (product-scope spec L59).
+        Sufficiency::Sufficient
+            if !input.product_identified && !input.question_signals.is_empty() =>
+        {
+            AnswerDecision::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                layer: 3,
+                route_to: input.default_route.to_string(),
+                disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+                audit_required: true,
+                missing: Vec::new(),
+                hearing: None,
+                customer_ack: None,
+                known_resolution_id: None,
+            }
+        }
         Sufficiency::Sufficient => AnswerDecision::Allowed {
             source: AnswerSource::Manual,
             evidence_section_keys: input.best_manual_sections.to_vec(),
@@ -375,6 +403,8 @@ mod tests {
             stakes_input,
             thresholds,
             default_route: "triage",
+            // Fail-closed default: tests opt in to an identified product explicitly.
+            product_identified: false,
         }
     }
 
@@ -1315,6 +1345,68 @@ mod tests {
             }
             other => panic!("expected allowed via manual, got {other:?}"),
         }
+    }
+
+    /// Issue #131: 製品未特定 + signal あり + 十分なマニュアル一致 は Allowed にせず、
+    /// layer 3 の ProductUnidentified（聞き返し契約）に倒す。
+    #[test]
+    fn layer3_unidentified_product_with_signal_escalates_product_unidentified() {
+        let q = signals(&["discoloration"]);
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &thresholds(),
+            &sections,
+            None,
+        ));
+        match d {
+            AnswerDecision::Escalate {
+                reason,
+                layer,
+                missing,
+                ..
+            } => {
+                assert_eq!(reason, EscalateReason::ProductUnidentified);
+                assert_eq!(layer, 3);
+                assert!(missing.is_empty());
+            }
+            other => panic!("expected ProductUnidentified escalate, got {other:?}"),
+        }
+    }
+
+    /// signal の立たない汎用質問は製品未特定でも従来どおり Allowed（Issue #131 L59）。
+    #[test]
+    fn layer3_unidentified_product_without_signal_stays_allowed() {
+        let q = SignalSet::new();
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &thresholds(),
+            &sections,
+            None,
+        ));
+        assert!(matches!(d, AnswerDecision::Allowed { .. }));
+    }
+
+    /// 製品特定済みなら signal があっても Allowed のまま。
+    #[test]
+    fn layer3_identified_product_with_signal_stays_allowed() {
+        let q = signals(&["discoloration"]);
+        let sections = vec!["doc-1#x".to_string()];
+        let th = thresholds();
+        let mut inp = input(&q, &[], &[], &[], Some(0.95), calm(), &th, &sections, None);
+        inp.product_identified = true;
+        assert!(matches!(decide(&inp), AnswerDecision::Allowed { .. }));
     }
 
     #[test]

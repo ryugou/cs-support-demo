@@ -1322,6 +1322,7 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
+            product_identified: false,
         });
         assert!(
             matches!(decision, AnswerDecision::Escalate { layer: 2, .. }),

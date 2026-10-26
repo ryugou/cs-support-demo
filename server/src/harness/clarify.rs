@@ -33,6 +33,26 @@ pub fn append_final_turn_suffix(text: String, is_final_turn: bool) -> String {
     }
 }
 
+/// Issue #131: 取扱製品が特定できていない signal 付きターンの聞き返し文を、テンプレートと
+/// 取扱製品 allowlist の型番だけで組み立てる純関数（LLM を呼ばない）。選択肢は引数の
+/// `models` のみ（取扱外の製品名・種別は出さない）。LINE は Markdown を描画しないため「・」で列挙する。
+pub fn product_catalog_clarify_text(models: &[String]) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    let bullets: Vec<String> = models
+        .iter()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty() && seen.insert(m.to_string()))
+        .map(|m| format!("・{m}"))
+        .collect();
+    if bullets.is_empty() {
+        return FALLBACK_CLARIFY_TEXT.to_string();
+    }
+    format!(
+        "ご相談の製品をお知らせください。次の取扱製品のうち、どれについてのお問い合わせでしょうか。\n\n{}\n\n該当する型番をお知らせいただければ、確認を進めます。",
+        bullets.join("\n")
+    )
+}
+
 /// 聞き返し生成用の system prompt / user message を組み立てる純関数。
 ///
 /// **検索ヒットの title・本文は入力に含めない**（引数にも存在しない）。回答してよい問い合わせ
@@ -174,6 +194,26 @@ mod tests {
             r#"{"block_terms":["絶対に治ります"],"abstain_terms":["効果があります"],"customer_leak_terms":[]}"#,
         )
         .unwrap()
+    }
+
+    /// Issue #131: 製品カタログの聞き返しは allowlist の型番だけを「・」で列挙する。
+    #[test]
+    fn product_catalog_clarify_lists_only_allowlist_models_as_bullets() {
+        let allowlist =
+            ProductAllowlist::from_models(vec!["ADC-V724".to_string(), "ADC-V522IR".to_string()]);
+        let text = product_catalog_clarify_text(allowlist.models());
+        assert!(text.contains("・ADC-V522IR\n・ADC-V724"), "{text}");
+        assert_eq!(text.matches('・').count(), 2, "{text}");
+        assert!(!text.contains("**") && !text.contains("- "), "{text}");
+        // 生成文は egress の取扱外型番ゲートを通る（allowlist 外を含まない）
+        assert!(allowlist.out_of_scope_mentions(&text).is_empty(), "{text}");
+    }
+
+    #[test]
+    fn product_catalog_clarify_dedupes_and_falls_back_when_empty() {
+        let text = product_catalog_clarify_text(&["A-1".to_string(), "A-1".to_string()]);
+        assert_eq!(text.matches("・A-1").count(), 1);
+        assert_eq!(product_catalog_clarify_text(&[]), FALLBACK_CLARIFY_TEXT);
     }
 
     #[test]

@@ -2139,21 +2139,33 @@ async fn reply_handler(
                     // `decide_reply_action` の前提により `conv.clarify_turns < clarify_max_turns`
                     // は保証済み（`is_final_clarify_turn` の doc コメント参照）。
                     let is_final_clarify_turn = is_final_clarify_turn(&conv, &state.config.api);
-                    let reply_text = match state.harness.reply_drafter.as_ref() {
-                        Some(drafter) => {
-                            clarify::draft_clarify_question(
-                                drafter,
-                                &state.harness.ng,
-                                state.harness.reply_draft_max_tokens,
-                                &req.message,
-                                &missing_text,
-                                &known_facts,
-                                is_continuation,
-                                &allowlist,
-                            )
-                            .await
+                    let product_unidentified = matches!(
+                        &outcome.decision,
+                        AnswerDecision::Escalate {
+                            reason: decision::EscalateReason::ProductUnidentified,
+                            ..
                         }
-                        None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
+                    );
+                    let reply_text = if product_unidentified {
+                        // Issue #131: 取扱製品カタログから選ばせる。テンプレート生成で LLM を呼ばない。
+                        clarify::product_catalog_clarify_text(allowlist.models())
+                    } else {
+                        match state.harness.reply_drafter.as_ref() {
+                            Some(drafter) => {
+                                clarify::draft_clarify_question(
+                                    drafter,
+                                    &state.harness.ng,
+                                    state.harness.reply_draft_max_tokens,
+                                    &req.message,
+                                    &missing_text,
+                                    &known_facts,
+                                    is_continuation,
+                                    &allowlist,
+                                )
+                                .await
+                            }
+                            None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
+                        }
                     };
                     // Issue #28 §3.5: 応答側ゲート その 2/3。聞き返し。フォールバック定型文
                     // 経由でも allowlist 外を含み得ない（定数文字列）ため、判定は無害だが
@@ -2716,6 +2728,7 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -2968,6 +2981,39 @@ mod tests {
         let outcome = base_outcome(gray_escalate_decision(), true);
         let mut conv = default_conv_state();
         conv.clarify_turns = 3; // == clarify_max_turns(3): 枯渇
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    fn product_unidentified_decision() -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::ProductUnidentified,
+            layer: 3,
+            route_to: "triage".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            hearing: None,
+            customer_ack: None,
+            known_resolution_id: None,
+        }
+    }
+
+    /// Issue #131: 製品未特定の聞き返しも既存の `clarify_turns` 上限に従う（v11 L21）。
+    #[test]
+    fn decide_reply_action_clarifies_product_unidentified_with_turns_remaining() {
+        let outcome = base_outcome(product_unidentified_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 2;
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::Clarify);
+    }
+
+    #[test]
+    fn decide_reply_action_hands_off_product_unidentified_when_clarify_turns_exhausted() {
+        let outcome = base_outcome(product_unidentified_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3; // == clarify_max_turns(3)
         let action = decide_reply_action(&outcome, &conv, &default_api_config());
         assert_eq!(action, ReplyAction::EscalationReply);
     }

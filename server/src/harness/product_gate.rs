@@ -169,6 +169,8 @@ const MIN_FRAGMENT_VETO_CHARS: usize = 3;
 pub struct ProductAllowlist {
     canonical: HashMap<String, String>,
     display: String,
+    /// 取扱型番の一覧（ソート済み・trim 済み）。`display` と同じ元データ。
+    models: Vec<String>,
 }
 
 impl ProductAllowlist {
@@ -202,7 +204,17 @@ impl ProductAllowlist {
             .map(|m| (normalize_model_token(m), m.clone()))
             .collect();
         let display = usable.join("、");
-        Self { canonical, display }
+        Self {
+            canonical,
+            display,
+            models: usable,
+        }
+    }
+
+    /// 取扱型番の一覧（ソート済み）。聞き返しの選択肢（Issue #131）など、製品マスタ由来の
+    /// 型番だけを列挙する用途に使う。
+    pub fn models(&self) -> &[String] {
+        &self.models
     }
 
     /// allowlist に実際に使える型番が 1 件も無いか（`ProductGate::fetch` の fail-closed 判定

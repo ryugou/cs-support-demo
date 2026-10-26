@@ -438,6 +438,9 @@ fn merge_outcome_attributes(
 ///   製品未特定・症状要点不足などで `missing` が積まれた場合は、聞き返しを一切せず即時
 ///   エスカレーションへ倒すべきではない。
 /// - 第3層グレー（`InsufficientDirectness` / `UnknownAddedSignal`）は常に許可（変更なし）。
+/// - 第3層 `ProductUnidentified`（Issue #131: signal が立つのにケースに取扱製品が特定されていない）も
+///   常に許可する。聞き返しの上限（`clarify_turns`）は呼び出し側（`api.rs::decide_reply_action`）が
+///   既存どおり適用し、上限到達で取次に倒れる（v11 設計 §2）。
 /// - 第2層（禁止ドメイン）は `missing` の値に関わらず常に不許可（fail-closed の核。第2層は
 ///   `decide()` が `missing: Vec::new()` を返す不変条件と対で成立しているが、この関数側でも
 ///   `layer: 2` を `_ => false` に明示的に落とすことで、万一 `missing` を持つようになっても
@@ -455,7 +458,8 @@ fn clarification_allowed(decision: &decision::AnswerDecision) -> bool {
             layer: 3,
             reason:
                 decision::EscalateReason::InsufficientDirectness
-                | decision::EscalateReason::UnknownAddedSignal,
+                | decision::EscalateReason::UnknownAddedSignal
+                | decision::EscalateReason::ProductUnidentified,
             ..
         } => true,
         _ => false,
@@ -1963,6 +1967,20 @@ impl Harness {
             stakes_input,
             applicable_known_resolution,
         } = kr_turn;
+        // Issue #131: 製品特定済み = 今ターンの `Matched` 製品参照（allowlist の一覧表記に
+        // 解決できたもの）、またはケース属性 `product_models` が空でない。`product_models` へ入る
+        // のは `resolve_matched_models` を通った `Matched` 型番だけ（Ambiguous / Foreign は入らない）。
+        // 解決は allowlist の一覧表記への正規化を1か所（`resolve_matched_models`）に集約する
+        // （design doc §2.1 末尾）。未解決の警告は /api/reply と MCP の両経路で毎ターン通るここで
+        // 1 回だけ出す（api.rs::judge_product_switch はログを出さない側を使う）。
+        let existing_product_models = case_attrs
+            .get("product_models")
+            .cloned()
+            .unwrap_or_default();
+        let resolved_matched_models =
+            case_switch::resolve_matched_models(&allowlist, &product_references);
+        let product_identified = !resolved_matched_models.is_empty()
+            || !knowledge::csv_list(&existing_product_models).is_empty();
         let decision_result = decision::decide(&decision::DecisionInput {
             question_signals: decide_signals,
             question_raw: question,
@@ -1975,6 +1993,7 @@ impl Harness {
             thresholds: &self.thresholds,
             default_route: &self.default_route,
             known_resolution: applicable_known_resolution.as_ref(),
+            product_identified,
         });
         let handoff_items = handoff_items::handoff_items_for_decision(
             &decision_result,
@@ -2083,16 +2102,8 @@ impl Harness {
         // CS 連携モード。support schema に対して呼ぶ）の 3 つ。どの経路でも `product_models` は
         // 書き戻されるが、切り替えの自動検知は `api.rs::reply_handler` にしか無いため、
         // MCP 経路・アドバイザー経路の入出力・判定は変わらない（design doc §1 末尾）。
-        let existing_product_models = case_attrs
-            .get("product_models")
-            .cloned()
-            .unwrap_or_default();
-        // 解決（allowlist の一覧表記への正規化）は resolve_matched_models の1か所に集約する
-        // （design doc §2.1 末尾）。本関数の冒頭で取得済みの `allowlist` を
-        // 再利用する。未解決の警告は /api/reply と MCP の両経路で毎ターン通るここで 1 回だけ出す
-        // （api.rs::judge_product_switch はログを出さない側を使う）。
-        let resolved_matched_models =
-            case_switch::resolve_matched_models(&allowlist, &product_references);
+        // `existing_product_models` / `resolved_matched_models` は判定前（`decide()` の入力
+        // `product_identified`）に算出済み。
         case_attrs.insert(
             "product_models".to_string(),
             case_switch::merge_product_models(&existing_product_models, &resolved_matched_models),
@@ -2111,6 +2122,15 @@ impl Harness {
             decision::AnswerDecision::Allowed { source, .. } => {
                 (format!("allowed:{source:?}"), None)
             }
+            decision::AnswerDecision::Escalate {
+                reason: decision::EscalateReason::ProductUnidentified,
+                layer,
+                route_to,
+                ..
+            } => (
+                format!("escalate:layer{layer}:product_unidentified"),
+                Some(route_to.clone()),
+            ),
             decision::AnswerDecision::Escalate {
                 layer, route_to, ..
             } => (format!("escalate:layer{layer}"), Some(route_to.clone())),
@@ -3262,6 +3282,9 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
+            // Issue #131: このテストの関心は TurnOnly 判定であり製品特定ではない。
+            // 旧来の Allowed 期待を保つため製品特定済みとして明示する。
+            product_identified: true,
             known_resolution: None,
         })
     }
@@ -4924,6 +4947,16 @@ mod tests {
     }
 
     #[test]
+    fn clarification_is_allowed_for_layer3_product_unidentified() {
+        let d = escalate_for_contract_test(
+            3,
+            decision::EscalateReason::ProductUnidentified,
+            Vec::new(),
+        );
+        assert!(clarification_allowed(&d));
+    }
+
+    #[test]
     fn clarification_is_allowed_for_layer3_gray() {
         let insufficient_directness = escalate_for_contract_test(
             3,
@@ -5019,6 +5052,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5058,6 +5092,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5101,6 +5136,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5137,6 +5173,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5172,6 +5209,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5201,6 +5239,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5237,6 +5276,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5430,6 +5470,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5459,6 +5500,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: None,
         });
         assert!(
@@ -5468,6 +5510,60 @@ mod tests {
         );
     }
 
+    /// Issue #131 の再現（red）。型番を一切含まない症状だけの発話「赤いランプが点滅してる」に対し、
+    /// 製品非依存の alarm.com 由来の材料（取扱外の Aeotec LED 電球、`ADC-` 型番トークン無し）が
+    /// 高スコアで当たると、`evaluate()` と同じ手順（signal 抽出 → `filter_out_of_scope_hits` →
+    /// `decide()`）で `Allowed` になり、`decide_reply_action` が Answer を返して取扱外製品の手順を
+    /// 案内してしまう。望ましい挙動は、その材料で回答せず、聞き返し（Escalate 判定で Clarify）に
+    /// 倒れること。
+    #[test]
+    fn unscoped_symptom_with_third_party_material_is_not_answered() {
+        let lexicon = signal::LexiconNormalizer::from_json(include_str!(
+            "../../data/urtect/signal-lexicon.json"
+        ))
+        .expect("bundled lexicon must parse");
+        let question = "赤いランプが点滅してる";
+        let signals = signal::SignalNormalizer::normalize(&lexicon, question);
+        assert!(
+            signals.iter().any(|s| s.as_str() == "led_red_blinking"),
+            "precondition: the utterance must hit led_red_blinking, got {signals:?}"
+        );
+
+        let allow = product_gate::ProductAllowlist::from_models(vec![
+            "ADC-V724".to_string(),
+            "ADC-V523".to_string(),
+            "ADC-VC727P".to_string(),
+        ]);
+        let hits = vec![scoped_hit(
+            "alarmcom#aeotec-led-bulb-red-blinking",
+            "Aeotec LED電球の赤色点滅",
+            "Aeotec LED電球が赤く点滅している場合は、Z-Wave ネットワークからの除外と再ペアリングを行ってください。",
+        )];
+        let filtered = filter_out_of_scope_hits(hits, &allow);
+        let best_manual_score = filtered.first().map(|h| h.score);
+        let sections: Vec<String> = filtered.iter().map(|h| h.section_key.clone()).collect();
+        let rules = crate::test_support::load_bundled_escalation_rules();
+        let domains = crate::test_support::load_bundled_prohibited_domains();
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &signals,
+            question_raw: question,
+            rules: &rules,
+            domains: &domains,
+            resolutions: &[],
+            best_manual_score,
+            best_manual_sections: &sections,
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+            product_identified: false,
+            known_resolution: None,
+        });
+        assert!(
+            !matches!(d, decision::AnswerDecision::Allowed { .. }),
+            "a product-less symptom must not be answered from a third-party (no ADC- token) \
+             material; expected Escalate (hearing/clarify), got {d:?}"
+        );
+    }
     // ---- adopt_product_references_for_extraction_mode（Issue #52 フォローアップ、Critical 是正）----
     //
     // PR #30 以前と同じ end-to-end 挙動（signals 抽出失敗時は product_references が必ず空だった）
@@ -6307,6 +6403,7 @@ mod tests {
             stakes_input: turn.stakes_input,
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
             known_resolution: turn.applicable_known_resolution.as_ref(),
         });
         assert!(matches!(
