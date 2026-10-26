@@ -109,6 +109,75 @@ pub struct ReplyHistoryTurn {
     pub text: String,
 }
 
+/// 過去の顧客発話の合計文字数（`chars().count()` の総和。正規化後の値で、今ターンの `message` と
+/// 行区切りの `\n` は含まない）の上限。Jev の判定入力（Issue #58）と、製品特定の判定
+/// （Issue #131、`Harness::evaluate`）が共有する窓の字数予算。
+///
+/// `/api/reply` の `history[].text` 上限と同値。`validate` を通った入力では 1 発話だけで予算を
+/// 超えることはなく、超過は複数発話の合計でのみ起きる。1 発話で超える分岐（丸ごと落として過去発話
+/// 0 件になる）は、`validate` を経由しない呼び出しや将来の上限変更に対する防御であり、切り詰めで
+/// 代替しない。
+pub(crate) const MAX_JEV_HISTORY_CHARS: usize = 2_000;
+
+/// 過去の顧客発話の窓の選択（Issue #58 で Jev の判定入力用に導入。Issue #131 で製品特定の判定と
+/// 共有するためここへ移動）。時系列昇順で返す。**発話を途中で切らない**。
+///
+/// 1. `role == Customer` に絞り、各発話へ改行潰しの正規化**のみ**を掛ける。正規化後に空になる
+///    もの（制御文字だけの発話等）は除外する（空の発話が枠を消費して有効な発話を押し出す事故を
+///    防ぐため）。
+/// 2. 新しい側から最大 [`MAX_HISTORY_TURNS`] 件を採る。
+/// 3. 合計文字数が [`MAX_JEV_HISTORY_CHARS`] を超える間、古い側の発話を 1 件ずつ**丸ごと**落とす
+///    （1 件だけで超える発話も切り詰めず丸ごと落とす。過去発話 0 件になりうる）。
+///
+/// 表示用の要約予算（1 発話 100 字 + `…`）を判定入力へ流用しないこと。理由と既知の限界
+/// （発話単位の削除も「安全側にしか振れない」保証が無いこと）は `api::build_jev_state` の doc
+/// コメントを参照。
+///
+/// 手順 2・3 のいずれかで 1 件以上落としたときは `tracing::warn!` を 1 回出す（件数窓は
+/// `window_dropped_turns`、予算超過は `dropped_turns`）。**発話本文は絶対に出さない**。
+/// `request_id` は該当リクエストと突き合わせるための相関 ID。
+pub(crate) fn select_customer_history_for_jev(
+    history: &[ReplyHistoryTurn],
+    request_id: &str,
+) -> Vec<String> {
+    let mut turns: Vec<String> = history
+        .iter()
+        .filter(|turn| turn.role == ReplyHistoryRole::Customer)
+        .map(|turn| crate::harness::prompt_input::collapse_to_single_line(&turn.text))
+        .filter(|text| !text.is_empty())
+        .collect();
+    let window_skip = turns.len().saturating_sub(MAX_HISTORY_TURNS);
+    turns.drain(..window_skip);
+
+    // 古い側から順に、合計が予算に収まるまで丸ごと落とす。`total_chars` は `turns` の総和なので、
+    // 全件落とせば 0 になりループは必ず終わる（`turns` が空でも panic しない）。
+    let mut total_chars: usize = turns.iter().map(|turn| turn.chars().count()).sum();
+    let mut dropped_turns = 0;
+    for turn in &turns {
+        if total_chars <= MAX_JEV_HISTORY_CHARS {
+            break;
+        }
+        total_chars -= turn.chars().count();
+        dropped_turns += 1;
+    }
+    turns.drain(..dropped_turns);
+
+    if window_skip > 0 || dropped_turns > 0 {
+        tracing::warn!(
+            request_id = %request_id,
+            window_dropped_turns = window_skip,
+            dropped_turns,
+            kept_turns = turns.len(),
+            reason = "jev_history_budget",
+            "past customer turns were dropped whole from jev's judgment input (via the history \
+             window and/or the character budget; turns are never truncated). if a dropped turn \
+             limited or negated something mentioned in a later turn, has_enough_info can come out \
+             either higher or lower than the whole conversation warrants"
+        );
+    }
+    turns
+}
+
 /// 会話履歴から、生成プロンプトに注入する分だけを選ぶ。
 ///
 /// 新しい側（末尾）から最大 [`MAX_HISTORY_TURNS`] ターン・合計 [`MAX_HISTORY_CHARS`] 字までを

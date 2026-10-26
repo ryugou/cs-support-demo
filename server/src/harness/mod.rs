@@ -432,22 +432,49 @@ fn merge_outcome_attributes(
     merged
 }
 
-/// Issue #131: 製品特定済みの判定（`DecisionInput::product_identified`）。次のいずれかで true。
-/// - 今ターンの `Matched` が allowlist の一覧表記に解決できた（`resolved_matched_models`）
-/// - ケース属性 `product_models` が空でない
-/// - 呼出元の明示的な `product_key` が allowlist に解決できる（MCP 経路。allowlist 外は数えず、
+/// Issue #131: 製品特定済みの判定（`DecisionInput::product_identified`）のうち、今ターンの
+/// 入力だけで決まる部分 (a)(b)。次のいずれかで true。
+/// - (a) 今ターンの `Matched` が allowlist の一覧表記に解決できた（`resolved_matched_models`）
+/// - (b) 呼出元の明示的な `product_key` が allowlist に解決できる（MCP 経路。allowlist 外は数えず、
 ///   既存の取扱外経路に任せる。`/api/reply` は `None` を渡すため LINE 経路は変わらない）
+///
+/// 過去の顧客発話の窓 (c) は [`window_matched_models`]。ケース属性 `product_models` は使わない
+/// （product-switch 設計 §4: 回答可否の判定には使わない）。
 fn is_product_identified(
     allowlist: &product_gate::ProductAllowlist,
     resolved_matched_models: &[String],
-    existing_product_models_csv: &str,
     product_key: Option<&str>,
 ) -> bool {
     !resolved_matched_models.is_empty()
-        || !knowledge::csv_list(existing_product_models_csv).is_empty()
         || product_key
             .and_then(|k| allowlist.canonical_model(k))
             .is_some()
+}
+
+/// Issue #131 (c): Jev 用の直近顧客発話の窓（[`reply::select_customer_history_for_jev`] を共有。
+/// 最大 6 件・2,000 字・発話は切らない）の過去の顧客発話に含まれる `Matched` 製品参照を、allowlist の
+/// 一覧表記に解決して返す。`[jev] enabled` には依存しない。
+///
+/// 窓の発話を `\n` で連結した 1 文字列で製品参照抽出を 1 回だけ呼ぶ（発話数ぶんの LLM 呼び出しを
+/// 避ける）。採用規則は今ターンと同じ（`adopt_product_references_for_extraction_mode`: signal 抽出が
+/// `Hybrid` でないターンは参照を採用しない = 未特定側に倒れる fail-closed）。窓が空なら抽出を
+/// 呼ばない。
+async fn window_matched_models(
+    extractor: &extraction::ProductReferenceExtractor,
+    allowlist: &product_gate::ProductAllowlist,
+    extraction_mode: extraction::ExtractionMode,
+    history: &[reply::ReplyHistoryTurn],
+    request_id: &str,
+) -> Vec<String> {
+    let window = reply::select_customer_history_for_jev(history, request_id);
+    if window.is_empty() {
+        return Vec::new();
+    }
+    let refs = extractor
+        .extract(&window.join("\n"), allowlist.display_list())
+        .await;
+    let (refs, _discarded) = adopt_product_references_for_extraction_mode(extraction_mode, refs);
+    case_switch::partition_matched_models(allowlist, &refs).0
 }
 
 /// 聞き返し可否（決定論、Issue #54 で契約を更新）:
@@ -1985,9 +2012,13 @@ impl Harness {
             stakes_input,
             applicable_known_resolution,
         } = kr_turn;
-        // Issue #131: 製品特定済み = 今ターンの `Matched` 製品参照（allowlist の一覧表記に
-        // 解決できたもの）、またはケース属性 `product_models` が空でない。`product_models` へ入る
-        // のは `resolve_matched_models` を通った `Matched` 型番だけ（Ambiguous / Foreign は入らない）。
+        // Issue #131: 製品特定済み = (a) 今ターンの `Matched` 製品参照（allowlist の一覧表記に
+        // 解決できたもの）、(b) 呼出元の明示的 `product_key` が allowlist 内、(c) Jev 用の直近
+        // 顧客発話の窓（最大 6 件・2,000 字。`select_customer_history_for_jev` を共有）内の過去の
+        // 顧客発話に `Matched`。ケース属性 `product_models` は使わない（product-switch 設計 §4:
+        // 判定の入力（切り替えの検知）にだけ使い、回答可否の判定には使わない）。(c) は signal が
+        // 1 つ以上あり (a)(b) で特定できないときだけ評価する（そうでなければ結果が判定に影響せず、
+        // 抽出の LLM 呼び出しを無駄に増やすため）。
         // 解決は allowlist の一覧表記への正規化を1か所（`resolve_matched_models`）に集約する
         // （design doc §2.1 末尾）。未解決の警告は /api/reply と MCP の両経路で毎ターン通るここで
         // 1 回だけ出す（api.rs::judge_product_switch はログを出さない側を使う）。
@@ -1997,12 +2028,18 @@ impl Harness {
             .unwrap_or_default();
         let resolved_matched_models =
             case_switch::resolve_matched_models(&allowlist, &product_references);
-        let product_identified = is_product_identified(
-            &allowlist,
-            &resolved_matched_models,
-            &existing_product_models,
-            product_key,
-        );
+        let product_identified =
+            is_product_identified(&allowlist, &resolved_matched_models, product_key)
+                || (!decide_signals.is_empty()
+                    && !window_matched_models(
+                        &self.product_reference_extractor,
+                        &allowlist,
+                        extraction_mode,
+                        history,
+                        &ctx.request_id,
+                    )
+                    .await
+                    .is_empty());
         let decision_result = decision::decide(&decision::DecisionInput {
             question_signals: decide_signals,
             question_raw: question,
@@ -4987,7 +5024,6 @@ mod tests {
         assert!(is_product_identified(
             &identified_allowlist(),
             &[],
-            "",
             Some("abc-100")
         ));
     }
@@ -4997,7 +5033,6 @@ mod tests {
         assert!(!is_product_identified(
             &identified_allowlist(),
             &[],
-            "",
             Some("ZZZ-999")
         ));
     }
@@ -5005,24 +5040,135 @@ mod tests {
     #[test]
     fn absent_product_key_without_other_evidence_is_unidentified() {
         // /api/reply は product_key に None を渡す（LINE 経路は変わらない）。
-        assert!(!is_product_identified(
+        assert!(!is_product_identified(&identified_allowlist(), &[], None));
+    }
+
+    #[test]
+    fn a_matched_model_this_turn_counts_as_identified() {
+        assert!(is_product_identified(
             &identified_allowlist(),
-            &[],
-            "",
+            &["ABC-100".to_string()],
             None
         ));
     }
 
-    #[test]
-    fn matched_or_case_product_models_count_as_identified() {
+    /// 発話に型番 `ABC-100` が含まれていれば `Matched` を返す疑似 LLM（実 LLM の代わり）。
+    struct ModelInTextClassifier;
+
+    #[async_trait::async_trait]
+    impl extraction::ClassifyProductReferences for ModelInTextClassifier {
+        async fn classify(
+            &self,
+            question: &str,
+            _catalog: &str,
+        ) -> anyhow::Result<Vec<product_gate::ProductReference>> {
+            Ok(if question.contains("ABC-100") {
+                vec![product_gate::ProductReference {
+                    surface: "ABC-100".to_string(),
+                    resolution: product_gate::ProductReferenceResolution::Matched,
+                    matched_model: Some("ABC-100".to_string()),
+                }]
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    fn customer(text: &str) -> reply::ReplyHistoryTurn {
+        reply::ReplyHistoryTurn {
+            role: reply::ReplyHistoryRole::Customer,
+            text: text.to_string(),
+        }
+    }
+
+    fn assistant(text: &str) -> reply::ReplyHistoryTurn {
+        reply::ReplyHistoryTurn {
+            role: reply::ReplyHistoryRole::Assistant,
+            text: text.to_string(),
+        }
+    }
+
+    /// `Harness::evaluate` の製品特定の組み立て（(a) 今ターン (b) product_key (c) 窓）を、同じ部品
+    /// （`is_product_identified` / `window_matched_models`）で再現する。ケース属性 `product_models`
+    /// はどこにも渡さない（product-switch 設計 §4）。
+    async fn identified_for_turn(
+        history: &[reply::ReplyHistoryTurn],
+        message: &str,
+        mode: extraction::ExtractionMode,
+    ) -> bool {
         let allowlist = identified_allowlist();
-        assert!(is_product_identified(
-            &allowlist,
-            &["ABC-100".to_string()],
-            "",
-            None
-        ));
-        assert!(is_product_identified(&allowlist, &[], "ABC-100", None));
+        let extractor = extraction::ProductReferenceExtractor::new(Some(Arc::new(
+            ModelInTextClassifier,
+        )
+            as Arc<dyn extraction::ClassifyProductReferences>));
+        let current = extractor.extract(message, allowlist.display_list()).await;
+        let (current, _) = adopt_product_references_for_extraction_mode(mode, current);
+        let resolved = case_switch::resolve_matched_models(&allowlist, &current);
+        is_product_identified(&allowlist, &resolved, None)
+            || !window_matched_models(&extractor, &allowlist, mode, history, "req-1")
+                .await
+                .is_empty()
+    }
+
+    #[tokio::test]
+    async fn multi_turn_symptom_then_model_then_symptom_is_identified_while_the_model_is_in_the_window(
+    ) {
+        let hybrid = extraction::ExtractionMode::Hybrid;
+        // 1 ターン目: 症状のみ → 未特定（Clarify 側）。
+        assert!(!identified_for_turn(&[], "赤いランプが点滅してる", hybrid).await);
+        // 2 ターン目: 型番のみ → 今ターンの Matched で特定済み。
+        let h2 = vec![
+            customer("赤いランプが点滅してる"),
+            assistant("製品名か型番を教えてください"),
+        ];
+        assert!(identified_for_turn(&h2, "ABC-100 です", hybrid).await);
+        // 3 ターン目: 症状のみ。型番は窓の中 → 特定済み（Clarify しない）。
+        let h3 = vec![
+            customer("赤いランプが点滅してる"),
+            assistant("製品名か型番を教えてください"),
+            customer("ABC-100 です"),
+            assistant("確認します"),
+        ];
+        assert!(identified_for_turn(&h3, "まだ点滅しています", hybrid).await);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_dropped_out_of_the_window_no_longer_identifies_the_product() {
+        // 型番を含む発話の後に顧客発話が窓の件数（MAX_HISTORY_TURNS）以上続くと、型番は窓から落ちる。
+        let mut h = vec![customer("ABC-100 です")];
+        for i in 0..reply::MAX_HISTORY_TURNS {
+            h.push(customer(&format!("症状の続き {i}")));
+        }
+        assert!(
+            !identified_for_turn(&h, "まだ点滅しています", extraction::ExtractionMode::Hybrid)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn case_product_models_without_a_matched_reference_in_the_window_stays_unidentified() {
+        // product-switch 設計 §4 の行（`product_models` は回答可否の判定に使わない）を固定する:
+        // 識別の部品はケース属性 `product_models` を入力に取らず、窓にも今ターンにも `Matched` が
+        // なければ、ケースにその型番が積まれていても未特定のままになる。
+        let h = vec![customer("赤いランプが点滅してる")];
+        assert!(
+            !identified_for_turn(&h, "まだ点滅しています", extraction::ExtractionMode::Hybrid)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn window_references_are_not_adopted_when_signal_extraction_fell_back_to_the_lexicon() {
+        // 今ターンと同じ採用規則: Hybrid でないターンは参照を採用しない（未特定側 = fail-closed）。
+        let h = vec![customer("ABC-100 です")];
+        assert!(
+            !identified_for_turn(
+                &h,
+                "まだ点滅しています",
+                extraction::ExtractionMode::LexiconFallback
+            )
+            .await
+        );
     }
 
     #[test]

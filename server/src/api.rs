@@ -611,81 +611,12 @@ fn build_jev_state(history: &[ReplyHistoryTurn], message: &str, request_id: &str
     lines.join("\n")
 }
 
-/// Jev の判定入力に載せる過去の顧客発話の合計文字数（`chars().count()` の総和。正規化後の値で、
-/// 今ターンの `message` と行区切りの `\n` は含まない）の上限。
-///
-/// `/api/reply` の `history[].text` 上限（[`MAX_HISTORY_TEXT_CHARS`]）と同値。したがって
-/// `validate` を通った入力では 1 発話だけで予算を超えることはなく、超過は複数発話の合計でのみ
-/// 起きる。1 発話で超える分岐（丸ごと落として過去発話 0 件になる）は、`validate` を経由しない
-/// 呼び出しや将来の上限変更に対する防御であり、切り詰めで代替しない。
-///
-/// state が今ターンだけの場合から最大でこの字数ぶん増えるため、Jev の入力トークン・
-/// レイテンシは有効化前に実測し直すこと（`docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
-const MAX_JEV_HISTORY_CHARS: usize = 2_000;
-
-/// Jev の**判定入力**専用の過去の顧客発話の選択。時系列昇順で返す。**発話を途中で切らない**。
-///
-/// 1. `role == Customer` に絞り、各発話へ改行潰しの正規化**のみ**を掛ける（切り詰めを伴う
-///    [`normalize_customer_turn_to_single_line`] は使わない）。正規化後に空になるもの
-///    （制御文字だけの発話等）は除外する。先に除外するのは、`validate` は `trim()` 後の非空しか
-///    見ないため、空になる発話が枠を消費して有効な発話を押し出す事故を防ぐ
-///    （[`select_customer_history_for_known_facts`] と同じ理由）。
-/// 2. 新しい側から最大 [`crate::harness::reply::MAX_HISTORY_TURNS`] 件を採る（把握済み事項の窓と
-///    件数を揃える）。この件数窓による除外も、下記の予算超過と同じく warn に出す
-///    （`window_dropped_turns` フィールド）。件数窓は固定長で除外理由も機械的だが、除外自体は
-///    観測できないと事後に会話を再構成できないため、対象外にしない。
-/// 3. 合計文字数が [`MAX_JEV_HISTORY_CHARS`] を超える間、古い側の発話を 1 件ずつ**丸ごと**落とす。
-///    1 件だけで超える発話も切り詰めず丸ごと落とす（過去発話 0 件になりうる）。
-///
-/// **表示用の要約予算（1 発話 100 字 + `…`）を判定入力へ流用しない**こと。理由（訂正・否定が
-/// 切り落とされて `has_enough_info` が不当に上がる意味反転）は [`build_jev_state`] の doc コメント
-/// を参照。同コメントが記す既知の限界（発話単位の削除も安全側にしか振れない保証は無いこと）も
-/// 参照。
-///
-/// 手順 2（件数窓）または手順 3（予算超過）のいずれかで 1 件以上落としたときは `tracing::warn!`
-/// を 1 回出す。件数窓で落ちた件数は `window_dropped_turns`、予算超過で落ちた件数は
-/// `dropped_turns`（既存フィールド名を維持）に分けて出す。**発話本文は絶対に出さない**
-/// （個人情報を含みうる）。`request_id` は該当リクエストと突き合わせるための相関 ID で、本文ではない。
-fn select_customer_history_for_jev(history: &[ReplyHistoryTurn], request_id: &str) -> Vec<String> {
-    let mut turns: Vec<String> = history
-        .iter()
-        .filter(|turn| turn.role == ReplyHistoryRole::Customer)
-        .map(|turn| crate::harness::prompt_input::collapse_to_single_line(&turn.text))
-        .filter(|text| !text.is_empty())
-        .collect();
-    let window_skip = turns
-        .len()
-        .saturating_sub(crate::harness::reply::MAX_HISTORY_TURNS);
-    turns.drain(..window_skip);
-
-    // 古い側から順に、合計が予算に収まるまで丸ごと落とす。`total_chars` は `turns` の総和なので、
-    // 全件落とせば 0 になりループは必ず終わる（`turns` が空でも panic しない）。
-    let mut total_chars: usize = turns.iter().map(|turn| turn.chars().count()).sum();
-    let mut dropped_turns = 0;
-    for turn in &turns {
-        if total_chars <= MAX_JEV_HISTORY_CHARS {
-            break;
-        }
-        total_chars -= turn.chars().count();
-        dropped_turns += 1;
-    }
-    turns.drain(..dropped_turns);
-
-    if window_skip > 0 || dropped_turns > 0 {
-        tracing::warn!(
-            request_id = %request_id,
-            window_dropped_turns = window_skip,
-            dropped_turns,
-            kept_turns = turns.len(),
-            reason = "jev_history_budget",
-            "past customer turns were dropped whole from jev's judgment input (via the history \
-             window and/or the character budget; turns are never truncated). if a dropped turn \
-             limited or negated something mentioned in a later turn, has_enough_info can come out \
-             either higher or lower than the whole conversation warrants"
-        );
-    }
-    turns
-}
+// Jev の判定入力に載せる過去の顧客発話の窓（件数・字数予算・選択規則）は、Issue #131 で
+// 製品特定の判定（`Harness::evaluate`）と共有するため `harness::reply` へ移した。規則の理由は
+// [`build_jev_state`] の doc コメントを参照。
+use crate::harness::reply::select_customer_history_for_jev;
+#[cfg(test)]
+use crate::harness::reply::MAX_JEV_HISTORY_CHARS;
 
 /// Issue #76: `outcome.decision` から、マッチした第1層ルールが宣言した顧客向けの受け止め文を
 /// 取り出す。`AnswerDecision::Allowed`、および第1層ルールが宣言していない取次（第2・3層を含む）
