@@ -15,7 +15,7 @@ use crate::harness::case_switch;
 use crate::harness::decision::{self, AnswerDecision};
 use crate::harness::extraction::{self, TurnExtraction};
 use crate::harness::product_gate;
-use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
+use crate::harness::reply::{select_customer_history_for_jev, ReplyHistoryRole, ReplyHistoryTurn};
 use crate::harness::{
     clarify, escalation_reply, hours, time_pref, Harness, ReplyDraftPolicy, RequestContext,
 };
@@ -610,13 +610,6 @@ fn build_jev_state(history: &[ReplyHistoryTurn], message: &str, request_id: &str
     }
     lines.join("\n")
 }
-
-// Jev の判定入力に載せる過去の顧客発話の窓（件数・字数予算・選択規則）は、Issue #131 で
-// 製品特定の判定（`Harness::evaluate`）と共有するため `harness::reply` へ移した。規則の理由は
-// [`build_jev_state`] の doc コメントを参照。
-use crate::harness::reply::select_customer_history_for_jev;
-#[cfg(test)]
-use crate::harness::reply::MAX_JEV_HISTORY_CHARS;
 
 /// Issue #76: `outcome.decision` から、マッチした第1層ルールが宣言した顧客向けの受け止め文を
 /// 取り出す。`AnswerDecision::Allowed`、および第1層ルールが宣言していない取次（第2・3層を含む）
@@ -2225,6 +2218,7 @@ pub fn api_router(state: ApiState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::reply::MAX_JEV_HISTORY_CHARS;
 
     fn valid_request() -> ReplyRequest {
         ReplyRequest {

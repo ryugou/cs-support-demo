@@ -200,10 +200,12 @@ pub struct DecisionInput<'a> {
     pub thresholds: &'a Thresholds,
     /// config 由来の既定エスカレーション route（第3層エスカレーション先）。
     pub default_route: &'a str,
-    /// Issue #131: whether the case has an identified handled product (a `Matched` product
-    /// reference this turn, or a non-empty case attribute `product_models`). Deliberately not an
-    /// `Option` and without a default: callers must state it, and `false` (unidentified) is the
-    /// fail-closed value.
+    /// Issue #131: whether the turn has an identified handled product. True when any of: (a) a
+    /// `Matched` product reference this turn, (b) an explicit caller-supplied `product_key` that
+    /// resolves into the handled-product allowlist, (c) a `Matched` reference in the window of
+    /// recent customer utterances (the same window as Jev's judgment input). `Ambiguous` and
+    /// `Foreign` references do not count. Deliberately not an `Option` and without a default:
+    /// callers must state it, and `false` (unidentified) is the fail-closed value.
     pub product_identified: bool,
 }
 

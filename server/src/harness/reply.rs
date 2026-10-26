@@ -133,13 +133,10 @@ pub(crate) const MAX_JEV_HISTORY_CHARS: usize = 2_000;
 /// （発話単位の削除も「安全側にしか振れない」保証が無いこと）は `api::build_jev_state` の doc
 /// コメントを参照。
 ///
-/// 手順 2・3 のいずれかで 1 件以上落としたときは `tracing::warn!` を 1 回出す（件数窓は
-/// `window_dropped_turns`、予算超過は `dropped_turns`）。**発話本文は絶対に出さない**。
-/// `request_id` は該当リクエストと突き合わせるための相関 ID。
-pub(crate) fn select_customer_history_for_jev(
-    history: &[ReplyHistoryTurn],
-    request_id: &str,
-) -> Vec<String> {
+/// ログを出さない純粋な選択。結果と、手順 2・3 で落とした件数を返す。Jev 経路のログ出力は
+/// [`select_customer_history_for_jev`] が担い、製品特定（Issue #131）の経路はこの関数を直接呼ぶ
+/// （Jev の判定入力ではないため `jev_history_budget` の warn を出さない）。
+pub(crate) fn customer_history_window(history: &[ReplyHistoryTurn]) -> CustomerHistoryWindow {
     let mut turns: Vec<String> = history
         .iter()
         .filter(|turn| turn.role == ReplyHistoryRole::Customer)
@@ -161,7 +158,35 @@ pub(crate) fn select_customer_history_for_jev(
         dropped_turns += 1;
     }
     turns.drain(..dropped_turns);
+    CustomerHistoryWindow {
+        turns,
+        window_skipped: window_skip,
+        budget_dropped: dropped_turns,
+    }
+}
 
+/// [`customer_history_window`] の結果。
+pub(crate) struct CustomerHistoryWindow {
+    /// 窓に残った過去の顧客発話（時系列昇順）。
+    pub(crate) turns: Vec<String>,
+    /// 件数窓（手順 2）で落とした件数。
+    pub(crate) window_skipped: usize,
+    /// 字数予算（手順 3）で丸ごと落とした件数。
+    pub(crate) budget_dropped: usize,
+}
+
+/// Jev の判定入力用の窓（[`customer_history_window`]）。手順 2・3 のいずれかで 1 件以上落としたときは
+/// `tracing::warn!` を 1 回出す（件数窓は `window_dropped_turns`、予算超過は `dropped_turns`）。
+/// **発話本文は絶対に出さない**。`request_id` は該当リクエストと突き合わせるための相関 ID。
+pub(crate) fn select_customer_history_for_jev(
+    history: &[ReplyHistoryTurn],
+    request_id: &str,
+) -> Vec<String> {
+    let CustomerHistoryWindow {
+        turns,
+        window_skipped: window_skip,
+        budget_dropped: dropped_turns,
+    } = customer_history_window(history);
     if window_skip > 0 || dropped_turns > 0 {
         tracing::warn!(
             request_id = %request_id,
