@@ -432,6 +432,24 @@ fn merge_outcome_attributes(
     merged
 }
 
+/// Issue #131: 製品特定済みの判定（`DecisionInput::product_identified`）。次のいずれかで true。
+/// - 今ターンの `Matched` が allowlist の一覧表記に解決できた（`resolved_matched_models`）
+/// - ケース属性 `product_models` が空でない
+/// - 呼出元の明示的な `product_key` が allowlist に解決できる（MCP 経路。allowlist 外は数えず、
+///   既存の取扱外経路に任せる。`/api/reply` は `None` を渡すため LINE 経路は変わらない）
+fn is_product_identified(
+    allowlist: &product_gate::ProductAllowlist,
+    resolved_matched_models: &[String],
+    existing_product_models_csv: &str,
+    product_key: Option<&str>,
+) -> bool {
+    !resolved_matched_models.is_empty()
+        || !knowledge::csv_list(existing_product_models_csv).is_empty()
+        || product_key
+            .and_then(|k| allowlist.canonical_model(k))
+            .is_some()
+}
+
 /// 聞き返し可否（決定論、Issue #54 で契約を更新）:
 /// - 第1層（明示エスカレーションルール）は `missing` が非空（情報不足）のときだけ許可する。
 ///   `decision::decide` は第1層マッチ時にも `evidence_sufficient` で情報充足度を評価しており、
@@ -1979,8 +1997,12 @@ impl Harness {
             .unwrap_or_default();
         let resolved_matched_models =
             case_switch::resolve_matched_models(&allowlist, &product_references);
-        let product_identified = !resolved_matched_models.is_empty()
-            || !knowledge::csv_list(&existing_product_models).is_empty();
+        let product_identified = is_product_identified(
+            &allowlist,
+            &resolved_matched_models,
+            &existing_product_models,
+            product_key,
+        );
         let decision_result = decision::decide(&decision::DecisionInput {
             question_signals: decide_signals,
             question_raw: question,
@@ -4954,6 +4976,53 @@ mod tests {
             Vec::new(),
         );
         assert!(clarification_allowed(&d));
+    }
+
+    fn identified_allowlist() -> product_gate::ProductAllowlist {
+        product_gate::ProductAllowlist::from_models(vec!["ABC-100".to_string()])
+    }
+
+    #[test]
+    fn explicit_product_key_in_allowlist_counts_as_identified() {
+        assert!(is_product_identified(
+            &identified_allowlist(),
+            &[],
+            "",
+            Some("abc-100")
+        ));
+    }
+
+    #[test]
+    fn explicit_product_key_outside_allowlist_does_not_count() {
+        assert!(!is_product_identified(
+            &identified_allowlist(),
+            &[],
+            "",
+            Some("ZZZ-999")
+        ));
+    }
+
+    #[test]
+    fn absent_product_key_without_other_evidence_is_unidentified() {
+        // /api/reply は product_key に None を渡す（LINE 経路は変わらない）。
+        assert!(!is_product_identified(
+            &identified_allowlist(),
+            &[],
+            "",
+            None
+        ));
+    }
+
+    #[test]
+    fn matched_or_case_product_models_count_as_identified() {
+        let allowlist = identified_allowlist();
+        assert!(is_product_identified(
+            &allowlist,
+            &["ABC-100".to_string()],
+            "",
+            None
+        ));
+        assert!(is_product_identified(&allowlist, &[], "ABC-100", None));
     }
 
     #[test]
