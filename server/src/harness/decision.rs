@@ -103,9 +103,9 @@ pub enum EscalateReason {
     RequiresHumanApproval,
     InsufficientDirectness,
     UnknownAddedSignal,
-    /// Issue #131: layer 3 where the utterance raises at least one signal but the case has no
-    /// identified handled product. The manual match score is not consulted; the reply asks the
-    /// customer to pick from the handled-product catalog.
+    /// Issue #131: ケース内の累積 signal が 1 つ以上あるのに取扱製品が特定されていない第3層。
+    /// マニュアル一致スコアと事前選択された known_resolution は参照しない。返信は取扱製品
+    /// カタログから機種を選ばせる聞き返しになる。
     ProductUnidentified,
 }
 
@@ -171,6 +171,17 @@ pub enum AnswerDecision {
 }
 
 impl AnswerDecision {
+    /// 製品未特定（`EscalateReason::ProductUnidentified`）による聞き返し判定か。
+    pub fn is_product_unidentified(&self) -> bool {
+        matches!(
+            self,
+            Self::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                ..
+            }
+        )
+    }
+
     /// Returns the known resolution id this decision carries (`Allowed` answers it, `Escalate` only carries it).
     pub fn known_resolution_id(&self) -> Option<&str> {
         match self {
@@ -200,12 +211,10 @@ pub struct DecisionInput<'a> {
     pub thresholds: &'a Thresholds,
     /// config 由来の既定エスカレーション route（第3層エスカレーション先）。
     pub default_route: &'a str,
-    /// Issue #131: whether the turn has an identified handled product. True when any of: (a) a
-    /// `Matched` product reference this turn, (b) an explicit caller-supplied `product_key` that
-    /// resolves into the handled-product allowlist, (c) a `Matched` reference in the window of
-    /// recent customer utterances (the same window as Jev's judgment input). `Ambiguous` and
-    /// `Foreign` references do not count. Deliberately not an `Option` and without a default:
-    /// callers must state it, and `false` (unidentified) is the fail-closed value.
+    /// Issue #131: 取扱製品が特定済みか。次のいずれかで true。(a) 今ターンの `Matched` 製品参照、
+    /// (b) 呼出元の明示的な `product_key` が allowlist に解決できる、(c) Jev の判定入力と同じ
+    /// 直近顧客発話の窓内の `Matched` 参照。`Ambiguous` と `Foreign` は数えない。`Option` にせず
+    /// 既定値も持たない（呼出元が必ず明示する。`false` = 未特定が fail-closed の値）。
     pub product_identified: bool,
 }
 
@@ -218,8 +227,11 @@ pub struct DecisionInput<'a> {
 /// 2. A layer-2 prohibited domain escalates (`missing` empty, no known resolution id).
 /// 3. A layer-1 `Binding::Advisory` rule escalates; `missing` comes from `evidence_sufficient`,
 ///    and the pre-selected `known_resolution`, if any, is carried as `known_resolution_id`.
-/// 4. A pre-selected `known_resolution` is `Allowed` with `AnswerSource::KnownResolution`.
-/// 5. Layer 3: sufficient manual evidence is `Allowed`, otherwise it escalates.
+/// 4. Issue #131: when `question_signals` (the signals accumulated over the case) is non-empty and
+///    `product_identified` is false, it escalates with `EscalateReason::ProductUnidentified`,
+///    whatever the manual score and whatever known resolution is pre-selected.
+/// 5. A pre-selected `known_resolution` is `Allowed` with `AnswerSource::KnownResolution`.
+/// 6. Layer 3: sufficient manual evidence is `Allowed`, otherwise it escalates.
 ///
 /// `hearing` is the matched rule's own declaration (`EscalationRule::hearing_contract`, always
 /// `None` for mandatory). `customer_ack` is carried only when exactly one layer-1 rule matches
@@ -257,6 +269,9 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             input.known_resolution.map(|kr| kr.id.clone()),
         );
     }
+    if !input.product_identified && !input.question_signals.is_empty() {
+        return product_unidentified_escalate(input);
+    }
     if let Some(kr) = input.known_resolution {
         return AnswerDecision::Allowed {
             source: AnswerSource::KnownResolution,
@@ -268,25 +283,6 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
     }
     let kr_match = match_known_resolution(input.resolutions, input.question_signals);
     match evidence_sufficient(threshold, input.best_manual_score) {
-        // Issue #131: a layer-3 turn that raises a signal while the case has no identified
-        // handled product must not be answered from whatever material scored high (it may be
-        // for an unhandled product). A turn that raises no signal (generic question) is
-        // unaffected (product-scope spec L59).
-        Sufficiency::Sufficient
-            if !input.product_identified && !input.question_signals.is_empty() =>
-        {
-            AnswerDecision::Escalate {
-                reason: EscalateReason::ProductUnidentified,
-                layer: 3,
-                route_to: input.default_route.to_string(),
-                disclosure_scope: DisclosureScope::ConfirmingWithTeam,
-                audit_required: true,
-                missing: Vec::new(),
-                hearing: None,
-                customer_ack: None,
-                known_resolution_id: None,
-            }
-        }
         Sufficiency::Sufficient => AnswerDecision::Allowed {
             source: AnswerSource::Manual,
             evidence_section_keys: input.best_manual_sections.to_vec(),
@@ -312,6 +308,21 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
                 known_resolution_id: None,
             }
         }
+    }
+}
+
+/// Issue #131: ケース内の累積 signal があるのに取扱製品が未特定のターンの Escalate（聞き返し契約）。
+fn product_unidentified_escalate(input: &DecisionInput) -> AnswerDecision {
+    AnswerDecision::Escalate {
+        reason: EscalateReason::ProductUnidentified,
+        layer: 3,
+        route_to: input.default_route.to_string(),
+        disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+        audit_required: true,
+        missing: Vec::new(),
+        hearing: None,
+        customer_ack: None,
+        known_resolution_id: None,
     }
 }
 
@@ -407,6 +418,34 @@ mod tests {
             default_route: "triage",
             // Fail-closed default: tests opt in to an identified product explicitly.
             product_identified: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn identified_input<'a>(
+        question_signals: &'a SignalSet,
+        rules: &'a [EscalationRule],
+        domains: &'a [ProhibitedDomain],
+        resolutions: &'a [KnownResolution],
+        best_manual_score: Option<f32>,
+        stakes_input: StakesInput,
+        thresholds: &'a Thresholds,
+        sections: &'a [String],
+        known_resolution: Option<&'a KnownResolution>,
+    ) -> DecisionInput<'a> {
+        DecisionInput {
+            product_identified: true,
+            ..input(
+                question_signals,
+                rules,
+                domains,
+                resolutions,
+                best_manual_score,
+                stakes_input,
+                thresholds,
+                sections,
+                known_resolution,
+            )
         }
     }
 
@@ -604,7 +643,7 @@ mod tests {
     fn kr_alone_is_allowed_known_resolution() {
         let k = kr("kr1", &["a"]);
         let q = signals(&["a"]);
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -679,7 +718,7 @@ mod tests {
         for (name, question, reason) in cases {
             let resolutions = vec![kr("kr1", &["a"])];
             let q = signals(question);
-            let d = decide(&input(
+            let d = decide(&identified_input(
                 &q,
                 &[],
                 &[],
@@ -1267,7 +1306,7 @@ mod tests {
     fn layer3_reuses_known_resolution() {
         let resolutions = vec![kr("kr1", &["discoloration"])];
         let q = signals(&["discoloration"]);
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -1295,7 +1334,7 @@ mod tests {
     fn layer3_added_signal_escalates_with_unknown_added_signal() {
         let resolutions = vec![kr("kr1", &["discoloration"])];
         let q = signals(&["discoloration", "mold"]);
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -1398,6 +1437,78 @@ mod tests {
             None,
         ));
         assert!(matches!(d, AnswerDecision::Allowed { .. }));
+    }
+
+    /// D1: 事前選択された known_resolution があっても、製品未特定 + signal あり は
+    /// ProductUnidentified（KR の Allowed より前に判定する）。
+    #[test]
+    fn preselected_known_resolution_with_unidentified_product_escalates_product_unidentified() {
+        let q = signals(&["led_red_blinking"]);
+        let resolution = kr("kr-1", &["led_red_blinking"]);
+        let th = thresholds();
+        let inp = input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &th,
+            &[],
+            Some(&resolution),
+        );
+        assert!(matches!(
+            decide(&inp),
+            AnswerDecision::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                layer: 3,
+                ..
+            }
+        ));
+    }
+
+    /// D1: 製品特定済み + 事前選択 known_resolution は従来どおり KR の Allowed（回帰なし）。
+    #[test]
+    fn preselected_known_resolution_with_identified_product_is_allowed() {
+        let q = signals(&["led_red_blinking"]);
+        let resolution = kr("kr-1", &["led_red_blinking"]);
+        let th = thresholds();
+        let mut inp = input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &th,
+            &[],
+            Some(&resolution),
+        );
+        inp.product_identified = true;
+        assert!(matches!(
+            decide(&inp),
+            AnswerDecision::Allowed {
+                source: AnswerSource::KnownResolution,
+                ..
+            }
+        ));
+    }
+
+    /// D1: マニュアル一致が不足（Insufficient）でも、製品未特定 + signal あり は
+    /// InsufficientDirectness ではなく ProductUnidentified。
+    #[test]
+    fn insufficient_manual_with_unidentified_product_escalates_product_unidentified() {
+        let q = signals(&["discoloration"]);
+        let th = thresholds();
+        let inp = input(&q, &[], &[], &[], Some(0.01), calm(), &th, &[], None);
+        assert!(matches!(
+            decide(&inp),
+            AnswerDecision::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                layer: 3,
+                ..
+            }
+        ));
     }
 
     /// 製品特定済みなら signal があっても Allowed のまま。

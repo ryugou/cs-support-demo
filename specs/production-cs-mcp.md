@@ -188,7 +188,7 @@ vegapunk / PunkRecord
 
 | PR（子 Issue） | 変わる挙動 | 置き換わる本書の記述 |
 | --- | --- | --- |
-| PR 2（#110） | 第2層（禁止領域）を第1層 mandatory より先に評価する。`electrical-work` はパターン（「電気工事」「高所作業」）のみで発火する。MCP でも、これらのパターンを含む工事の質問の監査ラベルが `construction-risk` から `electrical-work` に変わる（設計 §2.3）。`electrical-work` の取次は取り次ぐ項目を持たなくなるため、部分回答が付かない（設計 §2.3） | 上記「判定アーキテクチャ：3 層構造」の層の順序の図と「安全に関わる層（1・2）を必ず先に置き」、下記「例: `search_manual`」の「9. 第1層 mandatory → 第2層 → 第1層 advisory → 第3層 の順に判定する」（PR 2 はこの項目と上記 3 層の図で第2層を第1層 mandatory より先に移す）、下記「S1-1. パイプライン（Step 1 の確定フロー）」の第1層・第2層の順序 |
+| PR 2（#110） | 第2層（禁止領域）を第1層 mandatory より先に評価する。`electrical-work` はパターン（「電気工事」「高所作業」）のみで発火する。MCP でも、これらのパターンを含む工事の質問の監査ラベルが `construction-risk` から `electrical-work` に変わる（設計 §2.3）。`electrical-work` の取次は取り次ぐ項目を持たなくなるため、部分回答が付かない（設計 §2.3） | 上記「判定アーキテクチャ：3 層構造」の層の順序の図と「安全に関わる層（1・2）を必ず先に置き」、下記「例: `search_manual`」の「9. 第1層 mandatory → 第2層 → 第1層 advisory → 製品未特定ガード（`ProductUnidentified`。KR の Allowed と第3層より前）→ 第3層 の順に判定する」（PR 2 はこの項目と上記 3 層の図で第2層を第1層 mandatory より先に移す）、下記「S1-1. パイプライン（Step 1 の確定フロー）」の第1層・第2層の順序 |
 | PR 3（#111） | `/{project_id}/api/reply` で第1層ルールにマッチすると、advisory・mandatory を問わず「ヒアリング → 材料で回答 → 解決確認」の取り扱い（handling）に入る。ヒアリング後すぐ取り次ぐのは `after_hearing = handoff` のルール（`initial-cost-quote`）だけで、ほかは答えられない・解決しない場合、または回答の回数上限に達した場合に取り次ぐ（聞き返しの回数上限に達したときは、聞き取れた範囲で回答に進み、材料で答えられなければ取り次ぐ）。`human-handoff` もまず用件を聞く（同じ発話で具体的なルールの signal が出ていれば、そのルールの取り扱いに入る）。取り扱いからの取次の受け止め文は取り扱い中ルールの `customer_ack`。Jev（TypeSafe）へは全ルールのヒアリングと解決確認で顧客発話を送る（assistant 発話は送らない。`[jev] enabled = false` で全停止）。`ingest_rules` は mandatory への `hearing` 宣言を受理し、`hearing` / `hearing_items_ja` / `after_hearing` を必須にする（設計 §3〜§7.3、§9） | 上記「第1層 — 明示エスカレーションルール」の「マッチしたら問答無用で確定ルーティング、回答生成に進ませない」と `customer_ack` の「ちょうど 1 件」の条件（取り扱いからの取次について）、上記「追記: Jev（TypeSafe System One）の適用範囲（Issue #56 / #58、2026-09-21）」の適用対象・第三者への送信範囲・「mandatory の即時エスカレーション契約は不変」・投入前の検証、下記「課題 3: 確実なエスカレーション」の「該当したら問答無用でそこへ振る（第1層）」と回答生成への経路を閉じる記述と「第1層・第2層で回答生成への経路が閉じるという本 spec の判定思想」（第1層について）、下記「追記: 会話フロー v1.1（聞き返し・営業時間・希望時間帯、Issue #17）」の冒頭の「`/api/reply` 経路に限り、応答決定を「即答 / 聞き返し（最大3ターン）/ 文脈化エスカレーション」の3値へ拡張し、…」（第1層マッチ時は取り扱いの「ヒアリング → 回答 → 解決確認」になることについて）と Issue #54 改訂、下記「S1-1. パイプライン（Step 1 の確定フロー）」の「第1層 escalation_rule 照合 → マッチ: 固有ルーティングで確定」、インターフェース層「LINE アダプタは判断ゼロ」項の「会話履歴は原則…判定には使わない」と `warranty-failure` 限定の Jev 例外、ロードマップ「フルリプレイス回避 — Step 1 実装への遵守事項（追加）」1 の「会話履歴の言質は判定入力にしない」の例外注記、インターフェース層の「判定・応答文生成・egress_gate はすべて `Harness::evaluate()`（本ドキュメントが定義する decision ハーネス）に閉じる。」「`/api/reply` はその薄い HTTP アダプタであり、…判定ロジックを持たない。」「3 層判定・signal 抽出・escalation 判定・grade 運用は、…**同一**で、この節による変更はない。」「`/api/reply` は `evaluate()` を経路として追加しただけで、判定層・会話層に変更を加えていない。」、「Escalate では内部マニュアル本文を LLM に渡さない。」の項（「答える材料をそもそも渡さない」構造の担保）とその 2026-10-07 改訂注記の「条件を満たさない `Escalate` では本節の記述どおり材料を渡さない。」（PR 3 の取り扱いの回答ステップ `draft_handling_answer` が材料を渡すことについて。`build_reply_brief` 自体と MCP 経路は変わらない）、「経路ごとの生成方針（Issue #78）」の「`/api/reply` とアドバイザ経由（homesec）は判定が取次のとき、…には生成しない（取次では受け止め文と決定的ブロック・または聞き返しで応答を組み立て、…）」（第1層の取り扱いでは返信を回答ステップが作ることについて。`evaluate` 自身の下書きを生成しない点は変わらない）（いずれも `/api/reply` の会話層について） |
 | PR 4（#112） | 取次時に取次サマリ（見出し「用件」「聞き取った内容」「案内した対処」「結果」）を生成し、管理画面のスレッド詳細に表示する。PR 3 から PR 4 までの間はサマリが無い（設計 §7.1） | なし（追加のみ） |
 
@@ -637,6 +637,7 @@ MCP request（認証情報付き）
    第1層 mandatory の escalation_rule 照合 → マッチ: 固有ルーティングで確定
    第2層 prohibited_domain 照合 → 触れた: 領域の受け皿へエスカレーション
    第1層 advisory の escalation_rule 照合 → マッチ: 固有ルーティングで確定（選定済みの KR があれば回答を同乗）
+   製品未特定ガード（`decide` 入力 `product_identified`）→ 累積 signal が1つ以上で製品未特定: `EscalateReason::ProductUnidentified`（聞き返し。KR 選定済みでも、マニュアルのスコアに関わらず第3層より前に確定）
    第3層 answerability
        stakes = classify_stakes(SignalSet, binding, owner)     // low/mid/high
        threshold = answerability_threshold(stakes)             // 3 段（将来 Π 連続）
@@ -1045,3 +1046,12 @@ S1-0 の三原則に加え、Step 2 / Step 3 を無改修で載せるために S
 ## フェーズロードマップとの関係
 
 本節が実装するのは「フェーズロードマップ」章の Step 2（顧客直）が要求する入出力形態の**デモ範囲サブセット**であり、Step 2 そのものではない。「大原則」（判定層・会話層は Step 1 から無改修で持ち越す）はこの実装でも成立している——`/api/reply` は `evaluate()` を経路として追加しただけで、判定層・会話層に変更を加えていない。デモ範囲外（Step 2 移行までに必要）な項目は design doc §9 に列挙されている（会話履歴の AI サマライズ・雑談 triage の高度化・担当者個人単位の identity・権限、等）。
+
+## 追記: 製品未特定ガード（Issue #131、2026-10-29）
+
+`decide` の入力に `product_identified`（fail-closed。既定は未特定）を加えた。第1層 mandatory・第2層・第1層 advisory に当たらず、ケース内の累積 signal が1つ以上あり、製品が特定されていないターンは、KR が選定済みでもマニュアルのスコアが十分でも、`EscalateReason::ProductUnidentified` で確定する。KR の Allowed と第3層の評価より前に置く。製品が特定済みなら従来どおり KR または第3層で回答する。
+
+- 特定済みとみなすのは、当ターンに `Matched` がある、呼出元の `product_key` が取扱製品の allowlist 内にある、直近顧客発話の窓に `Matched` がある、のいずれか。
+- `/api/reply` と homesec アドバイザの CS モードは、取扱製品カタログから作る聞き返し（型番と製品名の箇条書き。LLM を呼ばない）を返す。聞き返しの回数上限は `clarify_max_turns` に従う。
+- MCP `evaluate_answerability` は、`customer_reply_draft` に同じカタログ文面を入れ、`clarification_allowed` を `true` にする。この経路は履歴を持たないため、窓による特定は成立しない。
+- 詳細は `docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md` §10。

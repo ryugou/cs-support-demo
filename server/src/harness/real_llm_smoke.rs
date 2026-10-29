@@ -561,7 +561,7 @@ async fn decide_for_case(
     let product_references = fx
         .harness
         .product_reference_extractor
-        .extract(question, fx.allowlist.display_list())
+        .extract(question, fx.allowlist.display_list(), "smoke")
         .await;
     println!("signals: {signals:?} (extraction_mode={mode:?})");
     println!("product_references: {product_references:?}");

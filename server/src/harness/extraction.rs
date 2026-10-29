@@ -245,6 +245,7 @@ impl ProductReferenceExtractor {
         &self,
         question: &str,
         catalog: &str,
+        request_id: &str,
     ) -> Vec<super::product_gate::ProductReference> {
         let Some(llm) = &self.llm else {
             return Vec::new();
@@ -253,9 +254,12 @@ impl ProductReferenceExtractor {
             Ok(refs) => refs,
             Err(err) => {
                 tracing::warn!(
+                    request_id = %request_id,
                     error = %err,
-                    "llm product reference extraction failed; treating this turn as if no \
-                     product reference was mentioned (product understanding degrades, the \
+                    "llm product reference extraction failed; 製品特定を未特定として扱った\
+                     （fail-closed）: treating this turn as if no product reference was \
+                     mentioned, so a turn with a signal and no other product evidence gets the \
+                     product-catalog clarify (product understanding degrades, the \
                      question-side gate stage 1 / material pre-filter / answer-side gate are \
                      unaffected)"
                 );
@@ -286,10 +290,11 @@ pub async fn extract_signals_and_product_references(
     product_reference_extractor: &ProductReferenceExtractor,
     question: &str,
     catalog: &str,
+    request_id: &str,
 ) -> TurnExtraction {
     tokio::join!(
         signal_extractor.extract(question),
-        product_reference_extractor.extract(question, catalog),
+        product_reference_extractor.extract(question, catalog, request_id),
     )
 }
 
@@ -308,6 +313,7 @@ pub async fn resolve_turn_extraction(
     product_reference_extractor: &ProductReferenceExtractor,
     question: &str,
     catalog: &str,
+    request_id: &str,
 ) -> TurnExtraction {
     match supplied {
         Some(extraction) => extraction,
@@ -317,6 +323,7 @@ pub async fn resolve_turn_extraction(
                 product_reference_extractor,
                 question,
                 catalog,
+                request_id,
             )
             .await
         }
@@ -441,7 +448,7 @@ mod tests {
         let extractor =
             ProductReferenceExtractor::new(Some(MockProductReferenceLlm::ok(refs.clone())));
         let out = extractor
-            .extract("ADC-VDB101について教えてください", "ADC-V724")
+            .extract("ADC-VDB101について教えてください", "ADC-V724", "req-test")
             .await;
         assert_eq!(out, refs);
     }
@@ -449,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn product_reference_extractor_degrades_to_empty_on_llm_failure() {
         let extractor = ProductReferenceExtractor::new(Some(MockProductReferenceLlm::err()));
-        let out = extractor.extract("質問", "ADC-V724").await;
+        let out = extractor.extract("質問", "ADC-V724", "req-test").await;
         assert!(
             out.is_empty(),
             "an llm failure must degrade to 'no product reference this turn', not propagate \
@@ -461,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn product_reference_extractor_is_empty_when_no_llm_configured() {
         let extractor = ProductReferenceExtractor::new(None);
-        let out = extractor.extract("質問", "ADC-V724").await;
+        let out = extractor.extract("質問", "ADC-V724", "req-test").await;
         assert!(out.is_empty());
     }
 
@@ -525,6 +532,7 @@ mod tests {
             &product_reference_extractor,
             "カビが生えた",
             "ADC-V724",
+            "req-test",
         )
         .await;
         let elapsed = start.elapsed();
@@ -555,6 +563,7 @@ mod tests {
             &product_reference_extractor,
             "カビが生えた",
             "ADC-V724",
+            "req-test",
         )
         .await;
 
@@ -583,6 +592,7 @@ mod tests {
             &product_reference_extractor,
             "カビが生えた",
             "ADC-V724",
+            "req-test",
         )
         .await;
 
@@ -681,6 +691,7 @@ mod tests {
             &ex.product_reference_extractor,
             "カビが生えた",
             "ADC-V724",
+            "req-test",
         )
         .await;
 
@@ -719,6 +730,7 @@ mod tests {
             &ex.product_reference_extractor,
             "カビが生えた",
             "ADC-V724",
+            "req-test",
         )
         .await;
 

@@ -33,20 +33,30 @@ pub fn append_final_turn_suffix(text: String, is_final_turn: bool) -> String {
     }
 }
 
+/// 取扱製品カタログの聞き返しで、製品を列挙する上限件数。超えるときは列挙せず、型番の
+/// 確認方法だけを箇条書きで案内する（LINE の 1 通あたりの文字数上限を超えないため）。
+const MAX_CATALOG_CLARIFY_ENTRIES: usize = 20;
+
 /// Issue #131: 取扱製品が特定できていない signal 付きターンの聞き返し文を、テンプレートと
-/// 取扱製品 allowlist の型番だけで組み立てる純関数（LLM を呼ばない）。選択肢は引数の
-/// `models` のみ（取扱外の製品名・種別は出さない）。LINE は Markdown を描画しないため「・」で列挙する。
-pub fn product_catalog_clarify_text(models: &[String]) -> String {
-    let mut seen = std::collections::BTreeSet::new();
-    let bullets: Vec<String> = models
-        .iter()
-        .map(|m| m.trim())
-        .filter(|m| !m.is_empty() && seen.insert(m.to_string()))
-        .map(|m| format!("・{m}"))
-        .collect();
-    if bullets.is_empty() {
+/// 取扱製品 allowlist の「型番（製品名）」だけで組み立てる純関数（LLM を呼ばない）。選択肢は
+/// `allowlist` のみ（取扱外の製品名・種別は出さない）。LINE は Markdown を描画しないため「・」で
+/// 列挙する。製品が [`MAX_CATALOG_CLARIFY_ENTRIES`] 件を超えるときは列挙せず、型番の確認方法を
+/// 箇条書きで案内する。allowlist が空なら [`FALLBACK_CLARIFY_TEXT`]。
+pub fn product_catalog_clarify_text(allowlist: &ProductAllowlist) -> String {
+    let catalog = allowlist.catalog();
+    if catalog.is_empty() {
         return FALLBACK_CLARIFY_TEXT.to_string();
     }
+    if catalog.len() > MAX_CATALOG_CLARIFY_ENTRIES {
+        return "ご相談の製品の型番をお知らせください。\n\n・本体のラベルに記載されています\n・購入時の書類に記載されています\n\n型番をお知らせいただければ、確認を進めます。".to_string();
+    }
+    let bullets: Vec<String> = catalog
+        .into_iter()
+        .map(|(model, name)| match name {
+            Some(name) => format!("・{model}（{name}）"),
+            None => format!("・{model}"),
+        })
+        .collect();
     format!(
         "ご相談の製品をお知らせください。次の取扱製品のうち、どれについてのお問い合わせでしょうか。\n\n{}\n\n該当する型番をお知らせいただければ、確認を進めます。",
         bullets.join("\n")
@@ -196,24 +206,58 @@ mod tests {
         .unwrap()
     }
 
-    /// Issue #131: 製品カタログの聞き返しは allowlist の型番だけを「・」で列挙する。
+    fn product_node(model: &str, name: &str) -> crate::proto::graphrag::NodeResult {
+        crate::proto::graphrag::NodeResult {
+            node_id: format!("urtect:gen1:Product:{model}"),
+            node_type: "Product".to_string(),
+            attributes: [("model", model), ("name", name)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Issue #131: 製品カタログの聞き返しは allowlist の「型番（製品名）」だけを「・」で列挙する。
     #[test]
-    fn product_catalog_clarify_lists_only_allowlist_models_as_bullets() {
-        let allowlist =
-            ProductAllowlist::from_models(vec!["ADC-V724".to_string(), "ADC-V522IR".to_string()]);
-        let text = product_catalog_clarify_text(allowlist.models());
-        assert!(text.contains("・ADC-V522IR\n・ADC-V724"), "{text}");
+    fn product_catalog_clarify_lists_only_allowlist_products_as_bullets() {
+        let allowlist = ProductAllowlist::from_nodes(vec![
+            product_node("ADC-V724", "屋外カメラ"),
+            product_node("ADC-V522IR", "ADC-V522IR"),
+        ]);
+        let text = product_catalog_clarify_text(&allowlist);
+        assert!(
+            text.contains("・ADC-V522IR\n・ADC-V724（屋外カメラ）"),
+            "{text}"
+        );
         assert_eq!(text.matches('・').count(), 2, "{text}");
         assert!(!text.contains("**") && !text.contains("- "), "{text}");
-        // 生成文は egress の取扱外型番ゲートを通る（allowlist 外を含まない）
         assert!(allowlist.out_of_scope_mentions(&text).is_empty(), "{text}");
     }
 
     #[test]
-    fn product_catalog_clarify_dedupes_and_falls_back_when_empty() {
-        let text = product_catalog_clarify_text(&["A-1".to_string(), "A-1".to_string()]);
-        assert_eq!(text.matches("・A-1").count(), 1);
-        assert_eq!(product_catalog_clarify_text(&[]), FALLBACK_CLARIFY_TEXT);
+    fn product_catalog_clarify_falls_back_when_empty() {
+        let empty = ProductAllowlist::from_models(Vec::new());
+        assert_eq!(product_catalog_clarify_text(&empty), FALLBACK_CLARIFY_TEXT);
+    }
+
+    /// 製品が 20 件を超えるときは列挙せず、型番の確認方法だけを箇条書きで案内する。
+    #[test]
+    fn product_catalog_clarify_does_not_enumerate_more_than_twenty_products() {
+        let over = ProductAllowlist::from_models((0..21).map(|i| format!("ADC-V{i:03}")).collect());
+        let text = product_catalog_clarify_text(&over);
+        assert!(!text.contains("ADC-V"), "{text}");
+        assert!(
+            text.contains("・本体のラベル") && text.contains("・購入時の書類"),
+            "{text}"
+        );
+        let at_limit =
+            ProductAllowlist::from_models((0..20).map(|i| format!("ADC-V{i:03}")).collect());
+        assert_eq!(
+            product_catalog_clarify_text(&at_limit)
+                .matches("・ADC-V")
+                .count(),
+            20
+        );
     }
 
     #[test]

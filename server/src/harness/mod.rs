@@ -126,7 +126,8 @@ pub struct EvaluationOutcome {
     /// 会話の継続キー。新規作成時は採番して返す
     pub case_id: String,
     /// 聞き返し可否。第1層 binding=advisory かつ情報不足、または第3層グレー
-    /// （`InsufficientDirectness` / `UnknownAddedSignal`）のときのみ true。第1層
+    /// （`InsufficientDirectness` / `UnknownAddedSignal`）、第3層 `ProductUnidentified`
+    /// （Issue #131）のときのみ true。第1層
     /// binding=mandatory と第2層（禁止ドメイン）は問答無用でルーティングし常に false
     /// （契約の正本は `clarification_allowed()` 関数、Issue #54 + reviewer 一次レビュー Critical 1）
     pub clarification_allowed: bool,
@@ -470,7 +471,11 @@ async fn window_matched_models(
     }
     let refs = window
         .extractor
-        .extract(&turns.join("\n"), allowlist.display_list())
+        .extract(
+            &turns.join("\n"),
+            allowlist.display_list(),
+            window.request_id,
+        )
         .await;
     let (refs, _discarded) =
         adopt_product_references_for_extraction_mode(window.extraction_mode, refs);
@@ -482,6 +487,7 @@ struct PastTurnsWindow<'a> {
     extractor: &'a extraction::ProductReferenceExtractor,
     extraction_mode: extraction::ExtractionMode,
     history: &'a [reply::ReplyHistoryTurn],
+    request_id: &'a str,
 }
 
 /// Issue #131: 製品特定済みの判定の唯一の入口（`DecisionInput::product_identified` の値）。(a)(b) は
@@ -750,7 +756,8 @@ pub fn should_draft_reply(
     partial_answer_ok: bool,
 ) -> bool {
     match policy {
-        ReplyDraftPolicy::Always => true,
+        // 製品未特定の聞き返しはカタログ文面（決定的）を返すため、LLM の下書きは捨てられる。生成しない。
+        ReplyDraftPolicy::Always => !decision.is_product_unidentified(),
         ReplyDraftPolicy::SkipWhenUnused { .. } => {
             let is_allowed = matches!(decision, decision::AnswerDecision::Allowed { .. });
             let is_forced_escalation_by_extraction_failure =
@@ -1865,6 +1872,7 @@ impl Harness {
                 &self.product_reference_extractor,
                 question,
                 allowlist.display_list(),
+                &ctx.request_id,
             ),
         );
         let resolutions = resolutions?;
@@ -2039,7 +2047,7 @@ impl Harness {
         } = kr_turn;
         // Issue #131: 製品特定済み = (a) 今ターンの `Matched` 製品参照（allowlist の一覧表記に
         // 解決できたもの）、(b) 呼出元の明示的 `product_key` が allowlist 内、(c) Jev 用の直近
-        // 顧客発話の窓（最大 6 件・2,000 字。`select_customer_history_for_jev` を共有）内の過去の
+        // 顧客発話の窓（最大 6 件・2,000 字。`customer_history_window` を共有）内の過去の
         // 顧客発話に `Matched`。ケース属性 `product_models` は使わない（product-switch 設計 §4:
         // 判定の入力（切り替えの検知）にだけ使い、回答可否の判定には使わない）。(c) は遅延評価:
         // まず (a)(b) だけで decide し、結果が `ProductUnidentified` の Escalate のときに限り窓を
@@ -2083,6 +2091,7 @@ impl Harness {
                 extractor: &self.product_reference_extractor,
                 extraction_mode,
                 history,
+                request_id: &ctx.request_id,
             };
             if identify_product(
                 &allowlist,
@@ -3339,6 +3348,24 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn should_draft_reply_is_false_for_always_when_product_unidentified() {
+        let decision = escalate_for_contract_test(
+            3,
+            decision::EscalateReason::ProductUnidentified,
+            Vec::new(),
+        );
+        for mode in all_extraction_modes() {
+            assert!(!should_draft_reply(
+                &ReplyDraftPolicy::Always,
+                &decision,
+                mode,
+                false,
+                false
+            ));
+        }
     }
 
     #[test]
@@ -5148,6 +5175,7 @@ mod tests {
             extractor: &extractor,
             extraction_mode: hybrid,
             history: &empty,
+            request_id: "req-test",
         };
         assert!(!identify_product(&allowlist, &[], None, Some(&w1)).await);
         // 2 ターン目: 型番のみ → 今ターンの Matched（(a)）で特定済み。窓は評価しない。
@@ -5163,6 +5191,7 @@ mod tests {
             extractor: &extractor,
             extraction_mode: hybrid,
             history: &h3,
+            request_id: "req-test",
         };
         assert!(identify_product(&allowlist, &[], None, Some(&w3)).await);
         // 窓を渡さなければ (c) は評価されない（遅延評価の前提: 呼び出し側が決める）。
@@ -5181,6 +5210,7 @@ mod tests {
             extractor: &extractor,
             extraction_mode: extraction::ExtractionMode::Hybrid,
             history: &h,
+            request_id: "req-test",
         };
         assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
     }
@@ -5196,6 +5226,7 @@ mod tests {
             extractor: &extractor,
             extraction_mode: extraction::ExtractionMode::Hybrid,
             history: &h,
+            request_id: "req-test",
         };
         assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
     }
@@ -5209,6 +5240,7 @@ mod tests {
             extractor: &extractor,
             extraction_mode: extraction::ExtractionMode::LexiconFallback,
             history: &h,
+            request_id: "req-test",
         };
         assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
     }
@@ -5533,7 +5565,7 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
-            product_identified: false,
+            product_identified: true,
             known_resolution: None,
         });
         assert!(
@@ -6660,7 +6692,7 @@ mod tests {
             stakes_input: turn.stakes_input,
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
-            product_identified: false,
+            product_identified: true,
             known_resolution: turn.applicable_known_resolution.as_ref(),
         });
         assert!(matches!(
@@ -6670,6 +6702,57 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn decide_turn_escalates_product_unidentified_on_a_signal_only_from_a_previous_turn() {
+        let harness = kr_selection_harness(Some(KrStubJudge::selecting(&["kr_a"])), &[]);
+        let allowlist = product_gate::ProductAllowlist::from_models(Vec::new());
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allowlist,
+            already_escalated: false,
+            partial_answer_enabled: false,
+        };
+        let krs = [contract_test_kr("kr_a", &["a"])];
+        let signals = contract_test_signals(&[]);
+        let accumulated = contract_test_signals(&["a"]);
+        let turn = harness
+            .prepare_kr_turn(
+                &kr_ctx(),
+                krs.to_vec(),
+                &policy,
+                &signals,
+                &accumulated,
+                &[],
+                CUSTOMER_TEXT,
+                CUSTOMER_TEXT,
+                HYBRID,
+            )
+            .await;
+        let decision = decision::decide(&decision::DecisionInput {
+            question_signals: turn.decide_signals,
+            question_raw: CUSTOMER_TEXT,
+            rules: &[],
+            domains: &[],
+            resolutions: &turn.resolutions,
+            best_manual_score: Some(1.0),
+            best_manual_sections: &[],
+            stakes_input: turn.stakes_input,
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+            product_identified: false,
+            known_resolution: turn.applicable_known_resolution.as_ref(),
+        });
+        assert!(
+            matches!(
+                decision,
+                decision::AnswerDecision::Escalate {
+                    reason: decision::EscalateReason::ProductUnidentified,
+                    ..
+                }
+            ),
+            "今ターンに signal が無くても、ケース内の累積 signal で製品未特定を判定する: {decision:?}"
+        );
     }
 
     #[tokio::test]

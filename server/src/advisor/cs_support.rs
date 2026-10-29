@@ -446,7 +446,9 @@ async fn build_post_evaluate_reply(
             let known_facts =
                 build_known_facts(&harness.lexicon, &outcome.accumulated_signals, history);
             let is_final_clarify_turn = is_final_clarify_turn(conv, api_cfg);
+            let product_unidentified = outcome.decision.is_product_unidentified();
             let reply_text = match harness.reply_drafter.as_ref() {
+                _ if product_unidentified => clarify::product_catalog_clarify_text(allowlist),
                 Some(drafter) => {
                     clarify::draft_clarify_question(
                         drafter,
@@ -1149,6 +1151,50 @@ mod tests {
             conv.clarify_turns, 1,
             "Clarify 分岐は clarify_turns を加算する"
         );
+    }
+
+    #[tokio::test]
+    async fn build_post_evaluate_reply_clarifies_product_unidentified_with_the_catalog_text() {
+        let harness = test_harness(vec!["ADC-V724"]);
+        let allowlist = harness.product_allowlist(TEST_SCHEMA).await.unwrap();
+        let api_cfg = default_api_config();
+        let mut conv = default_conv_state();
+        let mut outcome = base_outcome(
+            AnswerDecision::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                layer: 3,
+                route_to: "triage".to_string(),
+                disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+                audit_required: true,
+                missing: Vec::new(),
+                hearing: None,
+                customer_ack: None,
+                known_resolution_id: None,
+            },
+            true,
+        );
+
+        let (kind, text) = build_post_evaluate_reply(
+            &harness,
+            &api_cfg,
+            &allowlist,
+            "req-1",
+            "赤いランプが点滅してる",
+            &[],
+            false,
+            &mut outcome,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(kind, SupportReplyKind::Clarify);
+        assert_eq!(
+            text,
+            clarify::product_catalog_clarify_text(&allowlist),
+            "製品未特定の聞き返しは LLM を呼ばず取扱製品の定型文を返す"
+        );
+        assert!(text.contains("ADC-V724"));
+        assert_eq!(conv.clarify_turns, 1);
     }
 
     #[tokio::test]

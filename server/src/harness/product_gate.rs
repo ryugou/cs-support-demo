@@ -171,6 +171,8 @@ pub struct ProductAllowlist {
     display: String,
     /// 取扱型番の一覧（ソート済み・trim 済み）。`display` と同じ元データ。
     models: Vec<String>,
+    /// 型番（trim 済み）→ 製品名（Product ノードの `name`。`from_nodes` だけが埋める）。
+    names: HashMap<String, String>,
 }
 
 impl ProductAllowlist {
@@ -208,13 +210,25 @@ impl ProductAllowlist {
             canonical,
             display,
             models: usable,
+            names: HashMap::new(),
         }
     }
 
-    /// 取扱型番の一覧（ソート済み）。聞き返しの選択肢（Issue #131）など、製品マスタ由来の
-    /// 型番だけを列挙する用途に使う。
-    pub fn models(&self) -> &[String] {
-        &self.models
+    /// 取扱製品の一覧（型番のソート順）。各要素は `(型番, 製品名)`。製品名は Product ノードの
+    /// `name` が空でなく型番と異なるときだけ `Some`。聞き返しの選択肢（Issue #131）など、
+    /// 製品マスタ由来の製品だけを列挙する用途に使う。
+    pub fn catalog(&self) -> Vec<(&str, Option<&str>)> {
+        self.models
+            .iter()
+            .map(|model| {
+                let name = self
+                    .names
+                    .get(model)
+                    .map(String::as_str)
+                    .filter(|name| !name.is_empty() && *name != model);
+                (model.as_str(), name)
+            })
+            .collect()
     }
 
     /// allowlist に実際に使える型番が 1 件も無いか（`ProductGate::fetch` の fail-closed 判定
@@ -246,10 +260,16 @@ impl ProductAllowlist {
     /// `name == model`、design doc §1）由来のマージは実利用上到達しない不要な複雑さだった。
     /// 単純化のため撤去する。
     pub(crate) fn from_nodes(nodes: Vec<crate::proto::graphrag::NodeResult>) -> Self {
+        let mut names = HashMap::new();
         let models: Vec<String> = nodes
             .into_iter()
             .filter_map(|n| match n.attributes.get("model") {
-                Some(model) => Some(model.clone()),
+                Some(model) => {
+                    if let Some(name) = n.attributes.get("name") {
+                        names.insert(model.trim().to_string(), name.trim().to_string());
+                    }
+                    Some(model.clone())
+                }
                 None => {
                     tracing::warn!(
                         node_id = %n.node_id,
@@ -260,7 +280,10 @@ impl ProductAllowlist {
                 }
             })
             .collect();
-        Self::from_models(models)
+        Self {
+            names,
+            ..Self::from_models(models)
+        }
     }
 
     /// 正規化済みトークンが allowlist 内か。
@@ -2148,6 +2171,29 @@ mod tests {
             node_type: KIND_PRODUCT.to_string(),
             attributes,
         }
+    }
+
+    /// Issue #131: `catalog` は Product ノードの `name` を返す。空の name と型番と同じ name は
+    /// `None`（型番の重複表示を避ける）。`from_models` 由来の allowlist は name を持たない。
+    #[test]
+    fn catalog_returns_names_only_when_they_differ_from_the_model() {
+        let allowlist = ProductAllowlist::from_nodes(vec![
+            product_node_with_name("ADC-V724", "屋外カメラ"),
+            product_node_with_name("ADC-V523", "ADC-V523"),
+            product_node_with_name("ADC-VC729P", " "),
+            product_node("ADC-V522IR"),
+        ]);
+        assert_eq!(
+            allowlist.catalog(),
+            vec![
+                ("ADC-V522IR", None),
+                ("ADC-V523", None),
+                ("ADC-V724", Some("屋外カメラ")),
+                ("ADC-VC729P", None),
+            ]
+        );
+        let models_only = ProductAllowlist::from_models(vec!["ADC-V724".to_string()]);
+        assert_eq!(models_only.catalog(), vec![("ADC-V724", None)]);
     }
 
     // ---- ProductAllowlist::from_nodes: name は一致判定に含めない（W-3 是正） ----

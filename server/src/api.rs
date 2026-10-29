@@ -921,6 +921,7 @@ async fn detect_product_switch(
         &state.harness.product_reference_extractor,
         message,
         allowlist.display_list(),
+        request_id,
     )
     .await;
     judge_product_switch(
@@ -2063,16 +2064,10 @@ async fn reply_handler(
                     // `decide_reply_action` の前提により `conv.clarify_turns < clarify_max_turns`
                     // は保証済み（`is_final_clarify_turn` の doc コメント参照）。
                     let is_final_clarify_turn = is_final_clarify_turn(&conv, &state.config.api);
-                    let product_unidentified = matches!(
-                        &outcome.decision,
-                        AnswerDecision::Escalate {
-                            reason: decision::EscalateReason::ProductUnidentified,
-                            ..
-                        }
-                    );
+                    let product_unidentified = outcome.decision.is_product_unidentified();
                     let reply_text = if product_unidentified {
                         // Issue #131: 取扱製品カタログから選ばせる。テンプレート生成で LLM を呼ばない。
-                        clarify::product_catalog_clarify_text(allowlist.models())
+                        clarify::product_catalog_clarify_text(&allowlist)
                     } else {
                         match state.harness.reply_drafter.as_ref() {
                             Some(drafter) => {
