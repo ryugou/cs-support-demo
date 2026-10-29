@@ -446,24 +446,18 @@ async fn build_post_evaluate_reply(
             let known_facts =
                 build_known_facts(&harness.lexicon, &outcome.accumulated_signals, history);
             let is_final_clarify_turn = is_final_clarify_turn(conv, api_cfg);
-            let product_unidentified = outcome.decision.is_product_unidentified();
-            let reply_text = match harness.reply_drafter.as_ref() {
-                _ if product_unidentified => clarify::product_catalog_clarify_text(allowlist),
-                Some(drafter) => {
-                    clarify::draft_clarify_question(
-                        drafter,
-                        &harness.ng,
-                        harness.reply_draft_max_tokens,
-                        message,
-                        &missing_text,
-                        &known_facts,
-                        is_continuation,
-                        allowlist,
-                    )
-                    .await
-                }
-                None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
-            };
+            let reply_text = clarify::clarify_question_text(
+                harness.reply_drafter.as_ref(),
+                &harness.ng,
+                harness.reply_draft_max_tokens,
+                message,
+                &missing_text,
+                &known_facts,
+                is_continuation,
+                allowlist,
+                outcome.decision.is_product_unidentified(),
+            )
+            .await;
             let reply_text = gate_generated_text(
                 reply_text,
                 allowlist,

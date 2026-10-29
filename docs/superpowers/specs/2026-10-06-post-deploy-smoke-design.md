@@ -37,8 +37,13 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 ```json
 {
   "layer1": [
+    { "utterance": "月額いくらですか？", "expect_rule": null },
+    { "utterance": "契約前に料金を知りたいです", "expect_rule": null },
     { "utterance": "初期費用はいくらですか？", "expect_rule": "initial-cost-quote" },
-    { "utterance": "月額いくらですか？", "expect_rule": null }
+    { "utterance": "解約したいです", "expect_rule": "contract-billing" },
+    { "utterance": "請求額が違います", "expect_rule": "contract-billing" },
+    { "utterance": "担当者につないでください", "expect_rule": "human-handoff" },
+    { "utterance": "赤いランプが点滅してる", "expect_rule": null, "expect_signals_nonempty": true }
   ]
 }
 ```
@@ -51,14 +56,15 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 
 初期の内容は、次の発話とする。期待値は現在の `server/data/urtect/signal-lexicon.json` と `server/data/urtect/rules.json` に対する正しい結果である。
 
-| 発話 | `expect_rule` |
-| --- | --- |
-| 月額いくらですか？ | `null` |
-| 契約前に料金を知りたいです | `null` |
-| 初期費用はいくらですか？ | `initial-cost-quote` |
-| 解約したいです | `contract-billing` |
-| 請求額が違います | `contract-billing` |
-| 担当者につないでください | `human-handoff` |
+| 発話 | `expect_rule` | `expect_signals_nonempty` |
+| --- | --- | --- |
+| 月額いくらですか？ | `null` | 省略 |
+| 契約前に料金を知りたいです | `null` | 省略 |
+| 初期費用はいくらですか？ | `initial-cost-quote` | 省略 |
+| 解約したいです | `contract-billing` | 省略 |
+| 請求額が違います | `contract-billing` | 省略 |
+| 担当者につないでください | `human-handoff` | 省略 |
+| 赤いランプが点滅してる | `null` | `true` |
 
 ## 3. 検査項目
 
@@ -78,7 +84,7 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 
 1. その project の schema から、サービスと同じ関数でエスカレーションルールと禁止領域を読む（`load_escalation_rules`、`load_prohibited_domains`）。
 2. 設定ファイルが指す lexicon を、サービスと同じ方法で読む。
-3. 読んだルールと禁止領域の signal を、サービスの評価経路と同じ関数（`Harness::validate_rule_vocabulary`）で lexicon と突合する。語彙に無い signal を参照するルールが 1 つでもあれば、発話を評価せずに `layer1` を `fail` にし、`detail` にエラー文（ルール id と signal 名。発話は含まない）を入れる。理由: サービスはこの突合で全評価を fail closed にするため、期待値の 6 発話がそのルールを踏まなくても、本番は全件失敗している。突合を省くと、この検査が最も検出したい lexicon とルールの不一致を見逃す。
+3. 読んだルールと禁止領域の signal を、サービスの評価経路と同じ関数（`Harness::validate_rule_vocabulary`）で lexicon と突合する。語彙に無い signal を参照するルールが 1 つでもあれば、発話を評価せずに `layer1` を `fail` にし、`detail` にエラー文（ルール id と signal 名。発話は含まない）を入れる。理由: サービスはこの突合で全評価を fail closed にするため、期待値の 7 発話がそのルールを踏まなくても、本番は全件失敗している。突合を省くと、この検査が最も検出したい lexicon とルールの不一致を見逃す。
 4. 期待値ファイルの各発話を lexicon だけで signal に変換し（LLM を使わない）、`match_layer1` の結果を `expect_rule` と比べる。
 
 1 件ごとに、発話・立った signal・マッチしたルール・期待値・合否を記録する。

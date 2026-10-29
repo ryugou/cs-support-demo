@@ -216,22 +216,20 @@ impl ClassifyProductReferences for AnthropicProductReferenceClassifier {
 }
 
 /// 製品参照抽出器。LLM が未設定、または呼び出しが失敗した場合は空配列に degrade する
-/// （signals 抽出が lexicon フォールバックへ倒れるのと同じ「取りこぼしを許容しない」側の
-/// decision-safe フォールバックだが、こちらには lexicon のような決定論の床が無いため、
-/// 空配列＝「今ターンは製品言及なしとして扱う」が床になる）。
+/// （lexicon のような決定論の床は無いため、抽出層そのものは空を返す）。warn を出すのは LLM が
+/// 設定されていて呼び出しが失敗したときだけで、LLM 未設定の空の結果には出ない。
 ///
-/// 呼び出し元（`api.rs::second_stage_out_of_scope_reply` 等）は空配列を「foreign 判定なし」
-/// として扱い、通常の評価フローへフォールスルーする。**この抽出層自体は判定を fail closed
-/// （＝疑わしきは全件エスカレーション）にはしない**: 製品参照抽出はあくまで質問側ゲートの
-/// 二段目（LLM 解釈）であり、一段目の型番ゲート・材料事前除外・応答側ゲートは製品参照抽出の
-/// 成否と無関係に独立して機能し続けるため、ここで安全側に倒す必要が無い。
+/// 空配列は呼び出し側で「製品参照なし」として扱われ、判定では製品未特定
+/// （`EscalateReason::ProductUnidentified`）を駆動する。signal があるのに他に製品の根拠が無い
+/// ターンは、取扱製品カタログの聞き返しになる（fail-closed）。取扱外製品のゲートは、一段目の
+/// 型番ゲート・材料事前除外・応答側ゲートが製品参照抽出の成否と無関係に独立して機能し続ける。
 ///
 /// signals 抽出（`HybridExtractor`）とは完全に独立したコンポーネント: 一方の LLM 呼び出しが
 /// 失敗しても、もう一方の結果には一切影響しない（Issue #52 要件3）。**この独立性は抽出層
 /// （この struct）の中で閉じている。** `Harness::evaluate` は抽出結果を受け取った直後、
-/// signals 抽出が lexicon フォールバックへ落ちていた場合に限りこの抽出器の結果を採用しない
-/// （policy は harness 側にあり、この struct自体は持たない。`harness/mod.rs` の
-/// `adopt_product_references_for_extraction_mode` を参照）。
+/// signals 抽出が Hybrid でない（lexicon フォールバック、または LLM 無効）場合はこの抽出器の
+/// 結果を採用しない（policy は harness 側にあり、この struct自体は持たない。
+/// `harness/mod.rs` の `adopt_product_references_for_extraction_mode` を参照）。
 pub struct ProductReferenceExtractor {
     llm: Option<Arc<dyn ClassifyProductReferences>>,
 }
@@ -256,10 +254,10 @@ impl ProductReferenceExtractor {
                 tracing::warn!(
                     request_id = %request_id,
                     error = %err,
-                    "llm product reference extraction failed; 製品特定を未特定として扱った\
-                     （fail-closed）: treating this turn as if no product reference was \
-                     mentioned, so a turn with a signal and no other product evidence gets the \
-                     product-catalog clarify (product understanding degrades, the \
+                    "llm product reference extraction failed; treating the product as \
+                     unidentified (fail-closed): this turn is handled as if no product reference \
+                     was mentioned, so a turn with a signal and no other product evidence gets \
+                     the product-catalog clarify (product understanding degrades, the \
                      question-side gate stage 1 / material pre-filter / answer-side gate are \
                      unaffected)"
                 );

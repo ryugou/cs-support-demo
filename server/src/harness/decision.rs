@@ -416,7 +416,6 @@ mod tests {
             stakes_input,
             thresholds,
             default_route: "triage",
-            // Fail-closed default: tests opt in to an identified product explicitly.
             product_identified: false,
         }
     }
@@ -1473,7 +1472,7 @@ mod tests {
         let q = signals(&["led_red_blinking"]);
         let resolution = kr("kr-1", &["led_red_blinking"]);
         let th = thresholds();
-        let mut inp = input(
+        let inp = identified_input(
             &q,
             &[],
             &[],
@@ -1484,7 +1483,6 @@ mod tests {
             &[],
             Some(&resolution),
         );
-        inp.product_identified = true;
         assert!(matches!(
             decide(&inp),
             AnswerDecision::Allowed {
@@ -1517,8 +1515,7 @@ mod tests {
         let q = signals(&["discoloration"]);
         let sections = vec!["doc-1#x".to_string()];
         let th = thresholds();
-        let mut inp = input(&q, &[], &[], &[], Some(0.95), calm(), &th, &sections, None);
-        inp.product_identified = true;
+        let inp = identified_input(&q, &[], &[], &[], Some(0.95), calm(), &th, &sections, None);
         assert!(matches!(decide(&inp), AnswerDecision::Allowed { .. }));
     }
 

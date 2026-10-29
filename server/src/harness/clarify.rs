@@ -190,6 +190,43 @@ pub async fn draft_clarify_question(
     )
 }
 
+/// 聞き返し文の文面源を選んで返す（`api.rs` の `/api/reply` と `advisor/cs_support.rs` が共有）。
+/// `product_unidentified`（Issue #131）なら drafter の有無にかかわらず LLM を呼ばず
+/// [`product_catalog_clarify_text`] を返す。それ以外は drafter があれば
+/// [`draft_clarify_question`]、無ければ [`FALLBACK_CLARIFY_TEXT`]。
+#[allow(clippy::too_many_arguments)]
+pub async fn clarify_question_text(
+    drafter: Option<&crate::llm::AnthropicClient>,
+    ng: &NgDictionary,
+    max_tokens: u32,
+    question: &str,
+    missing: &str,
+    known_facts: &str,
+    is_continuation: bool,
+    allowlist: &ProductAllowlist,
+    product_unidentified: bool,
+) -> String {
+    if product_unidentified {
+        return product_catalog_clarify_text(allowlist);
+    }
+    match drafter {
+        Some(drafter) => {
+            draft_clarify_question(
+                drafter,
+                ng,
+                max_tokens,
+                question,
+                missing,
+                known_facts,
+                is_continuation,
+                allowlist,
+            )
+            .await
+        }
+        None => FALLBACK_CLARIFY_TEXT.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +575,28 @@ mod tests {
         draft_text: &str,
         stop_reason: &str,
     ) -> (String, crate::llm::test_support::RequestLog) {
+        let (drafter, log) = stub_drafter(draft_text, stop_reason).await;
+        let out = draft_clarify_question(
+            &drafter,
+            &ng(),
+            700,
+            "エラーが出ます",
+            "製品名が不明",
+            "",
+            false,
+            &test_allowlist(),
+        )
+        .await;
+        (out, log)
+    }
+
+    async fn stub_drafter(
+        draft_text: &str,
+        stop_reason: &str,
+    ) -> (
+        crate::llm::AnthropicClient,
+        crate::llm::test_support::RequestLog,
+    ) {
         let body = serde_json::json!({
             "stop_reason": stop_reason,
             "content": [{"type": "text", "text": draft_text}],
@@ -557,9 +616,35 @@ mod tests {
         })
         .expect("llm client must build from the stub config")
         .expect("enabled = true with a readable key file must yield a client");
+        (drafter, log)
+    }
 
-        let out = draft_clarify_question(
-            &drafter,
+    #[tokio::test]
+    async fn clarify_question_text_uses_the_catalog_without_calling_the_drafter_when_product_unidentified(
+    ) {
+        let (drafter, log) = stub_drafter("製品名と発生時期を教えてください。", "end_turn").await;
+        let allowlist = test_allowlist();
+        let out = clarify_question_text(
+            Some(&drafter),
+            &ng(),
+            700,
+            "赤いランプが点滅してる",
+            "製品名が不明",
+            "",
+            false,
+            &allowlist,
+            true,
+        )
+        .await;
+        assert_eq!(out, product_catalog_clarify_text(&allowlist));
+        assert!(out.contains("ADC-V724"), "{out}");
+        assert_eq!(log.lock().unwrap().len(), 0, "drafter must not be called");
+    }
+
+    #[tokio::test]
+    async fn clarify_question_text_falls_back_without_a_drafter_when_product_identified() {
+        let out = clarify_question_text(
+            None,
             &ng(),
             700,
             "エラーが出ます",
@@ -567,9 +652,30 @@ mod tests {
             "",
             false,
             &test_allowlist(),
+            false,
         )
         .await;
-        (out, log)
+        assert_eq!(out, FALLBACK_CLARIFY_TEXT);
+    }
+
+    #[tokio::test]
+    async fn clarify_question_text_uses_the_drafter_when_product_identified() {
+        const CLEAN: &str = "製品名と発生時期を教えてください。";
+        let (drafter, log) = stub_drafter(CLEAN, "end_turn").await;
+        let out = clarify_question_text(
+            Some(&drafter),
+            &ng(),
+            700,
+            "エラーが出ます",
+            "製品名が不明",
+            "",
+            false,
+            &test_allowlist(),
+            false,
+        )
+        .await;
+        assert_eq!(out, CLEAN);
+        assert_eq!(log.lock().unwrap().len(), 1);
     }
 
     /// 生成上限で途中切断された下書きは、切れ目次第で完成文に見えることがあり、egress gate

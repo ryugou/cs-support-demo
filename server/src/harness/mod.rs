@@ -51,8 +51,9 @@ pub struct Harness {
     pub extractor: Arc<dyn extraction::AsyncSignalExtractor>,
     /// 取扱製品への言及抽出の入口（Issue #52: signals 抽出から分離した独立コンポーネント）。
     /// `evaluate` のみが使う（catalog 注入が必要なのは質問側ゲート二段目のみのため）。
-    /// LLM 未設定・呼び出し失敗のいずれでも空配列に degrade する（`extractor` が lexicon
-    /// フォールバックへ倒れるのと同じ decision-safe な扱いだが、signals とは独立に失敗する）。
+    /// LLM 未設定・呼び出し失敗のいずれでも空配列に degrade し、signals とは独立に失敗する。
+    /// 空は評価側で製品未特定として扱われ、signal のあるターンは取扱製品カタログの聞き返しになる
+    /// （fail-closed）。
     pub product_reference_extractor: extraction::ProductReferenceExtractor,
     pub ng: egress::NgDictionary,
     pub worm: Arc<audit::WormAuditLog>,
@@ -458,13 +459,15 @@ fn is_product_identified(
 ///
 /// 窓の発話を `\n` で連結した 1 文字列で製品参照抽出を 1 回だけ呼ぶ（発話数ぶんの LLM 呼び出しを
 /// 避ける）。採用規則は今ターンと同じ（`adopt_product_references_for_extraction_mode`: signal 抽出が
-/// `Hybrid` でないターンは参照を採用しない = 未特定側に倒れる fail-closed）。窓が空なら抽出を
-/// 呼ばない。
+/// `Hybrid` でないターンは参照を採用しない = 未特定側に倒れる fail-closed）。今ターンが `Hybrid` で
+/// ないときは採用されない結果のために LLM を呼ばず、窓が空のときも抽出を呼ばない。
 async fn window_matched_models(
     allowlist: &product_gate::ProductAllowlist,
     window: &PastTurnsWindow<'_>,
 ) -> Vec<String> {
-    // 製品特定の判定は Jev の判定入力ではないため、Jev 固有の warn を出さない純粋な選択を使う。
+    if window.extraction_mode != extraction::ExtractionMode::Hybrid {
+        return Vec::new();
+    }
     let turns = reply::customer_history_window(window.history).turns;
     if turns.is_empty() {
         return Vec::new();
@@ -742,6 +745,28 @@ fn second_stage_short_circuits(
     }
 }
 
+/// `EvaluationOutcome` の `customer_reply_draft` と `customer_reply_draft_truncated` を決める純関数。
+///
+/// 製品未特定（`ProductUnidentified`）のターンで `policy` が `Always`（MCP 経路）のときは、
+/// 判定に使った `allowlist` から作る取扱製品カタログの聞き返し文（LLM 非経由の定型文）を下書きにし、
+/// 打ち切りなし（`false`）とする。それ以外は生成済みの下書き（無ければ `None` と `false`）をそのまま使う。
+/// `SkipWhenUnused`（`/api/reply`・advisor）は製品未特定の下書きを使わないため対象外。
+fn customer_reply_draft_fields(
+    policy: &ReplyDraftPolicy<'_>,
+    decision: &decision::AnswerDecision,
+    allowlist: &product_gate::ProductAllowlist,
+    reply_draft: Option<crate::llm::ReplyDraft>,
+) -> (Option<String>, bool) {
+    if matches!(policy, ReplyDraftPolicy::Always) && decision.is_product_unidentified() {
+        return (
+            Some(clarify::product_catalog_clarify_text(allowlist)),
+            false,
+        );
+    }
+    let truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
+    (reply_draft.map(|d| d.text), truncated)
+}
+
 /// `policy` と確定した `decision`・抽出モード・二段目ゲートが打ち切るかどうか
 /// （`second_stage_short_circuits`）から、`Harness::draft_customer_reply` を呼ぶかどうかを決める
 /// 純関数（Issue #78, #83）。`partial_answer_ok`（部分回答の可否）は Escalate の省略だけを緩める。
@@ -756,7 +781,6 @@ pub fn should_draft_reply(
     partial_answer_ok: bool,
 ) -> bool {
     match policy {
-        // 製品未特定の聞き返しはカタログ文面（決定的）を返すため、LLM の下書きは捨てられる。生成しない。
         ReplyDraftPolicy::Always => !decision.is_product_unidentified(),
         ReplyDraftPolicy::SkipWhenUnused { .. } => {
             let is_allowed = matches!(decision, decision::AnswerDecision::Allowed { .. });
@@ -2045,18 +2069,6 @@ impl Harness {
             stakes_input,
             applicable_known_resolution,
         } = kr_turn;
-        // Issue #131: 製品特定済み = (a) 今ターンの `Matched` 製品参照（allowlist の一覧表記に
-        // 解決できたもの）、(b) 呼出元の明示的 `product_key` が allowlist 内、(c) Jev 用の直近
-        // 顧客発話の窓（最大 6 件・2,000 字。`customer_history_window` を共有）内の過去の
-        // 顧客発話に `Matched`。ケース属性 `product_models` は使わない（product-switch 設計 §4:
-        // 判定の入力（切り替えの検知）にだけ使い、回答可否の判定には使わない）。(c) は遅延評価:
-        // まず (a)(b) だけで decide し、結果が `ProductUnidentified` の Escalate のときに限り窓を
-        // 抽出して、窓に `Matched` があれば `product_identified = true` で decide をやり直す
-        // （decide は純関数）。判定が窓に依存しないターン（第1層/第2層一致など）では、過去の顧客
-        // 発話を LLM 抽出器へ送る追加呼び出しを起こさない。
-        // 解決は allowlist の一覧表記への正規化を1か所（`resolve_matched_models`）に集約する
-        // （design doc §2.1 末尾）。未解決の警告は /api/reply と MCP の両経路で毎ターン通るここで
-        // 1 回だけ出す（api.rs::judge_product_switch はログを出さない側を使う）。
         let existing_product_models = case_attrs
             .get("product_models")
             .cloned()
@@ -2080,13 +2092,7 @@ impl Harness {
             product_identified,
         };
         let mut decision_result = decision::decide(&decision_input);
-        if matches!(
-            &decision_result,
-            decision::AnswerDecision::Escalate {
-                reason: decision::EscalateReason::ProductUnidentified,
-                ..
-            }
-        ) {
+        if decision_result.is_product_unidentified() {
             let window = PastTurnsWindow {
                 extractor: &self.product_reference_extractor,
                 extraction_mode,
@@ -2212,8 +2218,6 @@ impl Harness {
         // CS 連携モード。support schema に対して呼ぶ）の 3 つ。どの経路でも `product_models` は
         // 書き戻されるが、切り替えの自動検知は `api.rs::reply_handler` にしか無いため、
         // MCP 経路・アドバイザー経路の入出力・判定は変わらない（design doc §1 末尾）。
-        // `existing_product_models` / `resolved_matched_models` は判定前（`decide()` の入力
-        // `product_identified`）に算出済み。
         case_attrs.insert(
             "product_models".to_string(),
             case_switch::merge_product_models(&existing_product_models, &resolved_matched_models),
@@ -2381,8 +2385,8 @@ impl Harness {
             }
             None => None,
         };
-        let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
-        let customer_reply_draft = reply_draft.map(|d| d.text);
+        let (customer_reply_draft, customer_reply_draft_truncated) =
+            customer_reply_draft_fields(&policy, &decision_result, &allowlist, reply_draft);
         let partial_answer =
             is_partial_answer_draft(partial_answer_ok, customer_reply_draft.as_deref());
 
@@ -3410,8 +3414,6 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
-            // Issue #131: このテストの関心は TurnOnly 判定であり製品特定ではない。
-            // 旧来の Allowed 期待を保つため製品特定済みとして明示する。
             product_identified: true,
             known_resolution: None,
         })
@@ -5108,7 +5110,6 @@ mod tests {
 
     #[test]
     fn absent_product_key_without_other_evidence_is_unidentified() {
-        // /api/reply は product_key に None を渡す（LINE 経路は変わらない）。
         assert!(!is_product_identified(&identified_allowlist(), &[], None));
     }
 
@@ -5169,7 +5170,6 @@ mod tests {
         let allowlist = identified_allowlist();
         let extractor = classifier_extractor();
         let hybrid = extraction::ExtractionMode::Hybrid;
-        // 1 ターン目: 症状のみ → 未特定（Clarify 側）。
         let empty: Vec<reply::ReplyHistoryTurn> = Vec::new();
         let w1 = PastTurnsWindow {
             extractor: &extractor,
@@ -5178,9 +5178,7 @@ mod tests {
             request_id: "req-test",
         };
         assert!(!identify_product(&allowlist, &[], None, Some(&w1)).await);
-        // 2 ターン目: 型番のみ → 今ターンの Matched（(a)）で特定済み。窓は評価しない。
         assert!(identify_product(&allowlist, &["ABC-100".to_string()], None, None).await);
-        // 3 ターン目: 症状のみ。型番は窓の中（(c)）→ 特定済み（Clarify しない）。
         let h3 = vec![
             customer("赤いランプが点滅してる"),
             assistant("製品名か型番を教えてください"),
@@ -5194,13 +5192,11 @@ mod tests {
             request_id: "req-test",
         };
         assert!(identify_product(&allowlist, &[], None, Some(&w3)).await);
-        // 窓を渡さなければ (c) は評価されない（遅延評価の前提: 呼び出し側が決める）。
         assert!(!identify_product(&allowlist, &[], None, None).await);
     }
 
     #[tokio::test]
     async fn a_model_that_dropped_out_of_the_window_no_longer_identifies_the_product() {
-        // 型番を含む発話の後に顧客発話が窓の件数（MAX_HISTORY_TURNS）以上続くと、型番は窓から落ちる。
         let mut h = vec![customer("ABC-100 です")];
         for i in 0..reply::MAX_HISTORY_TURNS {
             h.push(customer(&format!("症状の続き {i}")));
@@ -5217,9 +5213,6 @@ mod tests {
 
     #[tokio::test]
     async fn case_product_models_without_a_matched_reference_in_the_window_stays_unidentified() {
-        // product-switch 設計 §4 の行（`product_models` は回答可否の判定に使わない）を固定する:
-        // 識別の入口はケース属性 `product_models` を入力に取らず、窓にも今ターンにも `Matched` が
-        // なければ、ケースにその型番が積まれていても未特定のままになる。
         let h = vec![customer("赤いランプが点滅してる")];
         let extractor = classifier_extractor();
         let window = PastTurnsWindow {
@@ -5233,7 +5226,6 @@ mod tests {
 
     #[tokio::test]
     async fn window_references_are_not_adopted_when_signal_extraction_fell_back_to_the_lexicon() {
-        // 今ターンと同じ採用規則: Hybrid でないターンは参照を採用しない（未特定側 = fail-closed）。
         let h = vec![customer("ABC-100 です")];
         let extractor = classifier_extractor();
         let window = PastTurnsWindow {
@@ -5243,6 +5235,102 @@ mod tests {
             request_id: "req-test",
         };
         assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
+    }
+
+    struct CountingClassifier {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl extraction::ClassifyProductReferences for CountingClassifier {
+        async fn classify(
+            &self,
+            _question: &str,
+            _catalog: &str,
+        ) -> anyhow::Result<Vec<product_gate::ProductReference>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_past_turns_window_does_not_call_the_extractor_unless_the_current_turn_is_hybrid() {
+        let counter = Arc::new(CountingClassifier {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let extractor = extraction::ProductReferenceExtractor::new(Some(
+            counter.clone() as Arc<dyn extraction::ClassifyProductReferences>
+        ));
+        let h = vec![customer("ABC-100 です")];
+        for mode in [
+            extraction::ExtractionMode::LexiconOnly,
+            extraction::ExtractionMode::LexiconFallback,
+        ] {
+            let window = PastTurnsWindow {
+                extractor: &extractor,
+                extraction_mode: mode,
+                history: &h,
+                request_id: "req-test",
+            };
+            assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
+        }
+        assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let window = PastTurnsWindow {
+            extractor: &extractor,
+            extraction_mode: extraction::ExtractionMode::Hybrid,
+            history: &h,
+            request_id: "req-test",
+        };
+        identify_product(&identified_allowlist(), &[], None, Some(&window)).await;
+        assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn product_unidentified_draft_is_the_catalog_text_under_always_and_empty_under_skip_when_unused(
+    ) {
+        let allowlist = identified_allowlist();
+        let decision = escalate_for_contract_test(
+            3,
+            decision::EscalateReason::ProductUnidentified,
+            Vec::new(),
+        );
+        let generated = Some(crate::llm::ReplyDraft {
+            text: "生成".to_string(),
+            truncated: true,
+        });
+        let (text, truncated) = customer_reply_draft_fields(
+            &ReplyDraftPolicy::Always,
+            &decision,
+            &allowlist,
+            generated,
+        );
+        assert_eq!(
+            text,
+            Some(clarify::product_catalog_clarify_text(&allowlist))
+        );
+        assert!(!truncated);
+        let allow = response_allowlist_fixture();
+        let skip = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allow,
+            partial_answer_enabled: true,
+            already_escalated: false,
+        };
+        assert_eq!(
+            customer_reply_draft_fields(&skip, &decision, &allowlist, None),
+            (None, false)
+        );
+        assert_eq!(
+            customer_reply_draft_fields(
+                &ReplyDraftPolicy::Always,
+                &allowed_decision(),
+                &allowlist,
+                Some(crate::llm::ReplyDraft {
+                    text: "生成".to_string(),
+                    truncated: true,
+                })
+            ),
+            (Some("生成".to_string()), true)
+        );
     }
 
     #[test]

@@ -99,7 +99,8 @@ pub struct EvaluateAnswerabilityResponse {
     /// `lexicon_fallback`。WORM 監査にも同値を記録している。
     pub extraction_mode: String,
     /// 顧客へ送る返信文の**下書き**（デモ用。無効化時・生成失敗時・出口ゲートで弾かれた
-    /// ときは null）。
+    /// ときは null）。ただし第3層 `ProductUnidentified` のターンは、下書きの設定や LLM に
+    /// 関係なく、取扱製品カタログから作る定型の聞き返し文（LLM 非経由）が入り、null にならない。
     ///
     /// **これは検証前の下書きであって、承認された回答ではない。送信前に必ず担当者が内容を
     /// 確認すること。**
@@ -760,18 +761,6 @@ impl CsSupportRmcpServer {
             )
             .await
             .map_err(to_error)?;
-        let mut outcome = outcome;
-        if outcome.decision.is_product_unidentified() {
-            let allowlist = self
-                .harness
-                .product_allowlist(&ctx.schema)
-                .await
-                .map_err(to_error)?;
-            outcome.customer_reply_draft = Some(
-                crate::harness::clarify::product_catalog_clarify_text(&allowlist),
-            );
-            outcome.customer_reply_draft_truncated = false;
-        }
         Ok(Json(EvaluateAnswerabilityResponse::from_outcome(
             outcome,
             ctx.request_id,

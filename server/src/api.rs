@@ -2064,28 +2064,18 @@ async fn reply_handler(
                     // `decide_reply_action` の前提により `conv.clarify_turns < clarify_max_turns`
                     // は保証済み（`is_final_clarify_turn` の doc コメント参照）。
                     let is_final_clarify_turn = is_final_clarify_turn(&conv, &state.config.api);
-                    let product_unidentified = outcome.decision.is_product_unidentified();
-                    let reply_text = if product_unidentified {
-                        // Issue #131: 取扱製品カタログから選ばせる。テンプレート生成で LLM を呼ばない。
-                        clarify::product_catalog_clarify_text(&allowlist)
-                    } else {
-                        match state.harness.reply_drafter.as_ref() {
-                            Some(drafter) => {
-                                clarify::draft_clarify_question(
-                                    drafter,
-                                    &state.harness.ng,
-                                    state.harness.reply_draft_max_tokens,
-                                    &req.message,
-                                    &missing_text,
-                                    &known_facts,
-                                    is_continuation,
-                                    &allowlist,
-                                )
-                                .await
-                            }
-                            None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
-                        }
-                    };
+                    let reply_text = clarify::clarify_question_text(
+                        state.harness.reply_drafter.as_ref(),
+                        &state.harness.ng,
+                        state.harness.reply_draft_max_tokens,
+                        &req.message,
+                        &missing_text,
+                        &known_facts,
+                        is_continuation,
+                        &allowlist,
+                        outcome.decision.is_product_unidentified(),
+                    )
+                    .await;
                     // Issue #28 §3.5: 応答側ゲート その 2/3。聞き返し。フォールバック定型文
                     // 経由でも allowlist 外を含み得ない（定数文字列）ため、判定は無害だが
                     // 経路を分けず一律に適用する（allowlist は §3.1 のために取得済みのものを使う）。

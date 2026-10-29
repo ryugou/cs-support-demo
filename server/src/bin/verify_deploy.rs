@@ -142,12 +142,11 @@ struct Report {
 struct Layer1Case {
     utterance: String,
     expect_rule: Option<String>,
-    /// Issue #131: when true, the case also fails unless the lexicon raises at least one signal
-    /// for the utterance. Omitted = false (existing cases are unchanged). The guard of #131 (an
-    /// unscoped symptom is clarified, not answered) only fires with a signal present and no layer-1
-    /// match, so this keeps the case from passing vacuously when the lexicon stops raising signals.
-    /// It does not run `decide` and does not check product references (no LLM here): the utterance
-    /// in the file is fixed and must carry no product name.
+    /// Issue #131: true のとき、発話に対して lexicon が signal を 1 件以上立てなければケースを
+    /// 失敗にする。省略時は false（既存ケースは変わらない）。#131 のガード（製品を特定できない症状は
+    /// 回答せず聞き返す）は、signal があり第1層に一致しないときだけ働くため、lexicon が signal を
+    /// 立てなくなってケースが空振りで通ることをこれで防ぐ。`decide` は実行せず、製品参照も確認しない
+    /// （ここでは LLM を使わない）。ファイル内の発話は固定で、製品名を含めてはならない。
     #[serde(default)]
     expect_signals_nonempty: bool,
 }

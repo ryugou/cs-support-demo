@@ -541,6 +541,44 @@ fn build_fixture(
     }
 }
 
+/// 本番 `Harness::evaluate` と同じ規則で、ターンの `DecisionInput::product_identified` を求める。
+/// 今ターンの製品参照 `references`（抽出モード `mode` に応じて採用した後のもの）を
+/// `case_switch::resolve_matched_models` で allowlist に解決する (a) と、過去の顧客発話の窓 `history`
+/// の (c) を、`identify_product` に任せる。このターンは明示的な `product_key` を持たない。
+async fn identify_product_for_turn(
+    fx: &Fixture,
+    references: &[super::product_gate::ProductReference],
+    mode: extraction::ExtractionMode,
+    history: &[ReplyHistoryTurn],
+) -> bool {
+    let resolved = super::case_switch::resolve_matched_models(&fx.allowlist, references);
+    let window = super::PastTurnsWindow {
+        extractor: &fx.harness.product_reference_extractor,
+        extraction_mode: mode,
+        history,
+        request_id: "smoke",
+    };
+    super::identify_product(&fx.allowlist, &resolved, None, Some(&window)).await
+}
+
+/// `text` から製品参照を実 LLM で抽出し、本番と同じ採用規則（`adopt_product_references_for_extraction_mode`）
+/// を通して [`identify_product_for_turn`] で製品特定済みかどうかを求める。
+async fn extract_and_identify_product(
+    fx: &Fixture,
+    text: &str,
+    mode: extraction::ExtractionMode,
+    history: &[ReplyHistoryTurn],
+) -> bool {
+    let references = fx
+        .harness
+        .product_reference_extractor
+        .extract(text, fx.allowlist.display_list(), "smoke")
+        .await;
+    let (references, _discarded) =
+        super::adopt_product_references_for_extraction_mode(mode, references);
+    identify_product_for_turn(fx, &references, mode, history).await
+}
+
 /// signal 抽出から `decide` までを実行する。判定内容そのものへの assert はここでは行わず、
 /// 呼び出し側（`run_once`）が `expect`（design doc §10.5）に応じて [`assert_handoff_decision`] /
 /// [`assert_allowed_decision`] のどちらを課すか選ぶ。`question_hits` は本番 MCP `search_manual`
@@ -565,6 +603,10 @@ async fn decide_for_case(
         .await;
     println!("signals: {signals:?} (extraction_mode={mode:?})");
     println!("product_references: {product_references:?}");
+    let (adopted_references, _discarded) =
+        super::adopt_product_references_for_extraction_mode(mode, product_references);
+    let product_identified = identify_product_for_turn(fx, &adopted_references, mode, &[]).await;
+    println!("product_identified: {product_identified}");
 
     let (decision, matched_layer1_rule_ids) = decide_on_signals(
         fx,
@@ -572,6 +614,7 @@ async fn decide_for_case(
         question_hits,
         signals,
         signals,
+        product_identified,
         case_index,
         total_cases,
     );
@@ -580,12 +623,14 @@ async fn decide_for_case(
     (extracted, decision, matched_layer1_rule_ids)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide_on_signals(
     fx: &Fixture,
     question: &str,
     question_hits: &[SectionHit],
     question_signals: &signal::SignalSet,
     accumulated: &signal::SignalSet,
+    product_identified: bool,
     case_index: usize,
     total_cases: usize,
 ) -> (AnswerDecision, Vec<String>) {
@@ -615,7 +660,7 @@ fn decide_on_signals(
         thresholds: &fx.thresholds,
         default_route: &fx.config.harness.default_escalation_route,
         known_resolution: None,
-        product_identified: false,
+        product_identified,
     });
     let matched_layer1_rule_ids: Vec<String> =
         matching_layer1_rules(&fx.escalation_rules, question_signals)
@@ -1088,6 +1133,7 @@ fn assert_accumulated_signals_would_escalate(
     turn2_question: &str,
     turn2_question_hits: &[SectionHit],
     accumulated: &signal::SignalSet,
+    product_identified: bool,
     case_index: usize,
     total_cases: usize,
 ) {
@@ -1097,6 +1143,7 @@ fn assert_accumulated_signals_would_escalate(
         turn2_question_hits,
         accumulated,
         accumulated,
+        product_identified,
         case_index,
         total_cases,
     );
@@ -1108,12 +1155,14 @@ fn assert_accumulated_signals_would_escalate(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide_allowed_turn2(
     fx: &Fixture,
     turn2_question: &str,
     turn2_question_hits: &[SectionHit],
     decide_signals: &signal::SignalSet,
     accumulated: &signal::SignalSet,
+    product_identified: bool,
     case_index: usize,
     total_cases: usize,
 ) -> AnswerDecision {
@@ -1123,6 +1172,7 @@ fn decide_allowed_turn2(
         turn2_question_hits,
         decide_signals,
         accumulated,
+        product_identified,
         case_index,
         total_cases,
     );
@@ -1137,6 +1187,7 @@ fn decide_allowed_turn2(
         turn2_question,
         turn2_question_hits,
         accumulated,
+        product_identified,
         case_index,
         total_cases,
     );
@@ -1166,12 +1217,26 @@ async fn draft_allowed_turn2_answer(
     let accumulated: signal::SignalSet = turn1.extracted.signals.union(signals2).cloned().collect();
     let decide_signals =
         select_turn_only_signals(fx, signals2, &accumulated, case_index, total_cases);
+    let history = [
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: turn1_question.to_owned(),
+        },
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Assistant,
+            text: turn1.assistant_reply.clone(),
+        },
+    ];
+    let product_identified =
+        extract_and_identify_product(fx, turn2_question, extracted2.mode, &history).await;
+    println!("product_identified: {product_identified}");
     let decision2 = decide_allowed_turn2(
         fx,
         turn2_question,
         turn2_question_hits,
         decide_signals,
         &accumulated,
+        product_identified,
         case_index,
         total_cases,
     );
@@ -1188,16 +1253,6 @@ async fn draft_allowed_turn2_answer(
         "case {case_index}/{total_cases}: an Allowed decision must have no handoff items, got \
          {items:?}"
     );
-    let history = [
-        ReplyHistoryTurn {
-            role: ReplyHistoryRole::Customer,
-            text: turn1_question.to_owned(),
-        },
-        ReplyHistoryTurn {
-            role: ReplyHistoryRole::Assistant,
-            text: turn1.assistant_reply.clone(),
-        },
-    ];
     let best_score = turn2_question_hits.first().map(|h| h.score);
     let draft_text = draft_accepted_text(
         fx,
@@ -1802,7 +1857,7 @@ fn kr_applicability_cases() -> [KrCase; 5] {
         },
         KrCase {
             label: "b: 保存期間の質問は保存期間 KR を選び、下書きが数字を保つ",
-            utterance: "クラウドの保存期間は何日ですか？",
+            utterance: "ADC-V724X のクラウドの保存期間は何日ですか？",
             candidate_ids: &[KR_RETENTION],
             expected: Some(KR_RETENTION),
             draft_follows_kr: true,
@@ -1911,6 +1966,7 @@ fn decide_kr_turn(
     resolutions: &[rules::KnownResolution],
     selected: Option<&rules::KnownResolution>,
     stakes_input: &decision::StakesInput,
+    product_identified: bool,
 ) -> AnswerDecision {
     decision::decide(&DecisionInput {
         question_signals: signals,
@@ -1924,7 +1980,7 @@ fn decide_kr_turn(
         thresholds,
         default_route: &config.harness.default_escalation_route,
         known_resolution: selected,
-        product_identified: false,
+        product_identified,
     })
 }
 
@@ -1940,6 +1996,7 @@ fn decide_kr_riding_turn(
     resolutions: &[rules::KnownResolution],
     selected: Option<&rules::KnownResolution>,
     stakes_input: &decision::StakesInput,
+    product_identified: bool,
 ) -> KrRidingTurn {
     let decision = decide_kr_turn(
         config,
@@ -1951,6 +2008,7 @@ fn decide_kr_riding_turn(
         resolutions,
         selected,
         stakes_input,
+        product_identified,
     );
     let items = handoff_items::handoff_items_for_decision(
         &decision,
@@ -2428,6 +2486,8 @@ async fn draft_for_kr_turn(
     context: &str,
     no_draft: &str,
 ) -> crate::llm::ReplyDraft {
+    let product_identified =
+        extract_and_identify_product(fx, utterance, extraction::ExtractionMode::Hybrid, &[]).await;
     let decision = decide_kr_turn(
         &fx.config,
         &fx.escalation_rules,
@@ -2438,6 +2498,12 @@ async fn draft_for_kr_turn(
         &turn.resolutions,
         turn.applicable_known_resolution.as_ref(),
         &turn.stakes_input,
+        product_identified,
+    );
+    assert!(
+        !decision.is_product_unidentified(),
+        "{context}: the utterance names no handled product, so production answers with the \
+         product catalog instead of drafting from the known resolution: {utterance:?}"
     );
     let draft = fx
         .harness
@@ -2547,6 +2613,13 @@ async fn draft_and_assemble_kr_riding_reply(
     kr_turn: &super::KrTurn<'_>,
     label: &str,
 ) -> String {
+    let product_identified = extract_and_identify_product(
+        fx,
+        KR_RIDING_UTTERANCE,
+        extraction::ExtractionMode::Hybrid,
+        &[],
+    )
+    .await;
     let turn = decide_kr_riding_turn(
         &fx.config,
         &fx.lexicon,
@@ -2557,6 +2630,7 @@ async fn draft_and_assemble_kr_riding_reply(
         &kr_turn.resolutions,
         kr_turn.applicable_known_resolution.as_ref(),
         &kr_turn.stakes_input,
+        product_identified,
     );
     assert_kr_riding_turn(&turn, &fx.escalation_rules, kr_turn.decide_signals);
     let plan = plan_draft(
@@ -2978,7 +3052,7 @@ async fn real_llm_reply_list_formatting_smoke() {
         &ctx,
         &fixture,
         KR_STEPS_ANSWER,
-        "24時間録画ができているか確認する方法を教えてください",
+        "ADC-V724X で24時間録画ができているか確認する方法を教えてください",
         "i: steps KR",
     )
     .await;
@@ -2999,7 +3073,7 @@ async fn real_llm_reply_list_formatting_smoke() {
         &ctx,
         &fixture,
         KR_SINGLE_FACT_ANSWER,
-        "クラウドの保存期間は何日ですか？",
+        "ADC-V724X のクラウドの保存期間は何日ですか？",
         "ii: single-fact KR",
     )
     .await;
@@ -3029,7 +3103,7 @@ async fn real_llm_long_steps_draft_is_not_truncated_smoke() {
         &ctx,
         &fixture,
         KR_LONG_STEPS_ANSWER,
-        "カメラの初期設定の方法を教えてください",
+        "ADC-V724X の初期設定の方法を教えてください",
         "long steps KR",
     )
     .await;
@@ -4068,6 +4142,7 @@ fn kr_riding_advisory_turn_escalates_with_the_kr_and_plans_a_partial_answer() {
             ng_near_hit: false,
             hazard_signal_count: 0,
         },
+        false,
     );
     assert_kr_riding_turn(&turn, &escalation_rules, &signals);
     assert_partial_answer_plan(&plan_draft(
