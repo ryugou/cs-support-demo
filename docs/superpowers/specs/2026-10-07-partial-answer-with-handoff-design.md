@@ -178,7 +178,7 @@ user message には現行の材料（上位 3 件・各 2,500 字まで）と質
 ### 10.3 検証（§9 の改訂）
 
 - スモークの材料は手で選ばず、**本番 MCP `search_manual` の実結果**を入力にする。入力は `CS_VERIFY_CASES_JSON`（旧 `CS_VERIFY_SECTIONS_JSON` / `CS_VERIFY_QUESTION` は廃止）で、形式は `[{"question": <言い回し>, "expect": "handoff" | "allowed", "hits_json": <path>}, ...]`。各 `hits_json` は、質問文での `search_manual` の返却 JSON と、補助検索語（取り次ぐ signal の `description` + `surface_forms`）での返却 JSON を `{"question_hits": <返却 JSON>, "signal_hits": <返却 JSON>}` で持つ 1 ファイル。併合は §10.2 の本番と同じ関数で行う。
-- 言い回しは最低 3 件の相異なるもの: 「導入にいくらかかる？」（本番の回帰。必須）「導入にどれくらいの費用がかかるの？」「ADC-V724X の価格はいくらですか？」。`expect` の意味は §10.5。
+- 言い回しは最低 3 件の相異なるもの: 「導入にいくらかかる？」（本番の回帰。必須）「導入にどれくらいの費用がかかるの？」「ADC-V724X の料金は？」。`expect` の意味は §10.5。
 - 合否はケースの `expect` による（§10.5）: `handoff` は最終応答文に料金節の金額（`1,540`）・取次の一文・受付番号（補助検索が効いていることの確認）、`allowed` は下書きに金額（#73 の回答のみ経路の確認。補助検索は走らない）。
 - 本番の最終確認は、LINE ではなく MCP `evaluate_answerability` を同じ 3 文で呼ぶ（実施者はオーケストレータ）。`handoff` のケースは `partial_answer = true` かつ `customer_reply_draft` に金額、`allowed` のケースは `decision = allowed` かつ `partial_answer = false` かつ `customer_reply_draft` に金額、を確認する。
 
@@ -189,7 +189,7 @@ user message には現行の材料（上位 3 件・各 2,500 字まで）と質
 
 ### 10.5 スモークのケース別期待（2026-10-13 追記）
 
-言い回しによって判定が変わる（「ADC-V724X の価格はいくらですか？」は `price_question` → `Allowed` で回答のみ、#73 の設計どおり）。signal があり第 1 層に一致しない `allowed` のケースは、取扱製品の型番を含める（含まないと製品未特定ガードで型番の聞き返しになり、`Allowed` に到達しない）。`CS_VERIFY_CASES_JSON` の各ケースに `expect` を持たせる:
+言い回しによって判定が変わる（「ADC-V724X の料金は？」は `price_question` → `Allowed` で回答のみ、#73 の設計どおり）。`allowed` のケースは取扱製品の型番を含める（無いと聞き返しになる）。`CS_VERIFY_CASES_JSON` の各ケースに `expect` を持たせる:
 
 - `"handoff"`: 判定が第 1 層 `Escalate`、部分回答の下書きが採用され、最終応答文に料金節の金額（`1,540`）・取次の一文・受付番号が含まれる。
 - `"allowed"`: 判定が `Allowed`、`customer_reply_draft` が採用され（`NO_ANSWER` でない）、下書きに `1,540` が含まれる。最終応答文は下書きそのもの（取次の一文・受付番号は付かない）。

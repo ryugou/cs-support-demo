@@ -136,36 +136,32 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 ## 10. 追記（Issue #131）
 
-第1層ルールに一致せず、発話に signal-lexicon の signal が1つ以上立ち、製品が特定されていないターンは、マニュアル一致のスコアに関わらず、取扱製品カタログから選ばせる聞き返しを返す。signal の立たない汎用質問は聞き返しにならない。
+第1層ルールに一致せず、発話に signal-lexicon の signal が1つ以上立ち、製品が特定されていないターンは、マニュアルのスコアに関わらず、取扱製品カタログから選ばせる聞き返しを返す。signal の立たない質問は対象外。
 
-製品が特定済みとみなすのは、次のいずれかを満たすとき。
+製品が特定済みなのは次のいずれかのとき。
 
 - (a) 当ターンの発話に `ProductReference::Matched` がある。
-- (b) 呼出元が明示した `product_key` が取扱製品の allowlist 内にある。
-- (c) Jev 用の直近顧客発話の窓（最大 6 件・合計 2,000 字。組み立て規則は `build_jev_state` と共有し、`[jev] enabled` の値に依存せず組み立てる）内の顧客発話に `Matched` がある。
+- (b) 呼出元が明示した `product_key` が allowlist 内にある。
+- (c) Jev 用の直近顧客発話の窓（最大 6 件・合計 2,000 字。`build_jev_state` と規則を共有し、`[jev] enabled` に依存せず組み立てる）内に `Matched` がある。窓から外れた型番は根拠にならない。
 
-窓から外れた型番は特定の根拠にならない。
+判定に使う signal は `decide_signals`。通常はケース内の累積 signalで、取次済み（受付番号発行済み）のケースは今ターンの signal だけを使う（`decide_signals_for_policy`）。取次済みで未特定でも聞き返しは再開せず、`/api/reply` は `decide_reply_action` の規則で取次済みの応答（`EscalationReply`）を返す。
 
-判定に使う signal は `decide_signals` である。通常はケース内の累積 signal で、前のターンだけで立った signal も数える。取次済み（受付番号発行済み）のケースでは今ターンの signal だけを使う（`decide_signals_for_policy`）。取次済みのケースで製品未特定になっても聞き返しは再開せず、`/api/reply` は `decide_reply_action` の規則により取次済みの応答（`EscalationReply`）を返す。
+この判定は第1層 mandatory・第2層・第1層 advisory の後、既知解決（KR）の Allowed と第3層より前に置く。KR が選定済みでも未特定なら聞き返し、特定済みで KR があれば KR の回答を返す。
 
-この判定は、第1層 mandatory・第2層・第1層 advisory の後、既知解決（KR）の Allowed と第3層より前に置く。KR が事前に選定されていても、製品が未特定なら聞き返しを返す。製品が特定済みで KR があれば、KR の回答を返す。
+聞き返しの文面は取扱製品カタログから作る決定的な文字列で、LLM を呼ばない。
 
-製品未特定の聞き返しの文面は、取扱製品カタログから作る決定的な文字列で、LLM を呼ばない。
+- 「型番（製品名）」の箇条書きで尋ねる。製品名が型番と同じなら型番だけを出す。
+- 20 件を超えるときは製品名を並べず、型番を尋ねる箇条書きだけにする。
+- 0 件のときは固定の聞き返し文にする。
 
-- 「型番（製品名）」の箇条書きで型番を尋ねる。製品名は Product ノードの名称で、型番と同じ場合は型番だけを出す。
-- 取扱製品が 20 件を超えるときは、製品名を並べず型番を尋ねる箇条書きだけにする。
-- 取扱製品が 0 件のときは、固定の聞き返し文にフォールバックする。
+聞き返しの回数上限は既存の `clarify_max_turns` に従い、達したら取次に進む。
 
-聞き返しの回数上限は既存の `clarify_max_turns` に従う。上限に達したときは取次に進む。
+MCP `evaluate_answerability` は履歴が無く窓 (c) は不成立。未特定の判定では `customer_reply_draft` に同じカタログ文面を入れ、`clarification_allowed` を `true`、`decision.reason` を `product_unidentified` にする。取次済みの扱いは `/api/reply` 限定で、MCP は取次済みの判定を持たない（`already_escalated_for_policy` は常に false、`harness/mod.rs`）ため、取次済みでも未特定ならこの応答になる。
 
-MCP `evaluate_answerability` 経路は履歴を持たないため、窓 (c) は成立しない。製品未特定の判定が出たときは、`customer_reply_draft` に同じカタログ文面を入れ、`clarification_allowed` を `true` にする。`decision.reason` は `product_unidentified` になる。
+今ターンの製品参照の抽出が空なら (a) は不成立。(b) か窓 (c) で特定済みになればそれで判定し、できなければ未特定（fail-closed）として聞き返す。warn は LLM 設定済みで抽出の呼び出しが失敗したときだけ出し、`request_id` を含む（LLM 未設定の空結果では出さない）。ただし取次済みと `/api/reply` の `LexiconFallback` は、未特定でも聞き返さない。
 
-今ターンの製品参照の抽出が空を返したときは (a) が成立しない。(b) の `product_key` か窓 (c) の抽出で特定済みになれば特定済みとして判定し、どちらでも特定できなければ未特定として扱い（fail-closed）、聞き返しを返す。
+LLM 無効の構成（`ExtractionMode::LexiconOnly`）は製品参照を採用しないため (a)(c) は不成立で、特定できるのは (b) の `product_key` だけ。`product_key` の無い `/api/reply` では signal のあるターンは聞き返しになり、`clarify_max_turns` に達すると取次へ進む（fail-closed）。窓 (c) の抽出は今ターンの signal 抽出が `Hybrid` のときだけ行う。
 
-ただし取次済みのケース（上記）と `/api/reply` の `LexiconFallback` では、未特定でも聞き返しにならない。取次済みの扱いは `/api/reply` 経路に限る。MCP `evaluate_answerability` は取次済みの判定を持たない（`already_escalated_for_policy` は常に false、`harness/mod.rs`）ため、取次済みのケースでも製品未特定ならカタログ文面と `clarification_allowed = true` を返す。warn が出るのは LLM が設定されていて製品参照抽出の呼び出しが失敗したときだけで、`request_id` を含む。LLM が設定されていない構成の空の結果には warn が出ない。
+`LexiconFallback` のターンは経路で扱いが異なる。`/api/reply` は `decide_reply_action` の規則で、判定によらず取次に進む。MCP は製品参照を採用しないため、allowlist 内の `product_key` が無く累積 signal が 1 件以上で第1層・第2層に一致しなければ未特定になり、カタログ文面と `clarification_allowed = true` を返す。
 
-LLM 無効の構成（`ExtractionMode::LexiconOnly`）では製品参照を採用しないため、(a)(c) は成立せず、特定できるのは (b) の明示的な `product_key` だけである。`product_key` の無い `/api/reply` では、signal のあるターンは聞き返しになり、`clarify_max_turns` に達すると取次へ進む（fail-closed）。窓 (c) の製品参照抽出は、今ターンの signal 抽出が `Hybrid` のときだけ行う。
-
-signal 抽出が `LexiconFallback` のターンの扱いは経路で異なる。`/api/reply` は `decide_reply_action` の規則により、判定によらず取次に進む。MCP `evaluate_answerability` は製品参照を採用しない。そのため、allowlist 内の `product_key` が無く（(b) で特定済みなら未特定にならない）、累積 signal が 1 件以上あり（空なら未特定にならない）、第1層・第2層のどちらにも一致しないとき（判定はそちらが先）は製品未特定になり、カタログ文面の `customer_reply_draft` と `clarification_allowed = true` を返す。
-
-アドバイザ（homesec）の CS モードでも、製品未特定の聞き返しは LLM の `draft_clarify_question` を呼ばず、同じカタログ文面を返す。
+アドバイザ（homesec）の CS モードも、未特定の聞き返しは LLM の `draft_clarify_question` を呼ばず同じカタログ文面を返す。
