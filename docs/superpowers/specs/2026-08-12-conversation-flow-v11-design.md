@@ -136,7 +136,7 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 ## 10. 追記（Issue #131）
 
-第1層ルールに一致せず、発話に signal-lexicon の signal が1つ以上立ち、製品が特定されていないターンは、マニュアルのスコアに関わらず、取扱製品カタログから選ばせる聞き返しを返す。signal の立たない質問は対象外。
+第1層ルールに一致せず、判定に使う signal（下記 `decide_signals`）が1つ以上あり、製品が特定されていないターンは、マニュアルのスコアに関わらず、取扱製品カタログから選ばせる聞き返しを返す。判定に使う signal が無いターンは対象外。
 
 製品が特定済みなのは次のいずれかのとき。
 
@@ -144,7 +144,7 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 - (b) 呼出元が明示した `product_key` が allowlist 内にある。
 - (c) Jev 用の直近顧客発話の窓（最大 6 件・合計 2,000 字。`build_jev_state` と規則を共有し、`[jev] enabled` に依存せず組み立てる）内に `Matched` がある。窓から外れた型番は根拠にならない。
 
-判定に使う signal は `decide_signals`。通常はケース内の累積 signalで、取次済み（受付番号発行済み）のケースは今ターンの signal だけを使う（`decide_signals_for_policy`）。取次済みで未特定でも聞き返しは再開せず、`/api/reply` は `decide_reply_action` の規則で取次済みの応答（`EscalationReply`）を返す。
+判定に使う signal は `decide_signals`。通常はケース内の累積 signal で、取次済み（受付番号発行済み）のケースは今ターンの signal だけを使う（`decide_signals_for_policy`）。取次済みで未特定でも聞き返しは再開せず、`/api/reply` は `decide_reply_action` の規則で取次済みの応答（`EscalationReply`）を返す。
 
 この判定は第1層 mandatory・第2層・第1層 advisory の後、既知解決（KR）の Allowed と第3層より前に置く。KR が選定済みでも未特定なら聞き返し、特定済みで KR があれば KR の回答を返す。
 
@@ -156,7 +156,7 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 聞き返しの回数上限は既存の `clarify_max_turns` に従い、達したら取次に進む。
 
-MCP `evaluate_answerability` は履歴が無く窓 (c) は不成立。未特定の判定では `customer_reply_draft` に同じカタログ文面を入れ、`clarification_allowed` を `true`、`decision.reason` を `product_unidentified` にする。取次済みの扱いは `/api/reply` 限定で、MCP は取次済みの判定を持たない（`already_escalated_for_policy` は常に false、`harness/mod.rs`）ため、取次済みでも未特定ならこの応答になる。
+MCP `evaluate_answerability` は履歴が無く窓 (c) は不成立。製品未特定の判定に限り、§1 の「MCP tool（`evaluate_answerability`）の入出力・挙動は変更しない」と §9 の「MCP 経路への聞き返し・時間帯フローの適用」（範囲外）の例外とする。未特定の判定では `customer_reply_draft` に同じカタログ文面を入れ、`clarification_allowed` を `true`、`decision.reason` を `product_unidentified` にする。取次済みの扱いは `/api/reply` 限定で、MCP は取次済みの判定を持たない（`already_escalated_for_policy` は常に false、`harness/mod.rs`）ため、取次済みでも未特定ならこの応答になる。
 
 今ターンの製品参照の抽出が空なら (a) は不成立。(b) か窓 (c) で特定済みになればそれで判定し、できなければ未特定（fail-closed）として聞き返す。warn は LLM 設定済みで抽出の呼び出しが失敗したときだけ出し、`request_id` を含む（LLM 未設定の空結果では出さない）。ただし取次済みと `/api/reply` の `LexiconFallback` は、未特定でも聞き返さない。
 

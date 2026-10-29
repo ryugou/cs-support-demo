@@ -593,8 +593,6 @@ async fn decide_for_case(
 ) -> (extraction::ExtractionResult, AnswerDecision, Vec<String>) {
     let extracted = fx.harness.extractor.extract(question).await;
     let (signals, mode) = (&extracted.signals, extracted.mode);
-    // 製品言及抽出は signal 抽出と独立したコンポーネント（Issue #52）。抽出結果から
-    // `product_identified` を導き、製品未特定ガードの判定に渡す（本番と同じ配線）。
     let product_references = fx
         .harness
         .product_reference_extractor
