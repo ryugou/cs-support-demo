@@ -136,7 +136,7 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 ## 10. 追記（Issue #131）
 
-第1層ルールに一致せず、発話に signal-lexicon の signal が1つ以上立ち、製品が特定されていないターンは、マニュアル一致のスコアに関わらず、取扱製品カタログから選ばせる聞き返しを返す。signal の立たない汎用質問は従来どおり。
+第1層ルールに一致せず、発話に signal-lexicon の signal が1つ以上立ち、製品が特定されていないターンは、マニュアル一致のスコアに関わらず、取扱製品カタログから選ばせる聞き返しを返す。signal の立たない汎用質問は聞き返しにならない。
 
 製品が特定済みとみなすのは、次のいずれかを満たすとき。
 
@@ -148,7 +148,7 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 判定に使う signal は `decide_signals` である。通常はケース内の累積 signal で、前のターンだけで立った signal も数える。取次済み（受付番号発行済み）のケースでは今ターンの signal だけを使う（`decide_signals_for_policy`）。取次済みのケースで製品未特定になっても聞き返しは再開せず、`/api/reply` は `decide_reply_action` の規則により取次済みの応答（`EscalationReply`）を返す。
 
-この判定は、第1層 mandatory・第2層・第1層 advisory の後、既知解決（KR）の Allowed と第3層より前に置く。KR が事前に選定されていても、製品が未特定なら聞き返しを返す。製品が特定済みで KR があれば、従来どおり KR の回答を返す。
+この判定は、第1層 mandatory・第2層・第1層 advisory の後、既知解決（KR）の Allowed と第3層より前に置く。KR が事前に選定されていても、製品が未特定なら聞き返しを返す。製品が特定済みで KR があれば、KR の回答を返す。
 
 製品未特定の聞き返しの文面は、取扱製品カタログから作る決定的な文字列で、LLM を呼ばない。
 
@@ -156,11 +156,13 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 - 取扱製品が 20 件を超えるときは、製品名を並べず型番を尋ねる箇条書きだけにする。
 - 取扱製品が 0 件のときは、固定の聞き返し文にフォールバックする。
 
-聞き返しの回数上限は既存の `clarify_max_turns` に従う。上限に達したときは従来どおり取次に進む。
+聞き返しの回数上限は既存の `clarify_max_turns` に従う。上限に達したときは取次に進む。
 
 MCP `evaluate_answerability` 経路は履歴を持たないため、窓 (c) は成立しない。製品未特定の判定が出たときは、`customer_reply_draft` に同じカタログ文面を入れ、`clarification_allowed` を `true` にする。`decision.reason` は `product_unidentified` になる。
 
-今ターンの製品参照の抽出が空を返したときは (a) が成立しない。(b) の `product_key` か窓 (c) の抽出で特定済みになれば特定済みとして判定し、どちらでも特定できなければ未特定として扱い（fail-closed）、聞き返しを返す。ただし取次済みのケース（上記）と `/api/reply` の `LexiconFallback` では、未特定でも聞き返しにならない。warn が出るのは LLM が設定されていて製品参照抽出の呼び出しが失敗したときだけで、`request_id` を含む。LLM が設定されていない構成の空の結果には warn が出ない。
+今ターンの製品参照の抽出が空を返したときは (a) が成立しない。(b) の `product_key` か窓 (c) の抽出で特定済みになれば特定済みとして判定し、どちらでも特定できなければ未特定として扱い（fail-closed）、聞き返しを返す。
+
+ただし取次済みのケース（上記）と `/api/reply` の `LexiconFallback` では、未特定でも聞き返しにならない。取次済みの扱いは `/api/reply` 経路に限る。MCP `evaluate_answerability` は取次済みの判定を持たない（`already_escalated_for_policy` は常に false、`harness/mod.rs`）ため、取次済みのケースでも製品未特定ならカタログ文面と `clarification_allowed = true` を返す。warn が出るのは LLM が設定されていて製品参照抽出の呼び出しが失敗したときだけで、`request_id` を含む。LLM が設定されていない構成の空の結果には warn が出ない。
 
 LLM 無効の構成（`ExtractionMode::LexiconOnly`）では製品参照を採用しないため、(a)(c) は成立せず、特定できるのは (b) の明示的な `product_key` だけである。`product_key` の無い `/api/reply` では、signal のあるターンは聞き返しになり、`clarify_max_turns` に達すると取次へ進む（fail-closed）。窓 (c) の製品参照抽出は、今ターンの signal 抽出が `Hybrid` のときだけ行う。
 
