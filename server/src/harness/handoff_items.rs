@@ -1323,6 +1323,7 @@ mod tests {
             thresholds: &thresholds,
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
         });
         assert!(
             matches!(decision, AnswerDecision::Escalate { layer: 2, .. }),

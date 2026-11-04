@@ -2639,6 +2639,7 @@ mod tests {
             thresholds: &thresholds,
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -4573,6 +4574,7 @@ mod tests {
             crate::harness::extraction::ExtractionResult {
                 signals: crate::harness::signal::SignalSet::new(),
                 mode,
+                product_dependent: None,
             },
             refs,
         )

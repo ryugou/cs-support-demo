@@ -612,6 +612,7 @@ async fn decide_for_case(
         signals,
         signals,
         product_identified,
+        extracted.product_dependent,
         case_index,
         total_cases,
     );
@@ -628,6 +629,7 @@ fn decide_on_signals(
     question_signals: &signal::SignalSet,
     accumulated: &signal::SignalSet,
     product_identified: bool,
+    llm_product_dependent: Option<bool>,
     case_index: usize,
     total_cases: usize,
 ) -> (AnswerDecision, Vec<String>) {
@@ -658,6 +660,8 @@ fn decide_on_signals(
         default_route: &fx.config.harness.default_escalation_route,
         known_resolution: None,
         product_identified,
+        product_dependent: llm_product_dependent
+            .unwrap_or_else(|| fx.lexicon.is_product_dependent_by_lexicon(accumulated)),
     });
     let matched_layer1_rule_ids: Vec<String> =
         matching_layer1_rules(&fx.escalation_rules, question_signals)
@@ -1141,6 +1145,7 @@ fn assert_accumulated_signals_would_escalate(
         accumulated,
         accumulated,
         product_identified,
+        None,
         case_index,
         total_cases,
     );
@@ -1170,6 +1175,7 @@ fn decide_allowed_turn2(
         decide_signals,
         accumulated,
         product_identified,
+        None,
         case_index,
         total_cases,
     );
@@ -1964,6 +1970,7 @@ fn decide_kr_turn(
     selected: Option<&rules::KnownResolution>,
     stakes_input: &decision::StakesInput,
     product_identified: bool,
+    product_dependent: bool,
 ) -> AnswerDecision {
     decision::decide(&DecisionInput {
         question_signals: signals,
@@ -1978,6 +1985,7 @@ fn decide_kr_turn(
         default_route: &config.harness.default_escalation_route,
         known_resolution: selected,
         product_identified,
+        product_dependent,
     })
 }
 
@@ -2006,6 +2014,7 @@ fn decide_kr_riding_turn(
         selected,
         stakes_input,
         product_identified,
+        lexicon.is_product_dependent_by_lexicon(signals),
     );
     let items = handoff_items::handoff_items_for_decision(
         &decision,
@@ -2496,6 +2505,8 @@ async fn draft_for_kr_turn(
         turn.applicable_known_resolution.as_ref(),
         &turn.stakes_input,
         product_identified,
+        fx.lexicon
+            .is_product_dependent_by_lexicon(turn.decide_signals),
     );
     assert!(
         !decision.is_product_unidentified(),
@@ -2690,6 +2701,7 @@ fn build_kr_riding_outcome(
             &extraction::ExtractionResult {
                 signals: kr_turn.decide_signals.clone(),
                 mode: extraction::ExtractionMode::Hybrid,
+                product_dependent: None,
             },
             &[],
             draft_text,
@@ -4254,4 +4266,72 @@ fn any_leading_non_alphanumeric_mark_is_ignored_but_digits_are_kept() {
 fn full_width_comma_and_minus_fold_through_ascii_fold_alone() {
     assert_eq!(digit_runs("１，２３４台"), vec!["1234".to_owned()]);
     assert_eq!(normalize_for_match("Ｗｉ－Ｆｉ Wi\u{2212}Fi"), "wi-fiwi-fi");
+}
+
+fn smoke_product_node(model: &str, name: &str) -> crate::proto::graphrag::NodeResult {
+    crate::proto::graphrag::NodeResult {
+        node_id: format!("urtect:gen1:Product:{model}"),
+        node_type: "Product".to_string(),
+        attributes: [("model", model), ("name", name)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
+async fn real_llm_product_unidentified_hearing_smoke() {
+    init_warn_subscriber();
+    let (config, client) = load_config_and_client();
+    let lexicon = Arc::new(load_bundled_lexicon());
+    let classifier: Arc<dyn extraction::ClassifyLlm> = Arc::new(
+        extraction::AnthropicSignalClassifier::new(client.clone(), lexicon.vocabulary_for_prompt()),
+    );
+    let extractor = extraction::HybridExtractor::new(lexicon.clone(), Some(classifier));
+    let ng =
+        egress::NgDictionary::from_path(&resolve_server_path(&config.harness.ng_dictionary_path))
+            .expect("production ng dictionary must load and parse");
+    let allowlist = ProductAllowlist::from_nodes(vec![
+        smoke_product_node("ADC-V724", "ADC-V724"),
+        smoke_product_node("ADC-V724X", "ADC-V724X"),
+        smoke_product_node("ADC-VC727P", "ADC-VC727P"),
+    ]);
+    for (utterance, expect_dependent) in [
+        ("赤いランプが点滅してる", true),
+        ("ランプが消えてて動かない", true),
+        ("費用はどれくらい？", false),
+    ] {
+        let extracted = extraction::AsyncSignalExtractor::extract(&extractor, utterance).await;
+        let dependent = extracted
+            .product_dependent
+            .unwrap_or_else(|| lexicon.is_product_dependent_by_lexicon(&extracted.signals));
+        println!(
+            "utterance: {utterance}\nsignals: {:?} mode: {:?}\nproduct_dependent (llm): {:?} => {dependent}",
+            extracted.signals, extracted.mode, extracted.product_dependent
+        );
+        assert_eq!(dependent, expect_dependent, "{utterance}");
+        if dependent {
+            let text = super::clarify::draft_product_identification_question(
+                &client,
+                &ng,
+                config.harness.customer_reply_draft_max_tokens,
+                utterance,
+                "",
+                false,
+                &allowlist,
+            )
+            .await;
+            println!("hearing:\n{text}\n---");
+            assert_ne!(text, super::clarify::FALLBACK_CLARIFY_TEXT, "{utterance}");
+            assert!(
+                allowlist.out_of_scope_mentions(&text).is_empty(),
+                "{utterance}"
+            );
+            assert!(
+                !text.to_lowercase().contains("aeotec"),
+                "{utterance}: names an out-of-scope vendor"
+            );
+        }
+    }
 }

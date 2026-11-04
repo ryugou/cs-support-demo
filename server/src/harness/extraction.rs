@@ -65,6 +65,8 @@ pub fn audit_extraction_mode(mode: Option<ExtractionMode>) -> String {
 pub struct ExtractionResult {
     pub signals: SignalSet,
     pub mode: ExtractionMode,
+    /// Whether the LLM judged that the correct answer depends on the customer's product; `None` for lexicon-only, fallback, or an omitted/malformed flag.
+    pub product_dependent: Option<bool>,
 }
 
 /// Harness が保持する抽出口の trait 境界。`evaluate` / `root_cause_probe` はこれ経由で
@@ -79,6 +81,17 @@ pub trait AsyncSignalExtractor: Send + Sync {
 #[async_trait::async_trait]
 pub trait ClassifyLlm: Send + Sync {
     async fn classify(&self, question: &str) -> anyhow::Result<Vec<String>>;
+
+    /// Classifies and also reports the `product_dependent` judgment; the default reports no judgment.
+    async fn classify_with_product_dependence(
+        &self,
+        question: &str,
+    ) -> anyhow::Result<crate::llm::SignalClassification> {
+        Ok(crate::llm::SignalClassification {
+            signals: self.classify(question).await?,
+            product_dependent: None,
+        })
+    }
 }
 
 /// `AnthropicClient` を `ClassifyLlm` として使うためのアダプタ。
@@ -103,6 +116,15 @@ impl ClassifyLlm for AnthropicSignalClassifier {
     async fn classify(&self, question: &str) -> anyhow::Result<Vec<String>> {
         self.client
             .classify_signals(question, &self.system_prompt)
+            .await
+    }
+
+    async fn classify_with_product_dependence(
+        &self,
+        question: &str,
+    ) -> anyhow::Result<crate::llm::SignalClassification> {
+        self.client
+            .classify_with_product_dependence(question, &self.system_prompt)
             .await
     }
 }
@@ -135,10 +157,12 @@ impl AsyncSignalExtractor for HybridExtractor {
             return ExtractionResult {
                 signals: lexicon_signals,
                 mode: ExtractionMode::LexiconOnly,
+                product_dependent: None,
             };
         };
-        match llm.classify(question).await {
-            Ok(raw_names) => {
+        match llm.classify_with_product_dependence(question).await {
+            Ok(classification) => {
+                let raw_names = classification.signals;
                 // 語彙内の signal だけ採用してから lexicon 分と和集合する
                 // （mod.rs の累積 signal 集合と同じ union/collect の作法に揃える）。
                 let llm_signals: SignalSet = raw_names
@@ -158,6 +182,7 @@ impl AsyncSignalExtractor for HybridExtractor {
                 ExtractionResult {
                     signals: lexicon_signals.union(&llm_signals).cloned().collect(),
                     mode: ExtractionMode::Hybrid,
+                    product_dependent: classification.product_dependent,
                 }
             }
             Err(err) => {
@@ -168,6 +193,7 @@ impl AsyncSignalExtractor for HybridExtractor {
                 ExtractionResult {
                     signals: lexicon_signals,
                     mode: ExtractionMode::LexiconFallback,
+                    product_dependent: None,
                 }
             }
         }
@@ -221,7 +247,7 @@ impl ClassifyProductReferences for AnthropicProductReferenceClassifier {
 ///
 /// 空配列は呼び出し側で「製品参照なし」として扱われ、判定では製品未特定
 /// （`EscalateReason::ProductUnidentified`）を駆動する。signal があるのに他に製品の根拠が無い
-/// ターンは、取扱製品カタログの聞き返しになる（fail-closed）。取扱外製品のゲートは、一段目の
+/// ターンは、製品と症状を尋ねる聞き返しになる（fail-closed）。取扱外製品のゲートは、一段目の
 /// 型番ゲート・材料事前除外・応答側ゲートが製品参照抽出の成否と無関係に独立して機能し続ける。
 ///
 /// signals 抽出（`HybridExtractor`）とは完全に独立したコンポーネント: 一方の LLM 呼び出しが
@@ -399,6 +425,59 @@ mod tests {
         let r = ex.extract("カビが生えた").await;
         assert!(r.signals.iter().any(|s| s.as_str() == "mold"));
         assert!(matches!(r.mode, ExtractionMode::LexiconOnly));
+    }
+
+    struct DependenceLlm {
+        product_dependent: Option<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ClassifyLlm for DependenceLlm {
+        async fn classify(&self, _question: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn classify_with_product_dependence(
+            &self,
+            _question: &str,
+        ) -> anyhow::Result<crate::llm::SignalClassification> {
+            Ok(crate::llm::SignalClassification {
+                signals: Vec::new(),
+                product_dependent: self.product_dependent,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_extraction_carries_the_llm_product_dependent_flag() {
+        for flag in [Some(true), Some(false), None] {
+            let ex = HybridExtractor::new(
+                lexicon(),
+                Some(Arc::new(DependenceLlm {
+                    product_dependent: flag,
+                })),
+            );
+            let r = ex.extract("料金はいくらですか").await;
+            assert_eq!(r.product_dependent, flag);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_classifier_adapter_reports_no_product_dependent_flag() {
+        let ex = HybridExtractor::new(lexicon(), Some(MockLlm::ok(vec!["mold"])));
+        let r = ex.extract("カビが生えた").await;
+        assert_eq!(r.product_dependent, None);
+    }
+
+    #[tokio::test]
+    async fn lexicon_only_and_fallback_extraction_report_no_product_dependent_flag() {
+        let only = HybridExtractor::new(lexicon(), None);
+        assert_eq!(only.extract("カビが生えた").await.product_dependent, None);
+        let fallback = HybridExtractor::new(lexicon(), Some(MockLlm::err()));
+        assert_eq!(
+            fallback.extract("カビが生えた").await.product_dependent,
+            None
+        );
     }
 
     // ==== Issue #52: ProductReferenceExtractor（signals 抽出から分離した独立コンポーネント）====
@@ -679,6 +758,7 @@ mod tests {
             ExtractionResult {
                 signals: SignalSet::new(),
                 mode: ExtractionMode::LexiconFallback,
+                product_dependent: None,
             },
             supplied_refs.clone(),
         );

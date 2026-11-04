@@ -51,6 +51,8 @@ struct LexiconEntry {
     /// 分類（classes マップ）と vocabulary_for_prompt にのみ登録する。
     #[serde(default)]
     llm_only: bool,
+    #[serde(default)]
+    device_state: bool,
     /// LLM プロンプト向けの語義。vocabulary_for_prompt に埋め込まれる。**内部専用**
     /// （部署名・`mandatory エスカレーション対象` 等の社内運用語を含みうる）。顧客向け表示には
     /// 使わない。顧客向けには必ず `customer_label` を使うこと。
@@ -159,6 +161,7 @@ pub struct LexiconNormalizer {
     /// `SignalSet`（`BTreeSet`）はアルファベット順になるため、宣言順を必要とする呼び出し側
     /// （`handoff_items::derive_handoff_items`、design doc
     /// `2026-10-07-partial-answer-with-handoff-design.md` §2）がこれを使って並べ替える。
+    device_state_signals: std::collections::HashSet<String>,
     declaration_order: Vec<String>,
 }
 
@@ -200,6 +203,12 @@ impl LexiconNormalizer {
                 description: entry.description.clone(),
                 surface_forms: entry.surface_forms.clone(),
             })
+            .collect();
+        let device_state_signals = file
+            .signals
+            .iter()
+            .filter(|entry| entry.device_state)
+            .map(|entry| entry.signal.clone())
             .collect();
         let declaration_order: Vec<String> = file
             .signals
@@ -274,6 +283,7 @@ impl LexiconNormalizer {
             classes,
             customer_labels,
             vocabulary,
+            device_state_signals,
             declaration_order,
         })
     }
@@ -293,6 +303,14 @@ impl LexiconNormalizer {
             .iter()
             .find(|entry| entry.signal == signal.as_str())
             .map(|entry| entry.normalized_forms.as_slice())
+    }
+
+    /// Lexicon-only judgment of whether the answer depends on the customer's product: true when any signal is of the hazard class or flagged `device_state`.
+    pub fn is_product_dependent_by_lexicon(&self, signals: &SignalSet) -> bool {
+        signals.iter().any(|signal| {
+            self.class_of(signal) == Some(SignalClass::Hazard)
+                || self.device_state_signals.contains(signal.as_str())
+        })
     }
 
     pub fn class_of(&self, signal: &Signal) -> Option<SignalClass> {
@@ -452,6 +470,39 @@ mod tests {
         assert_eq!(n.class_of(&Signal::new("unknown")), None);
     }
 
+    fn dependence_lexicon() -> LexiconNormalizer {
+        LexiconNormalizer::from_json(
+            r#"{ "signals": [
+                { "signal": "led_state", "class": "context", "device_state": true, "surface_forms": ["ランプ"] },
+                { "signal": "price_question", "class": "context", "surface_forms": ["費用"] },
+                { "signal": "smoke", "class": "hazard", "surface_forms": ["煙"] }
+            ] }"#,
+        )
+        .expect("lexicon parses")
+    }
+
+    fn signal_set(names: &[&str]) -> SignalSet {
+        names.iter().map(|n| Signal::new(*n)).collect()
+    }
+
+    #[test]
+    fn lexicon_fail_back_treats_a_device_state_signal_as_product_dependent() {
+        let n = dependence_lexicon();
+        assert!(n.is_product_dependent_by_lexicon(&signal_set(&["led_state"])));
+    }
+
+    #[test]
+    fn lexicon_fail_back_treats_a_hazard_signal_as_product_dependent() {
+        let n = dependence_lexicon();
+        assert!(n.is_product_dependent_by_lexicon(&signal_set(&["smoke"])));
+    }
+
+    #[test]
+    fn lexicon_fail_back_treats_a_plain_context_signal_or_no_signal_as_product_independent() {
+        let n = dependence_lexicon();
+        assert!(!n.is_product_dependent_by_lexicon(&signal_set(&["price_question"])));
+        assert!(!n.is_product_dependent_by_lexicon(&SignalSet::new()));
+    }
     #[test]
     fn rejects_signal_with_no_usable_surface_forms() {
         // 記号のみ（正規化で空になる）の signal はサイレント never-match になるため拒否

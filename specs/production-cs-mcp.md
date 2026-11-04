@@ -637,7 +637,7 @@ MCP request（認証情報付き）
    第1層 mandatory の escalation_rule 照合 → マッチ: 固有ルーティングで確定
    第2層 prohibited_domain 照合 → 触れた: 領域の受け皿へエスカレーション
    第1層 advisory の escalation_rule 照合 → マッチ: 固有ルーティングで確定（選定済みの KR があれば回答を同乗）
-   製品未特定（累積 signal 1 つ以上かつ製品未特定）→ KR Allowed・第3層より前に ProductUnidentified（Clarify）で確定。詳細は docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md §10
+   製品未特定（製品依存の問い合わせかつ製品未特定。依存の判定は抽出 LLM の product_dependent、得られなければ語彙）→ KR Allowed・第3層より前に ProductUnidentified（Clarify。文面は LLM 生成・失敗時は既存の FALLBACK_CLARIFY_TEXT）で確定。詳細は docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md §10
    第3層 answerability
        stakes = classify_stakes(SignalSet, binding, owner)     // low/mid/high
        threshold = answerability_threshold(stakes)             // 3 段（将来 Π 連続）

@@ -216,6 +216,8 @@ pub struct DecisionInput<'a> {
     /// 直近顧客発話の窓内の `Matched` 参照。`Ambiguous` と `Foreign` は数えない。`Option` にせず
     /// 既定値も持たない（呼出元が必ず明示する。`false` = 未特定が fail-closed の値）。
     pub product_identified: bool,
+    /// Issue #131: whether the correct answer depends on the customer's product or model (device symptoms, state, operation, settings). Product-independent questions (pricing, contract, company information) skip the product-unidentified guard. Decided by the extraction LLM, or by the lexicon when the LLM gave no judgment; no default, callers state it explicitly.
+    pub product_dependent: bool,
 }
 
 /// Pure, LLM-free decision function: the same input always yields the same decision. The first
@@ -227,8 +229,7 @@ pub struct DecisionInput<'a> {
 /// 2. A layer-2 prohibited domain escalates (`missing` empty, no known resolution id).
 /// 3. A layer-1 `Binding::Advisory` rule escalates; `missing` comes from `evidence_sufficient`,
 ///    and the pre-selected `known_resolution`, if any, is carried as `known_resolution_id`.
-/// 4. Issue #131: when `question_signals` (the signals accumulated over the case) is non-empty and
-///    `product_identified` is false, it escalates with `EscalateReason::ProductUnidentified`,
+/// 4. Issue #131: when `product_dependent` is true and `product_identified` is false, it escalates with `EscalateReason::ProductUnidentified`,
 ///    whatever the manual score and whatever known resolution is pre-selected.
 /// 5. A pre-selected `known_resolution` is `Allowed` with `AnswerSource::KnownResolution`.
 /// 6. Layer 3: sufficient manual evidence is `Allowed`, otherwise it escalates.
@@ -269,7 +270,7 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             input.known_resolution.map(|kr| kr.id.clone()),
         );
     }
-    if !input.product_identified && !input.question_signals.is_empty() {
+    if !input.product_identified && input.product_dependent {
         return product_unidentified_escalate(input);
     }
     if let Some(kr) = input.known_resolution {
@@ -417,6 +418,7 @@ mod tests {
             thresholds,
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
         }
     }
 
@@ -1363,7 +1365,7 @@ mod tests {
     fn layer3_direct_manual_answers() {
         let q = SignalSet::new();
         let sections = vec!["doc-1#storage".to_string()];
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -1421,7 +1423,49 @@ mod tests {
 
     /// signal の立たない汎用質問は製品未特定でも従来どおり Allowed（Issue #131 L59）。
     #[test]
-    fn layer3_unidentified_product_without_signal_stays_allowed() {
+    fn layer3_unidentified_product_independent_question_without_signal_stays_allowed() {
+        let q = SignalSet::new();
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&DecisionInput {
+            product_dependent: false,
+            ..input(
+                &q,
+                &[],
+                &[],
+                &[],
+                Some(0.95),
+                calm(),
+                &thresholds(),
+                &sections,
+                None,
+            )
+        });
+        assert!(matches!(d, AnswerDecision::Allowed { .. }));
+    }
+
+    #[test]
+    fn layer3_unidentified_product_with_signal_but_product_independent_stays_allowed() {
+        let q = signals(&["discoloration"]);
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&DecisionInput {
+            product_dependent: false,
+            ..input(
+                &q,
+                &[],
+                &[],
+                &[],
+                Some(0.95),
+                calm(),
+                &thresholds(),
+                &sections,
+                None,
+            )
+        });
+        assert!(matches!(d, AnswerDecision::Allowed { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn layer3_unidentified_product_dependent_question_without_any_signal_escalates() {
         let q = SignalSet::new();
         let sections = vec!["doc-1#x".to_string()];
         let d = decide(&input(
@@ -1435,9 +1479,26 @@ mod tests {
             &sections,
             None,
         ));
-        assert!(matches!(d, AnswerDecision::Allowed { .. }));
+        assert!(d.is_product_unidentified(), "{d:?}");
     }
 
+    #[test]
+    fn layer3_identified_product_dependent_question_is_not_blocked_by_the_guard() {
+        let q = signals(&["discoloration"]);
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&identified_input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &thresholds(),
+            &sections,
+            None,
+        ));
+        assert!(matches!(d, AnswerDecision::Allowed { .. }), "{d:?}");
+    }
     /// D1: 事前選択された known_resolution があっても、製品未特定 + signal あり は
     /// ProductUnidentified（KR の Allowed より前に判定する）。
     #[test]
@@ -1528,7 +1589,7 @@ mod tests {
             ng_near_hit: true,
             hazard_signal_count: 0,
         };
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -1553,7 +1614,7 @@ mod tests {
             other => panic!("expected high-stakes escalate, got {other:?}"),
         }
         // 同じ根拠でも low stakes なら答えられる（実用性のダイヤル）
-        let d2 = decide(&input(
+        let d2 = decide(&identified_input(
             &q,
             &[],
             &[],

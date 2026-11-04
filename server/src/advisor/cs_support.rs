@@ -1148,7 +1148,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_post_evaluate_reply_clarifies_product_unidentified_with_the_catalog_text() {
+    async fn build_post_evaluate_reply_clarifies_product_unidentified_with_only_the_existing_fallback_when_no_drafter(
+    ) {
         let harness = test_harness(vec!["ADC-V724"]);
         let allowlist = harness.product_allowlist(TEST_SCHEMA).await.unwrap();
         let api_cfg = default_api_config();
@@ -1184,10 +1185,9 @@ mod tests {
         assert_eq!(kind, SupportReplyKind::Clarify);
         assert_eq!(
             text,
-            clarify::product_catalog_clarify_text(&allowlist),
-            "製品未特定の聞き返しは LLM を呼ばず取扱製品の定型文を返す"
+            clarify::FALLBACK_CLARIFY_TEXT,
+            "drafter が無いとき、製品未特定の聞き返しは既存の FALLBACK_CLARIFY_TEXT だけに倒す"
         );
-        assert!(text.contains("ADC-V724"));
         assert_eq!(conv.clarify_turns, 1);
     }
 

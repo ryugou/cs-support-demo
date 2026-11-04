@@ -83,9 +83,9 @@ pub struct EvaluateAnswerabilityResponse {
     /// `binding = advisory` のルール（例: 契約・保証関連）は、マニュアル一致度が閾値未満
     /// （製品未特定・症状要点不足）なら true になりうる。第3層グレー
     /// （`InsufficientDirectness` / `UnknownAddedSignal`）は従来どおり常に true。
-    /// 第3層 `ProductUnidentified`（Issue #131: ケース内の累積 signal が 1 件以上あるのに
-    /// 取扱製品が特定されていない）も常に true で、`customer_reply_draft` には取扱製品の型番を
-    /// 尋ねる定型の聞き返し文（LLM 非経由）が入る。MCP 経路は会話履歴を持たないため、過去発話の窓
+    /// 第3層 `ProductUnidentified`（Issue #131: 製品依存の問い合わせなのに取扱製品が特定されていない）
+    /// も常に true で、`customer_reply_draft` には、LLM が取扱製品カタログを材料に生成した、
+    /// 製品と症状を尋ねる聞き返し文が入る（生成失敗時は既存の `FALLBACK_CLARIFY_TEXT`）。MCP 経路は会話履歴を持たないため、過去発話の窓
     /// （v11 設計 §10 の (c)）による製品特定は成立せず、今ターンの製品参照か `product_key` だけが
     /// 特定の根拠になる。
     pub clarification_allowed: bool,
@@ -99,8 +99,8 @@ pub struct EvaluateAnswerabilityResponse {
     /// `lexicon_fallback`。WORM 監査にも同値を記録している。
     pub extraction_mode: String,
     /// 顧客へ送る返信文の**下書き**（デモ用。無効化時・生成失敗時・出口ゲートで弾かれた
-    /// ときは null）。ただし第3層 `ProductUnidentified` のターンは、下書きの設定や LLM に
-    /// 関係なく、取扱製品カタログから作る定型の聞き返し文（LLM 非経由）が入り、null にならない。
+    /// ときは null）。ただし第3層 `ProductUnidentified` のターンは、LLM が取扱製品カタログを材料に生成した
+    /// 聞き返し文（生成できないときは既存の `FALLBACK_CLARIFY_TEXT`）が入り、null にならない。
     ///
     /// **これは検証前の下書きであって、承認された回答ではない。送信前に必ず担当者が内容を
     /// 確認すること。**
@@ -532,6 +532,7 @@ impl CsSupportRmcpServer {
                 let crate::harness::extraction::ExtractionResult {
                     signals: query_signals,
                     mode: query_extraction_mode,
+                    product_dependent: _,
                 } = self.harness.extractor.extract(&req.query_ja).await;
                 let top_k = req.top_k.unwrap_or(5).max(1) as usize;
                 // 意味検索（ベクトル経路）は urtect design §2.3: 合成の可否・最終スコアは
@@ -718,7 +719,7 @@ impl CsSupportRmcpServer {
         //
         // 分節のラベル（【…】）は、呼び出し方の要件（case_id）と返却物の処理を
         // モデルが取り違えないために置いている。
-        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。【返却された customer_reply_draft の扱い】customer_reply_draft は検証前の下書きであり、承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れているため、そのまま顧客へ送らないこと。decision.decision が allowed の場合に限り、hits と突き合わせて補完してよい。decision.decision が escalate の場合、customer_reply_draft は 2 種類ある。部分回答の条件（第 1・2 層の取次で取り次ぐ項目があり、材料の関連度が十分）を満たすときは材料で答えられる部分のみを含む下書きで、取り次ぐ項目（取次が必要な話題）には金額・可否・条件を含め一切踏み込まない。満たさないときは取り次ぐ旨のみを含む下書きで、回答部分は含まない。受付番号や対応時間などの取次案内文は含まれないため、エスカレーションを実施する際はそれらを別途補うこと。取り次ぐ項目について、解決方法・手順・金額・可否を自分で補ってはならない（判定を無効化するため）。partial_answer が true の場合（部分回答の下書き）に限り、取次の文言が含まれないため、顧客への案内では handoff_items（取り次ぐ項目の顧客提示用ラベル列）を使い、下書きの後にこれらの項目を担当者が確認して案内する旨を付けること。partial_answer が false の場合は、下書きが既に取次の旨を含むため、この一文を付けないこと。【decision.reason が product_unidentified の場合】ケース内の累積 signal はあるが取扱製品が特定されていない。回答も取次もせず、clarification_allowed が true になり、customer_reply_draft には取扱製品の型番を尋ねる聞き返し文（LLM 非経由の定型文）が入る。型番が分かったら、同じ case_id とともに product_key に取扱製品の型番を渡して再評価すること。MCP は過去のターンの型番を引き継がないため、同じケースの以後のターンでも product_key を渡し続けること。"
+        description = "顧客質問を 3 層判定（明示ルール → 禁止領域 → 回答可能性）にかけ、回答可否・エスカレーション判定・根拠を返す。回答系フローの必須入口。マルチターンの問い合わせでは前回の case_id を渡すこと（累積条件で毎回再判定される）。【返却された customer_reply_draft の扱い】customer_reply_draft は検証前の下書きであり、承認された回答ではない。customer_reply_draft_truncated が true の下書きは生成上限で途中で切れているため、そのまま顧客へ送らないこと。decision.decision が allowed の場合に限り、hits と突き合わせて補完してよい。decision.decision が escalate の場合、customer_reply_draft は 2 種類ある。部分回答の条件（第 1・2 層の取次で取り次ぐ項目があり、材料の関連度が十分）を満たすときは材料で答えられる部分のみを含む下書きで、取り次ぐ項目（取次が必要な話題）には金額・可否・条件を含め一切踏み込まない。満たさないときは取り次ぐ旨のみを含む下書きで、回答部分は含まない。受付番号や対応時間などの取次案内文は含まれないため、エスカレーションを実施する際はそれらを別途補うこと。取り次ぐ項目について、解決方法・手順・金額・可否を自分で補ってはならない（判定を無効化するため）。partial_answer が true の場合（部分回答の下書き）に限り、取次の文言が含まれないため、顧客への案内では handoff_items（取り次ぐ項目の顧客提示用ラベル列）を使い、下書きの後にこれらの項目を担当者が確認して案内する旨を付けること。partial_answer が false の場合は、下書きが既に取次の旨を含むため、この一文を付けないこと。【decision.reason が product_unidentified の場合】製品依存の問い合わせだが取扱製品が特定されていない。回答も取次もせず、clarification_allowed が true になり、customer_reply_draft には、LLM が取扱製品カタログを材料に生成した、製品と症状を尋ねる聞き返し文が入る（生成できないときは既存の汎用聞き返し文）。型番が分かったら、同じ case_id とともに product_key に取扱製品の型番を渡して再評価すること。MCP は過去のターンの型番を引き継がないため、同じケースの以後のターンでも product_key を渡し続けること。"
     )]
     async fn evaluate_answerability(
         &self,
@@ -783,6 +784,7 @@ impl CsSupportRmcpServer {
         let crate::harness::extraction::ExtractionResult {
             signals: question_signals,
             mode: extraction_mode,
+            product_dependent: _,
         } = self.harness.extractor.extract(&req.question).await;
         let resolutions = store
             .load_known_resolutions(&ctx.schema)

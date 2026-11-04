@@ -52,7 +52,7 @@ pub struct Harness {
     /// 取扱製品への言及抽出の入口（Issue #52: signals 抽出から分離した独立コンポーネント）。
     /// `evaluate` のみが使う（catalog 注入が必要なのは質問側ゲート二段目のみのため）。
     /// LLM 未設定・呼び出し失敗のいずれでも空配列に degrade し、signals とは独立に失敗する。
-    /// 空は評価側で製品未特定として扱われ、signal のあるターンは取扱製品カタログの聞き返しになる
+    /// 空は評価側で製品未特定として扱われ、製品依存のターンは製品と症状を尋ねる聞き返しになる
     /// （fail-closed）。
     pub product_reference_extractor: extraction::ProductReferenceExtractor,
     pub ng: egress::NgDictionary,
@@ -748,20 +748,17 @@ fn second_stage_short_circuits(
 /// `EvaluationOutcome` の `customer_reply_draft` と `customer_reply_draft_truncated` を決める純関数。
 ///
 /// 製品未特定（`ProductUnidentified`）のターンで `policy` が `Always`（MCP 経路）のときは、
-/// 判定に使った `allowlist` から作る取扱製品カタログの聞き返し文（LLM 非経由の定型文）を下書きにし、
+/// `identification_question`（LLM が取扱製品カタログを材料に生成した、製品と症状を尋ねる聞き返し文）を下書きにし、
 /// 打ち切りなし（`false`）とする。それ以外は生成済みの下書き（無ければ `None` と `false`）をそのまま使う。
 /// `SkipWhenUnused`（`/api/reply`・advisor）は製品未特定の下書きを使わないため対象外。
 fn customer_reply_draft_fields(
     policy: &ReplyDraftPolicy<'_>,
     decision: &decision::AnswerDecision,
-    allowlist: &product_gate::ProductAllowlist,
+    identification_question: Option<String>,
     reply_draft: Option<crate::llm::ReplyDraft>,
 ) -> (Option<String>, bool) {
     if matches!(policy, ReplyDraftPolicy::Always) && decision.is_product_unidentified() {
-        return (
-            Some(clarify::product_catalog_clarify_text(allowlist)),
-            false,
-        );
+        return (identification_question, false);
     }
     let truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
     (reply_draft.map(|d| d.text), truncated)
@@ -1902,6 +1899,7 @@ impl Harness {
         let resolutions = resolutions?;
         let signals = extraction_outcome.signals;
         let extraction_mode = extraction_outcome.mode;
+        let llm_product_dependent = extraction_outcome.product_dependent;
         // Issue #52 フォローアップ（Critical 是正）: signals 抽出が lexicon フォールバックへ
         // 落ちたターンは product_references を採用しない
         // （`adopt_product_references_for_extraction_mode` の doc を参照）。
@@ -2077,6 +2075,8 @@ impl Harness {
             case_switch::resolve_matched_models(&allowlist, &product_references);
         let product_identified =
             identify_product(&allowlist, &resolved_matched_models, product_key, None).await;
+        let product_dependent = llm_product_dependent
+            .unwrap_or_else(|| self.lexicon.is_product_dependent_by_lexicon(decide_signals));
         let mut decision_input = decision::DecisionInput {
             question_signals: decide_signals,
             question_raw: question,
@@ -2090,6 +2090,7 @@ impl Harness {
             default_route: &self.default_route,
             known_resolution: applicable_known_resolution.as_ref(),
             product_identified,
+            product_dependent,
         };
         let mut decision_result = decision::decide(&decision_input);
         if decision_result.is_product_unidentified() {
@@ -2385,8 +2386,33 @@ impl Harness {
             }
             None => None,
         };
-        let (customer_reply_draft, customer_reply_draft_truncated) =
-            customer_reply_draft_fields(&policy, &decision_result, &allowlist, reply_draft);
+        let identification_question = if matches!(policy, ReplyDraftPolicy::Always)
+            && decision_result.is_product_unidentified()
+        {
+            Some(match self.reply_drafter.as_ref() {
+                Some(drafter) => {
+                    clarify::draft_product_identification_question(
+                        drafter,
+                        &self.ng,
+                        self.reply_draft_max_tokens,
+                        question,
+                        "",
+                        is_continuation,
+                        &allowlist,
+                    )
+                    .await
+                }
+                None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
+            })
+        } else {
+            None
+        };
+        let (customer_reply_draft, customer_reply_draft_truncated) = customer_reply_draft_fields(
+            &policy,
+            &decision_result,
+            identification_question,
+            reply_draft,
+        );
         let partial_answer =
             is_partial_answer_draft(partial_answer_ok, customer_reply_draft.as_deref());
 
@@ -3415,6 +3441,7 @@ mod tests {
             thresholds: &thresholds,
             default_route: "triage",
             product_identified: true,
+            product_dependent: true,
             known_resolution: None,
         })
     }
@@ -5286,9 +5313,8 @@ mod tests {
     }
 
     #[test]
-    fn product_unidentified_draft_is_the_catalog_text_under_always_and_empty_under_skip_when_unused(
+    fn product_unidentified_draft_is_the_generated_question_under_always_and_empty_under_skip_when_unused(
     ) {
-        let allowlist = identified_allowlist();
         let decision = escalate_for_contract_test(
             3,
             decision::EscalateReason::ProductUnidentified,
@@ -5301,13 +5327,10 @@ mod tests {
         let (text, truncated) = customer_reply_draft_fields(
             &ReplyDraftPolicy::Always,
             &decision,
-            &allowlist,
+            Some("・どの製品ですか".to_string()),
             generated,
         );
-        assert_eq!(
-            text,
-            Some(clarify::product_catalog_clarify_text(&allowlist))
-        );
+        assert_eq!(text, Some("・どの製品ですか".to_string()));
         assert!(!truncated);
         let allow = response_allowlist_fixture();
         let skip = ReplyDraftPolicy::SkipWhenUnused {
@@ -5316,14 +5339,19 @@ mod tests {
             already_escalated: false,
         };
         assert_eq!(
-            customer_reply_draft_fields(&skip, &decision, &allowlist, None),
+            customer_reply_draft_fields(
+                &skip,
+                &decision,
+                Some("・どの製品ですか".to_string()),
+                None
+            ),
             (None, false)
         );
         assert_eq!(
             customer_reply_draft_fields(
                 &ReplyDraftPolicy::Always,
                 &allowed_decision(),
-                &allowlist,
+                None,
                 Some(crate::llm::ReplyDraft {
                     text: "生成".to_string(),
                     truncated: true,
@@ -5430,6 +5458,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5470,6 +5499,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5514,6 +5544,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5551,6 +5582,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5587,6 +5619,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5617,6 +5650,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: false,
             known_resolution: None,
         });
         assert!(
@@ -5654,6 +5688,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: true,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5848,6 +5883,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: false,
             known_resolution: None,
         });
         assert!(
@@ -5878,6 +5914,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5933,6 +5970,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -6781,6 +6819,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: true,
+            product_dependent: true,
             known_resolution: turn.applicable_known_resolution.as_ref(),
         });
         assert!(matches!(
@@ -6829,6 +6868,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
+            product_dependent: true,
             known_resolution: turn.applicable_known_resolution.as_ref(),
         });
         assert!(
