@@ -73,19 +73,23 @@ pub fn build_product_identification_prompt(
         system.push_str(CONTINUATION_OPENER_RULE);
     }
     let question = truncate_question(question, "clarify_question");
-    let mut user = format!(
+    let user = format!(
         "<顧客からの問い合わせ>\n{}\n</顧客からの問い合わせ>",
         neutralize_delimiters(&question)
     );
+    (system, prepend_known_facts(known_facts, user))
+}
+
+fn prepend_known_facts(known_facts: &str, user: String) -> String {
     let known_facts = known_facts.trim();
-    if !known_facts.is_empty() {
-        user = format!(
-            "<把握済み事項>\n{}\n</把握済み事項>\n\n{}",
-            neutralize_delimiters(known_facts),
-            user
-        );
+    if known_facts.is_empty() {
+        return user;
     }
-    (system, user)
+    format!(
+        "<把握済み事項>\n{}\n</把握済み事項>\n\n{}",
+        neutralize_delimiters(known_facts),
+        user
+    )
 }
 
 /// 聞き返し生成用の system prompt / user message を組み立てる純関数。
@@ -156,20 +160,12 @@ pub fn build_clarify_prompt(
     // 問い合わせ本文の切り詰め（trim + MAX_QUESTION_CHARS 超過時 warn）は `reply.rs` と同じ
     // 規律を `prompt_input::truncate_question` で共有する（Warning 3）。
     let question = truncate_question(question, "clarify_question");
-    let mut user = format!(
+    let user = format!(
         "<顧客からの問い合わせ>\n{}\n</顧客からの問い合わせ>\n\n<不足している情報>\n{}\n</不足している情報>",
         neutralize_delimiters(&question),
         neutralize_delimiters(missing.trim())
     );
-    let known_facts = known_facts.trim();
-    if !known_facts.is_empty() {
-        user = format!(
-            "<把握済み事項>\n{}\n</把握済み事項>\n\n{}",
-            neutralize_delimiters(known_facts),
-            user
-        );
-    }
-    (system, user)
+    (system, prepend_known_facts(known_facts, user))
 }
 
 /// 聞き返し文を 1 案生成する。生成失敗（LLM 呼び出しエラー）・生成上限による途中切断・
@@ -285,38 +281,32 @@ pub async fn clarify_question_text(
     allowlist: &ProductAllowlist,
     product_unidentified: bool,
 ) -> String {
+    let Some(drafter) = drafter else {
+        return FALLBACK_CLARIFY_TEXT.to_string();
+    };
     if product_unidentified {
-        return match drafter {
-            Some(drafter) => {
-                draft_product_identification_question(
-                    drafter,
-                    ng,
-                    max_tokens,
-                    question,
-                    known_facts,
-                    is_continuation,
-                    allowlist,
-                )
-                .await
-            }
-            None => FALLBACK_CLARIFY_TEXT.to_string(),
-        };
-    }
-    match drafter {
-        Some(drafter) => {
-            draft_clarify_question(
-                drafter,
-                ng,
-                max_tokens,
-                question,
-                missing,
-                known_facts,
-                is_continuation,
-                allowlist,
-            )
-            .await
-        }
-        None => FALLBACK_CLARIFY_TEXT.to_string(),
+        draft_product_identification_question(
+            drafter,
+            ng,
+            max_tokens,
+            question,
+            known_facts,
+            is_continuation,
+            allowlist,
+        )
+        .await
+    } else {
+        draft_clarify_question(
+            drafter,
+            ng,
+            max_tokens,
+            question,
+            missing,
+            known_facts,
+            is_continuation,
+            allowlist,
+        )
+        .await
     }
 }
 
