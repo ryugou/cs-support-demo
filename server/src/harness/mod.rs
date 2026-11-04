@@ -51,9 +51,9 @@ pub struct Harness {
     pub extractor: Arc<dyn extraction::AsyncSignalExtractor>,
     /// 取扱製品への言及抽出の入口（Issue #52: signals 抽出から分離した独立コンポーネント）。
     /// `evaluate` のみが使う（catalog 注入が必要なのは質問側ゲート二段目のみのため）。
-    /// LLM 未設定・呼び出し失敗のいずれでも空配列に degrade し、signals とは独立に失敗する。
-    /// 空は評価側で製品未特定として扱われ、製品依存のターンは製品と症状を尋ねる聞き返しになる
-    /// （fail-closed）。
+    /// Degrades to an empty list when no LLM is configured or the call fails, independently of signals.
+    /// An empty list is treated as no product identified, so a product-dependent turn gets a hearing
+    /// question (fail-closed).
     pub product_reference_extractor: extraction::ProductReferenceExtractor,
     pub ng: egress::NgDictionary,
     pub worm: Arc<audit::WormAuditLog>,
@@ -126,11 +126,11 @@ pub struct EvaluationOutcome {
     pub accumulated_signals: signal::SignalSet,
     /// 会話の継続キー。新規作成時は採番して返す
     pub case_id: String,
-    /// 聞き返し可否。第1層 binding=advisory かつ情報不足、または第3層グレー
-    /// （`InsufficientDirectness` / `UnknownAddedSignal`）、第3層 `ProductUnidentified`
-    /// （Issue #131）のときのみ true。第1層
-    /// binding=mandatory と第2層（禁止ドメイン）は問答無用でルーティングし常に false
-    /// （契約の正本は `clarification_allowed()` 関数、Issue #54 + reviewer 一次レビュー Critical 1）
+    /// Whether the user may be asked a clarifying question this turn.
+    /// True only for a layer-1 advisory rule with missing information, a layer-3 gray decision
+    /// (`InsufficientDirectness` / `UnknownAddedSignal`), or `ProductUnidentified`.
+    /// Always false for layer-1 mandatory rules and layer 2.
+    /// The `clarification_allowed()` function is the source of truth for this contract.
     pub clarification_allowed: bool,
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
@@ -140,10 +140,12 @@ pub struct EvaluationOutcome {
     pub related_cases: Vec<RelatedCase>,
     /// 今ターンの signal 抽出がどの経路を通ったか（S1-11 改訂・WORM 監査にも記録済み）。
     pub extraction_mode: extraction::ExtractionMode,
-    /// 顧客向け返信文の**下書き**（デモ用シミュレーション出力）。
+    /// Draft of the customer-facing reply (demo simulation output), not an authoritative answer.
     ///
-    /// `harness.customer_reply_draft_enabled = false`（既定）、LLM 未設定、生成失敗のいずれでも
-    /// `None`。**権威ある回答ではない**（文面の正本は client 側という spec の結論は不変）。
+    /// `None` when `harness.customer_reply_draft_enabled = false` (the default), when no LLM is
+    /// configured, or when generation fails. On the MCP `ProductUnidentified` path it is never
+    /// `None`: it holds the generated product-identification hearing, or the fallback clarify
+    /// text when generation or the egress gate rejects it.
     pub customer_reply_draft: Option<String>,
     /// 上記の下書きが `max_tokens` で**途中で切れている**か。
     ///
@@ -434,14 +436,6 @@ fn merge_outcome_attributes(
     merged
 }
 
-/// Issue #131: 製品特定済みの判定（`DecisionInput::product_identified`）のうち、今ターンの
-/// 入力だけで決まる部分 (a)(b)。次のいずれかで true。
-/// - (a) 今ターンの `Matched` が allowlist の一覧表記に解決できた（`resolved_matched_models`）
-/// - (b) 呼出元の明示的な `product_key` が allowlist に解決できる（MCP 経路。allowlist 外は数えず、
-///   既存の取扱外経路に任せる。`/api/reply` は `None` を渡すため LINE 経路は変わらない）
-///
-/// 過去の顧客発話の窓 (c) は [`window_matched_models`]。ケース属性 `product_models` は使わない
-/// （product-switch 設計 §4: 回答可否の判定には使わない）。
 fn is_product_identified(
     allowlist: &product_gate::ProductAllowlist,
     resolved_matched_models: &[String],
@@ -453,14 +447,6 @@ fn is_product_identified(
             .is_some()
 }
 
-/// Issue #131 (c): Jev 用の直近顧客発話の窓（[`reply::customer_history_window`] を共有。
-/// 最大 6 件・2,000 字・発話は切らない）の過去の顧客発話に含まれる `Matched` 製品参照を、allowlist の
-/// 一覧表記に解決して返す。`[jev] enabled` には依存しない。
-///
-/// 窓の発話を `\n` で連結した 1 文字列で製品参照抽出を 1 回だけ呼ぶ（発話数ぶんの LLM 呼び出しを
-/// 避ける）。採用規則は今ターンと同じ（`adopt_product_references_for_extraction_mode`: signal 抽出が
-/// `Hybrid` でないターンは参照を採用しない = 未特定側に倒れる fail-closed）。今ターンが `Hybrid` で
-/// ないときは採用されない結果のために LLM を呼ばず、窓が空のときも抽出を呼ばない。
 async fn window_matched_models(
     allowlist: &product_gate::ProductAllowlist,
     window: &PastTurnsWindow<'_>,
@@ -485,7 +471,6 @@ async fn window_matched_models(
     case_switch::partition_matched_models(allowlist, &refs).0
 }
 
-/// (c) 過去の顧客発話の窓の評価に必要な文脈。
 struct PastTurnsWindow<'a> {
     extractor: &'a extraction::ProductReferenceExtractor,
     extraction_mode: extraction::ExtractionMode,
@@ -493,9 +478,6 @@ struct PastTurnsWindow<'a> {
     request_id: &'a str,
 }
 
-/// Issue #131: 製品特定済みの判定の唯一の入口（`DecisionInput::product_identified` の値）。(a)(b) は
-/// [`is_product_identified`]、(c) は [`window_matched_models`]。`window` が `None` のときは (c) を評価せず
-/// （抽出の LLM 呼び出しを起こさない）、`Some` のときは (a)(b) で特定できない場合に限り評価する。
 async fn identify_product(
     allowlist: &product_gate::ProductAllowlist,
     resolved_matched_models: &[String],
@@ -517,9 +499,6 @@ async fn identify_product(
 ///   製品未特定・症状要点不足などで `missing` が積まれた場合は、聞き返しを一切せず即時
 ///   エスカレーションへ倒すべきではない。
 /// - 第3層グレー（`InsufficientDirectness` / `UnknownAddedSignal`）は常に許可（変更なし）。
-/// - 第3層 `ProductUnidentified`（Issue #131: signal が立つのにケースに取扱製品が特定されていない）も
-///   常に許可する。聞き返しの上限（`clarify_turns`）は呼び出し側（`api.rs::decide_reply_action`）が
-///   既存どおり適用し、上限到達で取次に倒れる（v11 設計 §2）。
 /// - 第2層（禁止ドメイン）は `missing` の値に関わらず常に不許可（fail-closed の核。第2層は
 ///   `decide()` が `missing: Vec::new()` を返す不変条件と対で成立しているが、この関数側でも
 ///   `layer: 2` を `_ => false` に明示的に落とすことで、万一 `missing` を持つようになっても
@@ -745,20 +724,12 @@ fn second_stage_short_circuits(
     }
 }
 
-/// `EvaluationOutcome` の `customer_reply_draft` と `customer_reply_draft_truncated` を決める純関数。
-///
-/// 製品未特定（`ProductUnidentified`）のターンで `policy` が `Always`（MCP 経路）のときは、
-/// `identification_question`（LLM が取扱製品カタログを材料に生成した、製品と症状を尋ねる聞き返し文）を下書きにし、
-/// 打ち切りなし（`false`）とする。それ以外は生成済みの下書き（無ければ `None` と `false`）をそのまま使う。
-/// `SkipWhenUnused`（`/api/reply`・advisor）は製品未特定の下書きを使わないため対象外。
 fn customer_reply_draft_fields(
-    policy: &ReplyDraftPolicy<'_>,
-    decision: &decision::AnswerDecision,
     identification_question: Option<String>,
     reply_draft: Option<crate::llm::ReplyDraft>,
 ) -> (Option<String>, bool) {
-    if matches!(policy, ReplyDraftPolicy::Always) && decision.is_product_unidentified() {
-        return (identification_question, false);
+    if let Some(question) = identification_question {
+        return (Some(question), false);
     }
     let truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
     (reply_draft.map(|d| d.text), truncated)
@@ -797,6 +768,17 @@ pub fn should_draft_reply(
 struct ReplyDraftPlan {
     generate: bool,
     partial_answer_ok: bool,
+}
+
+pub(crate) fn classifier_window(
+    already_escalated: bool,
+    history: &[reply::ReplyHistoryTurn],
+) -> Vec<String> {
+    if already_escalated {
+        Vec::new()
+    } else {
+        reply::customer_history_window(history).turns
+    }
 }
 
 fn already_escalated_for_policy(policy: &ReplyDraftPolicy<'_>) -> bool {
@@ -1880,6 +1862,8 @@ impl Harness {
         // 抽出より前に allowlist を取得する（§3.2 の材料選別直前で取得していた従来位置から
         // 前倒し。以降の参照はすべてこの束縛を使い回し、二重取得しない）。
         let allowlist = self.product_allowlist(&ctx.schema).await?;
+        let recent_customer_turns =
+            classifier_window(already_escalated_for_policy(&policy), history);
         // KR 読み込み（gRPC）・signal 抽出・製品参照抽出（いずれも LLM 有効時は HTTP 往復を
         // 伴う）は互いに依存しないため並列発行し、往復レイテンシを重ねて隠す。signal 抽出と
         // 製品参照抽出は Issue #52 で別々の LLM 呼び出しに分離した独立コンポーネントであり
@@ -1892,6 +1876,7 @@ impl Harness {
                 self.extractor.as_ref(),
                 &self.product_reference_extractor,
                 question,
+                &recent_customer_turns,
                 allowlist.display_list(),
                 &ctx.request_id,
             ),
@@ -2074,7 +2059,7 @@ impl Harness {
         let resolved_matched_models =
             case_switch::resolve_matched_models(&allowlist, &product_references);
         let product_identified =
-            identify_product(&allowlist, &resolved_matched_models, product_key, None).await;
+            is_product_identified(&allowlist, &resolved_matched_models, product_key);
         let product_dependent = llm_product_dependent
             .unwrap_or_else(|| self.lexicon.is_product_dependent_by_lexicon(decide_signals));
         let mut decision_input = decision::DecisionInput {
@@ -2389,30 +2374,25 @@ impl Harness {
         let identification_question = if matches!(policy, ReplyDraftPolicy::Always)
             && decision_result.is_product_unidentified()
         {
-            Some(match self.reply_drafter.as_ref() {
-                Some(drafter) => {
-                    clarify::draft_product_identification_question(
-                        drafter,
-                        &self.ng,
-                        self.reply_draft_max_tokens,
-                        question,
-                        "",
-                        is_continuation,
-                        &allowlist,
-                    )
-                    .await
-                }
-                None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
-            })
+            Some(
+                clarify::clarify_question_text(
+                    self.reply_drafter.as_ref(),
+                    &self.ng,
+                    self.reply_draft_max_tokens,
+                    question,
+                    "",
+                    "",
+                    is_continuation,
+                    &allowlist,
+                    true,
+                )
+                .await,
+            )
         } else {
             None
         };
-        let (customer_reply_draft, customer_reply_draft_truncated) = customer_reply_draft_fields(
-            &policy,
-            &decision_result,
-            identification_question,
-            reply_draft,
-        );
+        let (customer_reply_draft, customer_reply_draft_truncated) =
+            customer_reply_draft_fields(identification_question, reply_draft);
         let partial_answer =
             is_partial_answer_draft(partial_answer_ok, customer_reply_draft.as_deref());
 
@@ -2611,7 +2591,7 @@ impl Harness {
                     .manual
                     .as_ref()
                     .ok_or_else(|| anyhow!("manual store not configured"))?;
-                let extraction_outcome = self.extractor.extract(corrected_answer).await;
+                let extraction_outcome = self.extractor.extract(corrected_answer, &[]).await;
                 tracing::debug!(
                     mode = extraction_outcome.mode.as_str(),
                     "root_cause_probe signal extraction mode"
@@ -3507,6 +3487,50 @@ mod tests {
             decide_with_bundled_rules_and_high_manual_score(decide_signals),
             decision::AnswerDecision::Escalate { layer: 1, .. }
         ));
+    }
+
+    fn symptom_history() -> Vec<reply::ReplyHistoryTurn> {
+        vec![
+            reply::ReplyHistoryTurn {
+                role: reply::ReplyHistoryRole::Customer,
+                text: "赤いランプが点滅してる".to_string(),
+            },
+            reply::ReplyHistoryTurn {
+                role: reply::ReplyHistoryRole::Assistant,
+                text: "型番を教えてください".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn classifier_window_carries_customer_turns_only_for_a_case_that_is_not_escalated() {
+        let allowlist = product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()]);
+        let customer_turns = vec!["赤いランプが点滅してる".to_string()];
+        let cases = [
+            (ReplyDraftPolicy::Always, customer_turns.clone()),
+            (
+                ReplyDraftPolicy::SkipWhenUnused {
+                    response_allowlist: &allowlist,
+                    already_escalated: false,
+                    partial_answer_enabled: true,
+                },
+                customer_turns,
+            ),
+            (
+                ReplyDraftPolicy::SkipWhenUnused {
+                    response_allowlist: &allowlist,
+                    already_escalated: true,
+                    partial_answer_enabled: true,
+                },
+                Vec::new(),
+            ),
+        ];
+        for (policy, expected) in cases {
+            assert_eq!(
+                classifier_window(already_escalated_for_policy(&policy), &symptom_history()),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -5149,7 +5173,6 @@ mod tests {
         ));
     }
 
-    /// 発話に型番 `ABC-100` が含まれていれば `Matched` を返す疑似 LLM（実 LLM の代わり）。
     struct ModelInTextClassifier;
 
     #[async_trait::async_trait]
@@ -5313,44 +5336,18 @@ mod tests {
     }
 
     #[test]
-    fn product_unidentified_draft_is_the_generated_question_under_always_and_empty_under_skip_when_unused(
-    ) {
-        let decision = escalate_for_contract_test(
-            3,
-            decision::EscalateReason::ProductUnidentified,
-            Vec::new(),
-        );
+    fn identification_question_replaces_the_generated_draft_and_is_never_truncated() {
         let generated = Some(crate::llm::ReplyDraft {
             text: "生成".to_string(),
             truncated: true,
         });
-        let (text, truncated) = customer_reply_draft_fields(
-            &ReplyDraftPolicy::Always,
-            &decision,
-            Some("・どの製品ですか".to_string()),
-            generated,
-        );
+        let (text, truncated) =
+            customer_reply_draft_fields(Some("・どの製品ですか".to_string()), generated);
         assert_eq!(text, Some("・どの製品ですか".to_string()));
         assert!(!truncated);
-        let allow = response_allowlist_fixture();
-        let skip = ReplyDraftPolicy::SkipWhenUnused {
-            response_allowlist: &allow,
-            partial_answer_enabled: true,
-            already_escalated: false,
-        };
+        assert_eq!(customer_reply_draft_fields(None, None), (None, false));
         assert_eq!(
             customer_reply_draft_fields(
-                &skip,
-                &decision,
-                Some("・どの製品ですか".to_string()),
-                None
-            ),
-            (None, false)
-        );
-        assert_eq!(
-            customer_reply_draft_fields(
-                &ReplyDraftPolicy::Always,
-                &allowed_decision(),
                 None,
                 Some(crate::llm::ReplyDraft {
                     text: "生成".to_string(),
@@ -5924,12 +5921,6 @@ mod tests {
         );
     }
 
-    /// Issue #131 の再現（red）。型番を一切含まない症状だけの発話「赤いランプが点滅してる」に対し、
-    /// 製品非依存の alarm.com 由来の材料（取扱外の Aeotec LED 電球、`ADC-` 型番トークン無し）が
-    /// 高スコアで当たると、`evaluate()` と同じ手順（signal 抽出 → `filter_out_of_scope_hits` →
-    /// `decide()`）で `Allowed` になり、`decide_reply_action` が Answer を返して取扱外製品の手順を
-    /// 案内してしまう。望ましい挙動は、その材料で回答せず、聞き返し（Escalate 判定で Clarify）に
-    /// 倒れること。
     #[test]
     fn unscoped_symptom_with_third_party_material_is_not_answered() {
         let lexicon = signal::LexiconNormalizer::from_json(include_str!(
@@ -6879,7 +6870,7 @@ mod tests {
                     ..
                 }
             ),
-            "今ターンに signal が無くても、ケース内の累積 signal で製品未特定を判定する: {decision:?}"
+            "product_dependent かつ製品未特定なら、今ターンに signal が無くても ProductUnidentified になる: {decision:?}"
         );
     }
 

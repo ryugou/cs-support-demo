@@ -891,6 +891,7 @@ async fn detect_product_switch(
     ctx: &RequestContext,
     case_id: &str,
     message: &str,
+    history: &[ReplyHistoryTurn],
     allowlist: &product_gate::ProductAllowlist,
     request_id: &str,
 ) -> SwitchDetection {
@@ -916,10 +917,25 @@ async fn detect_product_switch(
     if previous_models.is_empty() {
         return no_detection;
     }
+    let already_escalated = match state.harness.load_conv_state(ctx, case_id).await {
+        Ok(conv) => conv.is_already_escalated(),
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                request_id = %request_id,
+                case_id,
+                "answer api: failed to load the conversation state for case switch detection; \
+                 classifying this turn without the customer history window"
+            );
+            true
+        }
+    };
+    let recent_customer_turns = crate::harness::classifier_window(already_escalated, history);
     let extraction = extraction::extract_signals_and_product_references(
         state.harness.extractor.as_ref(),
         &state.harness.product_reference_extractor,
         message,
+        &recent_customer_turns,
         allowlist.display_list(),
         request_id,
     )
@@ -1686,8 +1702,16 @@ async fn reply_handler(
         extraction: supplied_extraction,
     } = match req.case_id.as_deref() {
         Some(case_id) => {
-            detect_product_switch(&state, &ctx, case_id, &req.message, &allowlist, &request_id)
-                .await
+            detect_product_switch(
+                &state,
+                &ctx,
+                case_id,
+                &req.message,
+                &history,
+                &allowlist,
+                &request_id,
+            )
+            .await
         }
         None => SwitchDetection {
             switch: None,
@@ -2910,7 +2934,110 @@ mod tests {
         }
     }
 
-    /// Issue #131: 製品未特定の聞き返しも既存の `clarify_turns` 上限に従う（v11 L21）。
+    struct DeviceQuestionClassifier;
+
+    #[async_trait::async_trait]
+    impl crate::harness::extraction::ClassifyLlm for DeviceQuestionClassifier {
+        async fn classify(&self, _question: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn classify_with_product_dependence(
+            &self,
+            question: &str,
+            recent_customer_turns: &[String],
+        ) -> anyhow::Result<crate::llm::SignalClassification> {
+            let about_a_device = question.contains("ランプ")
+                || recent_customer_turns.iter().any(|t| t.contains("ランプ"));
+            Ok(crate::llm::SignalClassification {
+                signals: Vec::new(),
+                product_dependent: Some(about_a_device),
+            })
+        }
+    }
+
+    fn unidentified_turn_decision(product_dependent: bool) -> AnswerDecision {
+        let thresholds = decision::Thresholds {
+            low: 0.6,
+            mid: 0.8,
+            high: 0.95,
+        };
+        let sections = vec!["doc-1#x".to_string()];
+        decision::decide(&decision::DecisionInput {
+            question_signals: &crate::harness::signal::SignalSet::new(),
+            question_raw: "質問",
+            rules: &[],
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: Some(0.95),
+            best_manual_sections: &sections,
+            stakes_input: decision::StakesInput {
+                mandatory_domain_near: false,
+                ng_near_hit: false,
+                hazard_signal_count: 0,
+            },
+            thresholds: &thresholds,
+            default_route: "triage",
+            product_identified: false,
+            product_dependent,
+            known_resolution: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_followup_that_withholds_the_model_number_keeps_firing_the_product_guard_with_the_window(
+    ) {
+        use crate::harness::extraction::{AsyncSignalExtractor, ClassifyLlm, HybridExtractor};
+        use crate::harness::reply::customer_history_window;
+        let lexicon = std::sync::Arc::new(
+            crate::harness::signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap(),
+        );
+        let llm: std::sync::Arc<dyn ClassifyLlm> = std::sync::Arc::new(DeviceQuestionClassifier);
+        let extractor = HybridExtractor::new(lexicon, Some(llm));
+
+        let first = extractor.extract("赤いランプが点滅してる", &[]).await;
+        let first_decision =
+            unidentified_turn_decision(first.product_dependent.expect("llm judged turn 1"));
+        let outcome = base_outcome(first_decision, true);
+        let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
+        assert_eq!(action, ReplyAction::Clarify);
+
+        let history = vec![
+            ReplyHistoryTurn {
+                role: ReplyHistoryRole::Customer,
+                text: "赤いランプが点滅してる".to_string(),
+            },
+            ReplyHistoryTurn {
+                role: ReplyHistoryRole::Assistant,
+                text: "型番を教えてください".to_string(),
+            },
+        ];
+        let window = customer_history_window(&history).turns;
+        let second = extractor.extract("型番はわかりません", &window).await;
+        assert_eq!(second.product_dependent, Some(true));
+        let second_decision =
+            unidentified_turn_decision(second.product_dependent.expect("llm judged turn 2"));
+        assert!(
+            second_decision.is_product_unidentified(),
+            "{second_decision:?}"
+        );
+        let outcome = base_outcome(second_decision, true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 1;
+        assert_eq!(
+            decide_reply_action(&outcome, &conv, &default_api_config()),
+            ReplyAction::Clarify
+        );
+        conv.clarify_turns = 3;
+        assert_eq!(
+            decide_reply_action(&outcome, &conv, &default_api_config()),
+            ReplyAction::EscalationReply
+        );
+
+        let without_window = extractor.extract("型番はわかりません", &[]).await;
+        assert_eq!(without_window.product_dependent, Some(false));
+    }
+
     #[test]
     fn decide_reply_action_clarifies_product_unidentified_with_turns_remaining() {
         let outcome = base_outcome(product_unidentified_decision(), true);
@@ -2924,7 +3051,7 @@ mod tests {
     fn decide_reply_action_hands_off_product_unidentified_when_clarify_turns_exhausted() {
         let outcome = base_outcome(product_unidentified_decision(), true);
         let mut conv = default_conv_state();
-        conv.clarify_turns = 3; // == clarify_max_turns(3)
+        conv.clarify_turns = 3;
         let action = decide_reply_action(&outcome, &conv, &default_api_config());
         assert_eq!(action, ReplyAction::EscalationReply);
     }
@@ -4533,6 +4660,7 @@ mod tests {
             &ctx,
             "case-1",
             "ADC-V523の電源が入りません",
+            &[],
             &allowlist,
             "req-1",
         )

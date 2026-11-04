@@ -73,7 +73,8 @@ pub struct ExtractionResult {
 /// signal を得る（lexicon 単体の `SignalNormalizer` は admission 検証用に別途残す）。
 #[async_trait::async_trait]
 pub trait AsyncSignalExtractor: Send + Sync {
-    async fn extract(&self, question: &str) -> ExtractionResult;
+    /// Extracts signals from `question` only; `recent_customer_turns` (oldest first) is context for the `product_dependent` judgment and never a source of signals.
+    async fn extract(&self, question: &str, recent_customer_turns: &[String]) -> ExtractionResult;
 }
 
 /// LLM 分類の抽象境界。`AnthropicClient::classify_signals` はテストで直接叩けない
@@ -86,6 +87,7 @@ pub trait ClassifyLlm: Send + Sync {
     async fn classify_with_product_dependence(
         &self,
         question: &str,
+        _recent_customer_turns: &[String],
     ) -> anyhow::Result<crate::llm::SignalClassification> {
         Ok(crate::llm::SignalClassification {
             signals: self.classify(question).await?,
@@ -122,9 +124,10 @@ impl ClassifyLlm for AnthropicSignalClassifier {
     async fn classify_with_product_dependence(
         &self,
         question: &str,
+        recent_customer_turns: &[String],
     ) -> anyhow::Result<crate::llm::SignalClassification> {
         self.client
-            .classify_with_product_dependence(question, &self.system_prompt)
+            .classify_with_product_dependence(question, recent_customer_turns, &self.system_prompt)
             .await
     }
 }
@@ -151,7 +154,7 @@ impl HybridExtractor {
 
 #[async_trait::async_trait]
 impl AsyncSignalExtractor for HybridExtractor {
-    async fn extract(&self, question: &str) -> ExtractionResult {
+    async fn extract(&self, question: &str, recent_customer_turns: &[String]) -> ExtractionResult {
         let lexicon_signals = self.lexicon.normalize(question);
         let Some(llm) = &self.llm else {
             return ExtractionResult {
@@ -160,7 +163,10 @@ impl AsyncSignalExtractor for HybridExtractor {
                 product_dependent: None,
             };
         };
-        match llm.classify_with_product_dependence(question).await {
+        match llm
+            .classify_with_product_dependence(question, recent_customer_turns)
+            .await
+        {
             Ok(classification) => {
                 let raw_names = classification.signals;
                 // 語彙内の signal だけ採用してから lexicon 分と和集合する
@@ -241,21 +247,10 @@ impl ClassifyProductReferences for AnthropicProductReferenceClassifier {
     }
 }
 
-/// 製品参照抽出器。LLM が未設定、または呼び出しが失敗した場合は空配列に degrade する
-/// （lexicon のような決定論の床は無いため、抽出層そのものは空を返す）。warn を出すのは LLM が
-/// 設定されていて呼び出しが失敗したときだけで、LLM 未設定の空の結果には出ない。
+/// Extracts the catalog products a customer question refers to; without an LLM, or when the call fails, it returns an empty list (no product reference).
 ///
-/// 空配列は呼び出し側で「製品参照なし」として扱われ、判定では製品未特定
-/// （`EscalateReason::ProductUnidentified`）を駆動する。signal があるのに他に製品の根拠が無い
-/// ターンは、製品と症状を尋ねる聞き返しになる（fail-closed）。取扱外製品のゲートは、一段目の
-/// 型番ゲート・材料事前除外・応答側ゲートが製品参照抽出の成否と無関係に独立して機能し続ける。
-///
-/// signals 抽出（`HybridExtractor`）とは完全に独立したコンポーネント: 一方の LLM 呼び出しが
-/// 失敗しても、もう一方の結果には一切影響しない（Issue #52 要件3）。**この独立性は抽出層
-/// （この struct）の中で閉じている。** `Harness::evaluate` は抽出結果を受け取った直後、
-/// signals 抽出が Hybrid でない（lexicon フォールバック、または LLM 無効）場合はこの抽出器の
-/// 結果を採用しない（policy は harness 側にあり、この struct自体は持たない。
-/// `harness/mod.rs` の `adopt_product_references_for_extraction_mode` を参照）。
+/// It is independent of signal extraction: a failure in one never changes the result of the other.
+/// `Harness::evaluate` discards its result when signal extraction is not `Hybrid`.
 pub struct ProductReferenceExtractor {
     llm: Option<Arc<dyn ClassifyProductReferences>>,
 }
@@ -313,11 +308,12 @@ pub async fn extract_signals_and_product_references(
     signal_extractor: &dyn AsyncSignalExtractor,
     product_reference_extractor: &ProductReferenceExtractor,
     question: &str,
+    recent_customer_turns: &[String],
     catalog: &str,
     request_id: &str,
 ) -> TurnExtraction {
     tokio::join!(
-        signal_extractor.extract(question),
+        signal_extractor.extract(question, recent_customer_turns),
         product_reference_extractor.extract(question, catalog, request_id),
     )
 }
@@ -336,6 +332,7 @@ pub async fn resolve_turn_extraction(
     signal_extractor: &dyn AsyncSignalExtractor,
     product_reference_extractor: &ProductReferenceExtractor,
     question: &str,
+    recent_customer_turns: &[String],
     catalog: &str,
     request_id: &str,
 ) -> TurnExtraction {
@@ -346,6 +343,7 @@ pub async fn resolve_turn_extraction(
                 signal_extractor,
                 product_reference_extractor,
                 question,
+                recent_customer_turns,
                 catalog,
                 request_id,
             )
@@ -404,7 +402,7 @@ mod tests {
             lexicon(),
             Some(MockLlm::ok(vec!["discoloration", "evil_signal"])),
         );
-        let r = ex.extract("カビが生えた").await;
+        let r = ex.extract("カビが生えた", &[]).await;
         assert!(r.signals.iter().any(|s| s.as_str() == "mold")); // lexicon 床は不変
         assert!(r.signals.iter().any(|s| s.as_str() == "discoloration")); // LLM 追加分（語彙内）
         assert!(r.signals.iter().all(|s| s.as_str() != "evil_signal")); // 語彙外破棄
@@ -414,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn llm_failure_falls_back_to_lexicon() {
         let ex = HybridExtractor::new(lexicon(), Some(MockLlm::err()));
-        let r = ex.extract("カビが生えた").await;
+        let r = ex.extract("カビが生えた", &[]).await;
         assert!(r.signals.iter().any(|s| s.as_str() == "mold"));
         assert!(matches!(r.mode, ExtractionMode::LexiconFallback));
     }
@@ -422,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn no_llm_configured_is_lexicon_only() {
         let ex = HybridExtractor::new(lexicon(), None);
-        let r = ex.extract("カビが生えた").await;
+        let r = ex.extract("カビが生えた", &[]).await;
         assert!(r.signals.iter().any(|s| s.as_str() == "mold"));
         assert!(matches!(r.mode, ExtractionMode::LexiconOnly));
     }
@@ -440,6 +438,7 @@ mod tests {
         async fn classify_with_product_dependence(
             &self,
             _question: &str,
+            _recent_customer_turns: &[String],
         ) -> anyhow::Result<crate::llm::SignalClassification> {
             Ok(crate::llm::SignalClassification {
                 signals: Vec::new(),
@@ -457,25 +456,74 @@ mod tests {
                     product_dependent: flag,
                 })),
             );
-            let r = ex.extract("料金はいくらですか").await;
+            let r = ex.extract("料金はいくらですか", &[]).await;
             assert_eq!(r.product_dependent, flag);
         }
+    }
+
+    struct WindowRecordingLlm {
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ClassifyLlm for WindowRecordingLlm {
+        async fn classify(&self, _question: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn classify_with_product_dependence(
+            &self,
+            _question: &str,
+            recent_customer_turns: &[String],
+        ) -> anyhow::Result<crate::llm::SignalClassification> {
+            self.seen
+                .lock()
+                .expect("lock")
+                .push(recent_customer_turns.to_vec());
+            Ok(crate::llm::SignalClassification {
+                signals: Vec::new(),
+                product_dependent: Some(!recent_customer_turns.is_empty()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_extraction_passes_the_recent_customer_turns_to_the_classifier() {
+        let llm = Arc::new(WindowRecordingLlm {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let ex = HybridExtractor::new(lexicon(), Some(llm.clone()));
+        let turns = vec!["赤いランプが点滅してる".to_string()];
+        let with_window = ex.extract("型番はわかりません", &turns).await;
+        let without_window = ex.extract("型番はわかりません", &[]).await;
+        assert_eq!(with_window.product_dependent, Some(true));
+        assert_eq!(without_window.product_dependent, Some(false));
+        assert_eq!(
+            *llm.seen.lock().expect("lock"),
+            vec![turns, Vec::<String>::new()]
+        );
     }
 
     #[tokio::test]
     async fn default_classifier_adapter_reports_no_product_dependent_flag() {
         let ex = HybridExtractor::new(lexicon(), Some(MockLlm::ok(vec!["mold"])));
-        let r = ex.extract("カビが生えた").await;
+        let r = ex.extract("カビが生えた", &[]).await;
         assert_eq!(r.product_dependent, None);
     }
 
     #[tokio::test]
     async fn lexicon_only_and_fallback_extraction_report_no_product_dependent_flag() {
         let only = HybridExtractor::new(lexicon(), None);
-        assert_eq!(only.extract("カビが生えた").await.product_dependent, None);
+        assert_eq!(
+            only.extract("カビが生えた", &[]).await.product_dependent,
+            None
+        );
         let fallback = HybridExtractor::new(lexicon(), Some(MockLlm::err()));
         assert_eq!(
-            fallback.extract("カビが生えた").await.product_dependent,
+            fallback
+                .extract("カビが生えた", &[])
+                .await
+                .product_dependent,
             None
         );
     }
@@ -608,6 +656,7 @@ mod tests {
             &signal_extractor,
             &product_reference_extractor,
             "カビが生えた",
+            &[],
             "ADC-V724",
             "req-test",
         )
@@ -639,6 +688,7 @@ mod tests {
             &signal_extractor,
             &product_reference_extractor,
             "カビが生えた",
+            &[],
             "ADC-V724",
             "req-test",
         )
@@ -668,6 +718,7 @@ mod tests {
             &signal_extractor,
             &product_reference_extractor,
             "カビが生えた",
+            &[],
             "ADC-V724",
             "req-test",
         )
@@ -768,6 +819,7 @@ mod tests {
             &ex.signal_extractor,
             &ex.product_reference_extractor,
             "カビが生えた",
+            &[],
             "ADC-V724",
             "req-test",
         )
@@ -807,6 +859,7 @@ mod tests {
             &ex.signal_extractor,
             &ex.product_reference_extractor,
             "カビが生えた",
+            &[],
             "ADC-V724",
             "req-test",
         )

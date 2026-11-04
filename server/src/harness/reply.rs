@@ -109,33 +109,8 @@ pub struct ReplyHistoryTurn {
     pub text: String,
 }
 
-/// 過去の顧客発話の合計文字数（`chars().count()` の総和。正規化後の値で、今ターンの `message` と
-/// 行区切りの `\n` は含まない）の上限。Jev の判定入力（Issue #58）と、製品特定の判定
-/// （Issue #131、`Harness::evaluate`）が共有する窓の字数予算。
-///
-/// `/api/reply` の `history[].text` 上限と同値。`validate` を通った入力では 1 発話だけで予算を
-/// 超えることはなく、超過は複数発話の合計でのみ起きる。1 発話で超える分岐（丸ごと落として過去発話
-/// 0 件になる）は、`validate` を経由しない呼び出しや将来の上限変更に対する防御であり、切り詰めで
-/// 代替しない。
 pub(crate) const MAX_JEV_HISTORY_CHARS: usize = 2_000;
 
-/// 過去の顧客発話の窓の選択（Issue #58 で Jev の判定入力用に導入。Issue #131 で製品特定の判定と
-/// 共有するためここへ移動）。時系列昇順で返す。**発話を途中で切らない**。
-///
-/// 1. `role == Customer` に絞り、各発話へ改行潰しの正規化**のみ**を掛ける。正規化後に空になる
-///    もの（制御文字だけの発話等）は除外する（空の発話が枠を消費して有効な発話を押し出す事故を
-///    防ぐため）。
-/// 2. 新しい側から最大 [`MAX_HISTORY_TURNS`] 件を採る。
-/// 3. 合計文字数が [`MAX_JEV_HISTORY_CHARS`] を超える間、古い側の発話を 1 件ずつ**丸ごと**落とす
-///    （1 件だけで超える発話も切り詰めず丸ごと落とす。過去発話 0 件になりうる）。
-///
-/// 表示用の要約予算（1 発話 100 字 + `…`）を判定入力へ流用しないこと。理由と既知の限界
-/// （発話単位の削除も「安全側にしか振れない」保証が無いこと）は `api::build_jev_state` の doc
-/// コメントを参照。
-///
-/// ログを出さない純粋な選択。結果と、手順 2・3 で落とした件数を返す。Jev 経路のログ出力は
-/// [`select_customer_history_for_jev`] が担い、製品特定（Issue #131）の経路はこの関数を直接呼ぶ
-/// （Jev の判定入力ではないため `jev_history_budget` の warn を出さない）。
 pub(crate) fn customer_history_window(history: &[ReplyHistoryTurn]) -> CustomerHistoryWindow {
     let mut turns: Vec<String> = history
         .iter()
@@ -165,19 +140,12 @@ pub(crate) fn customer_history_window(history: &[ReplyHistoryTurn]) -> CustomerH
     }
 }
 
-/// [`customer_history_window`] の結果。
 pub(crate) struct CustomerHistoryWindow {
-    /// 窓に残った過去の顧客発話（時系列昇順）。
     pub(crate) turns: Vec<String>,
-    /// 件数窓（手順 2）で落とした件数。
     pub(crate) window_skipped: usize,
-    /// 字数予算（手順 3）で丸ごと落とした件数。
     pub(crate) budget_dropped: usize,
 }
 
-/// Jev の判定入力用の窓（[`customer_history_window`]）。手順 2・3 のいずれかで 1 件以上落としたときは
-/// `tracing::warn!` を 1 回出す（件数窓は `window_dropped_turns`、予算超過は `dropped_turns`）。
-/// **発話本文は絶対に出さない**。`request_id` は該当リクエストと突き合わせるための相関 ID。
 pub(crate) fn select_customer_history_for_jev(
     history: &[ReplyHistoryTurn],
     request_id: &str,

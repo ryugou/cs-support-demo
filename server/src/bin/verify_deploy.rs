@@ -142,13 +142,8 @@ struct Report {
 struct Layer1Case {
     utterance: String,
     expect_rule: Option<String>,
-    /// Issue #131: true のとき、発話に対して lexicon が signal を 1 件以上立てなければケースを
-    /// 失敗にする。省略時は false（既存ケースは変わらない）。#131 のガード（製品を特定できない症状は
-    /// 回答せず聞き返す）は、signal があり第1層に一致しないときだけ働くため、lexicon が signal を
-    /// 立てなくなってケースが空振りで通ることをこれで防ぐ。`decide` は実行せず、製品参照も確認しない
-    /// （ここでは LLM を使わない）。ファイル内の発話は固定で、製品名を含めてはならない。
     #[serde(default)]
-    expect_signals_nonempty: bool,
+    expect_signal: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -497,7 +492,10 @@ fn evaluate_layer1_case(
     let signals = normalizer.normalize(&case.utterance);
     let matched_rule = match_layer1(rules, &signals).map(|rule| rule.id.clone());
     let status = if matched_rule == case.expect_rule
-        && (!case.expect_signals_nonempty || !signals.is_empty())
+        && case
+            .expect_signal
+            .as_deref()
+            .is_none_or(|expected| signals.iter().any(|s| s.as_str() == expected))
     {
         CheckStatus::Pass
     } else {
@@ -1316,7 +1314,7 @@ mod tests {
         let case = Layer1Case {
             utterance: "ふーですか".to_string(),
             expect_rule: Some("r1".to_string()),
-            expect_signals_nonempty: false,
+            expect_signal: None,
         };
         let result = evaluate_layer1_case(&rules, &lexicon, &case);
         assert_eq!(result.status, CheckStatus::Pass);
@@ -1331,7 +1329,7 @@ mod tests {
         let case = Layer1Case {
             utterance: "関係ない発話".to_string(),
             expect_rule: None,
-            expect_signals_nonempty: false,
+            expect_signal: None,
         };
         let result = evaluate_layer1_case(&rules, &lexicon, &case);
         assert_eq!(result.status, CheckStatus::Pass);
@@ -1345,7 +1343,7 @@ mod tests {
         let case = Layer1Case {
             utterance: "ふーですか".to_string(),
             expect_rule: Some("r2".to_string()),
-            expect_signals_nonempty: false,
+            expect_signal: None,
         };
         let result = evaluate_layer1_case(&rules, &lexicon, &case);
         assert_eq!(result.status, CheckStatus::Fail);
@@ -1359,7 +1357,7 @@ mod tests {
         let case = Layer1Case {
             utterance: "ふーですか".to_string(),
             expect_rule: None,
-            expect_signals_nonempty: false,
+            expect_signal: None,
         };
         let result = evaluate_layer1_case(&rules, &lexicon, &case);
         assert_eq!(result.status, CheckStatus::Fail);
@@ -1372,7 +1370,7 @@ mod tests {
         let case = Layer1Case {
             utterance: "関係ない発話".to_string(),
             expect_rule: Some("r1".to_string()),
-            expect_signals_nonempty: false,
+            expect_signal: None,
         };
         let result = evaluate_layer1_case(&rules, &lexicon, &case);
         assert_eq!(result.status, CheckStatus::Fail);
@@ -1380,13 +1378,13 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_layer1_case_passes_when_signals_are_required_and_present_without_a_match() {
+    fn evaluate_layer1_case_passes_when_the_expected_signal_is_raised_without_a_match() {
         let lexicon = lexicon_with_one_signal();
         let rules = vec![rule("r1", &["other_signal"], Binding::Advisory)];
         let case = Layer1Case {
             utterance: "ふーですか".to_string(),
             expect_rule: None,
-            expect_signals_nonempty: true,
+            expect_signal: Some("foo_signal".to_string()),
         };
         let result = evaluate_layer1_case(&rules, &lexicon, &case);
         assert_eq!(result.status, CheckStatus::Pass);
@@ -1395,13 +1393,13 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_layer1_case_fails_when_signals_are_required_but_none_are_raised() {
+    fn evaluate_layer1_case_fails_when_the_expected_signal_is_not_raised() {
         let lexicon = lexicon_with_one_signal();
         let rules = vec![rule("r1", &["foo_signal"], Binding::Advisory)];
         let case = Layer1Case {
             utterance: "関係ない発話".to_string(),
             expect_rule: None,
-            expect_signals_nonempty: true,
+            expect_signal: Some("foo_signal".to_string()),
         };
         let result = evaluate_layer1_case(&rules, &lexicon, &case);
         assert_eq!(result.status, CheckStatus::Fail);
@@ -1409,24 +1407,38 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_layer1_case_fails_when_signals_are_required_but_a_layer1_rule_matches() {
+    fn evaluate_layer1_case_fails_when_a_different_signal_than_the_expected_one_is_raised() {
+        let lexicon = lexicon_with_one_signal();
+        let rules = vec![rule("r1", &["other_signal"], Binding::Advisory)];
+        let case = Layer1Case {
+            utterance: "ふーですか".to_string(),
+            expect_rule: None,
+            expect_signal: Some("bar_signal".to_string()),
+        };
+        let result = evaluate_layer1_case(&rules, &lexicon, &case);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(result.signals, vec!["foo_signal".to_string()]);
+    }
+
+    #[test]
+    fn evaluate_layer1_case_fails_when_the_expected_signal_is_raised_but_a_layer1_rule_matches() {
         let lexicon = lexicon_with_one_signal();
         let rules = vec![rule("r1", &["foo_signal"], Binding::Advisory)];
         let case = Layer1Case {
             utterance: "ふーですか".to_string(),
             expect_rule: None,
-            expect_signals_nonempty: true,
+            expect_signal: Some("foo_signal".to_string()),
         };
         let result = evaluate_layer1_case(&rules, &lexicon, &case);
         assert_eq!(result.status, CheckStatus::Fail);
     }
 
     #[test]
-    fn parse_expectations_file_defaults_expect_signals_nonempty_to_false() {
-        let body = r#"{"layer1":[{"utterance":"x","expect_rule":null},{"utterance":"y","expect_rule":null,"expect_signals_nonempty":true}]}"#;
+    fn parse_expectations_file_defaults_expect_signal_to_none() {
+        let body = r#"{"layer1":[{"utterance":"x","expect_rule":null},{"utterance":"y","expect_rule":null,"expect_signal":"foo_signal"}]}"#;
         let file = parse_expectations_file(body).unwrap();
-        assert!(!file.layer1[0].expect_signals_nonempty);
-        assert!(file.layer1[1].expect_signals_nonempty);
+        assert_eq!(file.layer1[0].expect_signal, None);
+        assert_eq!(file.layer1[1].expect_signal.as_deref(), Some("foo_signal"));
     }
 
     #[test]
@@ -1541,7 +1553,7 @@ mod tests {
         let cases = vec![Layer1Case {
             utterance: "ごいですか".to_string(),
             expect_rule: None,
-            expect_signals_nonempty: false,
+            expect_signal: None,
         }];
 
         let (check, results) =
@@ -1580,7 +1592,7 @@ mod tests {
         let cases = vec![Layer1Case {
             utterance: "ごいですか".to_string(),
             expect_rule: None,
-            expect_signals_nonempty: false,
+            expect_signal: None,
         }];
 
         let (check, results) =
@@ -1613,7 +1625,7 @@ mod tests {
         let cases = vec![Layer1Case {
             utterance: "ごいですか".to_string(),
             expect_rule: Some("rule-in-vocabulary".to_string()),
-            expect_signals_nonempty: false,
+            expect_signal: None,
         }];
 
         let (check, results) =

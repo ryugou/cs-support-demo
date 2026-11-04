@@ -541,10 +541,6 @@ fn build_fixture(
     }
 }
 
-/// 本番 `Harness::evaluate` と同じ規則で、ターンの `DecisionInput::product_identified` を求める。
-/// 今ターンの製品参照 `references`（抽出モード `mode` に応じて採用した後のもの）を
-/// `case_switch::resolve_matched_models` で allowlist に解決する (a) と、過去の顧客発話の窓 `history`
-/// の (c) を、`identify_product` に任せる。このターンは明示的な `product_key` を持たない。
 async fn identify_product_for_turn(
     fx: &Fixture,
     references: &[super::product_gate::ProductReference],
@@ -561,8 +557,6 @@ async fn identify_product_for_turn(
     super::identify_product(&fx.allowlist, &resolved, None, Some(&window)).await
 }
 
-/// `text` から製品参照を実 LLM で抽出し、本番と同じ採用規則（`adopt_product_references_for_extraction_mode`）
-/// を通して [`identify_product_for_turn`] で製品特定済みかどうかを求める。
 async fn extract_and_identify_product(
     fx: &Fixture,
     text: &str,
@@ -591,7 +585,7 @@ async fn decide_for_case(
     case_index: usize,
     total_cases: usize,
 ) -> (extraction::ExtractionResult, AnswerDecision, Vec<String>) {
-    let extracted = fx.harness.extractor.extract(question).await;
+    let extracted = fx.harness.extractor.extract(question, &[]).await;
     let (signals, mode) = (&extracted.signals, extracted.mode);
     let product_references = fx
         .harness
@@ -1211,7 +1205,7 @@ async fn draft_allowed_turn2_answer(
     AnswerDecision,
     String,
 ) {
-    let extracted2 = fx.harness.extractor.extract(turn2_question).await;
+    let extracted2 = fx.harness.extractor.extract(turn2_question, &[]).await;
     let signals2 = &extracted2.signals;
     println!(
         "signals: {signals2:?} (extraction_mode={:?})",
@@ -4279,16 +4273,23 @@ fn smoke_product_node(model: &str, name: &str) -> crate::proto::graphrag::NodeRe
     }
 }
 
+fn smoke_hybrid_extractor(
+    client: AnthropicClient,
+    lexicon: Arc<signal::LexiconNormalizer>,
+) -> extraction::HybridExtractor {
+    let classifier: Arc<dyn extraction::ClassifyLlm> = Arc::new(
+        extraction::AnthropicSignalClassifier::new(client, lexicon.vocabulary_for_prompt()),
+    );
+    extraction::HybridExtractor::new(lexicon, Some(classifier))
+}
+
 #[tokio::test]
 #[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
 async fn real_llm_product_unidentified_hearing_smoke() {
     init_warn_subscriber();
     let (config, client) = load_config_and_client();
     let lexicon = Arc::new(load_bundled_lexicon());
-    let classifier: Arc<dyn extraction::ClassifyLlm> = Arc::new(
-        extraction::AnthropicSignalClassifier::new(client.clone(), lexicon.vocabulary_for_prompt()),
-    );
-    let extractor = extraction::HybridExtractor::new(lexicon.clone(), Some(classifier));
+    let extractor = smoke_hybrid_extractor(client.clone(), lexicon.clone());
     let ng =
         egress::NgDictionary::from_path(&resolve_server_path(&config.harness.ng_dictionary_path))
             .expect("production ng dictionary must load and parse");
@@ -4302,7 +4303,7 @@ async fn real_llm_product_unidentified_hearing_smoke() {
         ("ランプが消えてて動かない", true),
         ("費用はどれくらい？", false),
     ] {
-        let extracted = extraction::AsyncSignalExtractor::extract(&extractor, utterance).await;
+        let extracted = extraction::AsyncSignalExtractor::extract(&extractor, utterance, &[]).await;
         let dependent = extracted
             .product_dependent
             .unwrap_or_else(|| lexicon.is_product_dependent_by_lexicon(&extracted.signals));
@@ -4331,6 +4332,55 @@ async fn real_llm_product_unidentified_hearing_smoke() {
             assert!(
                 !text.to_lowercase().contains("aeotec"),
                 "{utterance}: names an out-of-scope vendor"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
+async fn real_llm_product_dependence_reads_the_window_as_context_only() {
+    init_warn_subscriber();
+    let (_config, client) = load_config_and_client();
+    let lexicon = Arc::new(load_bundled_lexicon());
+    let extractor = smoke_hybrid_extractor(client, lexicon);
+    for (past_customer_text, utterance, expect_dependent, absent_signal) in [
+        (
+            "赤いランプが点滅してる",
+            "型番はわかりません",
+            Some(true),
+            None,
+        ),
+        (
+            "カメラがオフラインになって映らなくなった",
+            "月額料金はいくらですか",
+            Some(false),
+            Some("camera_offline"),
+        ),
+    ] {
+        let history = [
+            ReplyHistoryTurn {
+                role: ReplyHistoryRole::Customer,
+                text: past_customer_text.to_string(),
+            },
+            ReplyHistoryTurn {
+                role: ReplyHistoryRole::Assistant,
+                text: "ご利用の製品の型番を教えていただけますか？".to_string(),
+            },
+        ];
+        let window = super::reply::customer_history_window(&history).turns;
+        let extracted =
+            extraction::AsyncSignalExtractor::extract(&extractor, utterance, &window).await;
+        println!(
+            "utterance: {utterance}\nsignals: {:?} mode: {:?}\nproduct_dependent (llm, with window): {:?}",
+            extracted.signals, extracted.mode, extracted.product_dependent
+        );
+        assert_eq!(extracted.product_dependent, expect_dependent, "{utterance}");
+        if let Some(absent) = absent_signal {
+            assert!(
+                extracted.signals.iter().all(|s| s.as_str() != absent),
+                "{utterance}: {:?}",
+                extracted.signals
             );
         }
     }

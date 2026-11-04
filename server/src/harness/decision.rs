@@ -103,9 +103,7 @@ pub enum EscalateReason {
     RequiresHumanApproval,
     InsufficientDirectness,
     UnknownAddedSignal,
-    /// Issue #131: ケース内の累積 signal が 1 つ以上あるのに取扱製品が特定されていない第3層。
-    /// マニュアル一致スコアと事前選択された known_resolution は参照しない。返信は取扱製品
-    /// カタログから機種を選ばせる聞き返しになる。
+    /// The question depends on the customer's product (`product_dependent`) and no catalog product is identified; the reply is an LLM-generated hearing, not an answer.
     ProductUnidentified,
 }
 
@@ -171,7 +169,7 @@ pub enum AnswerDecision {
 }
 
 impl AnswerDecision {
-    /// 製品未特定（`EscalateReason::ProductUnidentified`）による聞き返し判定か。
+    /// Returns true when this decision is an `Escalate` with `EscalateReason::ProductUnidentified`.
     pub fn is_product_unidentified(&self) -> bool {
         matches!(
             self,
@@ -211,12 +209,9 @@ pub struct DecisionInput<'a> {
     pub thresholds: &'a Thresholds,
     /// config 由来の既定エスカレーション route（第3層エスカレーション先）。
     pub default_route: &'a str,
-    /// Issue #131: 取扱製品が特定済みか。次のいずれかで true。(a) 今ターンの `Matched` 製品参照、
-    /// (b) 呼出元の明示的な `product_key` が allowlist に解決できる、(c) Jev の判定入力と同じ
-    /// 直近顧客発話の窓内の `Matched` 参照。`Ambiguous` と `Foreign` は数えない。`Option` にせず
-    /// 既定値も持たない（呼出元が必ず明示する。`false` = 未特定が fail-closed の値）。
+    /// Whether a catalog product is identified; only a `Matched` product reference counts, `Ambiguous` and `Foreign` do not. Callers must state it explicitly; `false` is the fail-closed value.
     pub product_identified: bool,
-    /// Issue #131: whether the correct answer depends on the customer's product or model (device symptoms, state, operation, settings). Product-independent questions (pricing, contract, company information) skip the product-unidentified guard. Decided by the extraction LLM, or by the lexicon when the LLM gave no judgment; no default, callers state it explicitly.
+    /// Whether the correct answer depends on the customer's product or model. Product-independent questions skip the product-unidentified escalation. Callers must state it explicitly.
     pub product_dependent: bool,
 }
 
@@ -229,7 +224,7 @@ pub struct DecisionInput<'a> {
 /// 2. A layer-2 prohibited domain escalates (`missing` empty, no known resolution id).
 /// 3. A layer-1 `Binding::Advisory` rule escalates; `missing` comes from `evidence_sufficient`,
 ///    and the pre-selected `known_resolution`, if any, is carried as `known_resolution_id`.
-/// 4. Issue #131: when `product_dependent` is true and `product_identified` is false, it escalates with `EscalateReason::ProductUnidentified`,
+/// 4. When `product_dependent` is true and `product_identified` is false, it escalates with `EscalateReason::ProductUnidentified`,
 ///    whatever the manual score and whatever known resolution is pre-selected.
 /// 5. A pre-selected `known_resolution` is `Allowed` with `AnswerSource::KnownResolution`.
 /// 6. Layer 3: sufficient manual evidence is `Allowed`, otherwise it escalates.
@@ -312,7 +307,6 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
     }
 }
 
-/// Issue #131: ケース内の累積 signal があるのに取扱製品が未特定のターンの Escalate（聞き返し契約）。
 fn product_unidentified_escalate(input: &DecisionInput) -> AnswerDecision {
     AnswerDecision::Escalate {
         reason: EscalateReason::ProductUnidentified,
@@ -1389,8 +1383,6 @@ mod tests {
         }
     }
 
-    /// Issue #131: 製品未特定 + signal あり + 十分なマニュアル一致 は Allowed にせず、
-    /// layer 3 の ProductUnidentified（聞き返し契約）に倒す。
     #[test]
     fn layer3_unidentified_product_with_signal_escalates_product_unidentified() {
         let q = signals(&["discoloration"]);
@@ -1421,7 +1413,6 @@ mod tests {
         }
     }
 
-    /// signal の立たない汎用質問は製品未特定でも従来どおり Allowed（Issue #131 L59）。
     #[test]
     fn layer3_unidentified_product_independent_question_without_signal_stays_allowed() {
         let q = SignalSet::new();
@@ -1499,8 +1490,6 @@ mod tests {
         ));
         assert!(matches!(d, AnswerDecision::Allowed { .. }), "{d:?}");
     }
-    /// D1: 事前選択された known_resolution があっても、製品未特定 + signal あり は
-    /// ProductUnidentified（KR の Allowed より前に判定する）。
     #[test]
     fn preselected_known_resolution_with_unidentified_product_escalates_product_unidentified() {
         let q = signals(&["led_red_blinking"]);
@@ -1527,7 +1516,6 @@ mod tests {
         ));
     }
 
-    /// D1: 製品特定済み + 事前選択 known_resolution は従来どおり KR の Allowed（回帰なし）。
     #[test]
     fn preselected_known_resolution_with_identified_product_is_allowed() {
         let q = signals(&["led_red_blinking"]);
@@ -1553,8 +1541,6 @@ mod tests {
         ));
     }
 
-    /// D1: マニュアル一致が不足（Insufficient）でも、製品未特定 + signal あり は
-    /// InsufficientDirectness ではなく ProductUnidentified。
     #[test]
     fn insufficient_manual_with_unidentified_product_escalates_product_unidentified() {
         let q = signals(&["discoloration"]);
@@ -1570,7 +1556,6 @@ mod tests {
         ));
     }
 
-    /// 製品特定済みなら signal があっても Allowed のまま。
     #[test]
     fn layer3_identified_product_with_signal_stays_allowed() {
         let q = signals(&["discoloration"]);

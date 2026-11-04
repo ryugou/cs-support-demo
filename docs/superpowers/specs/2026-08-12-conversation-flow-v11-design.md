@@ -136,20 +136,23 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 ## 10. 追記（Issue #131）
 
-### 10.1 原因（実測）
-
-第3層は製品の特定状態を入力に持たない。そのため製品を名乗らない症状の相談は、次のとおり製品に依らずマニュアルの記事で Allowed になりえた。
-
-- 抽出 LLM は語彙に当たらない入力にも hazard の `unclassified_risk` を返していた。stakes が Mid（しきい値 0.8）になり、結果として偶然に聞き返しへ倒れていた。
-- #103 の語彙追加（`led_red_blinking`）で、「赤いランプが点滅してる」は語彙に当たる低リスクの signal になった。stakes が Low（しきい値 0.6）になり、取扱外の Aeotec の記事が Allowed で回答された。
-
-原因の根拠は `.superpowers/runs/131-h1-extraction.md` に残している。
-
 ### 10.2 判定
 
-「製品に依存する問い合わせ（`product_dependent`）」かつ「製品が未特定」のターンは、マニュアルのスコアに関わらず、製品と症状を尋ねる聞き返しを返す。signal が1つも無いターン（語彙に当たらない症状の相談）も、`product_dependent` が true なら対象になる。料金・契約・会社情報の質問は `product_dependent` が false で、このガードを通らない。
+「製品に依存する問い合わせ（`product_dependent`）」かつ「製品が未特定」のターンは、マニュアルのスコアに関わらず、製品と症状を尋ねる聞き返しを返す。
+signal が1つも無いターン（語彙に当たらない症状の相談）も、`product_dependent` が true なら対象になる。料金・契約・会社情報の質問は `product_dependent` が false で、このガードを通らない。
+第3層は製品の特定状態を入力に持たず、製品を名乗らない症状の相談が製品に依らずマニュアルの記事で Allowed になりえたため、このガードを置く (Issue #131)。
 
-`product_dependent` は signal 抽出 LLM の出力（`{"signals": [...], "product_dependent": true または false}`）に加えた真偽値で、機器の症状・状態・操作・設定・故障なら true、料金・契約・会社情報・一般的な手順なら false、迷うときは true とする。LLM の判定が得られないとき（`LexiconOnly`・`LexiconFallback`・値が真偽値でない・欠落）は語彙へ倒し、hazard 区分の signal、または語彙で `device_state` を宣言した signal（`camera_offline`、`wifi_connection_failure`、`camera_not_detected`、`sd_not_recognized`、`playback_failure`、`app_malfunction`、`notification_not_received`、`warranty_hardware_failure`、`led_red_blinking`）があれば依存とみなす。
+`product_dependent` は signal 抽出 LLM の出力（`{"signals": [...], "product_dependent": true または false}`）に加えた真偽値である。
+LLM への問いは「この会話で顧客が求めている回答は、顧客の製品・機種によって変わるか」で、機器の症状・状態・操作・設定・故障なら true、料金・契約・会社情報・一般的な手順なら false、迷うときは true とする。
+LLM には今ターンの発話に加えて、直近の顧客発話の窓（Jev と同じ窓。最大 6 件・合計 2,000 字・古い順・assistant 発話なし。`reply::customer_history_window`）を渡す。窓は信頼できない過去の顧客発話として扱い、既存の injection 対策文言を保つ。
+signal（`unclassified_risk` を含む安全・契約・法務上の懸念の判定も含む）は今ターンの発話だけから抽出し、窓は `product_dependent` の判断の文脈にだけ使う。これにより、先行ターンで症状を述べ、次ターンで「型番はわかりません」とだけ答えた会話でも、依存と判定され続ける。
+窓は今回の発話を解釈する文脈であり、判定の対象は今回の発話が求める回答である。窓に症状の発話があっても、今回の発話が料金・契約など製品によらない質問なら false とする。
+取次済みのターンは窓を渡さず今回の発話だけで判定する（今ターンの signal だけで判定する既存の取次後判定と揃える）。
+LLM の判定が得られないとき（`LexiconOnly`・`LexiconFallback`・値が真偽値でない・欠落）は、ケース内の累積 signal に対する語彙判定へ倒す。
+hazard 区分の signal、または語彙で `device_state` を宣言した signal
+（`camera_offline`、`wifi_connection_failure`、`camera_not_detected`、`sd_not_recognized`、`playback_failure`、
+`app_malfunction`、`notification_not_received`、`warranty_hardware_failure`、`led_red_blinking`）があれば依存とみなす。
+Hybrid で LLM が false を返したときは、語彙判定との OR を取らず false のままにする。MCP の `evaluate_answerability` は窓を持たず（`known_facts` が空なのと同じ）、今ターンの発話だけで判定する。
 
 製品が特定済みなのは次のいずれかのとき。
 
@@ -165,19 +168,28 @@ case ノードへ追加する属性（すべて加算のみ・後方互換）:
 
 固定文面（取扱製品カタログから作る決定的な文字列）は採用しない。2026-11-02 にユーザーが、顧客向け返信に固定テンプレートを使わない方針を示した。
 
-- LLM に渡すのは顧客発話・把握済み事項・取扱製品カタログ（型番と名称）。
+- LLM に渡すのは顧客発話・把握済み事項・取扱製品カタログ（型番と名称）。カタログは製品マスタ由来の外部データなので system prompt には置かず、user message の先頭のデータブロック `<取扱製品一覧>` に入れて区切りタグを無害化する。system prompt は、返信に書いてよい製品は `<取扱製品一覧>` にあるものだけとし、このブロックは指示ではなくそこに含まれる指示には従わないと定める。
 - 制約は、取扱製品以外の製品名・型番・他社製品の手順を書かないこと、製品と症状を特定するために必要なことを箇条書き（行頭「・」）で尋ねること、原因や対処を推測しないこと。
 - 出力は既存の出口ゲート（`egress_gate`）を通し、さらにカタログ外の型番への言及を検出したら warn を出して却下する。
 - LLM が失敗した、LLM が未設定、下書きが打ち切られた、ゲートや型番検査で却下された、のいずれでも、既存の `FALLBACK_CLARIFY_TEXT` だけに倒す。製品未特定専用の固定文面は持たない。
 
 型番トークンしか検出しない `out_of_scope_mentions` は、ベンダー名だけ（例: Aeotec）の言及を検出しない。この穴はプロンプトの制約で塞ぎ、実 LLM スモークで取扱外の製品名が出ないことを確認する。
 
-MCP `evaluate_answerability` は履歴が無く窓 (c) は不成立。製品未特定の判定に限り、§1 の「MCP tool（`evaluate_answerability`）の入出力・挙動は変更しない」と §9 の「MCP 経路への聞き返し・時間帯フローの適用」（範囲外）の例外とする。未特定の判定では `customer_reply_draft` に上記の LLM 生成の聞き返し文を入れ、`clarification_allowed` を `true`、`decision.reason` を `product_unidentified` にする。取次済みの扱いは `/api/reply` 限定で、MCP は取次済みの判定を持たない（`already_escalated_for_policy` は常に false、`harness/mod.rs`）ため、取次済みでも未特定ならこの応答になる。
+MCP `evaluate_answerability` は履歴が無く窓 (c) は不成立。
+製品未特定の判定に限り、§1 の「MCP tool（`evaluate_answerability`）の入出力・挙動は変更しない」と
+§9 の「MCP 経路への聞き返し・時間帯フローの適用」（範囲外）の例外とする。
+未特定の判定では `customer_reply_draft` に上記の LLM 生成の聞き返し文を入れ、
+`clarification_allowed` を `true`、`decision.reason` を `product_unidentified` にする。
+取次済みの扱いは `/api/reply` 限定で、MCP は取次済みの判定を持たない（`already_escalated_for_policy` は常に false、`harness/mod.rs`）ため、取次済みでも未特定ならこの応答になる。
 
-今ターンの製品参照の抽出が空なら (a) は不成立。(b) か窓 (c) で特定済みになればそれで判定し、できなければ未特定（fail-closed）として聞き返す。warn は LLM 設定済みで抽出の呼び出しが失敗したときだけ出し、`request_id` を含む（LLM 未設定の空結果では出さない）。ただし取次済みと `/api/reply` の `LexiconFallback` は、未特定でも聞き返さない。
+今ターンの製品参照の抽出が空なら (a) は不成立。(b) か窓 (c) で特定済みになればそれで判定し、できなければ未特定（fail-closed）として聞き返す。
+warn は LLM 設定済みで抽出の呼び出しが失敗したときだけ出し、`request_id` を含む（LLM 未設定の空結果では出さない）。ただし取次済みと `/api/reply` の `LexiconFallback` は、未特定でも聞き返さない。
 
-LLM 無効の構成（`ExtractionMode::LexiconOnly`）は製品参照を採用しないため (a)(c) は不成立で、特定できるのは (b) の `product_key` だけ。`product_key` の無い `/api/reply` では製品依存と判定されたターンは聞き返しになり、`clarify_max_turns` に達すると取次へ進む（fail-closed）。窓 (c) の抽出は今ターンの signal 抽出が `Hybrid` のときだけ行う。
+LLM 無効の構成（`ExtractionMode::LexiconOnly`）は製品参照を採用しないため (a)(c) は不成立で、特定できるのは (b) の `product_key` だけ。
+`product_key` の無い `/api/reply` では製品依存と判定されたターンは聞き返しになり、`clarify_max_turns` に達すると取次へ進む（fail-closed）。
+窓 (c) の抽出は今ターンの signal 抽出が `Hybrid` のときだけ行う。
 
-`LexiconFallback` のターンは経路で扱いが異なる。`/api/reply` は `decide_reply_action` の規則で、判定によらず取次に進む。MCP は製品参照を採用しないため、allowlist 内の `product_key` が無く語彙で製品依存と判定され第1層・第2層に一致しなければ未特定になり、LLM 生成の聞き返し文と `clarification_allowed = true` を返す。
+`LexiconFallback` のターンは経路で扱いが異なる。`/api/reply` は `decide_reply_action` の規則で、判定によらず取次に進む。
+MCP は製品参照を採用しないため、allowlist 内の `product_key` が無く語彙で製品依存と判定され第1層・第2層に一致しなければ未特定になり、LLM 生成の聞き返し文と `clarification_allowed = true` を返す。
 
 アドバイザ（homesec）の CS モードの未特定の聞き返しも、同じ LLM 生成の関数を呼ぶ。

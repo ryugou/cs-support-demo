@@ -189,7 +189,7 @@ user message には現行の材料（上位 3 件・各 2,500 字まで）と質
 
 ### 10.5 スモークのケース別期待（2026-10-13 追記）
 
-言い回しによって判定が変わる（「ADC-V724X の料金は？」は `price_question` → `Allowed` で回答のみ、#73 の設計どおり）。`allowed` のケースは取扱製品の型番を含める（無いと聞き返しになる）。`CS_VERIFY_CASES_JSON` の各ケースに `expect` を持たせる:
+言い回しによって判定が変わる（「ADC-V724X の料金は？」は `price_question` → `Allowed` で回答のみ、#73 の設計どおり）。料金の質問は `product_dependent` が false で製品特定ガードの対象外のため（v11 §10.2）、型番の有無は判定に影響しない。`CS_VERIFY_CASES_JSON` の各ケースに `expect` を持たせる:
 
 - `"handoff"`: 判定が第 1 層 `Escalate`、部分回答の下書きが採用され、最終応答文に料金節の金額（`1,540`）・取次の一文・受付番号が含まれる。
 - `"allowed"`: 判定が `Allowed`、`customer_reply_draft` が採用され（`NO_ANSWER` でない）、下書きに `1,540` が含まれる。最終応答文は下書きそのもの（取次の一文・受付番号は付かない）。

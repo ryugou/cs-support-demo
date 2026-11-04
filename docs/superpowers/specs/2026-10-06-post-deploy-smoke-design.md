@@ -43,20 +43,20 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
     { "utterance": "解約したいです", "expect_rule": "contract-billing" },
     { "utterance": "請求額が違います", "expect_rule": "contract-billing" },
     { "utterance": "担当者につないでください", "expect_rule": "human-handoff" },
-    { "utterance": "赤いランプが点滅してる", "expect_rule": null, "expect_signals_nonempty": true }
+    { "utterance": "赤いランプが点滅してる", "expect_rule": null, "expect_signal": "led_red_blinking" }
   ]
 }
 ```
 
 - `expect_rule`: マッチすべき第 1 層ルールの `rule_id`。どのルールにもマッチしないことを期待する場合は `null`。
 - 未知のフィールドは拒否する（`deny_unknown_fields`）。`layer1` が空の場合はエラーにする。
-- `expect_signals_nonempty`（任意、既定 `false`）: `true` のとき、lexicon がその発話に signal を 1 つ以上立てなければ、`expect_rule` が合っていても不合格にする。省略したケースは `expect_rule` だけで判定する。
-  - 目的: 「製品名なしの症状発話は、第 1 層に非一致のまま signal だけが立つ」という、第 3 層の製品未特定ガード（Issue #131）の前提が崩れたことを検知する。`expect_rule: null` だけでは、signal が立たなくなっても（lexicon の欠落・語彙名の変更）合格のままになる。
+- `expect_signal`（任意、既定は省略）: signal 名を書くと、lexicon がその発話にその signal を立てなければ、`expect_rule` が合っていても不合格にする（別の signal が立っているだけでは合格にしない）。省略したケースは `expect_rule` だけで判定する。
+  - 目的: 「製品名なしの症状発話は、第 1 層に非一致のまま signal だけが立つ」という、第 3 層より前に置く製品未特定ガード（Issue #131）の前提が崩れたことを検知する。`expect_rule: null` だけでは、signal が立たなくなっても（lexicon の欠落・語彙名の変更）合格のままになり、signal が空でないことだけを見る検査では別の signal に置き換わっても合格のままになるため、立つべき signal 名を指定する。
   - 検知しないもの: `decide` の結果（Clarify になること自体）は見ない。`decide` は材料検索・取扱製品カタログ（Product ノード）・LLM による製品参照抽出に依存し、この検査は読み取り専用・LLM 不使用のため評価できない。発話に Matched の製品参照が無いことも評価しない（期待値ファイルの発話は固定であり、製品名・型番を含めない前提を、ケースを書く側が守る）。
 
 初期の内容は、次の発話とする。期待値は現在の `server/data/urtect/signal-lexicon.json` と `server/data/urtect/rules.json` に対する正しい結果である。
 
-| 発話 | `expect_rule` | `expect_signals_nonempty` |
+| 発話 | `expect_rule` | `expect_signal` |
 | --- | --- | --- |
 | 月額いくらですか？ | `null` | 省略 |
 | 契約前に料金を知りたいです | `null` | 省略 |
@@ -64,7 +64,7 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 | 解約したいです | `contract-billing` | 省略 |
 | 請求額が違います | `contract-billing` | 省略 |
 | 担当者につないでください | `human-handoff` | 省略 |
-| 赤いランプが点滅してる | `null` | `true` |
+| 赤いランプが点滅してる | `null` | `led_red_blinking` |
 
 ## 3. 検査項目
 

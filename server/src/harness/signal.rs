@@ -161,8 +161,8 @@ pub struct LexiconNormalizer {
     /// `SignalSet`（`BTreeSet`）はアルファベット順になるため、宣言順を必要とする呼び出し側
     /// （`handoff_items::derive_handoff_items`、design doc
     /// `2026-10-07-partial-answer-with-handoff-design.md` §2）がこれを使って並べ替える。
-    device_state_signals: std::collections::HashSet<String>,
     declaration_order: Vec<String>,
+    device_state_signals: std::collections::HashSet<String>,
 }
 
 impl LexiconNormalizer {
