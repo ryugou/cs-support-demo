@@ -5911,7 +5911,7 @@ mod tests {
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
             product_identified: false,
-            product_dependent: true,
+            product_dependent: false,
             known_resolution: None,
         });
         assert!(
