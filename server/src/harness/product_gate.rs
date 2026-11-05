@@ -157,6 +157,22 @@ pub fn extract_model_tokens(text: &str) -> Vec<String> {
 /// 空文字の扱いは変わらない（多層防御）。
 const MIN_FRAGMENT_VETO_CHARS: usize = 3;
 
+const MAX_PRODUCT_NAME_CHARS: usize = 100;
+
+fn validated_product_name(name: &str) -> Result<&str, &'static str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("name is blank after trimming");
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("name contains a control character");
+    }
+    if trimmed.chars().count() > MAX_PRODUCT_NAME_CHARS {
+        return Err("name exceeds the maximum length");
+    }
+    Ok(trimmed)
+}
+
 /// 取扱製品の allowlist（1 schema 分のスナップショット）。
 ///
 /// 正規化形（大文字比較用）から一覧の表記（`from_models` に渡された trim 済み元の値）への
@@ -169,6 +185,8 @@ const MIN_FRAGMENT_VETO_CHARS: usize = 3;
 pub struct ProductAllowlist {
     canonical: HashMap<String, String>,
     display: String,
+    models: Vec<String>,
+    names: HashMap<String, String>,
 }
 
 impl ProductAllowlist {
@@ -202,7 +220,27 @@ impl ProductAllowlist {
             .map(|m| (normalize_model_token(m), m.clone()))
             .collect();
         let display = usable.join("、");
-        Self { canonical, display }
+        Self {
+            canonical,
+            display,
+            models: usable,
+            names: HashMap::new(),
+        }
+    }
+
+    /// Returns the catalog products in model order as `(model, name)`; the name is `Some` only when the product master gives one that is non-empty and differs from the model.
+    pub fn catalog(&self) -> Vec<(&str, Option<&str>)> {
+        self.models
+            .iter()
+            .map(|model| {
+                let name = self
+                    .names
+                    .get(model)
+                    .map(String::as_str)
+                    .filter(|name| !name.is_empty() && *name != model);
+                (model.as_str(), name)
+            })
+            .collect()
     }
 
     /// allowlist に実際に使える型番が 1 件も無いか（`ProductGate::fetch` の fail-closed 判定
@@ -234,10 +272,28 @@ impl ProductAllowlist {
     /// `name == model`、design doc §1）由来のマージは実利用上到達しない不要な複雑さだった。
     /// 単純化のため撤去する。
     pub(crate) fn from_nodes(nodes: Vec<crate::proto::graphrag::NodeResult>) -> Self {
+        let mut names = HashMap::new();
         let models: Vec<String> = nodes
             .into_iter()
             .filter_map(|n| match n.attributes.get("model") {
-                Some(model) => Some(model.clone()),
+                Some(model) => {
+                    if let Some(name) = n.attributes.get("name") {
+                        match validated_product_name(name) {
+                            Ok(valid) => {
+                                names.insert(model.trim().to_string(), valid.to_string());
+                            }
+                            Err(reason) => {
+                                tracing::warn!(
+                                    node_id = %n.node_id,
+                                    reason,
+                                    "product node has an invalid 'name' attribute; excluding \
+                                     the name from the product catalog"
+                                );
+                            }
+                        }
+                    }
+                    Some(model.clone())
+                }
                 None => {
                     tracing::warn!(
                         node_id = %n.node_id,
@@ -248,7 +304,10 @@ impl ProductAllowlist {
                 }
             })
             .collect();
-        Self::from_models(models)
+        Self {
+            names,
+            ..Self::from_models(models)
+        }
     }
 
     /// 正規化済みトークンが allowlist 内か。
@@ -2135,6 +2194,54 @@ mod tests {
             node_id: format!("urtect:gen1:Product:{model}"),
             node_type: KIND_PRODUCT.to_string(),
             attributes,
+        }
+    }
+
+    #[test]
+    fn catalog_returns_names_only_when_they_differ_from_the_model() {
+        let allowlist = ProductAllowlist::from_nodes(vec![
+            product_node_with_name("ADC-V724", "屋外カメラ"),
+            product_node_with_name("ADC-V523", "ADC-V523"),
+            product_node_with_name("ADC-VC729P", " "),
+            product_node("ADC-V522IR"),
+        ]);
+        assert_eq!(
+            allowlist.catalog(),
+            vec![
+                ("ADC-V522IR", None),
+                ("ADC-V523", None),
+                ("ADC-V724", Some("屋外カメラ")),
+                ("ADC-VC729P", None),
+            ]
+        );
+        let models_only = ProductAllowlist::from_models(vec!["ADC-V724".to_string()]);
+        assert_eq!(models_only.catalog(), vec![("ADC-V724", None)]);
+    }
+
+    #[test]
+    fn from_nodes_excludes_invalid_names_from_the_catalog_and_keeps_the_model() {
+        let at_limit = "あ".repeat(MAX_PRODUCT_NAME_CHARS);
+        let over_limit = "あ".repeat(MAX_PRODUCT_NAME_CHARS + 1);
+        let cases: Vec<(&str, String, bool)> = vec![
+            ("newline", "屋外\nカメラ".to_string(), false),
+            ("control character", "屋外\u{7}カメラ".to_string(), false),
+            ("over length", over_limit, false),
+            ("exactly at the limit", at_limit, true),
+        ];
+        for (label, name, name_kept) in cases {
+            let allowlist =
+                ProductAllowlist::from_nodes(vec![product_node_with_name("ADC-V724", &name)]);
+            let expected_name = name_kept.then_some(name.as_str());
+            assert_eq!(
+                allowlist.catalog(),
+                vec![("ADC-V724", expected_name)],
+                "{label}"
+            );
+            assert_eq!(
+                allowlist.canonical_model("adc-v724"),
+                Some("ADC-V724".to_string()),
+                "{label}: the model must stay usable"
+            );
         }
     }
 

@@ -37,25 +37,34 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 ```json
 {
   "layer1": [
+    { "utterance": "月額いくらですか？", "expect_rule": null },
+    { "utterance": "契約前に料金を知りたいです", "expect_rule": null },
     { "utterance": "初期費用はいくらですか？", "expect_rule": "initial-cost-quote" },
-    { "utterance": "月額いくらですか？", "expect_rule": null }
+    { "utterance": "解約したいです", "expect_rule": "contract-billing" },
+    { "utterance": "請求額が違います", "expect_rule": "contract-billing" },
+    { "utterance": "担当者につないでください", "expect_rule": "human-handoff" },
+    { "utterance": "赤いランプが点滅してる", "expect_rule": null, "expect_signal": "led_red_blinking" }
   ]
 }
 ```
 
 - `expect_rule`: マッチすべき第 1 層ルールの `rule_id`。どのルールにもマッチしないことを期待する場合は `null`。
 - 未知のフィールドは拒否する（`deny_unknown_fields`）。`layer1` が空の場合はエラーにする。
+- `expect_signal`（任意、既定は省略）: signal 名を書くと、lexicon がその発話にその signal を立てなければ、`expect_rule` が合っていても不合格にする（別の signal が立っているだけでは合格にしない）。省略したケースは `expect_rule` だけで判定する。
+  - 目的: 「製品名なしの症状発話は、第 1 層に非一致のまま signal だけが立つ」という、第 3 層より前に置く製品未特定ガード（Issue #131）の前提が崩れたことを検知する。`expect_rule: null` だけでは、signal が立たなくなっても（lexicon の欠落・語彙名の変更）合格のままになり、signal が空でないことだけを見る検査では別の signal に置き換わっても合格のままになるため、立つべき signal 名を指定する。
+  - 検知しないもの: `decide` の結果（Clarify になること自体）は見ない。`decide` は材料検索・取扱製品カタログ（Product ノード）・LLM による製品参照抽出に依存し、この検査は読み取り専用・LLM 不使用のため評価できない。発話に Matched の製品参照が無いことも評価しない（期待値ファイルの発話は固定であり、製品名・型番を含めない前提を、ケースを書く側が守る）。
 
 初期の内容は、次の発話とする。期待値は現在の `server/data/urtect/signal-lexicon.json` と `server/data/urtect/rules.json` に対する正しい結果である。
 
-| 発話 | `expect_rule` |
-| --- | --- |
-| 月額いくらですか？ | `null` |
-| 契約前に料金を知りたいです | `null` |
-| 初期費用はいくらですか？ | `initial-cost-quote` |
-| 解約したいです | `contract-billing` |
-| 請求額が違います | `contract-billing` |
-| 担当者につないでください | `human-handoff` |
+| 発話 | `expect_rule` | `expect_signal` |
+| --- | --- | --- |
+| 月額いくらですか？ | `null` | 省略 |
+| 契約前に料金を知りたいです | `null` | 省略 |
+| 初期費用はいくらですか？ | `initial-cost-quote` | 省略 |
+| 解約したいです | `contract-billing` | 省略 |
+| 請求額が違います | `contract-billing` | 省略 |
+| 担当者につないでください | `human-handoff` | 省略 |
+| 赤いランプが点滅してる | `null` | `led_red_blinking` |
 
 ## 3. 検査項目
 
@@ -75,7 +84,7 @@ vegapunk の認証情報は、サービスと同じ環境変数（`VEGAPUNK_BEAR
 
 1. その project の schema から、サービスと同じ関数でエスカレーションルールと禁止領域を読む（`load_escalation_rules`、`load_prohibited_domains`）。
 2. 設定ファイルが指す lexicon を、サービスと同じ方法で読む。
-3. 読んだルールと禁止領域の signal を、サービスの評価経路と同じ関数（`Harness::validate_rule_vocabulary`）で lexicon と突合する。語彙に無い signal を参照するルールが 1 つでもあれば、発話を評価せずに `layer1` を `fail` にし、`detail` にエラー文（ルール id と signal 名。発話は含まない）を入れる。理由: サービスはこの突合で全評価を fail closed にするため、期待値の 6 発話がそのルールを踏まなくても、本番は全件失敗している。突合を省くと、この検査が最も検出したい lexicon とルールの不一致を見逃す。
+3. 読んだルールと禁止領域の signal を、サービスの評価経路と同じ関数（`Harness::validate_rule_vocabulary`）で lexicon と突合する。語彙に無い signal を参照するルールが 1 つでもあれば、発話を評価せずに `layer1` を `fail` にし、`detail` にエラー文（ルール id と signal 名。発話は含まない）を入れる。理由: サービスはこの突合で全評価を fail closed にするため、期待値の 7 発話がそのルールを踏まなくても、本番は全件失敗している。突合を省くと、この検査が最も検出したい lexicon とルールの不一致を見逃す。
 4. 期待値ファイルの各発話を lexicon だけで signal に変換し（LLM を使わない）、`match_layer1` の結果を `expect_rule` と比べる。
 
 1 件ごとに、発話・立った signal・マッチしたルール・期待値・合否を記録する。

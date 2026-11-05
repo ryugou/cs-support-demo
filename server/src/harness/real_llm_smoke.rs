@@ -541,6 +541,38 @@ fn build_fixture(
     }
 }
 
+async fn identify_product_for_turn(
+    fx: &Fixture,
+    references: &[super::product_gate::ProductReference],
+    mode: extraction::ExtractionMode,
+    history: &[ReplyHistoryTurn],
+) -> bool {
+    let resolved = super::case_switch::resolve_matched_models(&fx.allowlist, references);
+    let window = super::PastTurnsWindow {
+        extractor: &fx.harness.product_reference_extractor,
+        extraction_mode: mode,
+        history,
+        request_id: "smoke",
+    };
+    super::identify_product(&fx.allowlist, &resolved, None, Some(&window)).await
+}
+
+async fn extract_and_identify_product(
+    fx: &Fixture,
+    text: &str,
+    mode: extraction::ExtractionMode,
+    history: &[ReplyHistoryTurn],
+) -> bool {
+    let references = fx
+        .harness
+        .product_reference_extractor
+        .extract(text, fx.allowlist.display_list(), "smoke")
+        .await;
+    let (references, _discarded) =
+        super::adopt_product_references_for_extraction_mode(mode, references);
+    identify_product_for_turn(fx, &references, mode, history).await
+}
+
 /// signal 抽出から `decide` までを実行する。判定内容そのものへの assert はここでは行わず、
 /// 呼び出し側（`run_once`）が `expect`（design doc §10.5）に応じて [`assert_handoff_decision`] /
 /// [`assert_allowed_decision`] のどちらを課すか選ぶ。`question_hits` は本番 MCP `search_manual`
@@ -553,18 +585,19 @@ async fn decide_for_case(
     case_index: usize,
     total_cases: usize,
 ) -> (extraction::ExtractionResult, AnswerDecision, Vec<String>) {
-    let extracted = fx.harness.extractor.extract(question).await;
+    let extracted = fx.harness.extractor.extract(question, &[]).await;
     let (signals, mode) = (&extracted.signals, extracted.mode);
-    // 製品言及抽出は signal 抽出と完全に独立したコンポーネント（Issue #52）。この質問は
-    // 型番言及を含まないため判定には使わないが、本番と同じ配線を実際に動かして確認する
-    // （design doc §10.3「実 LLM による...製品言及抽出」）。
     let product_references = fx
         .harness
         .product_reference_extractor
-        .extract(question, fx.allowlist.display_list())
+        .extract(question, fx.allowlist.display_list(), "smoke")
         .await;
     println!("signals: {signals:?} (extraction_mode={mode:?})");
     println!("product_references: {product_references:?}");
+    let (adopted_references, _discarded) =
+        super::adopt_product_references_for_extraction_mode(mode, product_references);
+    let product_identified = identify_product_for_turn(fx, &adopted_references, mode, &[]).await;
+    println!("product_identified: {product_identified}");
 
     let (decision, matched_layer1_rule_ids) = decide_on_signals(
         fx,
@@ -572,6 +605,8 @@ async fn decide_for_case(
         question_hits,
         signals,
         signals,
+        product_identified,
+        extracted.product_dependent,
         case_index,
         total_cases,
     );
@@ -580,12 +615,15 @@ async fn decide_for_case(
     (extracted, decision, matched_layer1_rule_ids)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide_on_signals(
     fx: &Fixture,
     question: &str,
     question_hits: &[SectionHit],
     question_signals: &signal::SignalSet,
     accumulated: &signal::SignalSet,
+    product_identified: bool,
+    llm_product_dependent: Option<bool>,
     case_index: usize,
     total_cases: usize,
 ) -> (AnswerDecision, Vec<String>) {
@@ -615,6 +653,9 @@ fn decide_on_signals(
         thresholds: &fx.thresholds,
         default_route: &fx.config.harness.default_escalation_route,
         known_resolution: None,
+        product_identified,
+        product_dependent: llm_product_dependent
+            .unwrap_or_else(|| fx.lexicon.is_product_dependent_by_lexicon(accumulated)),
     });
     let matched_layer1_rule_ids: Vec<String> =
         matching_layer1_rules(&fx.escalation_rules, question_signals)
@@ -1087,6 +1128,7 @@ fn assert_accumulated_signals_would_escalate(
     turn2_question: &str,
     turn2_question_hits: &[SectionHit],
     accumulated: &signal::SignalSet,
+    product_identified: bool,
     case_index: usize,
     total_cases: usize,
 ) {
@@ -1096,6 +1138,8 @@ fn assert_accumulated_signals_would_escalate(
         turn2_question_hits,
         accumulated,
         accumulated,
+        product_identified,
+        None,
         case_index,
         total_cases,
     );
@@ -1107,12 +1151,14 @@ fn assert_accumulated_signals_would_escalate(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide_allowed_turn2(
     fx: &Fixture,
     turn2_question: &str,
     turn2_question_hits: &[SectionHit],
     decide_signals: &signal::SignalSet,
     accumulated: &signal::SignalSet,
+    product_identified: bool,
     case_index: usize,
     total_cases: usize,
 ) -> AnswerDecision {
@@ -1122,6 +1168,8 @@ fn decide_allowed_turn2(
         turn2_question_hits,
         decide_signals,
         accumulated,
+        product_identified,
+        None,
         case_index,
         total_cases,
     );
@@ -1136,6 +1184,7 @@ fn decide_allowed_turn2(
         turn2_question,
         turn2_question_hits,
         accumulated,
+        product_identified,
         case_index,
         total_cases,
     );
@@ -1156,7 +1205,7 @@ async fn draft_allowed_turn2_answer(
     AnswerDecision,
     String,
 ) {
-    let extracted2 = fx.harness.extractor.extract(turn2_question).await;
+    let extracted2 = fx.harness.extractor.extract(turn2_question, &[]).await;
     let signals2 = &extracted2.signals;
     println!(
         "signals: {signals2:?} (extraction_mode={:?})",
@@ -1165,12 +1214,26 @@ async fn draft_allowed_turn2_answer(
     let accumulated: signal::SignalSet = turn1.extracted.signals.union(signals2).cloned().collect();
     let decide_signals =
         select_turn_only_signals(fx, signals2, &accumulated, case_index, total_cases);
+    let history = [
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Customer,
+            text: turn1_question.to_owned(),
+        },
+        ReplyHistoryTurn {
+            role: ReplyHistoryRole::Assistant,
+            text: turn1.assistant_reply.clone(),
+        },
+    ];
+    let product_identified =
+        extract_and_identify_product(fx, turn2_question, extracted2.mode, &history).await;
+    println!("product_identified: {product_identified}");
     let decision2 = decide_allowed_turn2(
         fx,
         turn2_question,
         turn2_question_hits,
         decide_signals,
         &accumulated,
+        product_identified,
         case_index,
         total_cases,
     );
@@ -1187,16 +1250,6 @@ async fn draft_allowed_turn2_answer(
         "case {case_index}/{total_cases}: an Allowed decision must have no handoff items, got \
          {items:?}"
     );
-    let history = [
-        ReplyHistoryTurn {
-            role: ReplyHistoryRole::Customer,
-            text: turn1_question.to_owned(),
-        },
-        ReplyHistoryTurn {
-            role: ReplyHistoryRole::Assistant,
-            text: turn1.assistant_reply.clone(),
-        },
-    ];
     let best_score = turn2_question_hits.first().map(|h| h.score);
     let draft_text = draft_accepted_text(
         fx,
@@ -1801,7 +1854,7 @@ fn kr_applicability_cases() -> [KrCase; 5] {
         },
         KrCase {
             label: "b: 保存期間の質問は保存期間 KR を選び、下書きが数字を保つ",
-            utterance: "クラウドの保存期間は何日ですか？",
+            utterance: "ADC-V724X のクラウドの保存期間は何日ですか？",
             candidate_ids: &[KR_RETENTION],
             expected: Some(KR_RETENTION),
             draft_follows_kr: true,
@@ -1910,6 +1963,8 @@ fn decide_kr_turn(
     resolutions: &[rules::KnownResolution],
     selected: Option<&rules::KnownResolution>,
     stakes_input: &decision::StakesInput,
+    product_identified: bool,
+    product_dependent: bool,
 ) -> AnswerDecision {
     decision::decide(&DecisionInput {
         question_signals: signals,
@@ -1923,6 +1978,8 @@ fn decide_kr_turn(
         thresholds,
         default_route: &config.harness.default_escalation_route,
         known_resolution: selected,
+        product_identified,
+        product_dependent,
     })
 }
 
@@ -1938,6 +1995,7 @@ fn decide_kr_riding_turn(
     resolutions: &[rules::KnownResolution],
     selected: Option<&rules::KnownResolution>,
     stakes_input: &decision::StakesInput,
+    product_identified: bool,
 ) -> KrRidingTurn {
     let decision = decide_kr_turn(
         config,
@@ -1949,6 +2007,8 @@ fn decide_kr_riding_turn(
         resolutions,
         selected,
         stakes_input,
+        product_identified,
+        lexicon.is_product_dependent_by_lexicon(signals),
     );
     let items = handoff_items::handoff_items_for_decision(
         &decision,
@@ -2426,6 +2486,8 @@ async fn draft_for_kr_turn(
     context: &str,
     no_draft: &str,
 ) -> crate::llm::ReplyDraft {
+    let product_identified =
+        extract_and_identify_product(fx, utterance, extraction::ExtractionMode::Hybrid, &[]).await;
     let decision = decide_kr_turn(
         &fx.config,
         &fx.escalation_rules,
@@ -2436,6 +2498,14 @@ async fn draft_for_kr_turn(
         &turn.resolutions,
         turn.applicable_known_resolution.as_ref(),
         &turn.stakes_input,
+        product_identified,
+        fx.lexicon
+            .is_product_dependent_by_lexicon(turn.decide_signals),
+    );
+    assert!(
+        !decision.is_product_unidentified(),
+        "{context}: the utterance names no handled product, so production answers with the \
+         product catalog instead of drafting from the known resolution: {utterance:?}"
     );
     let draft = fx
         .harness
@@ -2545,6 +2615,13 @@ async fn draft_and_assemble_kr_riding_reply(
     kr_turn: &super::KrTurn<'_>,
     label: &str,
 ) -> String {
+    let product_identified = extract_and_identify_product(
+        fx,
+        KR_RIDING_UTTERANCE,
+        extraction::ExtractionMode::Hybrid,
+        &[],
+    )
+    .await;
     let turn = decide_kr_riding_turn(
         &fx.config,
         &fx.lexicon,
@@ -2555,6 +2632,7 @@ async fn draft_and_assemble_kr_riding_reply(
         &kr_turn.resolutions,
         kr_turn.applicable_known_resolution.as_ref(),
         &kr_turn.stakes_input,
+        product_identified,
     );
     assert_kr_riding_turn(&turn, &fx.escalation_rules, kr_turn.decide_signals);
     let plan = plan_draft(
@@ -2617,6 +2695,7 @@ fn build_kr_riding_outcome(
             &extraction::ExtractionResult {
                 signals: kr_turn.decide_signals.clone(),
                 mode: extraction::ExtractionMode::Hybrid,
+                product_dependent: None,
             },
             &[],
             draft_text,
@@ -2976,7 +3055,7 @@ async fn real_llm_reply_list_formatting_smoke() {
         &ctx,
         &fixture,
         KR_STEPS_ANSWER,
-        "24時間録画ができているか確認する方法を教えてください",
+        "ADC-V724X で24時間録画ができているか確認する方法を教えてください",
         "i: steps KR",
     )
     .await;
@@ -2997,7 +3076,7 @@ async fn real_llm_reply_list_formatting_smoke() {
         &ctx,
         &fixture,
         KR_SINGLE_FACT_ANSWER,
-        "クラウドの保存期間は何日ですか？",
+        "ADC-V724X のクラウドの保存期間は何日ですか？",
         "ii: single-fact KR",
     )
     .await;
@@ -3027,7 +3106,7 @@ async fn real_llm_long_steps_draft_is_not_truncated_smoke() {
         &ctx,
         &fixture,
         KR_LONG_STEPS_ANSWER,
-        "カメラの初期設定の方法を教えてください",
+        "ADC-V724X の初期設定の方法を教えてください",
         "long steps KR",
     )
     .await;
@@ -4066,6 +4145,7 @@ fn kr_riding_advisory_turn_escalates_with_the_kr_and_plans_a_partial_answer() {
             ng_near_hit: false,
             hazard_signal_count: 0,
         },
+        false,
     );
     assert_kr_riding_turn(&turn, &escalation_rules, &signals);
     assert_partial_answer_plan(&plan_draft(
@@ -4180,4 +4260,128 @@ fn any_leading_non_alphanumeric_mark_is_ignored_but_digits_are_kept() {
 fn full_width_comma_and_minus_fold_through_ascii_fold_alone() {
     assert_eq!(digit_runs("１，２３４台"), vec!["1234".to_owned()]);
     assert_eq!(normalize_for_match("Ｗｉ－Ｆｉ Wi\u{2212}Fi"), "wi-fiwi-fi");
+}
+
+fn smoke_product_node(model: &str, name: &str) -> crate::proto::graphrag::NodeResult {
+    crate::proto::graphrag::NodeResult {
+        node_id: format!("urtect:gen1:Product:{model}"),
+        node_type: "Product".to_string(),
+        attributes: [("model", model), ("name", name)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    }
+}
+
+fn smoke_hybrid_extractor(
+    client: AnthropicClient,
+    lexicon: Arc<signal::LexiconNormalizer>,
+) -> extraction::HybridExtractor {
+    let classifier: Arc<dyn extraction::ClassifyLlm> = Arc::new(
+        extraction::AnthropicSignalClassifier::new(client, lexicon.vocabulary_for_prompt()),
+    );
+    extraction::HybridExtractor::new(lexicon, Some(classifier))
+}
+
+#[tokio::test]
+#[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
+async fn real_llm_product_unidentified_hearing_smoke() {
+    init_warn_subscriber();
+    let (config, client) = load_config_and_client();
+    let lexicon = Arc::new(load_bundled_lexicon());
+    let extractor = smoke_hybrid_extractor(client.clone(), lexicon.clone());
+    let ng =
+        egress::NgDictionary::from_path(&resolve_server_path(&config.harness.ng_dictionary_path))
+            .expect("production ng dictionary must load and parse");
+    let allowlist = ProductAllowlist::from_nodes(vec![
+        smoke_product_node("ADC-V724", "ADC-V724"),
+        smoke_product_node("ADC-V724X", "ADC-V724X"),
+        smoke_product_node("ADC-VC727P", "ADC-VC727P"),
+    ]);
+    for (utterance, expect_dependent) in [
+        ("赤いランプが点滅してる", true),
+        ("ランプが消えてて動かない", true),
+        ("費用はどれくらい？", false),
+    ] {
+        let extracted = extraction::AsyncSignalExtractor::extract(&extractor, utterance, &[]).await;
+        let dependent = extracted
+            .product_dependent
+            .unwrap_or_else(|| lexicon.is_product_dependent_by_lexicon(&extracted.signals));
+        println!(
+            "utterance: {utterance}\nsignals: {:?} mode: {:?}\nproduct_dependent (llm): {:?} => {dependent}",
+            extracted.signals, extracted.mode, extracted.product_dependent
+        );
+        assert_eq!(dependent, expect_dependent, "{utterance}");
+        if dependent {
+            let text = super::clarify::draft_product_identification_question(
+                &client,
+                &ng,
+                config.harness.customer_reply_draft_max_tokens,
+                utterance,
+                "",
+                false,
+                &allowlist,
+            )
+            .await;
+            println!("hearing:\n{text}\n---");
+            assert_ne!(text, super::clarify::FALLBACK_CLARIFY_TEXT, "{utterance}");
+            assert!(
+                allowlist.out_of_scope_mentions(&text).is_empty(),
+                "{utterance}"
+            );
+            assert!(
+                !text.to_lowercase().contains("aeotec"),
+                "{utterance}: names an out-of-scope vendor"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires CS_SUPPORT_LLM_API_KEY and network access to the Anthropic API"]
+async fn real_llm_product_dependence_reads_the_window_as_context_only() {
+    init_warn_subscriber();
+    let (_config, client) = load_config_and_client();
+    let lexicon = Arc::new(load_bundled_lexicon());
+    let extractor = smoke_hybrid_extractor(client, lexicon);
+    for (past_customer_text, utterance, expect_dependent, absent_signal) in [
+        (
+            "赤いランプが点滅してる",
+            "型番はわかりません",
+            Some(true),
+            None,
+        ),
+        (
+            "カメラがオフラインになって映らなくなった",
+            "月額料金はいくらですか",
+            Some(false),
+            Some("camera_offline"),
+        ),
+    ] {
+        let history = [
+            ReplyHistoryTurn {
+                role: ReplyHistoryRole::Customer,
+                text: past_customer_text.to_string(),
+            },
+            ReplyHistoryTurn {
+                role: ReplyHistoryRole::Assistant,
+                text: "ご利用の製品の型番を教えていただけますか？".to_string(),
+            },
+        ];
+        let window = super::reply::customer_history_window(&history).turns;
+        let extracted =
+            extraction::AsyncSignalExtractor::extract(&extractor, utterance, &window).await;
+        println!(
+            "utterance: {utterance}\nsignals: {:?} mode: {:?}\nproduct_dependent (llm, with window): {:?}",
+            extracted.signals, extracted.mode, extracted.product_dependent
+        );
+        assert_eq!(extracted.product_dependent, expect_dependent, "{utterance}");
+        if let Some(absent) = absent_signal {
+            assert!(
+                extracted.signals.iter().all(|s| s.as_str() != absent),
+                "{utterance}: {:?}",
+                extracted.signals
+            );
+        }
+    }
 }

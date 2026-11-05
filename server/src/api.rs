@@ -15,7 +15,7 @@ use crate::harness::case_switch;
 use crate::harness::decision::{self, AnswerDecision};
 use crate::harness::extraction::{self, TurnExtraction};
 use crate::harness::product_gate;
-use crate::harness::reply::{ReplyHistoryRole, ReplyHistoryTurn};
+use crate::harness::reply::{select_customer_history_for_jev, ReplyHistoryRole, ReplyHistoryTurn};
 use crate::harness::{
     clarify, escalation_reply, hours, time_pref, Harness, ReplyDraftPolicy, RequestContext,
 };
@@ -611,82 +611,6 @@ fn build_jev_state(history: &[ReplyHistoryTurn], message: &str, request_id: &str
     lines.join("\n")
 }
 
-/// Jev の判定入力に載せる過去の顧客発話の合計文字数（`chars().count()` の総和。正規化後の値で、
-/// 今ターンの `message` と行区切りの `\n` は含まない）の上限。
-///
-/// `/api/reply` の `history[].text` 上限（[`MAX_HISTORY_TEXT_CHARS`]）と同値。したがって
-/// `validate` を通った入力では 1 発話だけで予算を超えることはなく、超過は複数発話の合計でのみ
-/// 起きる。1 発話で超える分岐（丸ごと落として過去発話 0 件になる）は、`validate` を経由しない
-/// 呼び出しや将来の上限変更に対する防御であり、切り詰めで代替しない。
-///
-/// state が今ターンだけの場合から最大でこの字数ぶん増えるため、Jev の入力トークン・
-/// レイテンシは有効化前に実測し直すこと（`docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
-const MAX_JEV_HISTORY_CHARS: usize = 2_000;
-
-/// Jev の**判定入力**専用の過去の顧客発話の選択。時系列昇順で返す。**発話を途中で切らない**。
-///
-/// 1. `role == Customer` に絞り、各発話へ改行潰しの正規化**のみ**を掛ける（切り詰めを伴う
-///    [`normalize_customer_turn_to_single_line`] は使わない）。正規化後に空になるもの
-///    （制御文字だけの発話等）は除外する。先に除外するのは、`validate` は `trim()` 後の非空しか
-///    見ないため、空になる発話が枠を消費して有効な発話を押し出す事故を防ぐ
-///    （[`select_customer_history_for_known_facts`] と同じ理由）。
-/// 2. 新しい側から最大 [`crate::harness::reply::MAX_HISTORY_TURNS`] 件を採る（把握済み事項の窓と
-///    件数を揃える）。この件数窓による除外も、下記の予算超過と同じく warn に出す
-///    （`window_dropped_turns` フィールド）。件数窓は固定長で除外理由も機械的だが、除外自体は
-///    観測できないと事後に会話を再構成できないため、対象外にしない。
-/// 3. 合計文字数が [`MAX_JEV_HISTORY_CHARS`] を超える間、古い側の発話を 1 件ずつ**丸ごと**落とす。
-///    1 件だけで超える発話も切り詰めず丸ごと落とす（過去発話 0 件になりうる）。
-///
-/// **表示用の要約予算（1 発話 100 字 + `…`）を判定入力へ流用しない**こと。理由（訂正・否定が
-/// 切り落とされて `has_enough_info` が不当に上がる意味反転）は [`build_jev_state`] の doc コメント
-/// を参照。同コメントが記す既知の限界（発話単位の削除も安全側にしか振れない保証は無いこと）も
-/// 参照。
-///
-/// 手順 2（件数窓）または手順 3（予算超過）のいずれかで 1 件以上落としたときは `tracing::warn!`
-/// を 1 回出す。件数窓で落ちた件数は `window_dropped_turns`、予算超過で落ちた件数は
-/// `dropped_turns`（既存フィールド名を維持）に分けて出す。**発話本文は絶対に出さない**
-/// （個人情報を含みうる）。`request_id` は該当リクエストと突き合わせるための相関 ID で、本文ではない。
-fn select_customer_history_for_jev(history: &[ReplyHistoryTurn], request_id: &str) -> Vec<String> {
-    let mut turns: Vec<String> = history
-        .iter()
-        .filter(|turn| turn.role == ReplyHistoryRole::Customer)
-        .map(|turn| crate::harness::prompt_input::collapse_to_single_line(&turn.text))
-        .filter(|text| !text.is_empty())
-        .collect();
-    let window_skip = turns
-        .len()
-        .saturating_sub(crate::harness::reply::MAX_HISTORY_TURNS);
-    turns.drain(..window_skip);
-
-    // 古い側から順に、合計が予算に収まるまで丸ごと落とす。`total_chars` は `turns` の総和なので、
-    // 全件落とせば 0 になりループは必ず終わる（`turns` が空でも panic しない）。
-    let mut total_chars: usize = turns.iter().map(|turn| turn.chars().count()).sum();
-    let mut dropped_turns = 0;
-    for turn in &turns {
-        if total_chars <= MAX_JEV_HISTORY_CHARS {
-            break;
-        }
-        total_chars -= turn.chars().count();
-        dropped_turns += 1;
-    }
-    turns.drain(..dropped_turns);
-
-    if window_skip > 0 || dropped_turns > 0 {
-        tracing::warn!(
-            request_id = %request_id,
-            window_dropped_turns = window_skip,
-            dropped_turns,
-            kept_turns = turns.len(),
-            reason = "jev_history_budget",
-            "past customer turns were dropped whole from jev's judgment input (via the history \
-             window and/or the character budget; turns are never truncated). if a dropped turn \
-             limited or negated something mentioned in a later turn, has_enough_info can come out \
-             either higher or lower than the whole conversation warrants"
-        );
-    }
-    turns
-}
-
 /// Issue #76: `outcome.decision` から、マッチした第1層ルールが宣言した顧客向けの受け止め文を
 /// 取り出す。`AnswerDecision::Allowed`、および第1層ルールが宣言していない取次（第2・3層を含む）
 /// では `None`。`reply_handler` の `ReplyAction::EscalationReply` 分岐から抽出した部品
@@ -967,6 +891,7 @@ async fn detect_product_switch(
     ctx: &RequestContext,
     case_id: &str,
     message: &str,
+    history: &[ReplyHistoryTurn],
     allowlist: &product_gate::ProductAllowlist,
     request_id: &str,
 ) -> SwitchDetection {
@@ -992,11 +917,27 @@ async fn detect_product_switch(
     if previous_models.is_empty() {
         return no_detection;
     }
+    let already_escalated = match state.harness.load_conv_state(ctx, case_id).await {
+        Ok(conv) => conv.is_already_escalated(),
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                request_id = %request_id,
+                case_id,
+                "answer api: failed to load the conversation state for case switch detection; \
+                 classifying this turn without the customer history window"
+            );
+            true
+        }
+    };
+    let recent_customer_turns = crate::harness::classifier_window(already_escalated, history);
     let extraction = extraction::extract_signals_and_product_references(
         state.harness.extractor.as_ref(),
         &state.harness.product_reference_extractor,
         message,
+        &recent_customer_turns,
         allowlist.display_list(),
+        request_id,
     )
     .await;
     judge_product_switch(
@@ -1761,8 +1702,16 @@ async fn reply_handler(
         extraction: supplied_extraction,
     } = match req.case_id.as_deref() {
         Some(case_id) => {
-            detect_product_switch(&state, &ctx, case_id, &req.message, &allowlist, &request_id)
-                .await
+            detect_product_switch(
+                &state,
+                &ctx,
+                case_id,
+                &req.message,
+                &history,
+                &allowlist,
+                &request_id,
+            )
+            .await
         }
         None => SwitchDetection {
             switch: None,
@@ -2139,22 +2088,18 @@ async fn reply_handler(
                     // `decide_reply_action` の前提により `conv.clarify_turns < clarify_max_turns`
                     // は保証済み（`is_final_clarify_turn` の doc コメント参照）。
                     let is_final_clarify_turn = is_final_clarify_turn(&conv, &state.config.api);
-                    let reply_text = match state.harness.reply_drafter.as_ref() {
-                        Some(drafter) => {
-                            clarify::draft_clarify_question(
-                                drafter,
-                                &state.harness.ng,
-                                state.harness.reply_draft_max_tokens,
-                                &req.message,
-                                &missing_text,
-                                &known_facts,
-                                is_continuation,
-                                &allowlist,
-                            )
-                            .await
-                        }
-                        None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
-                    };
+                    let reply_text = clarify::clarify_question_text(
+                        state.harness.reply_drafter.as_ref(),
+                        &state.harness.ng,
+                        state.harness.reply_draft_max_tokens,
+                        &req.message,
+                        &missing_text,
+                        &known_facts,
+                        is_continuation,
+                        &allowlist,
+                        outcome.decision.is_product_unidentified(),
+                    )
+                    .await;
                     // Issue #28 §3.5: 応答側ゲート その 2/3。聞き返し。フォールバック定型文
                     // 経由でも allowlist 外を含み得ない（定数文字列）ため、判定は無害だが
                     // 経路を分けず一律に適用する（allowlist は §3.1 のために取得済みのものを使う）。
@@ -2282,6 +2227,7 @@ pub fn api_router(state: ApiState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::reply::MAX_JEV_HISTORY_CHARS;
 
     fn valid_request() -> ReplyRequest {
         ReplyRequest {
@@ -2716,6 +2662,8 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -2968,6 +2916,142 @@ mod tests {
         let outcome = base_outcome(gray_escalate_decision(), true);
         let mut conv = default_conv_state();
         conv.clarify_turns = 3; // == clarify_max_turns(3): 枯渇
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::EscalationReply);
+    }
+
+    fn product_unidentified_decision() -> AnswerDecision {
+        AnswerDecision::Escalate {
+            reason: crate::harness::decision::EscalateReason::ProductUnidentified,
+            layer: 3,
+            route_to: "triage".to_string(),
+            disclosure_scope: crate::harness::decision::DisclosureScope::ConfirmingWithTeam,
+            audit_required: true,
+            missing: Vec::new(),
+            hearing: None,
+            customer_ack: None,
+            known_resolution_id: None,
+        }
+    }
+
+    struct DeviceQuestionClassifier;
+
+    #[async_trait::async_trait]
+    impl crate::harness::extraction::ClassifyLlm for DeviceQuestionClassifier {
+        async fn classify(&self, _question: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn classify_with_product_dependence(
+            &self,
+            question: &str,
+            recent_customer_turns: &[String],
+        ) -> anyhow::Result<crate::llm::SignalClassification> {
+            let about_a_device = question.contains("ランプ")
+                || recent_customer_turns.iter().any(|t| t.contains("ランプ"));
+            Ok(crate::llm::SignalClassification {
+                signals: Vec::new(),
+                product_dependent: Some(about_a_device),
+            })
+        }
+    }
+
+    fn unidentified_turn_decision(product_dependent: bool) -> AnswerDecision {
+        let thresholds = decision::Thresholds {
+            low: 0.6,
+            mid: 0.8,
+            high: 0.95,
+        };
+        let sections = vec!["doc-1#x".to_string()];
+        decision::decide(&decision::DecisionInput {
+            question_signals: &crate::harness::signal::SignalSet::new(),
+            question_raw: "質問",
+            rules: &[],
+            domains: &[],
+            resolutions: &[],
+            best_manual_score: Some(0.95),
+            best_manual_sections: &sections,
+            stakes_input: decision::StakesInput {
+                mandatory_domain_near: false,
+                ng_near_hit: false,
+                hazard_signal_count: 0,
+            },
+            thresholds: &thresholds,
+            default_route: "triage",
+            product_identified: false,
+            product_dependent,
+            known_resolution: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_followup_that_withholds_the_model_number_keeps_firing_the_product_guard_with_the_window(
+    ) {
+        use crate::harness::extraction::{AsyncSignalExtractor, ClassifyLlm, HybridExtractor};
+        use crate::harness::reply::customer_history_window;
+        let lexicon = std::sync::Arc::new(
+            crate::harness::signal::LexiconNormalizer::from_json(r#"{"signals":[]}"#).unwrap(),
+        );
+        let llm: std::sync::Arc<dyn ClassifyLlm> = std::sync::Arc::new(DeviceQuestionClassifier);
+        let extractor = HybridExtractor::new(lexicon, Some(llm));
+
+        let first = extractor.extract("赤いランプが点滅してる", &[]).await;
+        let first_decision =
+            unidentified_turn_decision(first.product_dependent.expect("llm judged turn 1"));
+        let outcome = base_outcome(first_decision, true);
+        let action = decide_reply_action(&outcome, &default_conv_state(), &default_api_config());
+        assert_eq!(action, ReplyAction::Clarify);
+
+        let history = vec![
+            ReplyHistoryTurn {
+                role: ReplyHistoryRole::Customer,
+                text: "赤いランプが点滅してる".to_string(),
+            },
+            ReplyHistoryTurn {
+                role: ReplyHistoryRole::Assistant,
+                text: "型番を教えてください".to_string(),
+            },
+        ];
+        let window = customer_history_window(&history).turns;
+        let second = extractor.extract("型番はわかりません", &window).await;
+        assert_eq!(second.product_dependent, Some(true));
+        let second_decision =
+            unidentified_turn_decision(second.product_dependent.expect("llm judged turn 2"));
+        assert!(
+            second_decision.is_product_unidentified(),
+            "{second_decision:?}"
+        );
+        let outcome = base_outcome(second_decision, true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 1;
+        assert_eq!(
+            decide_reply_action(&outcome, &conv, &default_api_config()),
+            ReplyAction::Clarify
+        );
+        conv.clarify_turns = 3;
+        assert_eq!(
+            decide_reply_action(&outcome, &conv, &default_api_config()),
+            ReplyAction::EscalationReply
+        );
+
+        let without_window = extractor.extract("型番はわかりません", &[]).await;
+        assert_eq!(without_window.product_dependent, Some(false));
+    }
+
+    #[test]
+    fn decide_reply_action_clarifies_product_unidentified_with_turns_remaining() {
+        let outcome = base_outcome(product_unidentified_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 2;
+        let action = decide_reply_action(&outcome, &conv, &default_api_config());
+        assert_eq!(action, ReplyAction::Clarify);
+    }
+
+    #[test]
+    fn decide_reply_action_hands_off_product_unidentified_when_clarify_turns_exhausted() {
+        let outcome = base_outcome(product_unidentified_decision(), true);
+        let mut conv = default_conv_state();
+        conv.clarify_turns = 3;
         let action = decide_reply_action(&outcome, &conv, &default_api_config());
         assert_eq!(action, ReplyAction::EscalationReply);
     }
@@ -4576,6 +4660,7 @@ mod tests {
             &ctx,
             "case-1",
             "ADC-V523の電源が入りません",
+            &[],
             &allowlist,
             "req-1",
         )
@@ -4617,6 +4702,7 @@ mod tests {
             crate::harness::extraction::ExtractionResult {
                 signals: crate::harness::signal::SignalSet::new(),
                 mode,
+                product_dependent: None,
             },
             refs,
         )

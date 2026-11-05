@@ -103,6 +103,8 @@ pub enum EscalateReason {
     RequiresHumanApproval,
     InsufficientDirectness,
     UnknownAddedSignal,
+    /// The question depends on the customer's product (`product_dependent`) and no catalog product is identified; the reply is an LLM-generated hearing, not an answer.
+    ProductUnidentified,
 }
 
 /// 顧客に開示してよい情報の範囲。文面そのものは client（生成側）が作る（spec「message_policy の扱い」）。
@@ -167,6 +169,17 @@ pub enum AnswerDecision {
 }
 
 impl AnswerDecision {
+    /// Returns true when this decision is an `Escalate` with `EscalateReason::ProductUnidentified`.
+    pub fn is_product_unidentified(&self) -> bool {
+        matches!(
+            self,
+            Self::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                ..
+            }
+        )
+    }
+
     /// Returns the known resolution id this decision carries (`Allowed` answers it, `Escalate` only carries it).
     pub fn known_resolution_id(&self) -> Option<&str> {
         match self {
@@ -196,6 +209,10 @@ pub struct DecisionInput<'a> {
     pub thresholds: &'a Thresholds,
     /// config 由来の既定エスカレーション route（第3層エスカレーション先）。
     pub default_route: &'a str,
+    /// Whether a catalog product is identified; only a `Matched` product reference counts, `Ambiguous` and `Foreign` do not. Callers must state it explicitly; `false` is the fail-closed value.
+    pub product_identified: bool,
+    /// Whether the correct answer depends on the customer's product or model. Product-independent questions skip the product-unidentified escalation. Callers must state it explicitly.
+    pub product_dependent: bool,
 }
 
 /// Pure, LLM-free decision function: the same input always yields the same decision. The first
@@ -207,8 +224,10 @@ pub struct DecisionInput<'a> {
 /// 2. A layer-2 prohibited domain escalates (`missing` empty, no known resolution id).
 /// 3. A layer-1 `Binding::Advisory` rule escalates; `missing` comes from `evidence_sufficient`,
 ///    and the pre-selected `known_resolution`, if any, is carried as `known_resolution_id`.
-/// 4. A pre-selected `known_resolution` is `Allowed` with `AnswerSource::KnownResolution`.
-/// 5. Layer 3: sufficient manual evidence is `Allowed`, otherwise it escalates.
+/// 4. When `product_dependent` is true and `product_identified` is false, it escalates with `EscalateReason::ProductUnidentified`,
+///    whatever the manual score and whatever known resolution is pre-selected.
+/// 5. A pre-selected `known_resolution` is `Allowed` with `AnswerSource::KnownResolution`.
+/// 6. Layer 3: sufficient manual evidence is `Allowed`, otherwise it escalates.
 ///
 /// `hearing` is the matched rule's own declaration (`EscalationRule::hearing_contract`, always
 /// `None` for mandatory). `customer_ack` is carried only when exactly one layer-1 rule matches
@@ -246,6 +265,9 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
             input.known_resolution.map(|kr| kr.id.clone()),
         );
     }
+    if !input.product_identified && input.product_dependent {
+        return product_unidentified_escalate(input);
+    }
     if let Some(kr) = input.known_resolution {
         return AnswerDecision::Allowed {
             source: AnswerSource::KnownResolution,
@@ -282,6 +304,20 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
                 known_resolution_id: None,
             }
         }
+    }
+}
+
+fn product_unidentified_escalate(input: &DecisionInput) -> AnswerDecision {
+    AnswerDecision::Escalate {
+        reason: EscalateReason::ProductUnidentified,
+        layer: 3,
+        route_to: input.default_route.to_string(),
+        disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+        audit_required: true,
+        missing: Vec::new(),
+        hearing: None,
+        customer_ack: None,
+        known_resolution_id: None,
     }
 }
 
@@ -375,6 +411,36 @@ mod tests {
             stakes_input,
             thresholds,
             default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn identified_input<'a>(
+        question_signals: &'a SignalSet,
+        rules: &'a [EscalationRule],
+        domains: &'a [ProhibitedDomain],
+        resolutions: &'a [KnownResolution],
+        best_manual_score: Option<f32>,
+        stakes_input: StakesInput,
+        thresholds: &'a Thresholds,
+        sections: &'a [String],
+        known_resolution: Option<&'a KnownResolution>,
+    ) -> DecisionInput<'a> {
+        DecisionInput {
+            product_identified: true,
+            ..input(
+                question_signals,
+                rules,
+                domains,
+                resolutions,
+                best_manual_score,
+                stakes_input,
+                thresholds,
+                sections,
+                known_resolution,
+            )
         }
     }
 
@@ -572,7 +638,7 @@ mod tests {
     fn kr_alone_is_allowed_known_resolution() {
         let k = kr("kr1", &["a"]);
         let q = signals(&["a"]);
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -647,7 +713,7 @@ mod tests {
         for (name, question, reason) in cases {
             let resolutions = vec![kr("kr1", &["a"])];
             let q = signals(question);
-            let d = decide(&input(
+            let d = decide(&identified_input(
                 &q,
                 &[],
                 &[],
@@ -1235,7 +1301,7 @@ mod tests {
     fn layer3_reuses_known_resolution() {
         let resolutions = vec![kr("kr1", &["discoloration"])];
         let q = signals(&["discoloration"]);
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -1263,7 +1329,7 @@ mod tests {
     fn layer3_added_signal_escalates_with_unknown_added_signal() {
         let resolutions = vec![kr("kr1", &["discoloration"])];
         let q = signals(&["discoloration", "mold"]);
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -1293,7 +1359,7 @@ mod tests {
     fn layer3_direct_manual_answers() {
         let q = SignalSet::new();
         let sections = vec!["doc-1#storage".to_string()];
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -1318,6 +1384,188 @@ mod tests {
     }
 
     #[test]
+    fn layer3_unidentified_product_with_signal_escalates_product_unidentified() {
+        let q = signals(&["discoloration"]);
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &thresholds(),
+            &sections,
+            None,
+        ));
+        match d {
+            AnswerDecision::Escalate {
+                reason,
+                layer,
+                missing,
+                ..
+            } => {
+                assert_eq!(reason, EscalateReason::ProductUnidentified);
+                assert_eq!(layer, 3);
+                assert!(missing.is_empty());
+            }
+            other => panic!("expected ProductUnidentified escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layer3_unidentified_product_independent_question_without_signal_stays_allowed() {
+        let q = SignalSet::new();
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&DecisionInput {
+            product_dependent: false,
+            ..input(
+                &q,
+                &[],
+                &[],
+                &[],
+                Some(0.95),
+                calm(),
+                &thresholds(),
+                &sections,
+                None,
+            )
+        });
+        assert!(matches!(d, AnswerDecision::Allowed { .. }));
+    }
+
+    #[test]
+    fn layer3_unidentified_product_with_signal_but_product_independent_stays_allowed() {
+        let q = signals(&["discoloration"]);
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&DecisionInput {
+            product_dependent: false,
+            ..input(
+                &q,
+                &[],
+                &[],
+                &[],
+                Some(0.95),
+                calm(),
+                &thresholds(),
+                &sections,
+                None,
+            )
+        });
+        assert!(matches!(d, AnswerDecision::Allowed { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn layer3_unidentified_product_dependent_question_without_any_signal_escalates() {
+        let q = SignalSet::new();
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &thresholds(),
+            &sections,
+            None,
+        ));
+        assert!(d.is_product_unidentified(), "{d:?}");
+    }
+
+    #[test]
+    fn layer3_identified_product_dependent_question_is_not_blocked_by_the_guard() {
+        let q = signals(&["discoloration"]);
+        let sections = vec!["doc-1#x".to_string()];
+        let d = decide(&identified_input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &thresholds(),
+            &sections,
+            None,
+        ));
+        assert!(matches!(d, AnswerDecision::Allowed { .. }), "{d:?}");
+    }
+    #[test]
+    fn preselected_known_resolution_with_unidentified_product_escalates_product_unidentified() {
+        let q = signals(&["led_red_blinking"]);
+        let resolution = kr("kr-1", &["led_red_blinking"]);
+        let th = thresholds();
+        let inp = input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.95),
+            calm(),
+            &th,
+            &[],
+            Some(&resolution),
+        );
+        assert!(matches!(
+            decide(&inp),
+            AnswerDecision::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                layer: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn preselected_known_resolution_with_identified_product_is_allowed() {
+        let q = signals(&["led_red_blinking"]);
+        let resolution = kr("kr-1", &["led_red_blinking"]);
+        let th = thresholds();
+        let inp = identified_input(
+            &q,
+            &[],
+            &[],
+            &[],
+            Some(0.1),
+            calm(),
+            &th,
+            &[],
+            Some(&resolution),
+        );
+        assert!(matches!(
+            decide(&inp),
+            AnswerDecision::Allowed {
+                source: AnswerSource::KnownResolution,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn insufficient_manual_with_unidentified_product_escalates_product_unidentified() {
+        let q = signals(&["discoloration"]);
+        let th = thresholds();
+        let inp = input(&q, &[], &[], &[], Some(0.01), calm(), &th, &[], None);
+        assert!(matches!(
+            decide(&inp),
+            AnswerDecision::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                layer: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn layer3_identified_product_with_signal_stays_allowed() {
+        let q = signals(&["discoloration"]);
+        let sections = vec!["doc-1#x".to_string()];
+        let th = thresholds();
+        let inp = identified_input(&q, &[], &[], &[], Some(0.95), calm(), &th, &sections, None);
+        assert!(matches!(decide(&inp), AnswerDecision::Allowed { .. }));
+    }
+
+    #[test]
     fn high_stakes_raises_threshold_and_escalates() {
         // S1-8 Done 条件 5: 第2層列挙に無くても stakes=high でしきい値が上がり escalate に倒れる
         let q = SignalSet::new();
@@ -1326,7 +1574,7 @@ mod tests {
             ng_near_hit: true,
             hazard_signal_count: 0,
         };
-        let d = decide(&input(
+        let d = decide(&identified_input(
             &q,
             &[],
             &[],
@@ -1351,7 +1599,7 @@ mod tests {
             other => panic!("expected high-stakes escalate, got {other:?}"),
         }
         // 同じ根拠でも low stakes なら答えられる（実用性のダイヤル）
-        let d2 = decide(&input(
+        let d2 = decide(&identified_input(
             &q,
             &[],
             &[],

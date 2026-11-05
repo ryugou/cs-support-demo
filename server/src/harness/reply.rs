@@ -109,6 +109,68 @@ pub struct ReplyHistoryTurn {
     pub text: String,
 }
 
+pub(crate) const MAX_JEV_HISTORY_CHARS: usize = 2_000;
+
+pub(crate) fn customer_history_window(history: &[ReplyHistoryTurn]) -> CustomerHistoryWindow {
+    let mut turns: Vec<String> = history
+        .iter()
+        .filter(|turn| turn.role == ReplyHistoryRole::Customer)
+        .map(|turn| crate::harness::prompt_input::collapse_to_single_line(&turn.text))
+        .filter(|text| !text.is_empty())
+        .collect();
+    let window_skip = turns.len().saturating_sub(MAX_HISTORY_TURNS);
+    turns.drain(..window_skip);
+
+    // 古い側から順に、合計が予算に収まるまで丸ごと落とす。`total_chars` は `turns` の総和なので、
+    // 全件落とせば 0 になりループは必ず終わる（`turns` が空でも panic しない）。
+    let mut total_chars: usize = turns.iter().map(|turn| turn.chars().count()).sum();
+    let mut dropped_turns = 0;
+    for turn in &turns {
+        if total_chars <= MAX_JEV_HISTORY_CHARS {
+            break;
+        }
+        total_chars -= turn.chars().count();
+        dropped_turns += 1;
+    }
+    turns.drain(..dropped_turns);
+    CustomerHistoryWindow {
+        turns,
+        window_skipped: window_skip,
+        budget_dropped: dropped_turns,
+    }
+}
+
+pub(crate) struct CustomerHistoryWindow {
+    pub(crate) turns: Vec<String>,
+    pub(crate) window_skipped: usize,
+    pub(crate) budget_dropped: usize,
+}
+
+pub(crate) fn select_customer_history_for_jev(
+    history: &[ReplyHistoryTurn],
+    request_id: &str,
+) -> Vec<String> {
+    let CustomerHistoryWindow {
+        turns,
+        window_skipped: window_skip,
+        budget_dropped: dropped_turns,
+    } = customer_history_window(history);
+    if window_skip > 0 || dropped_turns > 0 {
+        tracing::warn!(
+            request_id = %request_id,
+            window_dropped_turns = window_skip,
+            dropped_turns,
+            kept_turns = turns.len(),
+            reason = "jev_history_budget",
+            "past customer turns were dropped whole from jev's judgment input (via the history \
+             window and/or the character budget; turns are never truncated). if a dropped turn \
+             limited or negated something mentioned in a later turn, has_enough_info can come out \
+             either higher or lower than the whole conversation warrants"
+        );
+    }
+    turns
+}
+
 /// 会話履歴から、生成プロンプトに注入する分だけを選ぶ。
 ///
 /// 新しい側（末尾）から最大 [`MAX_HISTORY_TURNS`] ターン・合計 [`MAX_HISTORY_CHARS`] 字までを

@@ -446,22 +446,18 @@ async fn build_post_evaluate_reply(
             let known_facts =
                 build_known_facts(&harness.lexicon, &outcome.accumulated_signals, history);
             let is_final_clarify_turn = is_final_clarify_turn(conv, api_cfg);
-            let reply_text = match harness.reply_drafter.as_ref() {
-                Some(drafter) => {
-                    clarify::draft_clarify_question(
-                        drafter,
-                        &harness.ng,
-                        harness.reply_draft_max_tokens,
-                        message,
-                        &missing_text,
-                        &known_facts,
-                        is_continuation,
-                        allowlist,
-                    )
-                    .await
-                }
-                None => clarify::FALLBACK_CLARIFY_TEXT.to_string(),
-            };
+            let reply_text = clarify::clarify_question_text(
+                harness.reply_drafter.as_ref(),
+                &harness.ng,
+                harness.reply_draft_max_tokens,
+                message,
+                &missing_text,
+                &known_facts,
+                is_continuation,
+                allowlist,
+                outcome.decision.is_product_unidentified(),
+            )
+            .await;
             let reply_text = gate_generated_text(
                 reply_text,
                 allowlist,
@@ -1149,6 +1145,50 @@ mod tests {
             conv.clarify_turns, 1,
             "Clarify 分岐は clarify_turns を加算する"
         );
+    }
+
+    #[tokio::test]
+    async fn build_post_evaluate_reply_clarifies_product_unidentified_with_only_the_existing_fallback_when_no_drafter(
+    ) {
+        let harness = test_harness(vec!["ADC-V724"]);
+        let allowlist = harness.product_allowlist(TEST_SCHEMA).await.unwrap();
+        let api_cfg = default_api_config();
+        let mut conv = default_conv_state();
+        let mut outcome = base_outcome(
+            AnswerDecision::Escalate {
+                reason: EscalateReason::ProductUnidentified,
+                layer: 3,
+                route_to: "triage".to_string(),
+                disclosure_scope: DisclosureScope::ConfirmingWithTeam,
+                audit_required: true,
+                missing: Vec::new(),
+                hearing: None,
+                customer_ack: None,
+                known_resolution_id: None,
+            },
+            true,
+        );
+
+        let (kind, text) = build_post_evaluate_reply(
+            &harness,
+            &api_cfg,
+            &allowlist,
+            "req-1",
+            "赤いランプが点滅してる",
+            &[],
+            false,
+            &mut outcome,
+            &mut conv,
+        )
+        .await;
+
+        assert_eq!(kind, SupportReplyKind::Clarify);
+        assert_eq!(
+            text,
+            clarify::FALLBACK_CLARIFY_TEXT,
+            "drafter が無いとき、製品未特定の聞き返しは既存の FALLBACK_CLARIFY_TEXT だけに倒す"
+        );
+        assert_eq!(conv.clarify_turns, 1);
     }
 
     #[tokio::test]

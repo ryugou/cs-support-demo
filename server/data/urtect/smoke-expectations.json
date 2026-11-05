@@ -5,6 +5,7 @@
     { "utterance": "初期費用はいくらですか？", "expect_rule": "initial-cost-quote" },
     { "utterance": "解約したいです", "expect_rule": "contract-billing" },
     { "utterance": "請求額が違います", "expect_rule": "contract-billing" },
-    { "utterance": "担当者につないでください", "expect_rule": "human-handoff" }
+    { "utterance": "担当者につないでください", "expect_rule": "human-handoff" },
+    { "utterance": "赤いランプが点滅してる", "expect_rule": null, "expect_signal": "led_red_blinking" }
   ]
 }

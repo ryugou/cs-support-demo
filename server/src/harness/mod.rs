@@ -51,8 +51,9 @@ pub struct Harness {
     pub extractor: Arc<dyn extraction::AsyncSignalExtractor>,
     /// 取扱製品への言及抽出の入口（Issue #52: signals 抽出から分離した独立コンポーネント）。
     /// `evaluate` のみが使う（catalog 注入が必要なのは質問側ゲート二段目のみのため）。
-    /// LLM 未設定・呼び出し失敗のいずれでも空配列に degrade する（`extractor` が lexicon
-    /// フォールバックへ倒れるのと同じ decision-safe な扱いだが、signals とは独立に失敗する）。
+    /// Degrades to an empty list when no LLM is configured or the call fails, independently of signals.
+    /// An empty list is treated as no product identified, so a product-dependent turn gets a hearing
+    /// question (fail-closed).
     pub product_reference_extractor: extraction::ProductReferenceExtractor,
     pub ng: egress::NgDictionary,
     pub worm: Arc<audit::WormAuditLog>,
@@ -125,10 +126,11 @@ pub struct EvaluationOutcome {
     pub accumulated_signals: signal::SignalSet,
     /// 会話の継続キー。新規作成時は採番して返す
     pub case_id: String,
-    /// 聞き返し可否。第1層 binding=advisory かつ情報不足、または第3層グレー
-    /// （`InsufficientDirectness` / `UnknownAddedSignal`）のときのみ true。第1層
-    /// binding=mandatory と第2層（禁止ドメイン）は問答無用でルーティングし常に false
-    /// （契約の正本は `clarification_allowed()` 関数、Issue #54 + reviewer 一次レビュー Critical 1）
+    /// Whether the user may be asked a clarifying question this turn.
+    /// True only for a layer-1 advisory rule with missing information, a layer-3 gray decision
+    /// (`InsufficientDirectness` / `UnknownAddedSignal`), or `ProductUnidentified`.
+    /// Always false for layer-1 mandatory rules and layer 2.
+    /// The `clarification_allowed()` function is the source of truth for this contract.
     pub clarification_allowed: bool,
     pub hits: Vec<SectionHit>,
     pub audit_event_id: String,
@@ -138,10 +140,12 @@ pub struct EvaluationOutcome {
     pub related_cases: Vec<RelatedCase>,
     /// 今ターンの signal 抽出がどの経路を通ったか（S1-11 改訂・WORM 監査にも記録済み）。
     pub extraction_mode: extraction::ExtractionMode,
-    /// 顧客向け返信文の**下書き**（デモ用シミュレーション出力）。
+    /// Draft of the customer-facing reply (demo simulation output), not an authoritative answer.
     ///
-    /// `harness.customer_reply_draft_enabled = false`（既定）、LLM 未設定、生成失敗のいずれでも
-    /// `None`。**権威ある回答ではない**（文面の正本は client 側という spec の結論は不変）。
+    /// `None` when `harness.customer_reply_draft_enabled = false` (the default), when no LLM is
+    /// configured, or when generation fails. On the MCP `ProductUnidentified` path it is never
+    /// `None`: it holds the generated product-identification hearing, or the fallback clarify
+    /// text when generation or the egress gate rejects it.
     pub customer_reply_draft: Option<String>,
     /// 上記の下書きが `max_tokens` で**途中で切れている**か。
     ///
@@ -432,6 +436,63 @@ fn merge_outcome_attributes(
     merged
 }
 
+fn is_product_identified(
+    allowlist: &product_gate::ProductAllowlist,
+    resolved_matched_models: &[String],
+    product_key: Option<&str>,
+) -> bool {
+    !resolved_matched_models.is_empty()
+        || product_key
+            .and_then(|k| allowlist.canonical_model(k))
+            .is_some()
+}
+
+async fn window_matched_models(
+    allowlist: &product_gate::ProductAllowlist,
+    window: &PastTurnsWindow<'_>,
+) -> Vec<String> {
+    if window.extraction_mode != extraction::ExtractionMode::Hybrid {
+        return Vec::new();
+    }
+    let turns = reply::customer_history_window(window.history).turns;
+    if turns.is_empty() {
+        return Vec::new();
+    }
+    let refs = window
+        .extractor
+        .extract(
+            &turns.join("\n"),
+            allowlist.display_list(),
+            window.request_id,
+        )
+        .await;
+    let (refs, _discarded) =
+        adopt_product_references_for_extraction_mode(window.extraction_mode, refs);
+    case_switch::partition_matched_models(allowlist, &refs).0
+}
+
+struct PastTurnsWindow<'a> {
+    extractor: &'a extraction::ProductReferenceExtractor,
+    extraction_mode: extraction::ExtractionMode,
+    history: &'a [reply::ReplyHistoryTurn],
+    request_id: &'a str,
+}
+
+async fn identify_product(
+    allowlist: &product_gate::ProductAllowlist,
+    resolved_matched_models: &[String],
+    product_key: Option<&str>,
+    window: Option<&PastTurnsWindow<'_>>,
+) -> bool {
+    if is_product_identified(allowlist, resolved_matched_models, product_key) {
+        return true;
+    }
+    match window {
+        Some(window) => !window_matched_models(allowlist, window).await.is_empty(),
+        None => false,
+    }
+}
+
 /// 聞き返し可否（決定論、Issue #54 で契約を更新）:
 /// - 第1層（明示エスカレーションルール）は `missing` が非空（情報不足）のときだけ許可する。
 ///   `decision::decide` は第1層マッチ時にも `evidence_sufficient` で情報充足度を評価しており、
@@ -455,7 +516,8 @@ fn clarification_allowed(decision: &decision::AnswerDecision) -> bool {
             layer: 3,
             reason:
                 decision::EscalateReason::InsufficientDirectness
-                | decision::EscalateReason::UnknownAddedSignal,
+                | decision::EscalateReason::UnknownAddedSignal
+                | decision::EscalateReason::ProductUnidentified,
             ..
         } => true,
         _ => false,
@@ -662,6 +724,17 @@ fn second_stage_short_circuits(
     }
 }
 
+fn customer_reply_draft_fields(
+    identification_question: Option<String>,
+    reply_draft: Option<crate::llm::ReplyDraft>,
+) -> (Option<String>, bool) {
+    if let Some(question) = identification_question {
+        return (Some(question), false);
+    }
+    let truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
+    (reply_draft.map(|d| d.text), truncated)
+}
+
 /// `policy` と確定した `decision`・抽出モード・二段目ゲートが打ち切るかどうか
 /// （`second_stage_short_circuits`）から、`Harness::draft_customer_reply` を呼ぶかどうかを決める
 /// 純関数（Issue #78, #83）。`partial_answer_ok`（部分回答の可否）は Escalate の省略だけを緩める。
@@ -676,7 +749,7 @@ pub fn should_draft_reply(
     partial_answer_ok: bool,
 ) -> bool {
     match policy {
-        ReplyDraftPolicy::Always => true,
+        ReplyDraftPolicy::Always => !decision.is_product_unidentified(),
         ReplyDraftPolicy::SkipWhenUnused { .. } => {
             let is_allowed = matches!(decision, decision::AnswerDecision::Allowed { .. });
             let is_forced_escalation_by_extraction_failure =
@@ -695,6 +768,17 @@ pub fn should_draft_reply(
 struct ReplyDraftPlan {
     generate: bool,
     partial_answer_ok: bool,
+}
+
+pub(crate) fn classifier_window(
+    already_escalated: bool,
+    history: &[reply::ReplyHistoryTurn],
+) -> Vec<String> {
+    if already_escalated {
+        Vec::new()
+    } else {
+        reply::customer_history_window(history).turns
+    }
 }
 
 fn already_escalated_for_policy(policy: &ReplyDraftPolicy<'_>) -> bool {
@@ -1778,6 +1862,8 @@ impl Harness {
         // 抽出より前に allowlist を取得する（§3.2 の材料選別直前で取得していた従来位置から
         // 前倒し。以降の参照はすべてこの束縛を使い回し、二重取得しない）。
         let allowlist = self.product_allowlist(&ctx.schema).await?;
+        let recent_customer_turns =
+            classifier_window(already_escalated_for_policy(&policy), history);
         // KR 読み込み（gRPC）・signal 抽出・製品参照抽出（いずれも LLM 有効時は HTTP 往復を
         // 伴う）は互いに依存しないため並列発行し、往復レイテンシを重ねて隠す。signal 抽出と
         // 製品参照抽出は Issue #52 で別々の LLM 呼び出しに分離した独立コンポーネントであり
@@ -1790,12 +1876,15 @@ impl Harness {
                 self.extractor.as_ref(),
                 &self.product_reference_extractor,
                 question,
+                &recent_customer_turns,
                 allowlist.display_list(),
+                &ctx.request_id,
             ),
         );
         let resolutions = resolutions?;
         let signals = extraction_outcome.signals;
         let extraction_mode = extraction_outcome.mode;
+        let llm_product_dependent = extraction_outcome.product_dependent;
         // Issue #52 フォローアップ（Critical 是正）: signals 抽出が lexicon フォールバックへ
         // 落ちたターンは product_references を採用しない
         // （`adopt_product_references_for_extraction_mode` の doc を参照）。
@@ -1963,7 +2052,17 @@ impl Harness {
             stakes_input,
             applicable_known_resolution,
         } = kr_turn;
-        let decision_result = decision::decide(&decision::DecisionInput {
+        let existing_product_models = case_attrs
+            .get("product_models")
+            .cloned()
+            .unwrap_or_default();
+        let resolved_matched_models =
+            case_switch::resolve_matched_models(&allowlist, &product_references);
+        let product_identified =
+            is_product_identified(&allowlist, &resolved_matched_models, product_key);
+        let product_dependent = llm_product_dependent
+            .unwrap_or_else(|| self.lexicon.is_product_dependent_by_lexicon(decide_signals));
+        let mut decision_input = decision::DecisionInput {
             question_signals: decide_signals,
             question_raw: question,
             rules: &rules,
@@ -1975,7 +2074,29 @@ impl Harness {
             thresholds: &self.thresholds,
             default_route: &self.default_route,
             known_resolution: applicable_known_resolution.as_ref(),
-        });
+            product_identified,
+            product_dependent,
+        };
+        let mut decision_result = decision::decide(&decision_input);
+        if decision_result.is_product_unidentified() {
+            let window = PastTurnsWindow {
+                extractor: &self.product_reference_extractor,
+                extraction_mode,
+                history,
+                request_id: &ctx.request_id,
+            };
+            if identify_product(
+                &allowlist,
+                &resolved_matched_models,
+                product_key,
+                Some(&window),
+            )
+            .await
+            {
+                decision_input.product_identified = true;
+                decision_result = decision::decide(&decision_input);
+            }
+        }
         let handoff_items = handoff_items::handoff_items_for_decision(
             &decision_result,
             &rules,
@@ -2083,16 +2204,6 @@ impl Harness {
         // CS 連携モード。support schema に対して呼ぶ）の 3 つ。どの経路でも `product_models` は
         // 書き戻されるが、切り替えの自動検知は `api.rs::reply_handler` にしか無いため、
         // MCP 経路・アドバイザー経路の入出力・判定は変わらない（design doc §1 末尾）。
-        let existing_product_models = case_attrs
-            .get("product_models")
-            .cloned()
-            .unwrap_or_default();
-        // 解決（allowlist の一覧表記への正規化）は resolve_matched_models の1か所に集約する
-        // （design doc §2.1 末尾）。本関数の冒頭で取得済みの `allowlist` を
-        // 再利用する。未解決の警告は /api/reply と MCP の両経路で毎ターン通るここで 1 回だけ出す
-        // （api.rs::judge_product_switch はログを出さない側を使う）。
-        let resolved_matched_models =
-            case_switch::resolve_matched_models(&allowlist, &product_references);
         case_attrs.insert(
             "product_models".to_string(),
             case_switch::merge_product_models(&existing_product_models, &resolved_matched_models),
@@ -2111,6 +2222,15 @@ impl Harness {
             decision::AnswerDecision::Allowed { source, .. } => {
                 (format!("allowed:{source:?}"), None)
             }
+            decision::AnswerDecision::Escalate {
+                reason: decision::EscalateReason::ProductUnidentified,
+                layer,
+                route_to,
+                ..
+            } => (
+                format!("escalate:layer{layer}:product_unidentified"),
+                Some(route_to.clone()),
+            ),
             decision::AnswerDecision::Escalate {
                 layer, route_to, ..
             } => (format!("escalate:layer{layer}"), Some(route_to.clone())),
@@ -2251,8 +2371,28 @@ impl Harness {
             }
             None => None,
         };
-        let customer_reply_draft_truncated = reply_draft.as_ref().is_some_and(|d| d.truncated);
-        let customer_reply_draft = reply_draft.map(|d| d.text);
+        let identification_question = if matches!(policy, ReplyDraftPolicy::Always)
+            && decision_result.is_product_unidentified()
+        {
+            Some(
+                clarify::clarify_question_text(
+                    self.reply_drafter.as_ref(),
+                    &self.ng,
+                    self.reply_draft_max_tokens,
+                    question,
+                    "",
+                    "",
+                    is_continuation,
+                    &allowlist,
+                    true,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let (customer_reply_draft, customer_reply_draft_truncated) =
+            customer_reply_draft_fields(identification_question, reply_draft);
         let partial_answer =
             is_partial_answer_draft(partial_answer_ok, customer_reply_draft.as_deref());
 
@@ -2451,7 +2591,7 @@ impl Harness {
                     .manual
                     .as_ref()
                     .ok_or_else(|| anyhow!("manual store not configured"))?;
-                let extraction_outcome = self.extractor.extract(corrected_answer).await;
+                let extraction_outcome = self.extractor.extract(corrected_answer, &[]).await;
                 tracing::debug!(
                     mode = extraction_outcome.mode.as_str(),
                     "root_cause_probe signal extraction mode"
@@ -3221,6 +3361,24 @@ mod tests {
     }
 
     #[test]
+    fn should_draft_reply_is_false_for_always_when_product_unidentified() {
+        let decision = escalate_for_contract_test(
+            3,
+            decision::EscalateReason::ProductUnidentified,
+            Vec::new(),
+        );
+        for mode in all_extraction_modes() {
+            assert!(!should_draft_reply(
+                &ReplyDraftPolicy::Always,
+                &decision,
+                mode,
+                false,
+                false
+            ));
+        }
+    }
+
+    #[test]
     fn should_draft_reply_is_false_for_escalate_without_partial_answer_ok() {
         let decision =
             escalate_for_contract_test(1, decision::EscalateReason::RegulatedOrSafety, Vec::new());
@@ -3262,6 +3420,8 @@ mod tests {
             },
             thresholds: &thresholds,
             default_route: "triage",
+            product_identified: true,
+            product_dependent: true,
             known_resolution: None,
         })
     }
@@ -3327,6 +3487,50 @@ mod tests {
             decide_with_bundled_rules_and_high_manual_score(decide_signals),
             decision::AnswerDecision::Escalate { layer: 1, .. }
         ));
+    }
+
+    fn symptom_history() -> Vec<reply::ReplyHistoryTurn> {
+        vec![
+            reply::ReplyHistoryTurn {
+                role: reply::ReplyHistoryRole::Customer,
+                text: "赤いランプが点滅してる".to_string(),
+            },
+            reply::ReplyHistoryTurn {
+                role: reply::ReplyHistoryRole::Assistant,
+                text: "型番を教えてください".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn classifier_window_carries_customer_turns_only_for_a_case_that_is_not_escalated() {
+        let allowlist = product_gate::ProductAllowlist::from_models(vec!["ADC-V724".to_string()]);
+        let customer_turns = vec!["赤いランプが点滅してる".to_string()];
+        let cases = [
+            (ReplyDraftPolicy::Always, customer_turns.clone()),
+            (
+                ReplyDraftPolicy::SkipWhenUnused {
+                    response_allowlist: &allowlist,
+                    already_escalated: false,
+                    partial_answer_enabled: true,
+                },
+                customer_turns,
+            ),
+            (
+                ReplyDraftPolicy::SkipWhenUnused {
+                    response_allowlist: &allowlist,
+                    already_escalated: true,
+                    partial_answer_enabled: true,
+                },
+                Vec::new(),
+            ),
+        ];
+        for (policy, expected) in cases {
+            assert_eq!(
+                classifier_window(already_escalated_for_policy(&policy), &symptom_history()),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -4924,6 +5128,237 @@ mod tests {
     }
 
     #[test]
+    fn clarification_is_allowed_for_layer3_product_unidentified() {
+        let d = escalate_for_contract_test(
+            3,
+            decision::EscalateReason::ProductUnidentified,
+            Vec::new(),
+        );
+        assert!(clarification_allowed(&d));
+    }
+
+    fn identified_allowlist() -> product_gate::ProductAllowlist {
+        product_gate::ProductAllowlist::from_models(vec!["ABC-100".to_string()])
+    }
+
+    #[test]
+    fn explicit_product_key_in_allowlist_counts_as_identified() {
+        assert!(is_product_identified(
+            &identified_allowlist(),
+            &[],
+            Some("abc-100")
+        ));
+    }
+
+    #[test]
+    fn explicit_product_key_outside_allowlist_does_not_count() {
+        assert!(!is_product_identified(
+            &identified_allowlist(),
+            &[],
+            Some("ZZZ-999")
+        ));
+    }
+
+    #[test]
+    fn absent_product_key_without_other_evidence_is_unidentified() {
+        assert!(!is_product_identified(&identified_allowlist(), &[], None));
+    }
+
+    #[test]
+    fn a_matched_model_this_turn_counts_as_identified() {
+        assert!(is_product_identified(
+            &identified_allowlist(),
+            &["ABC-100".to_string()],
+            None
+        ));
+    }
+
+    struct ModelInTextClassifier;
+
+    #[async_trait::async_trait]
+    impl extraction::ClassifyProductReferences for ModelInTextClassifier {
+        async fn classify(
+            &self,
+            question: &str,
+            _catalog: &str,
+        ) -> anyhow::Result<Vec<product_gate::ProductReference>> {
+            Ok(if question.contains("ABC-100") {
+                vec![product_gate::ProductReference {
+                    surface: "ABC-100".to_string(),
+                    resolution: product_gate::ProductReferenceResolution::Matched,
+                    matched_model: Some("ABC-100".to_string()),
+                }]
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    fn customer(text: &str) -> reply::ReplyHistoryTurn {
+        reply::ReplyHistoryTurn {
+            role: reply::ReplyHistoryRole::Customer,
+            text: text.to_string(),
+        }
+    }
+
+    fn assistant(text: &str) -> reply::ReplyHistoryTurn {
+        reply::ReplyHistoryTurn {
+            role: reply::ReplyHistoryRole::Assistant,
+            text: text.to_string(),
+        }
+    }
+
+    fn classifier_extractor() -> extraction::ProductReferenceExtractor {
+        extraction::ProductReferenceExtractor::new(Some(
+            Arc::new(ModelInTextClassifier) as Arc<dyn extraction::ClassifyProductReferences>
+        ))
+    }
+
+    #[tokio::test]
+    async fn multi_turn_symptom_then_model_then_symptom_is_identified_while_the_model_is_in_the_window(
+    ) {
+        let allowlist = identified_allowlist();
+        let extractor = classifier_extractor();
+        let hybrid = extraction::ExtractionMode::Hybrid;
+        let empty: Vec<reply::ReplyHistoryTurn> = Vec::new();
+        let w1 = PastTurnsWindow {
+            extractor: &extractor,
+            extraction_mode: hybrid,
+            history: &empty,
+            request_id: "req-test",
+        };
+        assert!(!identify_product(&allowlist, &[], None, Some(&w1)).await);
+        assert!(identify_product(&allowlist, &["ABC-100".to_string()], None, None).await);
+        let h3 = vec![
+            customer("赤いランプが点滅してる"),
+            assistant("製品名か型番を教えてください"),
+            customer("ABC-100 です"),
+            assistant("確認します"),
+        ];
+        let w3 = PastTurnsWindow {
+            extractor: &extractor,
+            extraction_mode: hybrid,
+            history: &h3,
+            request_id: "req-test",
+        };
+        assert!(identify_product(&allowlist, &[], None, Some(&w3)).await);
+        assert!(!identify_product(&allowlist, &[], None, None).await);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_dropped_out_of_the_window_no_longer_identifies_the_product() {
+        let mut h = vec![customer("ABC-100 です")];
+        for i in 0..reply::MAX_HISTORY_TURNS {
+            h.push(customer(&format!("症状の続き {i}")));
+        }
+        let extractor = classifier_extractor();
+        let window = PastTurnsWindow {
+            extractor: &extractor,
+            extraction_mode: extraction::ExtractionMode::Hybrid,
+            history: &h,
+            request_id: "req-test",
+        };
+        assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
+    }
+
+    #[tokio::test]
+    async fn case_product_models_without_a_matched_reference_in_the_window_stays_unidentified() {
+        let h = vec![customer("赤いランプが点滅してる")];
+        let extractor = classifier_extractor();
+        let window = PastTurnsWindow {
+            extractor: &extractor,
+            extraction_mode: extraction::ExtractionMode::Hybrid,
+            history: &h,
+            request_id: "req-test",
+        };
+        assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
+    }
+
+    #[tokio::test]
+    async fn window_references_are_not_adopted_when_signal_extraction_fell_back_to_the_lexicon() {
+        let h = vec![customer("ABC-100 です")];
+        let extractor = classifier_extractor();
+        let window = PastTurnsWindow {
+            extractor: &extractor,
+            extraction_mode: extraction::ExtractionMode::LexiconFallback,
+            history: &h,
+            request_id: "req-test",
+        };
+        assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
+    }
+
+    struct CountingClassifier {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl extraction::ClassifyProductReferences for CountingClassifier {
+        async fn classify(
+            &self,
+            _question: &str,
+            _catalog: &str,
+        ) -> anyhow::Result<Vec<product_gate::ProductReference>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_past_turns_window_does_not_call_the_extractor_unless_the_current_turn_is_hybrid() {
+        let counter = Arc::new(CountingClassifier {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let extractor = extraction::ProductReferenceExtractor::new(Some(
+            counter.clone() as Arc<dyn extraction::ClassifyProductReferences>
+        ));
+        let h = vec![customer("ABC-100 です")];
+        for mode in [
+            extraction::ExtractionMode::LexiconOnly,
+            extraction::ExtractionMode::LexiconFallback,
+        ] {
+            let window = PastTurnsWindow {
+                extractor: &extractor,
+                extraction_mode: mode,
+                history: &h,
+                request_id: "req-test",
+            };
+            assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
+        }
+        assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let window = PastTurnsWindow {
+            extractor: &extractor,
+            extraction_mode: extraction::ExtractionMode::Hybrid,
+            history: &h,
+            request_id: "req-test",
+        };
+        identify_product(&identified_allowlist(), &[], None, Some(&window)).await;
+        assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn identification_question_replaces_the_generated_draft_and_is_never_truncated() {
+        let generated = Some(crate::llm::ReplyDraft {
+            text: "生成".to_string(),
+            truncated: true,
+        });
+        let (text, truncated) =
+            customer_reply_draft_fields(Some("・どの製品ですか".to_string()), generated);
+        assert_eq!(text, Some("・どの製品ですか".to_string()));
+        assert!(!truncated);
+        assert_eq!(customer_reply_draft_fields(None, None), (None, false));
+        assert_eq!(
+            customer_reply_draft_fields(
+                None,
+                Some(crate::llm::ReplyDraft {
+                    text: "生成".to_string(),
+                    truncated: true,
+                })
+            ),
+            (Some("生成".to_string()), true)
+        );
+    }
+
+    #[test]
     fn clarification_is_allowed_for_layer3_gray() {
         let insufficient_directness = escalate_for_contract_test(
             3,
@@ -5019,6 +5454,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5058,6 +5495,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5101,6 +5540,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5137,6 +5578,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5172,6 +5615,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5201,6 +5646,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
+            product_dependent: false,
             known_resolution: None,
         });
         assert!(
@@ -5237,6 +5684,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: true,
+            product_dependent: true,
             known_resolution: None,
         });
         assert!(
@@ -5430,6 +5879,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
+            product_dependent: false,
             known_resolution: None,
         });
         assert!(
@@ -5459,6 +5910,8 @@ mod tests {
             stakes_input: contract_test_calm_stakes(),
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: false,
+            product_dependent: false,
             known_resolution: None,
         });
         assert!(
@@ -5468,6 +5921,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unscoped_symptom_with_third_party_material_is_not_answered() {
+        let lexicon = signal::LexiconNormalizer::from_json(include_str!(
+            "../../data/urtect/signal-lexicon.json"
+        ))
+        .expect("bundled lexicon must parse");
+        let question = "赤いランプが点滅してる";
+        let signals = signal::SignalNormalizer::normalize(&lexicon, question);
+        assert!(
+            signals.iter().any(|s| s.as_str() == "led_red_blinking"),
+            "precondition: the utterance must hit led_red_blinking, got {signals:?}"
+        );
+
+        let allow = product_gate::ProductAllowlist::from_models(vec![
+            "ADC-V724".to_string(),
+            "ADC-V523".to_string(),
+            "ADC-VC727P".to_string(),
+        ]);
+        let hits = vec![scoped_hit(
+            "alarmcom#aeotec-led-bulb-red-blinking",
+            "Aeotec LED電球の赤色点滅",
+            "Aeotec LED電球が赤く点滅している場合は、Z-Wave ネットワークからの除外と再ペアリングを行ってください。",
+        )];
+        let filtered = filter_out_of_scope_hits(hits, &allow);
+        let best_manual_score = filtered.first().map(|h| h.score);
+        let sections: Vec<String> = filtered.iter().map(|h| h.section_key.clone()).collect();
+        let rules = crate::test_support::load_bundled_escalation_rules();
+        let domains = crate::test_support::load_bundled_prohibited_domains();
+        let d = decision::decide(&decision::DecisionInput {
+            question_signals: &signals,
+            question_raw: question,
+            rules: &rules,
+            domains: &domains,
+            resolutions: &[],
+            best_manual_score,
+            best_manual_sections: &sections,
+            stakes_input: contract_test_calm_stakes(),
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
+            known_resolution: None,
+        });
+        assert!(
+            !matches!(d, decision::AnswerDecision::Allowed { .. }),
+            "a product-less symptom must not be answered from a third-party (no ADC- token) \
+             material; expected Escalate (hearing/clarify), got {d:?}"
+        );
+    }
     // ---- adopt_product_references_for_extraction_mode（Issue #52 フォローアップ、Critical 是正）----
     //
     // PR #30 以前と同じ end-to-end 挙動（signals 抽出失敗時は product_references が必ず空だった）
@@ -6307,6 +6809,8 @@ mod tests {
             stakes_input: turn.stakes_input,
             thresholds: &contract_test_thresholds(),
             default_route: "triage",
+            product_identified: true,
+            product_dependent: true,
             known_resolution: turn.applicable_known_resolution.as_ref(),
         });
         assert!(matches!(
@@ -6316,6 +6820,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn decide_turn_escalates_product_unidentified_on_a_signal_only_from_a_previous_turn() {
+        let harness = kr_selection_harness(Some(KrStubJudge::selecting(&["kr_a"])), &[]);
+        let allowlist = product_gate::ProductAllowlist::from_models(Vec::new());
+        let policy = ReplyDraftPolicy::SkipWhenUnused {
+            response_allowlist: &allowlist,
+            already_escalated: false,
+            partial_answer_enabled: false,
+        };
+        let krs = [contract_test_kr("kr_a", &["a"])];
+        let signals = contract_test_signals(&[]);
+        let accumulated = contract_test_signals(&["a"]);
+        let turn = harness
+            .prepare_kr_turn(
+                &kr_ctx(),
+                krs.to_vec(),
+                &policy,
+                &signals,
+                &accumulated,
+                &[],
+                CUSTOMER_TEXT,
+                CUSTOMER_TEXT,
+                HYBRID,
+            )
+            .await;
+        let decision = decision::decide(&decision::DecisionInput {
+            question_signals: turn.decide_signals,
+            question_raw: CUSTOMER_TEXT,
+            rules: &[],
+            domains: &[],
+            resolutions: &turn.resolutions,
+            best_manual_score: Some(1.0),
+            best_manual_sections: &[],
+            stakes_input: turn.stakes_input,
+            thresholds: &contract_test_thresholds(),
+            default_route: "triage",
+            product_identified: false,
+            product_dependent: true,
+            known_resolution: turn.applicable_known_resolution.as_ref(),
+        });
+        assert!(
+            matches!(
+                decision,
+                decision::AnswerDecision::Escalate {
+                    reason: decision::EscalateReason::ProductUnidentified,
+                    ..
+                }
+            ),
+            "product_dependent かつ製品未特定なら、今ターンに signal が無くても ProductUnidentified になる: {decision:?}"
+        );
     }
 
     #[tokio::test]
