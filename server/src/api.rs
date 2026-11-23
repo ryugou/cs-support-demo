@@ -1667,15 +1667,12 @@ async fn present_name_confirmation(
 ///    state 変更はすべて `evaluate()` を呼ぶ**前**に保存を完了させる（`save_conv_state` の
 ///    lost-update 契約。`harness::mod::Harness::save_conv_state` の doc コメント参照）。
 ///    時間帯返信として確定した場合はここで応答を返し、`evaluate()` を呼ばない。
-///    5.5. 名称の確認待ちがあれば、発話を確認への返答として解釈して保存する（Issue #153。
-///    `2026-11-23-name-typo-confirmation-design.md` §3 が名称の確認を組み込む処理順の正本）。
 /// 6. `harness.evaluate`。`Err` はエラー分類関数で 503 / 500（500 は必ず `tracing::error!`）
 ///    6.5. `Ok(outcome)` を受け取った直後、conv state を取り直す**前**に Issue #28 §3.1 二段目
 ///    （`second_stage_out_of_scope_reply`）を判定する。foreign 確定なら evaluate() の判定
 ///    （signal 累積・`last_decision`・WORM 監査は既に書き込み済み）を破棄し、
 ///    `demote_case_to_out_of_scope` で case の正本を実際に返した内容へ一致させてから
 ///    定型応答（§4）を返す。
-///    6.6. 二段目に該当しなければ、名称の確認が必要かを判定し、必要なら確認文を返す（Issue #153）。
 /// 7. 二段目に該当しなければ、最新の conv state を取り直し、`decide_reply_action`
 ///    （design doc §2 の決定表）で `Answer` / `Clarify` / `EscalationReply` を決めて 200 を返す
 async fn reply_handler(
