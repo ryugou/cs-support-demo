@@ -14,6 +14,8 @@ pub mod model;
 pub mod oauth;
 pub mod project;
 pub mod proto;
+#[cfg(test)]
+pub(crate) mod reply_test_harness;
 pub mod resolve;
 pub mod rmcp_server;
 pub mod shutdown;
