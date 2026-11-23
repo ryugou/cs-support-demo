@@ -1,4 +1,5 @@
 use super::*;
+use crate::harness::clarify::{build_clarify_prompt, build_product_identification_prompt};
 use crate::harness::name_confirmation::flow::test_support::{assistant, customer, names_with};
 use crate::harness::name_confirmation::state::ConfirmationState;
 use crate::harness::name_confirmation::test_fixtures::{company_target, f_name, f_p7, product};
@@ -161,4 +162,46 @@ fn the_identified_products_are_read_from_the_case_attributes() {
         vec!["ADC-V523".to_string(), "ADC-V724".to_string()]
     );
     assert!(identified_product_models(&HashMap::new()).is_empty());
+}
+
+#[test]
+fn the_hearing_after_a_denial_lists_only_the_other_products_and_no_similar_one() {
+    let allowlist = f_p7();
+    let mut state = ConfirmationState::default();
+    state.deny(&[product("ADC-VC729P")]);
+    let denied = names_with(&allowlist, state);
+    let untouched = names_with(&allowlist, ConfirmationState::default());
+    for (names, withheld) in [(&denied, true), (&untouched, false)] {
+        let hearing = names.hearing_allowlist(&allowlist);
+        let (clarify, _) = build_clarify_prompt("録画されない", "型番", "", false, &hearing);
+        let (identification, _) =
+            build_product_identification_prompt("録画されない", "", false, &hearing);
+        for system in [&clarify, &identification] {
+            assert_eq!(
+                system.contains("顧客が違うと答えた製品を除いてある"),
+                withheld,
+                "{system}"
+            );
+            assert_eq!(
+                system.contains("「ほかの取扱製品」として挙げ"),
+                withheld,
+                "{system}"
+            );
+            assert_eq!(
+                system.contains("「近い」「似ている」という言葉を使わない"),
+                withheld,
+                "{system}"
+            );
+            assert_eq!(
+                system.contains("本体のラベルや購入時の書類で型番を確認してもらう"),
+                withheld,
+                "{system}"
+            );
+        }
+        assert_eq!(
+            clarify.contains("- 当社の取扱製品は次のとおりです: "),
+            !withheld,
+            "{clarify}"
+        );
+    }
 }

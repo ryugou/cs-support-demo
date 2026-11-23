@@ -208,6 +208,7 @@ pub struct ProductAllowlist {
     models: Vec<String>,
     names: HashMap<String, String>,
     aliases: HashMap<String, Vec<String>>,
+    withholds_models: bool,
 }
 
 impl ProductAllowlist {
@@ -247,6 +248,7 @@ impl ProductAllowlist {
             models: usable,
             names: HashMap::new(),
             aliases: HashMap::new(),
+            withholds_models: false,
         }
     }
 
@@ -353,6 +355,7 @@ impl ProductAllowlist {
             .cloned()
             .collect();
         Self {
+            withholds_models: self.withholds_models || models.len() < self.models.len(),
             names: self
                 .names
                 .iter()
@@ -367,6 +370,10 @@ impl ProductAllowlist {
                 .collect(),
             ..Self::from_models(models)
         }
+    }
+
+    pub(crate) fn withholds_models(&self) -> bool {
+        self.withholds_models
     }
 
     /// 正規化済みトークンが allowlist 内か。

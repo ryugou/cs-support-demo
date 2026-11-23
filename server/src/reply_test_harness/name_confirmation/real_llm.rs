@@ -12,6 +12,9 @@ const F_P7_MODELS: [&str; 7] = [
     "ADC-VC727P",
     "ADC-VC827P",
 ];
+const SIMILARITY_WORDS: [&str; 5] = ["近い", "近し", "似て", "似た", "類似"];
+const OTHER_PRODUCTS_WORDS: [&str; 2] = ["ほか", "他の"];
+const LABEL_WORDS: [&str; 2] = ["ラベル", "書類"];
 const QUESTION_ENDINGS: [&str; 10] = [
     "？",
     "?",
@@ -88,6 +91,36 @@ fn asks_about(text: &str, words: &[&str]) -> bool {
                 .iter()
                 .any(|ending| sentence.contains(ending))
     })
+}
+
+fn models_in(text: &str) -> Vec<&'static str> {
+    let tokens: Vec<&str> = text
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+        .collect();
+    F_P7_MODELS
+        .iter()
+        .copied()
+        .filter(|model| tokens.contains(model))
+        .collect()
+}
+
+fn frames_a_product_as_similar(text: &str) -> bool {
+    sentences(text).iter().any(|sentence| {
+        !models_in(sentence).is_empty()
+            && SIMILARITY_WORDS.iter().any(|word| sentence.contains(word))
+    })
+}
+
+fn lists_the_other_products_as_a_whole(text: &str, denied: &str) -> bool {
+    let others = others_than(&[denied]);
+    let listed = models_in(text);
+    listed.is_empty()
+        || (others.iter().all(|model| listed.contains(model))
+            && OTHER_PRODUCTS_WORDS.iter().any(|word| text.contains(word)))
+}
+
+fn acknowledges_and_asks_for_the_label(text: &str, written: &str) -> bool {
+    text.contains(written) && LABEL_WORDS.iter().any(|word| text.contains(word))
 }
 
 fn check_confirmation(
@@ -348,6 +381,18 @@ async fn t4_tie_and_denial(checks: &mut Checks) {
             turn.reply_text != FALLBACK_CLARIFY_TEXT,
         );
         checks.check("not_identified", turn.product_models.is_empty());
+        checks.check(
+            "no_similar_product_after_denial",
+            !frames_a_product_as_similar(&turn.reply_text),
+        );
+        checks.check(
+            "other_products_listed_as_a_whole",
+            lists_the_other_products_as_a_whole(&turn.reply_text, "ADC-VC729P"),
+        );
+        checks.check(
+            "notation_acknowledged_and_label_asked",
+            acknowledges_and_asks_for_the_label(&turn.reply_text, "ADV-VC729P"),
+        );
     }
 }
 
@@ -422,4 +467,25 @@ async fn l3_real_llm_name_confirmation() {
     failures.extend(checks.failures);
     println!("L3 summary failures={failures:?}");
     assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
+fn the_denial_checks_reject_the_hearings_seen_before_the_fix() {
+    let similar = "ご使用の機器の型番について確認させていただきたいのですが、ADV-VC729P ではなく、当社の製品は ADC-VC827P または ADC-VC727P のいずれかに近いでしょうか、それとも別の型番でしょうか。";
+    let partial = "ADV-VC729Pをお使いとのことですね。申し訳ございませんが、その型番は当社の取扱製品に該当しないようです。お使いの機器の型番をもう一度ご確認いただき、ADC-V523、ADC-V523X、ADC-V724、ADC-V724X、ADC-VC727P、ADC-VC827Pのいずれかに当てはまるかお知らせいただけますでしょうか。";
+    assert!(frames_a_product_as_similar(similar));
+    assert!(!lists_the_other_products_as_a_whole(similar, "ADC-VC729P"));
+    assert!(!lists_the_other_products_as_a_whole(partial, "ADC-VC729P"));
+    assert!(!acknowledges_and_asks_for_the_label(partial, "ADV-VC729P"));
+
+    let expected = "ADV-VC729P とお知らせいただきありがとうございます。お手数ですが、本体のラベルに記載の型番をご確認いただけますか。ほかの取扱製品は ADC-V523、ADC-V523X、ADC-V724、ADC-V724X、ADC-VC727P、ADC-VC827P です。";
+    assert!(!frames_a_product_as_similar(expected));
+    assert!(lists_the_other_products_as_a_whole(expected, "ADC-VC729P"));
+    assert!(acknowledges_and_asks_for_the_label(expected, "ADV-VC729P"));
+    let without_list =
+        "ADV-VC729P とのことですね。本体のラベルに記載の型番を教えていただけますか。";
+    assert!(lists_the_other_products_as_a_whole(
+        without_list,
+        "ADC-VC729P"
+    ));
 }
