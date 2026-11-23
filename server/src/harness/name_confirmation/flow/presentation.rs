@@ -8,12 +8,8 @@ use crate::harness::name_confirmation::interpret::ReplyResolution;
 use crate::harness::name_confirmation::matcher::{
     find_mentions, name_key, MentionMatch, NameMention,
 };
-use crate::harness::name_confirmation::state::{
-    capped_suggestions, AskReason, PendingMention, MAX_PENDING_MENTIONS,
-};
-use crate::harness::product_gate::{
-    find_confirmed_foreign_reference, is_safe_to_reflect, ProductAllowlist,
-};
+use crate::harness::name_confirmation::state::{PendingMention, MAX_PENDING_MENTIONS};
+use crate::harness::product_gate::{find_confirmed_foreign_reference, ProductAllowlist};
 use crate::harness::reply::{customer_history_window, ReplyHistoryTurn};
 use crate::harness::{EvaluationOutcome, Harness, RequestContext};
 
@@ -154,27 +150,23 @@ impl NameConfirmation {
             if mentions.len() >= MAX_PENDING_MENTIONS {
                 break;
             }
-            let listed = mentions
+            if mentions
                 .iter()
-                .any(|presented| presented.pending.surface_key == mention.key);
-            let live: Vec<NameTarget> = self
+                .any(|presented| presented.pending.surface_key == mention.key)
+            {
+                continue;
+            }
+            let live = self
                 .live_suggestions(mention)
                 .into_iter()
                 .filter(|target| !written_now.contains(&target))
                 .collect();
-            if listed || live.is_empty() {
-                continue;
+            if let Some(pending) = PendingMention::first_ask(mention, live) {
+                mentions.push(PresentedMention {
+                    pending,
+                    earlier_message,
+                });
             }
-            mentions.push(PresentedMention {
-                pending: PendingMention {
-                    surface: mention.surface.clone(),
-                    surface_key: mention.key.clone(),
-                    suggestions: capped_suggestions(live),
-                    asks: 0,
-                    reason: AskReason::First,
-                },
-                earlier_message,
-            });
         }
         mentions
     }
@@ -193,10 +185,7 @@ impl NameConfirmation {
             MentionMatch::Typo => true,
             MentionMatch::Exact => mention.targets.len() > 1,
         };
-        if !needs_confirmation
-            || self.state.is_settled(&mention.key)
-            || !is_safe_to_reflect(&mention.surface)
-        {
+        if !needs_confirmation || self.state.is_settled(&mention.key) {
             return Vec::new();
         }
         mention

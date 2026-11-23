@@ -5,8 +5,7 @@ use serde::Deserialize;
 
 use super::catalog::{NameCatalog, NameKind, NameTarget};
 use super::matcher::{find_mentions, name_key, MentionMatch, NameMention};
-use super::state::{capped_suggestions, AskReason, ConfirmationState, PendingMention, MAX_ASKS};
-use crate::harness::product_gate::is_safe_to_reflect;
+use super::state::{AskReason, ConfirmationState, PendingMention, MAX_ASKS};
 use crate::harness::prompt_input::{neutralize_delimiters, truncate_question};
 use crate::llm::{strip_markdown_fence, AnthropicClient};
 
@@ -278,25 +277,18 @@ fn correct(
         confirm(state, &mention, target, resolution);
         return;
     }
-    let retyped = mentions.iter().find_map(|found| {
-        let live: Vec<NameTarget> = found
-            .targets
-            .iter()
-            .filter(|target| !state.is_denied(target))
-            .cloned()
-            .collect();
-        (found.matched == MentionMatch::Typo
-            && !live.is_empty()
-            && !state.is_settled(&found.key)
-            && is_safe_to_reflect(&found.surface))
-        .then(|| PendingMention {
-            surface: found.surface.clone(),
-            surface_key: found.key.clone(),
-            suggestions: capped_suggestions(live),
-            asks: 0,
-            reason: AskReason::First,
-        })
-    });
+    let retyped = mentions
+        .iter()
+        .filter(|found| found.matched == MentionMatch::Typo && !state.is_settled(&found.key))
+        .find_map(|found| {
+            let live = found
+                .targets
+                .iter()
+                .filter(|target| !state.is_denied(target))
+                .cloned()
+                .collect();
+            PendingMention::first_ask(found, live)
+        });
     match retyped {
         Some(pending) => state.push_pending(pending),
         None => resolution.unresolved_surface = Some(mention.surface),

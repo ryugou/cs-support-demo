@@ -1,5 +1,8 @@
 use super::*;
-use crate::harness::name_confirmation::test_fixtures::{company_target, product};
+use crate::harness::name_confirmation::matcher::find_mentions;
+use crate::harness::name_confirmation::test_fixtures::{
+    catalog_of, company_target, f_p7, product, F_P7,
+};
 
 fn pending(surface: &str, suggestions: Vec<NameTarget>) -> PendingMention {
     PendingMention {
@@ -111,4 +114,34 @@ fn pending_mentions_are_capped_and_unique() {
         .map(|mention| mention.surface.as_str())
         .collect();
     assert_eq!(surfaces, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn a_first_ask_starts_unasked_with_at_most_the_suggestion_limit() {
+    let catalog = catalog_of(&f_p7());
+    let mention = &find_mentions("ADV-VC729Pが録画されない", &catalog)[0];
+    let suggestions: Vec<NameTarget> = F_P7.iter().map(|model| product(model)).collect();
+    let pending = PendingMention::first_ask(mention, suggestions).expect("a safe notation");
+    assert_eq!(pending.surface, "ADV-VC729P");
+    assert_eq!((pending.asks, pending.reason), (0, AskReason::First));
+    assert_eq!(pending.suggestions.len(), MAX_SUGGESTIONS);
+}
+
+#[test]
+fn a_first_ask_is_refused_without_a_suggestion_or_for_a_notation_unsafe_to_show() {
+    let catalog = catalog_of(&f_p7());
+    let safe = &find_mentions("ADV-VC729Pが録画されない", &catalog)[0];
+    assert_eq!(PendingMention::first_ask(safe, Vec::new()), None);
+    let unsafe_mentions: Vec<NameMention> =
+        find_mentions("ADV-VC7\u{200B}29Pが録画されない", &catalog)
+            .into_iter()
+            .filter(|mention| mention.surface.contains('\u{200B}'))
+            .collect();
+    assert!(!unsafe_mentions.is_empty());
+    for mention in &unsafe_mentions {
+        assert_eq!(
+            PendingMention::first_ask(mention, vec![product("ADC-VC729P")]),
+            None
+        );
+    }
 }

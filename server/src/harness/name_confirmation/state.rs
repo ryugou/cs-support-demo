@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::catalog::{NameKind, NameTarget};
+use super::matcher::NameMention;
 use crate::harness::product_gate::is_safe_to_reflect;
 
 pub(crate) const STATE_ATTRIBUTE: &str = "name_confirmation";
@@ -28,6 +29,32 @@ pub(crate) struct PendingMention {
     pub(crate) suggestions: Vec<NameTarget>,
     pub(crate) asks: u8,
     pub(crate) reason: AskReason,
+}
+
+impl PendingMention {
+    pub(crate) fn first_ask(
+        mention: &NameMention,
+        mut suggestions: Vec<NameTarget>,
+    ) -> Option<Self> {
+        suggestions.truncate(MAX_SUGGESTIONS);
+        let pending = Self {
+            surface: mention.surface.clone(),
+            surface_key: mention.key.clone(),
+            suggestions,
+            asks: 0,
+            reason: AskReason::First,
+        };
+        pending.is_valid().then_some(pending)
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.surface.is_empty()
+            && is_safe_to_reflect(&self.surface)
+            && !self.surface_key.is_empty()
+            && (1..=MAX_SUGGESTIONS).contains(&self.suggestions.len())
+            && self.suggestions.iter().all(is_complete_target)
+            && self.asks <= MAX_ASKS
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,14 +198,7 @@ impl ConfirmationState {
         {
             bail!("invalid name confirmation state: too many entries");
         }
-        let pending_valid = self.pending.iter().all(|pending| {
-            !pending.surface.is_empty()
-                && is_safe_to_reflect(&pending.surface)
-                && !pending.surface_key.is_empty()
-                && (1..=MAX_SUGGESTIONS).contains(&pending.suggestions.len())
-                && pending.suggestions.iter().all(is_complete_target)
-                && pending.asks <= MAX_ASKS
-        });
+        let pending_valid = self.pending.iter().all(PendingMention::is_valid);
         let records_valid = self.confirmed.iter().all(|confirmed| {
             !confirmed.surface_key.is_empty() && is_complete_target(&confirmed.target)
         }) && self.denied.iter().all(|denied| !denied.id.is_empty())
@@ -188,11 +208,6 @@ impl ConfirmationState {
         }
         Ok(self)
     }
-}
-
-pub(crate) fn capped_suggestions(mut suggestions: Vec<NameTarget>) -> Vec<NameTarget> {
-    suggestions.truncate(MAX_SUGGESTIONS);
-    suggestions
 }
 
 fn is_complete_target(target: &NameTarget) -> bool {
