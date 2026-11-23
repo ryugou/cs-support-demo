@@ -206,3 +206,6 @@ fn audit_event_id_or_empty(audited: Result<String>, ctx: &RequestContext, case_i
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

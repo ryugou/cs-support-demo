@@ -176,3 +176,6 @@ pub(crate) async fn identified_product_models(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

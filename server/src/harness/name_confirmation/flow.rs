@@ -176,4 +176,6 @@ pub(crate) fn rewritten_context(
 }
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
