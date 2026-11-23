@@ -638,6 +638,7 @@ MCP request（認証情報付き）
    第2層 prohibited_domain 照合 → 触れた: 領域の受け皿へエスカレーション
    第1層 advisory の escalation_rule 照合 → マッチ: 固有ルーティングで確定（選定済みの KR があれば回答を同乗）
    製品未特定（製品依存の問い合わせかつ製品未特定。依存の判定は抽出 LLM の product_dependent（今ターンの発話と直近の顧客発話の窓で判断。MCP 経路は今ターンのみ）、得られなければ累積 signal の語彙）→ KR Allowed・第3層より前に ProductUnidentified（Clarify。文面は LLM 生成・失敗時は既存の FALLBACK_CLARIFY_TEXT）で確定。詳細は docs/superpowers/specs/2026-08-12-conversation-flow-v11-design.md §10
+       （/api/reply は製品参照を登録名称の照合で絞り、登録名称から 1 文字だけ違う表記は確認してから特定する。docs/superpowers/specs/2026-11-23-name-typo-confirmation-design.md）
    第3層 answerability
        stakes = classify_stakes(SignalSet, binding, owner)     // low/mid/high
        threshold = answerability_threshold(stakes)             // 3 段（将来 Π 連続）
@@ -1041,6 +1042,10 @@ S1-0 の三原則に加え、Step 2 / Step 3 を無改修で載せるために S
 - **判定・応答文生成・egress_gate はすべて `Harness::evaluate()`（本ドキュメントが定義する decision ハーネス）に閉じる。** `/api/reply` はその薄い HTTP アダプタであり、`evaluate()` が返す `decision` と `customer_reply_draft` から応答文を選ぶ純関数（`reply_text_for`）を持つだけで、判定ロジックを持たない。
 - **MCP インターフェース（`evaluate_answerability` 等）とは判定経路を共有し、レスポンス整形だけが異なる。** 3 層判定・signal 抽出・escalation 判定・grade 運用は、本ドキュメント本文（S1-1〜S1-11）で定義したものと**同一**で、この節による変更はない。未知 `case_id` の扱いだけ経路ごとに分岐する（`/api/reply` は新規 case へフォールバック、MCP 経路は従来どおり拒否。理由は design doc §2）。
 - **LINE アダプタは判断ゼロ。** 署名検証・応答生成 API への 1 コール・LINE への返信・ユーザ単位の会話履歴保持（プロセス内メモリ）のみを行い、判定・生成ロジックを一切持たない。会話履歴は原則、生成プロンプトへの注入にのみ使い、判定（signal 抽出・第1〜3層の escalation 判定・signal 累積）には使わない（既存の case 機構が判定側のターン間文脈を担う）。**例外**: ヒアリング契約 `product_and_symptom` を宣言した第1層ルール（`warranty-failure`）の聞き返し判定（Jev の `has_enough_info`）に限り、顧客発話の履歴が判定入力になる（`[jev] enabled = true` のときのみ動く。適用範囲は「追記: Jev（TypeSafe System One）の適用範囲（Issue #56 / #58、2026-09-21）」節、正本は `docs/superpowers/specs/2026-09-21-jev-shadow-design.md` §7）。
+- **名称のタイポ候補の確認は `/api/reply`（CS の経路）がサーバ側で行う（Issue #153）。** 正本は `docs/superpowers/specs/2026-11-23-name-typo-confirmation-design.md`。
+  - 顧客の発話や直近の顧客発話の窓に、登録名称（製品の型番・製品名・別名、Punk Records の project schema に登録した社名）から 1 文字だけ違う表記があれば、回答・聞き返し・取扱外の定型応答の前に、顧客の表記と候補を並べて確認する。
+  - 確認待ちの候補と確定した名称は case（`support_case.name_confirmation`）に持つ。顧客の返答の解釈は LLM（抽出）、確定・否定・見送りの判断はコードが行う。即時の取次（第1層 mandatory・第2層）は確認より先に判定し、確認で遅らせない。
+  - 上記の「会話履歴は判定に使わない」原則の例外として、窓の顧客発話を、確認する表記の取り出しと、確定したターンの検索文（確定した表記を正式表記に置き換えた発話）に使う。LINE アダプタは判断を持たず、MCP 経路と advisor（homesec）経路では確認を行わない。
 - **相談対象（製品）の切り替えは `/api/reply`（CS の経路）がサーバ側で決定論により検知し、新しい case を作って履歴・累積 signal を引き継がせない（Issue #61）。** LINE アダプタはサーバの指示（応答の `case_reset`）に追従してセッションをリセットするだけで、切り替えの判定自体は行わない（上記「LINE アダプタは判断ゼロ」の原則の範囲内）。advisor（homesec）経路ではこの自動検知を行わない。利用者による明示的なリセット（クイックリプライ「別の相談を始める」、ポストバック）はアダプタ側の挙動としてどちらの経路でも効く。正本は `docs/superpowers/specs/2026-10-06-case-reset-on-topic-switch-design.md`。
 
 ## フェーズロードマップとの関係
