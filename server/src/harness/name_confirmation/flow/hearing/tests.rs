@@ -149,3 +149,16 @@ fn an_identified_product_with_a_name_tells_the_hearing_its_model() {
         "- 確認済みの製品: みまもりドームカメラ（型番 ADC-V724）"
     );
 }
+
+#[test]
+fn the_identified_products_are_read_from_the_case_attributes() {
+    let attributes = HashMap::from([(
+        "product_models".to_string(),
+        "ADC-V523,ADC-V724".to_string(),
+    )]);
+    assert_eq!(
+        identified_product_models(&attributes),
+        vec!["ADC-V523".to_string(), "ADC-V724".to_string()]
+    );
+    assert!(identified_product_models(&HashMap::new()).is_empty());
+}

@@ -1171,12 +1171,21 @@ impl Harness {
         ctx: &RequestContext,
         case_id: &str,
     ) -> Result<CaseConvState> {
-        let attrs = self
+        Ok(conv_state_from_attrs(
+            &self.load_case_attributes(ctx, case_id).await?,
+        ))
+    }
+
+    pub(crate) async fn load_case_attributes(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        Ok(self
             .knowledge()?
             .load_case(&ctx.schema, case_id)
             .await?
-            .unwrap_or_default();
-        Ok(conv_state_from_attrs(&attrs))
+            .unwrap_or_default())
     }
 
     /// support_case の会話状態を保存する。read-merge-write で既存属性（`question` 等）を保ち、

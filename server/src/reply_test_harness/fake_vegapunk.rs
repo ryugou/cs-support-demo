@@ -32,6 +32,7 @@ struct GraphState {
     nodes: BTreeMap<String, NodeRecord>,
     edges: BTreeSet<EdgeKey>,
     unavailable_node_types: BTreeSet<String>,
+    unavailable_after_server_write: BTreeSet<String>,
     queried_node_types: Vec<String>,
 }
 
@@ -91,8 +92,21 @@ impl GraphStore {
             .insert(node_type.to_string());
     }
 
+    pub(crate) fn make_queries_unavailable_after_the_server_writes(&self, node_type: &str) {
+        self.lock()
+            .unavailable_after_server_write
+            .insert(node_type.to_string());
+    }
+
     pub(crate) fn queried_node_types(&self) -> Vec<String> {
         self.lock().queried_node_types.clone()
+    }
+
+    fn record_server_write(&self, node_type: &str) {
+        let mut state = self.lock();
+        if state.unavailable_after_server_write.contains(node_type) {
+            state.unavailable_node_types.insert(node_type.to_string());
+        }
     }
 
     fn record_query(&self, node_type: &str) -> bool {
@@ -245,6 +259,7 @@ impl FakeEngine {
         for node in nodes {
             self.store
                 .upsert_node(&node.id, &node.r#type, attrs_of(node.attributes));
+            self.store.record_server_write(&node.r#type);
         }
         count
     }

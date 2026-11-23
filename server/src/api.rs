@@ -21,7 +21,8 @@ use crate::harness::name_confirmation::{
 use crate::harness::product_gate;
 use crate::harness::reply::{select_customer_history_for_jev, ReplyHistoryRole, ReplyHistoryTurn};
 use crate::harness::{
-    clarify, escalation_reply, hours, time_pref, Harness, ReplyDraftPolicy, RequestContext,
+    clarify, conv_state_from_attrs, escalation_reply, hours, time_pref, Harness, ReplyDraftPolicy,
+    RequestContext,
 };
 use crate::mcp::ToolService;
 use crate::oauth::VerifiedIdentity;
@@ -2080,10 +2081,15 @@ async fn reply_handler(
                 .await;
             }
 
-            let mut conv = match state.harness.load_conv_state(&ctx, &outcome.case_id).await {
-                Ok(conv) => conv,
+            let case_attributes = match state
+                .harness
+                .load_case_attributes(&ctx, &outcome.case_id)
+                .await
+            {
+                Ok(attributes) => attributes,
                 Err(err) => return conv_state_load_failed(&err, &request_id, &outcome.case_id),
             };
+            let mut conv = conv_state_from_attrs(&case_attributes);
 
             // Issue #28 §3.5: 応答側ゲート（決定論・最終防衛線）その 1/3。回答下書き。
             // `decide_reply_action`（下記）より前に判定する: `outcome.customer_reply_draft` を
@@ -2222,13 +2228,7 @@ async fn reply_handler(
                     };
                     // B1: 把握済み事項リスト（design doc §3 v1.2 追記）。聞き返しのたびに
                     // 既知の情報を再質問してしまう退行を防ぐ。
-                    let identified_models = identified_product_models(
-                        &state.harness,
-                        &ctx,
-                        &outcome.case_id,
-                        &allowlist,
-                    )
-                    .await;
+                    let identified_models = identified_product_models(&case_attributes);
                     let known_facts = names.with_name_facts(
                         build_known_facts(
                             &state.harness.lexicon,

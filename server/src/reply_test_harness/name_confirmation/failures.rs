@@ -150,3 +150,25 @@ async fn the_product_allowlist_does_not_read_company_names() {
         .queried_node_types()
         .contains(&"Company".to_string()));
 }
+
+#[tokio::test]
+async fn a_failed_case_read_after_the_evaluation_returns_an_error_and_no_hearing() {
+    let h = ReplyHarness::start(f_name_fixture()).await;
+    h.llm().respond_classify(&[], true);
+    h.llm()
+        .respond_text(LlmKind::ProductReferences, r#"{"product_references":[]}"#);
+    let mut conv = h.conversation();
+    conv.say("録画されません").await;
+    h.store()
+        .make_queries_unavailable_after_the_server_writes("support_case");
+
+    let turn = conv.say("みまもりドームカメラです").await;
+    println!("L2 case=g3-case-read-after-evaluation {}", turn.log_line());
+    assert_eq!(turn.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let body = turn.error_body.clone().unwrap_or_default();
+    assert!(body.contains("failed to load conversation state"), "{body}");
+    assert!(turn.llm_requests_of(LlmKind::Clarify).is_empty());
+    assert!(turn
+        .llm_requests_of(LlmKind::ProductIdentification)
+        .is_empty());
+}

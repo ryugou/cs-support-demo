@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use super::{NameConfirmation, PRODUCT_MODELS_ATTRIBUTE};
 use crate::harness::knowledge::csv_list;
@@ -7,7 +8,6 @@ use crate::harness::name_confirmation::interpret::ReplyResolution;
 use crate::harness::name_confirmation::matcher::{find_mentions, MentionMatch};
 use crate::harness::product_gate::ProductAllowlist;
 use crate::harness::reply::{customer_history_window, ReplyHistoryTurn};
-use crate::harness::{Harness, RequestContext};
 
 const CONFIRMED_PRODUCT_FACT: &str = "- 確認済みの製品: ";
 const CONFIRMED_MODEL_OPEN: &str = "（型番 ";
@@ -149,31 +149,10 @@ fn confirmed_fact(target: &NameTarget) -> String {
     }
 }
 
-pub(crate) async fn identified_product_models(
-    harness: &Harness,
-    ctx: &RequestContext,
-    case_id: &str,
-    allowlist: &ProductAllowlist,
-) -> Vec<String> {
-    if allowlist.catalog().iter().all(|(_, name)| name.is_none()) {
-        return Vec::new();
-    }
-    let loaded = match harness.store() {
-        Ok(store) => store.load_case(&ctx.schema, case_id).await,
-        Err(err) => Err(err),
-    };
-    match loaded {
-        Ok(attributes) => attributes
-            .and_then(|attributes| {
-                attributes
-                    .get(PRODUCT_MODELS_ATTRIBUTE)
-                    .map(|written| csv_list(written))
-            })
-            .unwrap_or_default(),
-        Err(err) => {
-            tracing::warn!(request_id = %ctx.request_id, case_id, error = ?err, "failed to read the identified products for a hearing; continuing without them");
-            Vec::new()
-        }
+pub(crate) fn identified_product_models(case_attributes: &HashMap<String, String>) -> Vec<String> {
+    match case_attributes.get(PRODUCT_MODELS_ATTRIBUTE) {
+        Some(written) => csv_list(written),
+        None => Vec::new(),
     }
 }
 
