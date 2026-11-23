@@ -31,6 +31,8 @@ struct EdgeKey {
 struct GraphState {
     nodes: BTreeMap<String, NodeRecord>,
     edges: BTreeSet<EdgeKey>,
+    unavailable_node_types: BTreeSet<String>,
+    queried_node_types: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -81,6 +83,22 @@ impl GraphStore {
             .filter(|n| n.node_type == node_type && n.node_id.starts_with(&prefix))
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn make_queries_unavailable_for(&self, node_type: &str) {
+        self.lock()
+            .unavailable_node_types
+            .insert(node_type.to_string());
+    }
+
+    pub(crate) fn queried_node_types(&self) -> Vec<String> {
+        self.lock().queried_node_types.clone()
+    }
+
+    fn record_query(&self, node_type: &str) -> bool {
+        let mut state = self.lock();
+        state.queried_node_types.push(node_type.to_string());
+        !state.unavailable_node_types.contains(node_type)
     }
 
     fn query(&self, req: &pb::QueryNodesRequest) -> Result<pb::QueryNodesResponse, String> {
@@ -301,8 +319,15 @@ engine_impl! {
         &self,
         request: Request<pb::QueryNodesRequest>,
     ) -> Result<Response<pb::QueryNodesResponse>, Status> {
+        let req = request.get_ref();
+        if !self.store.record_query(&req.node_type) {
+            return Err(Status::unavailable(format!(
+                "fake vegapunk makes queries for {} unavailable",
+                req.node_type
+            )));
+        }
         self.store
-            .query(request.get_ref())
+            .query(req)
             .map(Response::new)
             .map_err(Status::invalid_argument)
     }

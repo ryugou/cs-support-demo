@@ -13,7 +13,7 @@ use super::temp_dir::TempDir;
 use super::PROJECT_ID;
 use crate::api::{api_router, ApiState};
 use crate::config::AppConfig;
-
+use crate::harness::audit::WormAuditLog;
 use crate::harness::knowledge::{csv_list, harness_node_id};
 use crate::harness::{CaseConvState, Harness};
 use crate::mcp::ToolService;
@@ -87,6 +87,14 @@ impl ReplyHarness {
 
     pub(crate) fn api_state(&self) -> ApiState {
         self.state.clone()
+    }
+
+    pub(crate) fn harness(&self) -> &Harness {
+        &self.state.harness
+    }
+
+    pub(crate) fn audit_log(&self) -> Arc<WormAuditLog> {
+        self.state.harness.worm.clone()
     }
 
     pub(crate) fn vegapunk_client(&self) -> VegapunkClient {

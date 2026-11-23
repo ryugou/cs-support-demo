@@ -27,6 +27,7 @@ async fn t1_the_reported_conversation_confirms_the_model_and_resumes() {
     );
     assert!(first.product_models.is_empty());
     assert!(first.reply_text.contains("ADV-VC729P") && first.reply_text.contains("ADC-VC729P"));
+    assert_eq!(first.decision.as_deref(), Some("name_confirmation"));
 
     answer_yes(&h);
     let second = conv.say("はい、全く録画されていません").await;

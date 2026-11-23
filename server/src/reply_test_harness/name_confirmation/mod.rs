@@ -1,3 +1,4 @@
+mod failures;
 mod misproposals;
 mod real_llm;
 mod registered_names;

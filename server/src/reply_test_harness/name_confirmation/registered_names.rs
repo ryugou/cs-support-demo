@@ -29,6 +29,13 @@ async fn t3_a_swapped_japanese_product_name_is_confirmed_and_the_talk_resumes() 
         "the hearing must know the confirmed product and its model: {}",
         second.log_line()
     );
+    assert!(
+        hearing_requests(&second)
+            .iter()
+            .any(|request| request.user.contains("録画されません")),
+        "the resumed turn must carry the first symptom: {}",
+        second.log_line()
+    );
 
     let third = conv.say("昨日から録画されていません").await;
     log_turn("t3-product-name", &h, &third);
@@ -190,4 +197,31 @@ async fn t6_companies_registered_by_the_procedure_change_when_the_file_changes()
         &["ミドリノ防犯株式会社"],
         &[],
     );
+}
+
+#[tokio::test]
+async fn issue138_a_product_name_answer_to_the_hearing_identifies_the_product() {
+    let h = ReplyHarness::start(f_name_fixture()).await;
+    h.llm().respond_classify(&[], true);
+    h.llm()
+        .respond_text(LlmKind::ProductReferences, r#"{"product_references":[]}"#);
+    let mut conv = h.conversation();
+
+    let hearing = conv.say("録画されません").await;
+    log_turn("issue138-product-name-answer", &h, &hearing);
+    assert_eq!(hearing.reply_kind.as_deref(), Some("clarify"));
+    assert_eq!(hearing.decision.as_deref(), Some(PRODUCT_UNIDENTIFIED));
+
+    let answered = conv.say("みまもりドームカメラです").await;
+    log_turn("issue138-product-name-answer", &h, &answered);
+    assert_resumed(&answered);
+    assert_eq!(answered.product_models, vec!["ADC-V724".to_string()]);
+    assert!(answered
+        .llm_requests_of(LlmKind::ProductIdentification)
+        .is_empty());
+
+    let next = conv.say("昨日から録画されていません").await;
+    log_turn("issue138-product-name-answer", &h, &next);
+    assert_resumed(&next);
+    assert_eq!(next.product_models, vec!["ADC-V724".to_string()]);
 }
