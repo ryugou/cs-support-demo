@@ -1944,7 +1944,7 @@ mod tests {
         assert_eq!(attr(&build.nodes[0], "end_user_id"), Some("a1b2c3"));
     }
 
-    /// design doc §2 が列挙する 6 種の reply_kind のうち、実際に到達しうる 5 種（`fallback` は
+    /// design doc §2 が列挙する 7 種の reply_kind のうち、実際に到達しうる 6 種（`fallback` は
     /// api.rs のどの分岐からも到達しないため対象外。api.rs の doc コメント参照）が、すべて
     /// そのまま `reply_kind` 属性に載ることを固定する（属性組み立ての回帰）。
     #[test]
@@ -1955,6 +1955,7 @@ mod tests {
             "escalation",
             "out_of_scope",
             "time_pref",
+            "name_confirm",
         ] {
             let build = build_conversation_turn_graph(
                 "urtect",
