@@ -604,7 +604,7 @@ const KIND_KNOWN_RESOLUTION: &str = "KnownResolution";
 
 /// ConversationTurn 1 件分のグラフ表現（ノード + `case -HAS_TURN-> turn` 辺）を組み立てる
 /// 純関数（Issue #31 design doc §2）。`record_conversation_turn` から network I/O を分離して
-/// あるのは、属性組み立て・6 種の reply_kind 分類を実 vegapunk 無しでテストするため
+/// あるのは、属性組み立て・7 種の reply_kind 分類を実 vegapunk 無しでテストするため
 /// （`build_known_resolution_graph` / `build_answer_evidence_graph` と同じ規律）。
 ///
 /// **検索非汚染（design doc §2 受け入れ条件）**: 戻り値は `GraphBuild`（nodes/edges のみ）で

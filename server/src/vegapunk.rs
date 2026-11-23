@@ -822,9 +822,6 @@ impl VegapunkClient {
     }
 }
 
-/// offset ページングの終端判定: 1 ページで返った件数が要求 `page_size` 未満なら最終ページ。
-/// `<`（`<=` ではない）である点が重要 — ちょうど `page_size` 件返ったときはさらに次ページが
-/// 存在しうるため継続する。境界を誤ると早期終了（取りこぼし）か無限ループを招く。
 /// Reads the vegapunk bearer token for an ingest CLI from `token_file`, or from the environment
 /// variable `token_env` when the file is absent, unreadable, or blank.
 ///
@@ -856,6 +853,9 @@ pub fn read_cli_bearer_token(
     Ok(trimmed.to_string())
 }
 
+/// offset ページングの終端判定: 1 ページで返った件数が要求 `page_size` 未満なら最終ページ。
+/// `<`（`<=` ではない）である点が重要 — ちょうど `page_size` 件返ったときはさらに次ページが
+/// 存在しうるため継続する。境界を誤ると早期終了（取りこぼし）か無限ループを招く。
 fn page_is_last(returned: usize, page_size: usize) -> bool {
     returned < page_size
 }

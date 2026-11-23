@@ -1,23 +1,12 @@
-//! vegapunk（Punk Records の GraphRAG gRPC）のテスト用代替。
-//!
-//! 本番の `VegapunkClient` がそのまま接続できるよう、同じ proto（`graphrag.proto`）の
-//! サーバ側 trait を実装した in-process の gRPC サーバを `127.0.0.1` の空きポートで起動する。
-//! ノード・辺はメモリ上のグラフ（[`GraphStore`]）に保持し、ターンをまたいで読み戻せる。
-//!
-//! 実装する RPC は返信APIの経路が使うものだけ（`UpsertNodes` / `UpsertEdges` / `UpsertGraph` /
-//! `QueryNodes` / `GetGraphSnapshot` / `Search`）。それ以外は `unimplemented` を返す
-//! （未実装 RPC を呼ぶ変更が入ると、テストが `Unimplemented` で失敗して気づける）。
-//!
-//! 外部ネットワークには接続しない。ループバックの TCP を使うのは、本番の gRPC クライアント
-//! （tonic の Channel）をそのまま通すため。
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+
+use tonic::transport::server::TcpIncoming;
+use tonic::{Request, Response, Status};
 
 use crate::proto::graphrag as pb;
 use pb::graph_rag_engine_server::{GraphRagEngine, GraphRagEngineServer};
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
-use tonic::{Request, Response, Status};
 
-/// 1 ノード。`attributes` は `UpsertNodes` の全置換セマンティクスのまま保持する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NodeRecord {
     pub node_id: String,
@@ -26,7 +15,6 @@ pub(crate) struct NodeRecord {
 }
 
 impl NodeRecord {
-    /// 属性の値を返す。無ければ `None`。
     pub(crate) fn attr(&self, key: &str) -> Option<&str> {
         self.attributes.get(key).map(String::as_str)
     }
@@ -45,7 +33,6 @@ struct GraphState {
     edges: BTreeSet<EdgeKey>,
 }
 
-/// メモリ上のグラフ。サーバ実装とテスト（フィクスチャの投入・観測）が同じものを共有する。
 #[derive(Clone, Default)]
 pub(crate) struct GraphStore {
     state: Arc<Mutex<GraphState>>,
@@ -58,7 +45,6 @@ impl GraphStore {
             .expect("fake vegapunk graph state poisoned")
     }
 
-    /// ノードを全置換で保存する（`UpsertNodes` と同じ）。
     pub(crate) fn upsert_node(
         &self,
         node_id: &str,
@@ -75,7 +61,6 @@ impl GraphStore {
         );
     }
 
-    /// 辺を保存する（`from_id`・`to_id`・`edge_type` が同じなら 1 本にまとまる）。
     pub(crate) fn upsert_edge(&self, from_id: &str, to_id: &str, edge_type: &str) {
         self.lock().edges.insert(EdgeKey {
             from_id: from_id.to_string(),
@@ -84,12 +69,10 @@ impl GraphStore {
         });
     }
 
-    /// ノード 1 件を id で読む。
     pub(crate) fn node(&self, node_id: &str) -> Option<NodeRecord> {
         self.lock().nodes.get(node_id).cloned()
     }
 
-    /// `schema` の `node_type` のノードを id 昇順で全件返す。
     pub(crate) fn nodes_of_type(&self, schema: &str, node_type: &str) -> Vec<NodeRecord> {
         let prefix = schema_prefix(schema);
         self.lock()
@@ -199,13 +182,10 @@ impl GraphStore {
     }
 }
 
-/// `schema_generation_prefix`（`{schema}:gen1:`）。ノード id の先頭で schema を判別する。
 fn schema_prefix(schema: &str) -> String {
     crate::ingest::schema_generation_prefix(schema)
 }
 
-/// 数値として解釈できる両辺は数値で、それ以外は文字列で比較する（`AttributeFilter.value` の
-/// 「numeric inferred at runtime」に合わせる）。欠けた値は最小として扱う。
 fn compare_values(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
     match (a, b) {
         (None, None) => std::cmp::Ordering::Equal,
@@ -237,7 +217,6 @@ fn attrs_of(attributes: Vec<pb::NodeAttribute>) -> Vec<(String, String)> {
     attributes.into_iter().map(|a| (a.key, a.value)).collect()
 }
 
-/// gRPC サービス本体。状態は [`GraphStore`] にある。
 struct FakeEngine {
     store: GraphStore,
 }
@@ -262,9 +241,6 @@ impl FakeEngine {
     }
 }
 
-/// `GraphRagEngine` の実装を組み立てる。`async_trait` はマクロ呼び出しの展開前の impl しか見ない
-/// ため、実装する RPC（`impl { .. }`）と未実装の RPC（`unimplemented { .. }`）を 1 つの impl に
-/// まとめて出力する。未実装の RPC は返信APIの経路が使わないもので、`unimplemented` を返す。
 macro_rules! engine_impl {
     (
         impl { $($implemented:tt)* }
@@ -338,7 +314,6 @@ engine_impl! {
         Ok(Response::new(self.store.snapshot(request.get_ref())))
     }
 
-    /// 意味検索は常に 0 件を返す（ベクトルを持たないため）。
     async fn search(
         &self,
         _request: Request<pb::SearchRequest>,
@@ -385,7 +360,6 @@ engine_impl! {
     }
 }
 
-/// 起動中の vegapunk 代替。drop するとサーバを止める。
 pub(crate) struct FakeVegapunk {
     pub store: GraphStore,
     pub endpoint: String,
@@ -393,19 +367,17 @@ pub(crate) struct FakeVegapunk {
 }
 
 impl FakeVegapunk {
-    /// `127.0.0.1` の空きポートで gRPC サーバを起動する。
     pub(crate) async fn start(store: GraphStore) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a loopback port for the fake vegapunk");
         let addr = listener.local_addr().expect("read the fake vegapunk addr");
+        let incoming = TcpIncoming::from_listener(listener, true, None)
+            .expect("accept connections on the fake vegapunk listener");
         let service = GraphRagEngineServer::new(FakeEngine {
             store: store.clone(),
         });
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         let task = tokio::spawn(async move {
-            // サーバが落ちる（ポートを失う等）とテストの呼び出しが接続エラーで失敗する。
-            // ここで握りつぶさず、原因をテスト出力に残す。
             if let Err(err) = tonic::transport::Server::builder()
                 .add_service(service)
                 .serve_with_incoming(incoming)
