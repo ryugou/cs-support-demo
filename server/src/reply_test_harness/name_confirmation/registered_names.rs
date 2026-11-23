@@ -216,6 +216,15 @@ async fn issue138_a_product_name_answer_to_the_hearing_identifies_the_product() 
     log_turn("issue138-product-name-answer", &h, &answered);
     assert_resumed(&answered);
     assert_eq!(answered.product_models, vec!["ADC-V724".to_string()]);
+    let hearings = answered.llm_requests_of(LlmKind::Clarify);
+    assert!(
+        !hearings.is_empty()
+            && hearings.iter().all(|request| request
+                .user
+                .contains("- 特定済みの製品: みまもりドームカメラ（型番 ADC-V724）")),
+        "the hearing must know the identified product and its model: {}",
+        answered.log_line()
+    );
     assert!(answered
         .llm_requests_of(LlmKind::ProductIdentification)
         .is_empty());

@@ -15,7 +15,8 @@ use crate::harness::case_switch;
 use crate::harness::decision::{self, AnswerDecision};
 use crate::harness::extraction::{self, TurnExtraction};
 use crate::harness::name_confirmation::{
-    rewritten_context, NameConfirmation, Presentation, ProductNameMatching, ReplyResolution,
+    identified_product_models, rewritten_context, NameConfirmation, Presentation,
+    ProductNameMatching, ReplyResolution,
 };
 use crate::harness::product_gate;
 use crate::harness::reply::{select_customer_history_for_jev, ReplyHistoryRole, ReplyHistoryTurn};
@@ -2221,6 +2222,13 @@ async fn reply_handler(
                     };
                     // B1: 把握済み事項リスト（design doc §3 v1.2 追記）。聞き返しのたびに
                     // 既知の情報を再質問してしまう退行を防ぐ。
+                    let identified_models = identified_product_models(
+                        &state.harness,
+                        &ctx,
+                        &outcome.case_id,
+                        &allowlist,
+                    )
+                    .await;
                     let known_facts = names.with_name_facts(
                         build_known_facts(
                             &state.harness.lexicon,
@@ -2228,6 +2236,8 @@ async fn reply_handler(
                             eval_history,
                         ),
                         answered.as_ref(),
+                        &identified_models,
+                        &allowlist,
                     );
                     let hearing_allowlist = names.hearing_allowlist(&allowlist);
                     // B4: 残り確認回数の可視化（design doc §3 v1.2 追記）。この分岐に入る時点で

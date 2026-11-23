@@ -10,7 +10,9 @@ mod state;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 
-pub(crate) use flow::{rewritten_context, NameConfirmation, Presentation};
+pub(crate) use flow::{
+    identified_product_models, rewritten_context, NameConfirmation, Presentation,
+};
 pub(crate) use interpret::ReplyResolution;
 pub(crate) use screening::screen_product_references;
 

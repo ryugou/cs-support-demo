@@ -1,6 +1,8 @@
 mod hearing;
 mod presentation;
 
+pub(crate) use hearing::identified_product_models;
+
 use anyhow::{bail, Result};
 
 use super::catalog::{NameCatalog, NameKind, NameTarget};

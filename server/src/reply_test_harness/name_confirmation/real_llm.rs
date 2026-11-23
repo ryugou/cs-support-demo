@@ -179,7 +179,7 @@ async fn t1(checks: &mut Checks, first_message: &str) {
     ] {
         let turn = conv.say(message).await;
         print_turn(&checks.scenario, &h, &turn);
-        check_resumed(checks, &turn, &["型番"]);
+        check_resumed(checks, &turn, &["型番", "機種"]);
         checks.check(
             "identified",
             turn.product_models == vec!["ADC-VC729P".to_string()],
@@ -258,7 +258,7 @@ async fn t2_confirm(
         serde_json::json!({"message": "はい", "history": history, "case_id": recovered.case_id});
     let scenario = format!("{}-c", checks.scenario);
     let resumed = post_turn(h, &scenario, body).await;
-    check_resumed(checks, &resumed, &["型番"]);
+    check_resumed(checks, &resumed, &["型番", "機種"]);
     checks.check(
         "identified",
         resumed.product_models == vec!["ADC-VC729P".to_string()],
@@ -280,7 +280,7 @@ async fn t3_product_name(checks: &mut Checks) {
     for message in ["はい、そうです", "昨日から録画されていません"] {
         let turn = conv.say(message).await;
         print_turn(&checks.scenario, &h, &turn);
-        check_resumed(checks, &turn, &["型番", "製品名"]);
+        check_resumed(checks, &turn, &["型番", "製品名", "機種"]);
         checks.check(
             "identified",
             turn.product_models == vec!["ADC-V724".to_string()],
@@ -362,7 +362,7 @@ async fn issue138_product_name_answer(checks: &mut Checks) {
     );
     let answered = conv.say("みまもりドームカメラです").await;
     print_turn(&checks.scenario, &h, &answered);
-    check_resumed(checks, &answered, &["型番", "製品名"]);
+    check_resumed(checks, &answered, &["型番", "製品名", "機種"]);
     checks.check(
         "identified",
         answered.product_models == vec!["ADC-V724".to_string()],
@@ -383,7 +383,7 @@ async fn t5_out_of_scope_path(checks: &mut Checks) {
     );
     let turn = conv.say("はい").await;
     print_turn(&checks.scenario, &h, &turn);
-    check_resumed(checks, &turn, &["型番"]);
+    check_resumed(checks, &turn, &["型番", "機種"]);
     checks.check(
         "identified",
         turn.product_models == vec!["ADC-VC729P".to_string()],

@@ -6,7 +6,7 @@ use crate::harness::extraction::ExtractionMode;
 use crate::harness::name_confirmation::matcher::name_key;
 use crate::harness::name_confirmation::state::{AskReason, PendingMention};
 use crate::harness::name_confirmation::test_fixtures::{
-    catalog_of, company_target, f_p7, name_and_org_catalog, product,
+    catalog_of, company_target, f_name, f_p7, name_and_org_catalog, product,
 };
 use crate::harness::signal::SignalSet;
 use crate::harness::{DecisionBasis, EvaluationOutcome};
@@ -396,11 +396,16 @@ fn confirmed_names_join_the_known_facts() {
     state.confirm("b", company_target("ミドリノ警備保障株式会社"));
     let names = names_with(&f_p7(), state);
     assert_eq!(
-        names.with_name_facts("- 顧客発話: 録画されない".to_string(), None),
+        names.with_name_facts("- 顧客発話: 録画されない".to_string(), None, &[], &f_p7()),
         "- 顧客発話: 録画されない\n- 確認済みの製品: ADC-VC729P\n- 確認済みの社名: ミドリノ警備保障株式会社"
     );
     assert_eq!(
-        names_with(&f_p7(), ConfirmationState::default()).with_name_facts(String::new(), None),
+        names_with(&f_p7(), ConfirmationState::default()).with_name_facts(
+            String::new(),
+            None,
+            &[],
+            &f_p7()
+        ),
         ""
     );
 
@@ -414,7 +419,7 @@ fn confirmed_names_join_the_known_facts() {
         },
     );
     assert_eq!(
-        names_with(&f_p7(), by_name).with_name_facts(String::new(), None),
+        names_with(&f_p7(), by_name).with_name_facts(String::new(), None, &[], &f_name()),
         "- 確認済みの製品: みまもりドームカメラ（型番 ADC-V724）"
     );
 }
@@ -429,13 +434,13 @@ fn a_denial_tells_the_hearing_the_notation_and_the_names_to_leave_out() {
         unresolved_surface: Some("ADV-VC729P".to_string()),
     };
     assert_eq!(
-        names.with_name_facts("- 顧客発話: 録画されない".to_string(), Some(&denied)),
+        names.with_name_facts("- 顧客発話: 録画されない".to_string(), Some(&denied), &[], &f_p7()),
         "- 顧客発話: 録画されない\n\
          - 顧客がお知らせくださった名称（ADV-VC729P）は当社の登録名称と一致せず、確認した候補とも違うとのことです\n\
          - 顧客が違うと答えた候補（返信に書かない）: ADC-VC729P"
     );
     assert_eq!(
-        names.with_name_facts(String::new(), None),
+        names.with_name_facts(String::new(), None, &[], &f_p7()),
         "- 顧客が違うと答えた候補（返信に書かない）: ADC-VC729P"
     );
 }
@@ -495,5 +500,38 @@ fn the_hearing_after_a_denial_reads_the_notation_the_customer_wrote() {
     assert_eq!(
         NameConfirmation::hearing_question("いいえ、違います", &[], Some(&denied)),
         "いいえ、違います"
+    );
+}
+
+#[test]
+fn an_identified_product_with_a_name_tells_the_hearing_its_model() {
+    let names = names_with(&f_name(), ConfirmationState::default());
+    let identified = vec!["ADC-V724".to_string(), "ADC-V523".to_string()];
+    assert_eq!(
+        names.with_name_facts(String::new(), None, &identified, &f_name()),
+        "- 特定済みの製品: みまもりドームカメラ（型番 ADC-V724）"
+    );
+    assert_eq!(
+        names.with_name_facts(String::new(), None, &identified, &f_p7()),
+        ""
+    );
+
+    let mut confirmed = ConfirmationState::default();
+    confirmed.confirm(
+        "c",
+        NameTarget {
+            kind: NameKind::Product,
+            id: "ADC-V724".to_string(),
+            display: "みまもりドームカメラ".to_string(),
+        },
+    );
+    assert_eq!(
+        names_with(&f_name(), confirmed).with_name_facts(
+            String::new(),
+            None,
+            &identified,
+            &f_name()
+        ),
+        "- 確認済みの製品: みまもりドームカメラ（型番 ADC-V724）"
     );
 }

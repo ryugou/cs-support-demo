@@ -1,11 +1,13 @@
 use std::borrow::Cow;
 
-use super::NameConfirmation;
-use crate::harness::name_confirmation::catalog::NameKind;
+use super::{NameConfirmation, PRODUCT_MODELS_ATTRIBUTE};
+use crate::harness::knowledge::csv_list;
+use crate::harness::name_confirmation::catalog::{NameKind, NameTarget};
 use crate::harness::name_confirmation::interpret::ReplyResolution;
 use crate::harness::name_confirmation::matcher::{find_mentions, MentionMatch};
 use crate::harness::product_gate::ProductAllowlist;
 use crate::harness::reply::{customer_history_window, ReplyHistoryTurn};
+use crate::harness::{Harness, RequestContext};
 
 const CONFIRMED_PRODUCT_FACT: &str = "- 確認済みの製品: ";
 const CONFIRMED_MODEL_OPEN: &str = "（型番 ";
@@ -16,31 +18,32 @@ const UNMATCHED_NOTATION_NOTE: &str =
     "）は当社の登録名称と一致せず、確認した候補とも違うとのことです";
 const DENIED_NAMES_FACT: &str = "- 顧客が違うと答えた候補（返信に書かない）: ";
 const NAME_SEPARATOR: &str = "、";
+const IDENTIFIED_PRODUCT_FACT: &str = "- 特定済みの製品: ";
 
 impl NameConfirmation {
     pub(crate) fn with_name_facts(
         &self,
         known_facts: String,
         answered: Option<&ReplyResolution>,
+        identified_models: &[String],
+        allowlist: &ProductAllowlist,
     ) -> String {
         let mut lines: Vec<String> = Vec::new();
         if !known_facts.is_empty() {
             lines.push(known_facts);
         }
         for confirmed in self.state.confirmed() {
-            let target = &confirmed.target;
-            let line = match target.kind {
-                NameKind::Product if target.display == target.id => {
-                    format!("{CONFIRMED_PRODUCT_FACT}{}", target.id)
-                }
-                NameKind::Product => format!(
-                    "{CONFIRMED_PRODUCT_FACT}{}{CONFIRMED_MODEL_OPEN}{}{CONFIRMED_MODEL_CLOSE}",
-                    target.display, target.id
-                ),
-                NameKind::Company => format!("{CONFIRMED_COMPANY_FACT}{}", target.display),
-            };
+            let line = confirmed_fact(&confirmed.target);
             if !lines.contains(&line) {
                 lines.push(line);
+            }
+        }
+        for (model, name) in allowlist.catalog() {
+            let identified = identified_models.iter().any(|written| written == model);
+            if let (true, Some(name), false) = (identified, name, self.confirmed_product(model)) {
+                lines.push(format!(
+                    "{IDENTIFIED_PRODUCT_FACT}{name}{CONFIRMED_MODEL_OPEN}{model}{CONFIRMED_MODEL_CLOSE}"
+                ));
             }
         }
         if let Some(surface) =
@@ -61,6 +64,12 @@ impl NameConfirmation {
             ));
         }
         lines.join("\n")
+    }
+
+    fn confirmed_product(&self, model: &str) -> bool {
+        self.state.confirmed().iter().any(|confirmed| {
+            confirmed.target.kind == NameKind::Product && confirmed.target.id == model
+        })
     }
 
     pub(crate) fn hearing_allowlist<'a>(
@@ -124,5 +133,46 @@ impl NameConfirmation {
                     .iter()
                     .any(|target| self.state.is_denied(target))
             })
+    }
+}
+
+fn confirmed_fact(target: &NameTarget) -> String {
+    match target.kind {
+        NameKind::Product if target.display == target.id => {
+            format!("{CONFIRMED_PRODUCT_FACT}{}", target.id)
+        }
+        NameKind::Product => format!(
+            "{CONFIRMED_PRODUCT_FACT}{}{CONFIRMED_MODEL_OPEN}{}{CONFIRMED_MODEL_CLOSE}",
+            target.display, target.id
+        ),
+        NameKind::Company => format!("{CONFIRMED_COMPANY_FACT}{}", target.display),
+    }
+}
+
+pub(crate) async fn identified_product_models(
+    harness: &Harness,
+    ctx: &RequestContext,
+    case_id: &str,
+    allowlist: &ProductAllowlist,
+) -> Vec<String> {
+    if allowlist.catalog().iter().all(|(_, name)| name.is_none()) {
+        return Vec::new();
+    }
+    let loaded = match harness.store() {
+        Ok(store) => store.load_case(&ctx.schema, case_id).await,
+        Err(err) => Err(err),
+    };
+    match loaded {
+        Ok(attributes) => attributes
+            .and_then(|attributes| {
+                attributes
+                    .get(PRODUCT_MODELS_ATTRIBUTE)
+                    .map(|written| csv_list(written))
+            })
+            .unwrap_or_default(),
+        Err(err) => {
+            tracing::warn!(request_id = %ctx.request_id, case_id, error = ?err, "failed to read the identified products for a hearing; continuing without them");
+            Vec::new()
+        }
     }
 }
