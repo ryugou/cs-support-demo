@@ -2234,11 +2234,16 @@ async fn reply_handler(
                     // `decide_reply_action` の前提により `conv.clarify_turns < clarify_max_turns`
                     // は保証済み（`is_final_clarify_turn` の doc コメント参照）。
                     let is_final_clarify_turn = is_final_clarify_turn(&conv, &state.config.api);
+                    let hearing_question = NameConfirmation::hearing_question(
+                        &req.message,
+                        eval_history,
+                        answered.as_ref(),
+                    );
                     let reply_text = clarify::clarify_question_text(
                         state.harness.reply_drafter.as_ref(),
                         &state.harness.ng,
                         state.harness.reply_draft_max_tokens,
-                        &req.message,
+                        &hearing_question,
                         &missing_text,
                         &known_facts,
                         is_continuation,

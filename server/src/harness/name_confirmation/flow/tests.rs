@@ -431,7 +431,7 @@ fn a_denial_tells_the_hearing_the_notation_and_the_names_to_leave_out() {
     assert_eq!(
         names.with_name_facts("- 顧客発話: 録画されない".to_string(), Some(&denied)),
         "- 顧客発話: 録画されない\n\
-         - 顧客がお知らせくださった表記: ADV-VC729P（当社の登録名称と一致しません。確認した候補とは違うとのことです）\n\
+         - 顧客がお知らせくださった名称（ADV-VC729P）は当社の登録名称と一致せず、確認した候補とも違うとのことです\n\
          - 顧客が違うと答えた候補（返信に書かない）: ADC-VC729P"
     );
     assert_eq!(
@@ -472,4 +472,28 @@ fn the_hearing_catalog_leaves_out_denied_products() {
         untouched.hearing_allowlist(&allowlist),
         Cow::Borrowed(_)
     ));
+}
+
+#[test]
+fn the_hearing_after_a_denial_reads_the_notation_the_customer_wrote() {
+    let history = [
+        customer("ADV-VC729Pを使っているが録画されない"),
+        assistant("ADV-VC729P とお知らせいただきましたが、ADC-VC729P のことでしょうか？"),
+    ];
+    let denied = ReplyResolution {
+        confirmed: Vec::new(),
+        unresolved_surface: Some("ADV-VC729P".to_string()),
+    };
+    assert_eq!(
+        NameConfirmation::hearing_question("いいえ、違います", &history, Some(&denied)),
+        "ADV-VC729Pを使っているが録画されない\nいいえ、違います"
+    );
+    assert_eq!(
+        NameConfirmation::hearing_question("いいえ、違います", &history, None),
+        "いいえ、違います"
+    );
+    assert_eq!(
+        NameConfirmation::hearing_question("いいえ、違います", &[], Some(&denied)),
+        "いいえ、違います"
+    );
 }

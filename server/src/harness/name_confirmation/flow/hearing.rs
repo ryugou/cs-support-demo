@@ -5,14 +5,15 @@ use crate::harness::name_confirmation::catalog::NameKind;
 use crate::harness::name_confirmation::interpret::ReplyResolution;
 use crate::harness::name_confirmation::matcher::{find_mentions, MentionMatch};
 use crate::harness::product_gate::ProductAllowlist;
+use crate::harness::reply::{customer_history_window, ReplyHistoryTurn};
 
 const CONFIRMED_PRODUCT_FACT: &str = "- 確認済みの製品: ";
 const CONFIRMED_MODEL_OPEN: &str = "（型番 ";
 const CONFIRMED_MODEL_CLOSE: &str = "）";
 const CONFIRMED_COMPANY_FACT: &str = "- 確認済みの社名: ";
-const UNMATCHED_NOTATION_FACT: &str = "- 顧客がお知らせくださった表記: ";
+const UNMATCHED_NOTATION_FACT: &str = "- 顧客がお知らせくださった名称（";
 const UNMATCHED_NOTATION_NOTE: &str =
-    "（当社の登録名称と一致しません。確認した候補とは違うとのことです）";
+    "）は当社の登録名称と一致せず、確認した候補とも違うとのことです";
 const DENIED_NAMES_FACT: &str = "- 顧客が違うと答えた候補（返信に書かない）: ";
 const NAME_SEPARATOR: &str = "、";
 
@@ -91,6 +92,26 @@ impl NameConfirmation {
         } else {
             text
         }
+    }
+
+    pub(crate) fn hearing_question<'a>(
+        message: &'a str,
+        history: &[ReplyHistoryTurn],
+        answered: Option<&ReplyResolution>,
+    ) -> Cow<'a, str> {
+        let Some(surface) =
+            answered.and_then(|resolution| resolution.unresolved_surface.as_deref())
+        else {
+            return Cow::Borrowed(message);
+        };
+        customer_history_window(history)
+            .turns
+            .into_iter()
+            .rev()
+            .find(|turn| turn.contains(surface))
+            .map_or(Cow::Borrowed(message), |turn| {
+                Cow::Owned(format!("{turn}\n{message}"))
+            })
     }
 
     fn mentions_denied_name(&self, text: &str) -> bool {

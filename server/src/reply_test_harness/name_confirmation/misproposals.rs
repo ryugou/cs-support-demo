@@ -175,7 +175,14 @@ async fn t4_a_denied_candidate_is_not_offered_again() {
         assert!(
             request
                 .user
-                .contains("- 顧客がお知らせくださった表記: ADV-VC729P"),
+                .contains("- 顧客がお知らせくださった名称（ADV-VC729P）は当社の登録名称と一致せず"),
+            "{}",
+            request.user
+        );
+        assert!(
+            request
+                .user
+                .contains("ADV-VC729Pを使っているが録画されない\nいいえ、違います"),
             "{}",
             request.user
         );
