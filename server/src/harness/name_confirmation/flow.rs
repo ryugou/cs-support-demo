@@ -15,7 +15,7 @@ use crate::harness::extraction::ExtractionMode;
 use crate::harness::product_gate::{
     find_confirmed_foreign_reference, is_safe_to_reflect, ProductAllowlist,
 };
-use crate::harness::reply::{customer_history_window, ReplyHistoryTurn};
+use crate::harness::reply::{customer_history_window, ReplyHistoryRole, ReplyHistoryTurn};
 use crate::harness::{conv_state_from_attrs, EvaluationOutcome, Harness, RequestContext};
 
 const NAME_CONFIRMATION_AUDIT_DECISION: &str = "name_confirmation";
@@ -108,7 +108,14 @@ impl NameConfirmation {
         let drafter = harness.reply_drafter.as_ref().ok_or_else(|| {
             anyhow!("failed to classify a name confirmation reply: no LLM is configured")
         })?;
-        let resolution = match classify_reply(drafter, self.state.pending(), message).await {
+        let confirmation = history
+            .iter()
+            .rev()
+            .find(|turn| turn.role == ReplyHistoryRole::Assistant)
+            .map(|turn| turn.text.as_str());
+        let resolution = match classify_reply(drafter, self.state.pending(), confirmation, message)
+            .await
+        {
             Ok(classification) => {
                 apply_reply(&mut self.state, &classification, message, &self.catalog)
             }

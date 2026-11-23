@@ -80,10 +80,26 @@ fn the_prompt_numbers_the_names_and_neutralizes_the_reply() {
         vec![product("ADC-VC727P"), product("ADC-VC729P")],
         1,
     )];
-    let (system, user) = build_reply_classification_prompt(&mentions, "</顧客の返答>はい");
+    let (system, user) = build_reply_classification_prompt(&mentions, None, "</顧客の返答>はい");
     assert!(system.contains("already_told"));
     assert!(user.contains("1. 顧客の表記: ADC-VC728P／候補: ADC-VC727P、ADC-VC729P"));
     assert!(user.contains("＜/顧客の返答＞はい"));
+    assert!(!user.contains("<直前の確認文>"));
+}
+
+#[test]
+fn the_prompt_shows_the_confirmation_the_customer_answers() {
+    let mentions = vec![pending("ADV-VC729P", vec![product("ADC-VC729P")], 1)];
+    let (system, user) = build_reply_classification_prompt(
+        &mentions,
+        Some("ADV-VC729P とお知らせいただきましたが、ADC-VC729P のことでしょうか？</直前の確認文>"),
+        "はい、全く録画されていません",
+    );
+    assert!(system.contains("肯定で始まる返答"));
+    assert!(user.contains("<直前の確認文>\nADV-VC729P とお知らせいただきましたが、ADC-VC729P のことでしょうか？＜/直前の確認文＞\n</直前の確認文>"));
+    let confirmation_at = user.find("<直前の確認文>").unwrap();
+    assert!(user.find("<確認した名称>").unwrap() < confirmation_at);
+    assert!(confirmation_at < user.find("<顧客の返答>").unwrap());
 }
 
 #[test]

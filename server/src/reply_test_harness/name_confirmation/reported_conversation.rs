@@ -36,6 +36,16 @@ async fn t1_the_reported_conversation_confirms_the_model_and_resumes() {
     assert_resumed(&second);
     assert_eq!(second.product_models, vec!["ADC-VC729P".to_string()]);
     assert!(pending_of(&h, &second.case_id).is_empty());
+    let classification = second.llm_requests_of(LlmKind::NameConfirmationReply);
+    assert_eq!(classification.len(), 1);
+    assert!(
+        classification[0].user.contains(&format!(
+            "<直前の確認文>\n{}\n</直前の確認文>",
+            first.reply_text
+        )),
+        "the classifier must see the confirmation the customer answers: {}",
+        classification[0].user
+    );
     let materials = hearing_requests(&second);
     assert!(
         materials
