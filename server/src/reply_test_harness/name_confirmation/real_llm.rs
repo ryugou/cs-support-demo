@@ -102,8 +102,22 @@ fn check_confirmation(
         others.iter().all(|name| !turn.reply_text.contains(name)),
     );
     checks.check("M3", turn.reply_text != FALLBACK_CLARIFY_TEXT);
-    let fixed = format!("{written} とお知らせいただきましたが、");
-    checks.check("M4", !turn.reply_text.starts_with(&fixed));
+    checks.check(
+        "M4",
+        turn.reply_text != fixed_confirmation(written, suggestions),
+    );
+}
+
+fn fixed_confirmation(written: &str, suggestions: &[&str]) -> String {
+    let question = match suggestions.len() {
+        1 => "のことでしょうか？",
+        2 => "のどちらのことでしょうか？",
+        _ => "のどれのことでしょうか？",
+    };
+    format!(
+        "{written} とお知らせいただきましたが、{} {question}",
+        suggestions.join("、")
+    )
 }
 
 fn check_resumed(checks: &mut Checks, turn: &Turn, name_words: &[&str]) {
