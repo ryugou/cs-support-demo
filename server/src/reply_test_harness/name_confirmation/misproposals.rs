@@ -2,7 +2,7 @@ use super::*;
 use crate::harness::product_gate::{build_out_of_scope_reply, ProductAllowlist};
 
 const TYPO_MESSAGE: &str = "ADV-VC729Pを使っているが録画されない";
-const WITHHELD_PRODUCTS_NOTE: &str = "顧客が違うと答えた製品を除いてある";
+const WITHHELD_PRODUCTS_NOTE: &str = "この返信では当社の取扱製品を一覧にして挙げない";
 
 fn f_p7_allowlist() -> ProductAllowlist {
     ProductAllowlist::from_models(
@@ -170,6 +170,12 @@ async fn t4_a_denied_candidate_is_not_offered_again() {
             request.system.contains(WITHHELD_PRODUCTS_NOTE),
             "{}",
             request.system
+        );
+        assert!(
+            !request.system.contains("ADC-VC827P") && !request.user.contains("ADC-VC827P"),
+            "the hearing after a denial lists no other product: {}{}",
+            request.system,
+            request.user
         );
         assert!(
             request

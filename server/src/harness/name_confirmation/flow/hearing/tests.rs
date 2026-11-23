@@ -165,7 +165,7 @@ fn the_identified_products_are_read_from_the_case_attributes() {
 }
 
 #[test]
-fn the_hearing_after_a_denial_lists_only_the_other_products_and_no_similar_one() {
+fn the_hearing_after_a_denial_lists_no_product_and_no_similar_one() {
     let allowlist = f_p7();
     let mut state = ConfirmationState::default();
     state.deny(&[product("ADC-VC729P")]);
@@ -173,35 +173,21 @@ fn the_hearing_after_a_denial_lists_only_the_other_products_and_no_similar_one()
     let untouched = names_with(&allowlist, ConfirmationState::default());
     for (names, withheld) in [(&denied, true), (&untouched, false)] {
         let hearing = names.hearing_allowlist(&allowlist);
-        let (clarify, _) = build_clarify_prompt("録画されない", "型番", "", false, &hearing);
-        let (identification, _) =
+        let clarify = build_clarify_prompt("録画されない", "型番", "", false, &hearing);
+        let identification =
             build_product_identification_prompt("録画されない", "", false, &hearing);
-        for system in [&clarify, &identification] {
-            assert_eq!(
-                system.contains("顧客が違うと答えた製品を除いてある"),
-                withheld,
-                "{system}"
-            );
-            assert_eq!(
-                system.contains("「ほかの取扱製品」として挙げ"),
-                withheld,
-                "{system}"
-            );
-            assert_eq!(
-                system.contains("「近い」「似ている」という言葉を使わない"),
-                withheld,
-                "{system}"
-            );
-            assert_eq!(
-                system.contains("本体のラベルや購入時の書類で型番を確認してもらう"),
-                withheld,
-                "{system}"
-            );
+        for (system, user) in [&clarify, &identification] {
+            for rule in [
+                "この返信では当社の取扱製品を一覧にして挙げない",
+                "「近い」「似ている」という言葉を使わない",
+                "言い換えずにそのまま書いて受け止める",
+                "本体のラベルや購入時の書類で型番を確認してもらう",
+            ] {
+                assert_eq!(system.contains(rule), withheld, "{system}");
+            }
+            let prompt = format!("{system}{user}");
+            assert_eq!(prompt.contains("ADC-VC827P"), !withheld, "{prompt}");
+            assert!(!withheld || !prompt.contains("ADC-VC729P"), "{prompt}");
         }
-        assert_eq!(
-            clarify.contains("- 当社の取扱製品は次のとおりです: "),
-            !withheld,
-            "{clarify}"
-        );
     }
 }
