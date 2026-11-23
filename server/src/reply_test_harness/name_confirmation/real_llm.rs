@@ -351,6 +351,24 @@ async fn t4_tie_and_denial(checks: &mut Checks) {
     }
 }
 
+async fn issue138_product_name_answer(checks: &mut Checks) {
+    let h = start(f_name_fixture()).await;
+    let mut conv = h.conversation();
+    let hearing = conv.say("録画されません").await;
+    print_turn(&checks.scenario, &h, &hearing);
+    checks.check(
+        "hearing_first",
+        hearing.reply_kind.as_deref() == Some("clarify"),
+    );
+    let answered = conv.say("みまもりドームカメラです").await;
+    print_turn(&checks.scenario, &h, &answered);
+    check_resumed(checks, &answered, &["型番", "製品名"]);
+    checks.check(
+        "identified",
+        answered.product_models == vec!["ADC-V724".to_string()],
+    );
+}
+
 async fn t5_out_of_scope_path(checks: &mut Checks) {
     let h = start(f_p7_fixture()).await;
     let mut conv = h.conversation();
@@ -398,6 +416,9 @@ async fn l3_real_llm_name_confirmation() {
     failures.extend(checks.failures);
     let mut checks = Checks::new("t5-out-of-scope-path");
     t5_out_of_scope_path(&mut checks).await;
+    failures.extend(checks.failures);
+    let mut checks = Checks::new("issue138-product-name-answer");
+    issue138_product_name_answer(&mut checks).await;
     failures.extend(checks.failures);
     println!("L3 summary failures={failures:?}");
     assert!(failures.is_empty(), "{failures:?}");
