@@ -153,6 +153,11 @@ async fn start(fixture: Fixture) -> ReplyHarness {
         std::env::var(LLM_API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty()),
         "set {LLM_API_KEY_ENV} for the real LLM check"
     );
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_test_writer()
+        .try_init();
     ReplyHarness::start_with(fixture, LlmBackend::Anthropic).await
 }
 
@@ -182,6 +187,36 @@ async fn t1(checks: &mut Checks, first_message: &str) {
     }
 }
 
+async fn post_turn(h: &ReplyHarness, scenario: &str, body: serde_json::Value) -> Turn {
+    let message = body["message"].as_str().unwrap_or_default().to_string();
+    let (status, text) = h.post_reply(body).await;
+    let reply: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let case_id = reply["case_id"].as_str().unwrap_or_default().to_string();
+    let recorded = h.conversation_turns(&case_id);
+    let reply_kind = recorded
+        .last()
+        .and_then(|turn| turn.attr("reply_kind").map(ToString::to_string));
+    let decision = recorded
+        .last()
+        .and_then(|turn| turn.attr("audit_event_id"))
+        .and_then(|id| h.audit_decision(id));
+    let turn = Turn {
+        index: 1,
+        message,
+        status,
+        reply_text: reply["reply_text"].as_str().unwrap_or_default().to_string(),
+        case_id: case_id.clone(),
+        case_reset: false,
+        error_body: None,
+        reply_kind,
+        decision,
+        product_models: h.product_models(&case_id),
+        llm_requests: Vec::new(),
+    };
+    print_turn(scenario, h, &turn);
+    turn
+}
+
 async fn t2(checks: &mut Checks) {
     let h = start(f_p7_fixture()).await;
     let history = serde_json::json!([
@@ -192,36 +227,8 @@ async fn t2(checks: &mut Checks) {
         "型番は最初に伝えている",
         "全く録画されていない、型番は最初に伝えている",
     ] {
-        let (status, body) = h
-            .post_reply(serde_json::json!({"message": message, "history": history}))
-            .await;
-        let reply: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        let case_id = reply["case_id"].as_str().unwrap_or_default().to_string();
-        let reply_text = reply["reply_text"].as_str().unwrap_or_default().to_string();
-        let reply_kind = h
-            .conversation_turns(&case_id)
-            .last()
-            .and_then(|turn| turn.attr("reply_kind").map(ToString::to_string));
-        println!(
-            "L3 scenario={} message={message:?} status={status} reply_kind={reply_kind:?} pending={:?} product_models={:?}\nL3 scenario={} reply_text<<<\n{reply_text}\n>>>",
-            checks.scenario,
-            pending_of(&h, &case_id),
-            h.product_models(&case_id),
-            checks.scenario
-        );
-        let turn = Turn {
-            index: 1,
-            message: message.to_string(),
-            status,
-            reply_text,
-            case_id: case_id.clone(),
-            case_reset: false,
-            error_body: None,
-            reply_kind,
-            decision: None,
-            product_models: h.product_models(&case_id),
-            llm_requests: Vec::new(),
-        };
+        let body = serde_json::json!({"message": message, "history": history});
+        let turn = post_turn(&h, &checks.scenario, body).await;
         check_confirmation(
             checks,
             &turn,
@@ -231,44 +238,31 @@ async fn t2(checks: &mut Checks) {
         );
         checks.check("not_identified", turn.product_models.is_empty());
         if message.starts_with("全く") {
-            let mut history_c = history.clone();
-            history_c.as_array_mut().into_iter().for_each(|turns| {
-                turns.push(serde_json::json!({"role": "customer", "text": message}));
-                turns.push(serde_json::json!({"role": "assistant", "text": turn.reply_text}));
-            });
-            let (status, body) = h
-                .post_reply(serde_json::json!({"message": "はい", "history": history_c, "case_id": case_id}))
-                .await;
-            let reply: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            let reply_text = reply["reply_text"].as_str().unwrap_or_default().to_string();
-            let last = h.conversation_turns(&case_id);
-            let kind = last
-                .last()
-                .and_then(|turn| turn.attr("reply_kind").map(ToString::to_string));
-            let decision = last
-                .last()
-                .and_then(|turn| turn.attr("audit_event_id"))
-                .and_then(|id| h.audit_decision(id));
-            println!(
-                "L3 scenario={}-c status={status} reply_kind={kind:?} decision={decision:?} product_models={:?}\nL3 scenario={}-c reply_text<<<\n{reply_text}\n>>>",
-                checks.scenario,
-                h.product_models(&case_id),
-                checks.scenario
-            );
-            let resumed = Turn {
-                reply_text,
-                reply_kind: kind,
-                decision,
-                product_models: h.product_models(&case_id),
-                ..turn
-            };
-            check_resumed(checks, &resumed, &["型番"]);
-            checks.check(
-                "identified",
-                resumed.product_models == vec!["ADC-VC729P".to_string()],
-            );
+            t2_confirm(checks, &h, &history, &turn).await;
         }
     }
+}
+
+async fn t2_confirm(
+    checks: &mut Checks,
+    h: &ReplyHarness,
+    history: &serde_json::Value,
+    recovered: &Turn,
+) {
+    let mut history = history.clone();
+    if let Some(turns) = history.as_array_mut() {
+        turns.push(serde_json::json!({"role": "customer", "text": recovered.message}));
+        turns.push(serde_json::json!({"role": "assistant", "text": recovered.reply_text}));
+    }
+    let body =
+        serde_json::json!({"message": "はい", "history": history, "case_id": recovered.case_id});
+    let scenario = format!("{}-c", checks.scenario);
+    let resumed = post_turn(h, &scenario, body).await;
+    check_resumed(checks, &resumed, &["型番"]);
+    checks.check(
+        "identified",
+        resumed.product_models == vec!["ADC-VC729P".to_string()],
+    );
 }
 
 async fn t3_product_name(checks: &mut Checks) {
@@ -349,6 +343,10 @@ async fn t4_tie_and_denial(checks: &mut Checks) {
         let turn = conv.say(message).await;
         print_turn(&checks.scenario, &h, &turn);
         checks.check("H5_machine", !turn.reply_text.contains("ADC-VC729P"));
+        checks.check(
+            "not_fallback_after_denial",
+            turn.reply_text != FALLBACK_CLARIFY_TEXT,
+        );
         checks.check("not_identified", turn.product_models.is_empty());
     }
 }
