@@ -13,12 +13,13 @@
 
 use crate::harness::knowledge::csv_list;
 use crate::harness::name_confirmation::company::{self, RegisteredCompany};
+use crate::harness::schema_cache::SchemaCache;
 use crate::manual::schema_ids::KIND_PRODUCT;
 use crate::vegapunk::VegapunkClient;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
 
 /// 製品マスタ（Product ノード一覧）の TTL キャッシュ既定値（design doc §2）。
@@ -732,11 +733,6 @@ pub fn build_out_of_scope_reply(detected_model: &str, allowlist: &ProductAllowli
     )
 }
 
-struct CachedAllowlist {
-    stored_at: Instant,
-    allowlist: Arc<ProductAllowlist>,
-}
-
 /// 製品マスタ（Product ノード）から取扱 allowlist を取得し、schema 単位に TTL キャッシュする
 /// コンポーネント（design doc §2）。
 ///
@@ -746,9 +742,8 @@ struct CachedAllowlist {
 /// vegapunk 不達時は検索も成立しないため既存のエラー意味論と一致する）。
 pub struct ProductGate {
     client: Arc<VegapunkClient>,
-    cache: Mutex<HashMap<String, CachedAllowlist>>,
-    company_cache: Mutex<HashMap<String, CachedCompanies>>,
-    ttl: Duration,
+    allowlist_cache: SchemaCache<ProductAllowlist>,
+    company_cache: SchemaCache<Vec<RegisteredCompany>>,
 }
 
 impl ProductGate {
@@ -759,57 +754,15 @@ impl ProductGate {
     pub fn with_ttl(client: Arc<VegapunkClient>, ttl: Duration) -> Self {
         Self {
             client,
-            cache: Mutex::new(HashMap::new()),
-            company_cache: Mutex::new(HashMap::new()),
-            ttl,
+            allowlist_cache: SchemaCache::new("product allowlist", ttl),
+            company_cache: SchemaCache::new("company names", ttl),
         }
     }
 
     pub async fn allowlist(&self, schema: &str) -> Result<Arc<ProductAllowlist>> {
-        if let Some(fresh) = self.cached(schema, true) {
-            return Ok(fresh);
-        }
-        match self.fetch(schema).await {
-            Ok(allowlist) => {
-                let allowlist = Arc::new(allowlist);
-                self.store(schema, allowlist.clone());
-                Ok(allowlist)
-            }
-            Err(err) => {
-                if let Some(stale) = self.cached(schema, false) {
-                    tracing::warn!(
-                        schema,
-                        error = ?err,
-                        "product allowlist refresh failed; serving the stale cached allowlist \
-                         instead of failing the request (product scope master may be out of \
-                         date until vegapunk recovers)"
-                    );
-                    return Ok(stale);
-                }
-                Err(err)
-            }
-        }
-    }
-
-    /// `require_fresh = true` なら TTL 内のエントリだけを返す。`false` なら年齢を問わず返す
-    /// （stale フォールバック用）。
-    fn cached(&self, schema: &str, require_fresh: bool) -> Option<Arc<ProductAllowlist>> {
-        let guard = self.cache.lock().expect("product allowlist cache poisoned");
-        guard
-            .get(schema)
-            .filter(|c| !require_fresh || is_fresh(c.stored_at.elapsed(), self.ttl))
-            .map(|c| c.allowlist.clone())
-    }
-
-    fn store(&self, schema: &str, allowlist: Arc<ProductAllowlist>) {
-        let mut guard = self.cache.lock().expect("product allowlist cache poisoned");
-        guard.insert(
-            schema.to_string(),
-            CachedAllowlist {
-                stored_at: Instant::now(),
-                allowlist,
-            },
-        );
+        self.allowlist_cache
+            .get_or_fetch(schema, || self.fetch(schema))
+            .await
     }
 
     async fn fetch(&self, schema: &str) -> Result<ProductAllowlist> {
@@ -824,57 +777,14 @@ impl ProductGate {
         Ok(allowlist)
     }
 
-    pub(crate) async fn companies(&self, schema: &str) -> Arc<Vec<RegisteredCompany>> {
-        if let Some(fresh) = self.cached_companies(schema, true) {
-            return fresh;
-        }
-        match company::query_company_nodes(&self.client, schema).await {
-            Ok(nodes) => {
-                let companies = Arc::new(company::active_companies(nodes));
-                self.company_cache
-                    .lock()
-                    .expect("company names cache poisoned")
-                    .insert(
-                        schema.to_string(),
-                        CachedCompanies {
-                            stored_at: Instant::now(),
-                            companies: companies.clone(),
-                        },
-                    );
-                companies
-            }
-            Err(err) => match self.cached_companies(schema, false) {
-                Some(stale) => {
-                    tracing::warn!(schema, error = ?err, "company names refresh failed; serving the stale cached company names");
-                    stale
-                }
-                None => {
-                    tracing::warn!(schema, error = ?err, "failed to read company names; confirming names without company names");
-                    Arc::new(Vec::new())
-                }
-            },
-        }
+    pub(crate) async fn companies(&self, schema: &str) -> Result<Arc<Vec<RegisteredCompany>>> {
+        self.company_cache
+            .get_or_fetch(schema, || async {
+                let nodes = company::query_company_nodes(&self.client, schema).await?;
+                Ok(company::active_companies(nodes))
+            })
+            .await
     }
-
-    fn cached_companies(
-        &self,
-        schema: &str,
-        require_fresh: bool,
-    ) -> Option<Arc<Vec<RegisteredCompany>>> {
-        let guard = self
-            .company_cache
-            .lock()
-            .expect("company names cache poisoned");
-        guard
-            .get(schema)
-            .filter(|cached| !require_fresh || is_fresh(cached.stored_at.elapsed(), self.ttl))
-            .map(|cached| cached.companies.clone())
-    }
-}
-
-struct CachedCompanies {
-    stored_at: Instant,
-    companies: Arc<Vec<RegisteredCompany>>,
 }
 
 /// 製品マスタ（Product ノード）取得の問い合わせ上限。`ingest_urtect.rs` の同名の製品マスタ取得
@@ -941,13 +851,12 @@ fn validate_allowlist_not_empty(allowlist: &ProductAllowlist, schema: &str) -> R
     Ok(())
 }
 
-/// TTL キャッシュの鮮度判定。境界（`age == ttl`）は stale 扱い（`corpus.rs::is_fresh` と同じ規律）。
-fn is_fresh(age: Duration, ttl: Duration) -> bool {
-    age < ttl
-}
-
 #[cfg(test)]
 impl ProductGate {
+    fn store(&self, schema: &str, allowlist: Arc<ProductAllowlist>) {
+        self.allowlist_cache.store(schema, allowlist);
+    }
+
     /// テスト専用: 実ネットワークに繋がず、`schema` に `allowlist` を新鮮なキャッシュとして
     /// 埋め込んだ状態で構築する。`harness::mod` のテスト（`draft_customer_reply_via_stub` 等、
     /// VegapunkClient の実接続を張れない同期/擬似テスト環境）が、`Harness::product_gate` を

@@ -22,6 +22,7 @@ pub(crate) mod prompt_input;
 mod real_llm_smoke;
 pub mod reply;
 pub mod rules;
+mod schema_cache;
 pub mod scope;
 pub mod signal;
 mod supplementary_search;
@@ -1142,9 +1143,19 @@ impl Harness {
         &self,
         schema: &str,
     ) -> Arc<Vec<name_confirmation::company::RegisteredCompany>> {
-        match self.product_gate.as_ref() {
-            Some(gate) => gate.companies(schema).await,
-            None => Arc::new(Vec::new()),
+        let Some(gate) = self.product_gate.as_ref() else {
+            return Arc::default();
+        };
+        match gate.companies(schema).await {
+            Ok(companies) => companies,
+            Err(err) => {
+                tracing::warn!(
+                    schema,
+                    error = ?err,
+                    "failed to read company names; confirming names without company names"
+                );
+                Arc::default()
+            }
         }
     }
 
