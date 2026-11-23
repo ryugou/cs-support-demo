@@ -12,7 +12,18 @@ const F_P7_MODELS: [&str; 7] = [
     "ADC-VC727P",
     "ADC-VC827P",
 ];
-const QUESTION_ENDINGS: [&str; 6] = ["？", "?", "ください", "でしょうか", "ますか", "いただけ"];
+const QUESTION_ENDINGS: [&str; 10] = [
+    "？",
+    "?",
+    "ください",
+    "でしょうか",
+    "ですか",
+    "ますか",
+    "ませんか",
+    "いただけ",
+    "どれ",
+    "どちら",
+];
 
 struct Checks {
     scenario: String,

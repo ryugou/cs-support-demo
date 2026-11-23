@@ -248,6 +248,20 @@ fn confirmed_names_join_the_known_facts() {
         names_with(&f_p7(), ConfirmationState::default()).with_confirmed_names(String::new()),
         ""
     );
+
+    let mut by_name = ConfirmationState::default();
+    by_name.confirm(
+        "c",
+        NameTarget {
+            kind: NameKind::Product,
+            id: "ADC-V724".to_string(),
+            display: "みまもりドームカメラ".to_string(),
+        },
+    );
+    assert_eq!(
+        names_with(&f_p7(), by_name).with_confirmed_names(String::new()),
+        "- 確認済みの製品: みまもりドームカメラ（型番 ADC-V724）"
+    );
 }
 
 #[test]

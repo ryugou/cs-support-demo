@@ -21,6 +21,8 @@ use crate::harness::{conv_state_from_attrs, EvaluationOutcome, Harness, RequestC
 const NAME_CONFIRMATION_AUDIT_DECISION: &str = "name_confirmation";
 const PRODUCT_MODELS_ATTRIBUTE: &str = "product_models";
 const CONFIRMED_PRODUCT_FACT: &str = "- 確認済みの製品: ";
+const CONFIRMED_MODEL_OPEN: &str = "（型番 ";
+const CONFIRMED_MODEL_CLOSE: &str = "）";
 const CONFIRMED_COMPANY_FACT: &str = "- 確認済みの社名: ";
 
 pub(crate) struct NameConfirmation {
@@ -283,10 +285,15 @@ impl NameConfirmation {
     pub(crate) fn with_confirmed_names(&self, known_facts: String) -> String {
         let mut lines: Vec<String> = Vec::new();
         for confirmed in self.state.confirmed() {
-            let line = match confirmed.target.kind {
-                NameKind::Product => {
-                    format!("{CONFIRMED_PRODUCT_FACT}{}", confirmed.target.display)
+            let target = &confirmed.target;
+            let line = match target.kind {
+                NameKind::Product if target.display == target.id => {
+                    format!("{CONFIRMED_PRODUCT_FACT}{}", target.id)
                 }
+                NameKind::Product => format!(
+                    "{CONFIRMED_PRODUCT_FACT}{}{CONFIRMED_MODEL_OPEN}{}{CONFIRMED_MODEL_CLOSE}",
+                    target.display, target.id
+                ),
                 NameKind::Company => {
                     format!("{CONFIRMED_COMPANY_FACT}{}", confirmed.target.display)
                 }

@@ -22,6 +22,13 @@ async fn t3_a_swapped_japanese_product_name_is_confirmed_and_the_talk_resumes() 
     log_turn("t3-product-name", &h, &second);
     assert_resumed(&second);
     assert_eq!(second.product_models, vec!["ADC-V724".to_string()]);
+    assert!(
+        hearing_requests(&second).iter().any(|request| request
+            .user
+            .contains("確認済みの製品: みまもりドームカメラ（型番 ADC-V724）")),
+        "the hearing must know the confirmed product and its model: {}",
+        second.log_line()
+    );
 
     let third = conv.say("昨日から録画されていません").await;
     log_turn("t3-product-name", &h, &third);
