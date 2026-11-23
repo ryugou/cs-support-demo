@@ -88,6 +88,7 @@ export type ReplyKind =
   | 'out_of_scope'
   | 'time_pref'
   | 'fallback'
+  | 'name_confirm'
   | 'handoff'
   | 'safety'
   | 'out_of_domain'

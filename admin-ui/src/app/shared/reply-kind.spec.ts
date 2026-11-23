@@ -7,6 +7,12 @@ describe('replyKindLabel / replyKindBadgeClass', () => {
     expect(replyKindBadgeClass('answer')).toBe('bg-emerald-50 text-emerald-700');
   });
 
+  it('CS の name_confirm は「名称確認」のラベルと専用のバッジクラスを返す', () => {
+    expect(replyKindLabel('name_confirm')).toBe('名称確認');
+    expect(replyKindBadgeClass('name_confirm')).toBe('bg-blue-50 text-blue-700');
+    expect(replyKindBadgeClass('name_confirm')).not.toBe(replyKindBadgeClass('some_future_kind'));
+  });
+
   it('advisor 固有4値(handoff/safety/out_of_domain/lead)のラベルを返す', () => {
     expect(replyKindLabel('handoff')).toBe('個別サポート案内');
     expect(replyKindLabel('safety')).toBe('緊急案内');
