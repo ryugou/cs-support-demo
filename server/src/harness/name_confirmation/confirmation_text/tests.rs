@@ -145,6 +145,7 @@ fn the_prompt_lists_the_names_with_why_they_are_asked() {
     assert!(user.contains("（名称は最初に伝えたとのご指摘あり）"));
     assert!(user.contains("＜b＞型番は最初に伝えている"));
     assert!(system.contains("尋ねるのは名称の確認だけにする"));
+    assert!(system.contains("症状や状況を「〜とのことですね」のように確かめる文は書かない"));
     assert!(system.contains(CONTINUATION_OPENER_RULE));
     let (system, _) = build_confirmation_prompt(&mentions[..1], "x", false);
     assert!(!system.contains(CONTINUATION_OPENER_RULE));
