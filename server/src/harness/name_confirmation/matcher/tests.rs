@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use super::*;
 use crate::harness::name_confirmation::test_fixtures::{
-    catalog_of, company, f_name, f_name_and_org, f_p7, product_node,
+    catalog_of, company, f_name_and_org, f_p7, product_node,
 };
 use crate::harness::product_gate::ProductAllowlist;
 
@@ -158,12 +158,50 @@ fn names_separated_by_punctuation_are_found_one_by_one() {
 
 #[test]
 fn a_dropped_last_letter_keeps_the_particle_out_of_the_notation() {
-    let catalog = catalog_of(&f_name());
-    let mentions = typo_mentions_of("みまもりドームカメが録画されない", &catalog);
+    let catalog = catalog_of(&f_name_and_org());
+    let cases = [
+        ("みまもりドームカメが録画されない", "みまもりドームカメ"),
+        ("ADC-VC729の設定", "ADC-VC729"),
+        (
+            "ミドリノ警備保障株式会から購入しました",
+            "ミドリノ警備保障株式会",
+        ),
+    ];
+    for (written, surface) in cases {
+        let mentions = typo_mentions_of(written, &catalog);
+        assert_eq!(mentions.len(), 1, "{written}: {mentions:?}");
+        assert_eq!(mentions[0].surface, surface, "{written}");
+    }
+}
+
+#[test]
+fn a_mistyped_last_letter_stays_in_the_notation() {
+    let catalog = catalog_of(&f_name_and_org());
+    let cases = [
+        (
+            "ミドリノ警備保障株式会杜から購入しました",
+            "ミドリノ警備保障株式会杜",
+        ),
+        ("みまもりドームカメヲが録画されない", "みまもりドームカメヲ"),
+        ("ADC-VC729Qの設定", "ADC-VC729Q"),
+    ];
+    for (written, surface) in cases {
+        let mentions = typo_mentions_of(written, &catalog);
+        assert_eq!(mentions.len(), 1, "{written}: {mentions:?}");
+        assert_eq!(mentions[0].surface, surface, "{written}");
+    }
+}
+
+#[test]
+fn a_letter_of_another_script_is_still_a_typo_when_no_other_reading_exists() {
+    let catalog = catalog_of(&f_name_and_org());
+    let mentions = typo_mentions_of("ミドリの警備保障株式会社", &catalog);
     assert_eq!(mentions.len(), 1);
-    assert_eq!(mentions[0].surface, "みまもりドームカメ");
-    let mentions = typo_mentions_of("ADC-VC729の設定", &catalog);
-    assert_eq!(mentions[0].surface, "ADC-VC729");
+    assert_eq!(mentions[0].surface, "ミドリの警備保障株式会社");
+    assert_eq!(
+        target_ids(&mentions[0]),
+        BTreeSet::from(["ミドリノ警備保障株式会社"])
+    );
 }
 
 #[test]
@@ -240,6 +278,34 @@ fn single_typo_counts_each_kind_of_edit_once() {
     ];
     for (written, expected) in cases {
         let written: Vec<char> = written.chars().collect();
-        assert_eq!(is_single_typo(&written, &name), expected, "{written:?}");
+        assert_eq!(
+            single_typo_edit(&written, &name).is_some(),
+            expected,
+            "{written:?}"
+        );
+    }
+}
+
+#[test]
+fn an_edit_keeps_the_character_class_only_within_one_script() {
+    let chars = |text: &str| text.chars().collect::<Vec<char>>();
+    let cases = [
+        ("adcvc729q", "adcvc729p", true),
+        ("adcvc729の", "adcvc729p", false),
+        ("株式会杜", "株式会社", true),
+        ("株式会か", "株式会社", false),
+        ("adcvc7729p", "adcvc729p", true),
+        ("adcvc72の9p", "adcvc729p", false),
+        ("adcvc729", "adcvc729p", true),
+        ("adcvc792p", "adcvc729p", true),
+    ];
+    for (written, name, expected) in cases {
+        let (written, name) = (chars(written), chars(name));
+        let edit = single_typo_edit(&written, &name).expect("one edit away");
+        assert_eq!(
+            keeps_char_class(edit, &written, &name),
+            expected,
+            "{written:?}"
+        );
     }
 }

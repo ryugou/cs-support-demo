@@ -167,6 +167,18 @@ fn hearing_requests(turn: &Turn) -> Vec<&LlmRequest> {
         .collect()
 }
 
+fn presented_names(request: &LlmRequest) -> &str {
+    let start = request
+        .user
+        .find("<確認する名称>")
+        .expect("the confirmation prompt lists the names to confirm");
+    let end = request
+        .user
+        .find("</確認する名称>")
+        .expect("the confirmation prompt closes the name list");
+    &request.user[start..end]
+}
+
 fn assert_presented(turn: &Turn, written: &str, suggestions: &[&str], left_out: &[&str]) {
     assert_eq!(
         turn.reply_kind.as_deref(),
@@ -176,13 +188,13 @@ fn assert_presented(turn: &Turn, written: &str, suggestions: &[&str], left_out: 
     );
     let requests = confirmation_requests(turn);
     assert_eq!(requests.len(), 1, "{}", turn.log_line());
-    assert!(requests[0].user.contains(written), "{}", requests[0].user);
+    let presented = presented_names(requests[0]);
+    assert!(
+        presented.contains(&format!("顧客の表記: {written}／")),
+        "{presented}"
+    );
     for suggestion in suggestions {
-        assert!(
-            requests[0].user.contains(suggestion),
-            "{}",
-            requests[0].user
-        );
+        assert!(presented.contains(suggestion), "{presented}");
     }
     for name in left_out {
         assert!(!requests[0].user.contains(name), "{}", requests[0].user);

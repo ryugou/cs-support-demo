@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::ops::Range;
 
 use unicode_normalization::char::{canonical_combining_class, decompose_compatible};
@@ -43,6 +43,24 @@ struct Occurrence {
     entry: usize,
     span: Range<usize>,
     matched: MentionMatch,
+    keeps_class: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Substitution(usize),
+    Insertion(usize),
+    Deletion,
+    Transposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    AsciiAlphanumeric,
+    Hiragana,
+    Katakana,
+    Ideograph,
+    Other,
 }
 
 pub(crate) fn name_chars(text: &str) -> Vec<char> {
@@ -156,6 +174,7 @@ fn find_occurrences(text: &NormalizedText, catalog: &NameCatalog) -> Vec<Occurre
                         entry,
                         span,
                         matched: MentionMatch::Exact,
+                        keeps_class: true,
                     });
                 }
             }
@@ -164,13 +183,16 @@ fn find_occurrences(text: &NormalizedText, catalog: &NameCatalog) -> Vec<Occurre
             for len in name.len() - 1..=name.len() + 1 {
                 for start in text.starts(len) {
                     let span = start..start + len;
-                    if text.is_whole_word_span(&span)
-                        && is_single_typo(&text.chars[span.clone()], name)
-                    {
+                    if !text.is_whole_word_span(&span) {
+                        continue;
+                    }
+                    let written = &text.chars[span.clone()];
+                    if let Some(edit) = single_typo_edit(written, name) {
                         found.push(Occurrence {
                             entry,
                             span,
                             matched: MentionMatch::Typo,
+                            keeps_class: keeps_char_class(edit, written, name),
                         });
                     }
                 }
@@ -180,24 +202,52 @@ fn find_occurrences(text: &NormalizedText, catalog: &NameCatalog) -> Vec<Occurre
     found
 }
 
-fn is_single_typo(written: &[char], name: &[char]) -> bool {
+fn single_typo_edit(written: &[char], name: &[char]) -> Option<Edit> {
     let common = written
         .iter()
         .zip(name)
         .take_while(|(written, name)| written == name)
         .count();
     match written.len().cmp(&name.len()) {
-        Ordering::Equal => {
-            common < written.len()
-                && (written[common + 1..] == name[common + 1..]
-                    || is_adjacent_swap(written, name, common))
+        Ordering::Equal if common == written.len() => None,
+        Ordering::Equal if written[common + 1..] == name[common + 1..] => {
+            Some(Edit::Substitution(common))
         }
-        Ordering::Greater => {
-            written.len() == name.len() + 1 && written[common + 1..] == name[common..]
+        Ordering::Equal => is_adjacent_swap(written, name, common).then_some(Edit::Transposition),
+        Ordering::Greater => (written.len() == name.len() + 1
+            && written[common + 1..] == name[common..])
+            .then_some(Edit::Insertion(common)),
+        Ordering::Less => (written.len() + 1 == name.len()
+            && written[common..] == name[common + 1..])
+            .then_some(Edit::Deletion),
+    }
+}
+
+fn keeps_char_class(edit: Edit, written: &[char], name: &[char]) -> bool {
+    match edit {
+        Edit::Substitution(at) => char_class(written[at]) == char_class(name[at]),
+        Edit::Insertion(at) => {
+            let inserted = char_class(written[at]);
+            [at.checked_sub(1), Some(at)]
+                .into_iter()
+                .flatten()
+                .filter_map(|index| name.get(index))
+                .any(|neighbor| char_class(*neighbor) == inserted)
         }
-        Ordering::Less => {
-            written.len() + 1 == name.len() && written[common..] == name[common + 1..]
+        Edit::Deletion | Edit::Transposition => true,
+    }
+}
+
+fn char_class(ch: char) -> CharClass {
+    match ch {
+        _ if ch.is_ascii_alphanumeric() => CharClass::AsciiAlphanumeric,
+        '\u{3041}'..='\u{309F}' => CharClass::Hiragana,
+        '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' => CharClass::Katakana,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' => {
+            CharClass::Ideograph
         }
+        '\u{20000}'..='\u{3FFFF}' => CharClass::Ideograph,
+        _ => CharClass::Other,
     }
 }
 
@@ -265,39 +315,55 @@ fn typo_mentions(
     mut typos: Vec<&Occurrence>,
 ) -> Vec<NameMention> {
     typos.sort_by_key(|occurrence| (occurrence.span.start, occurrence.span.end));
-    let mut groups: Vec<(Range<usize>, usize, Vec<&Occurrence>)> = Vec::new();
+    let mut groups: Vec<(usize, Vec<&Occurrence>)> = Vec::new();
     for occurrence in typos {
         match groups.last_mut() {
-            Some((shortest, group_end, members)) if occurrence.span.start < *group_end => {
-                if occurrence.span.len() < shortest.len() {
-                    *shortest = occurrence.span.clone();
-                }
+            Some((group_end, members)) if occurrence.span.start < *group_end => {
                 *group_end = (*group_end).max(occurrence.span.end);
                 members.push(occurrence);
             }
-            _ => groups.push((
-                occurrence.span.clone(),
-                occurrence.span.end,
-                vec![occurrence],
-            )),
+            _ => groups.push((occurrence.span.end, vec![occurrence])),
         }
     }
     groups
         .into_iter()
-        .map(|(shortest, _, members)| {
+        .filter_map(|(_, members)| {
+            let readings = plausible_readings(members);
+            let span = written_span(&readings)?;
             let mut mention = NameMention {
-                surface: normalized.original(text, &shortest).to_string(),
-                key: normalized.chars[shortest.clone()].iter().collect(),
+                surface: normalized.original(text, &span).to_string(),
+                key: normalized.chars[span.clone()].iter().collect(),
                 matched: MentionMatch::Typo,
                 targets: Vec::new(),
-                span: shortest,
+                span,
             };
-            for member in members {
-                add_target(&mut mention, &catalog.entries()[member.entry].target);
+            for reading in readings {
+                add_target(&mut mention, &catalog.entries()[reading.entry].target);
             }
-            mention
+            Some(mention)
         })
         .collect()
+}
+
+fn plausible_readings(members: Vec<&Occurrence>) -> Vec<&Occurrence> {
+    if members.iter().any(|member| member.keeps_class) {
+        members
+            .into_iter()
+            .filter(|member| member.keeps_class)
+            .collect()
+    } else {
+        members
+    }
+}
+
+fn written_span(readings: &[&Occurrence]) -> Option<Range<usize>> {
+    let keeps_class = readings.iter().all(|reading| reading.keeps_class);
+    let spans = readings.iter().map(|reading| reading.span.clone());
+    if keeps_class {
+        spans.min_by_key(|span| (Reverse(span.len()), span.start))
+    } else {
+        spans.min_by_key(|span| (span.len(), span.start))
+    }
 }
 
 fn mention_at(
