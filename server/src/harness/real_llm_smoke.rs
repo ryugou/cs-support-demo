@@ -553,6 +553,7 @@ async fn identify_product_for_turn(
         extraction_mode: mode,
         history,
         request_id: "smoke",
+        product_name_matching: super::name_confirmation::ProductNameMatching::LlmReferencesOnly,
     };
     super::identify_product(&fx.allowlist, &resolved, None, Some(&window)).await
 }
@@ -1404,6 +1405,7 @@ fn build_outcome(
         partial_answer: false,
         decision_basis: turn.basis,
         applicable_known_resolution: None,
+        immediate_handoff: false,
     }
 }
 

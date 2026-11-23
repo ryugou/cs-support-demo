@@ -752,6 +752,7 @@ impl CsSupportRmcpServer {
                 ReplyDraftPolicy::Always,
                 // Issue #61: MCP 経路は製品切り替え検知を行わないので抽出済みの値は無い（内部で抽出）。
                 None,
+                crate::harness::name_confirmation::ProductNameMatching::LlmReferencesOnly,
             )
             .await
             .map_err(to_error)?;
@@ -1409,6 +1410,7 @@ mod tests {
             partial_answer,
             decision_basis: crate::harness::DecisionBasis::Accumulated,
             applicable_known_resolution: None,
+            immediate_handoff: false,
         }
     }
 

@@ -2322,6 +2322,7 @@ mod tests {
             // Issue #61 design doc §2.3: 製品切り替え検知時に harness/mod.rs::
             // record_case_switch（try_record_case_switch）が新 case へ書き込む。
             "previous_case_id",
+            "name_confirmation",
         ]
         .into_iter()
         .map(str::to_string)

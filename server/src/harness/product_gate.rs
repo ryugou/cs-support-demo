@@ -11,6 +11,8 @@
 //! 型番の allowlist（正本は vegapunk の `Product` ノード）はコードへハードコードしない。
 //! `ProductGate::allowlist` が schema 単位に TTL 10 分でキャッシュしつつ都度解決する。
 
+use crate::harness::knowledge::csv_list;
+use crate::harness::name_confirmation::company::{self, RegisteredCompany};
 use crate::manual::schema_ids::KIND_PRODUCT;
 use crate::vegapunk::VegapunkClient;
 use anyhow::{Context, Result};
@@ -157,20 +159,37 @@ pub fn extract_model_tokens(text: &str) -> Vec<String> {
 /// 空文字の扱いは変わらない（多層防御）。
 const MIN_FRAGMENT_VETO_CHARS: usize = 3;
 
-const MAX_PRODUCT_NAME_CHARS: usize = 100;
+const MAX_CATALOG_NAME_CHARS: usize = 100;
 
-fn validated_product_name(name: &str) -> Result<&str, &'static str> {
+pub(crate) fn validated_catalog_name(name: &str) -> Result<&str, &'static str> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err("name is blank after trimming");
+        return Err("is blank after trimming");
     }
     if trimmed.chars().any(char::is_control) {
-        return Err("name contains a control character");
+        return Err("contains a control character");
     }
-    if trimmed.chars().count() > MAX_PRODUCT_NAME_CHARS {
-        return Err("name exceeds the maximum length");
+    if trimmed.chars().count() > MAX_CATALOG_NAME_CHARS {
+        return Err("exceeds the maximum length");
     }
     Ok(trimmed)
+}
+
+fn valid_product_aliases(node_id: &str, written: &str) -> Vec<String> {
+    csv_list(written)
+        .into_iter()
+        .filter_map(|alias| match validated_catalog_name(&alias) {
+            Ok(valid) => Some(valid.to_string()),
+            Err(reason) => {
+                tracing::warn!(
+                    node_id = %node_id,
+                    reason,
+                    "product node has an invalid alias; excluding the alias from the product catalog"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// 取扱製品の allowlist（1 schema 分のスナップショット）。
@@ -187,6 +206,8 @@ pub struct ProductAllowlist {
     display: String,
     models: Vec<String>,
     names: HashMap<String, String>,
+    aliases: HashMap<String, Vec<String>>,
+    companies: Vec<RegisteredCompany>,
 }
 
 impl ProductAllowlist {
@@ -225,6 +246,8 @@ impl ProductAllowlist {
             display,
             models: usable,
             names: HashMap::new(),
+            aliases: HashMap::new(),
+            companies: Vec::new(),
         }
     }
 
@@ -273,12 +296,13 @@ impl ProductAllowlist {
     /// 単純化のため撤去する。
     pub(crate) fn from_nodes(nodes: Vec<crate::proto::graphrag::NodeResult>) -> Self {
         let mut names = HashMap::new();
+        let mut aliases = HashMap::new();
         let models: Vec<String> = nodes
             .into_iter()
             .filter_map(|n| match n.attributes.get("model") {
                 Some(model) => {
                     if let Some(name) = n.attributes.get("name") {
-                        match validated_product_name(name) {
+                        match validated_catalog_name(name) {
                             Ok(valid) => {
                                 names.insert(model.trim().to_string(), valid.to_string());
                             }
@@ -290,6 +314,12 @@ impl ProductAllowlist {
                                      the name from the product catalog"
                                 );
                             }
+                        }
+                    }
+                    if let Some(written) = n.attributes.get("aliases") {
+                        let valid = valid_product_aliases(&n.node_id, written);
+                        if !valid.is_empty() {
+                            aliases.insert(model.trim().to_string(), valid);
                         }
                     }
                     Some(model.clone())
@@ -306,6 +336,45 @@ impl ProductAllowlist {
             .collect();
         Self {
             names,
+            aliases,
+            ..Self::from_models(models)
+        }
+    }
+
+    pub(crate) fn with_companies(self, companies: Vec<RegisteredCompany>) -> Self {
+        Self { companies, ..self }
+    }
+
+    pub(crate) fn aliases_of(&self, model: &str) -> &[String] {
+        self.aliases.get(model).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn companies(&self) -> &[RegisteredCompany] {
+        &self.companies
+    }
+
+    pub(crate) fn excluding_models(&self, excluded: &[String]) -> Self {
+        let kept = |model: &String| !excluded.contains(model);
+        let models: Vec<String> = self
+            .models
+            .iter()
+            .filter(|model| kept(model))
+            .cloned()
+            .collect();
+        Self {
+            names: self
+                .names
+                .iter()
+                .filter(|(model, _)| kept(model))
+                .map(|(model, name)| (model.clone(), name.clone()))
+                .collect(),
+            aliases: self
+                .aliases
+                .iter()
+                .filter(|(model, _)| kept(model))
+                .map(|(model, aliases)| (model.clone(), aliases.clone()))
+                .collect(),
+            companies: self.companies.clone(),
             ..Self::from_models(models)
         }
     }
@@ -524,7 +593,7 @@ pub(crate) const MAX_REFLECTABLE_SURFACE_CHARS: usize = 64;
 /// との後方互換のために [`reflection_unsafe_char_regex`] のパターンへ直接追加して保持している。
 /// これ以外に旧列挙リストからの退行は無いことを reviewer が U+0000〜U+10FFFF 全スカラ値の
 /// スイープで確認済み。
-fn is_safe_to_reflect(surface: &str) -> bool {
+pub(crate) fn is_safe_to_reflect(surface: &str) -> bool {
     let char_count = surface.chars().count();
     char_count <= MAX_REFLECTABLE_SURFACE_CHARS && !reflection_unsafe_char_regex().is_match(surface)
 }
@@ -753,13 +822,18 @@ impl ProductGate {
     }
 
     async fn fetch(&self, schema: &str) -> Result<ProductAllowlist> {
-        let nodes = self
-            .client
-            .query_nodes(schema, KIND_PRODUCT, Vec::new(), PRODUCT_QUERY_LIMIT)
-            .await
-            .context("query product allowlist (Product nodes) from vegapunk")?;
+        let (nodes, company_nodes) = tokio::try_join!(
+            async {
+                self.client
+                    .query_nodes(schema, KIND_PRODUCT, Vec::new(), PRODUCT_QUERY_LIMIT)
+                    .await
+                    .context("query product allowlist (Product nodes) from vegapunk")
+            },
+            company::query_company_nodes(&self.client, schema),
+        )?;
         validate_product_nodes(&nodes, schema, PRODUCT_QUERY_LIMIT)?;
-        let allowlist = ProductAllowlist::from_nodes(nodes);
+        let allowlist = ProductAllowlist::from_nodes(nodes)
+            .with_companies(company::active_companies(company_nodes));
         validate_allowlist_not_empty(&allowlist, schema)?;
         Ok(allowlist)
     }
@@ -2220,8 +2294,8 @@ mod tests {
 
     #[test]
     fn from_nodes_excludes_invalid_names_from_the_catalog_and_keeps_the_model() {
-        let at_limit = "あ".repeat(MAX_PRODUCT_NAME_CHARS);
-        let over_limit = "あ".repeat(MAX_PRODUCT_NAME_CHARS + 1);
+        let at_limit = "あ".repeat(MAX_CATALOG_NAME_CHARS);
+        let over_limit = "あ".repeat(MAX_CATALOG_NAME_CHARS + 1);
         let cases: Vec<(&str, String, bool)> = vec![
             ("newline", "屋外\nカメラ".to_string(), false),
             ("control character", "屋外\u{7}カメラ".to_string(), false),

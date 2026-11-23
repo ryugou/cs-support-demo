@@ -73,6 +73,9 @@ nodes:
       # リクエストから通常の新規作成として作るため、この属性自体は homesec では書き込まれない
       # （design doc §7 のとおり、homesec ではどちらの属性も書き込まれず、宣言だけ行う）。
       previous_case_id: { type: string }
+      # Issue #153: 名称確認の状態。`/api/reply`（CS の経路）だけが書き、homesec では書き込まれない。
+      # support_case の属性集合を 3 つの schema ファイルで一致させるために宣言だけ行う。
+      name_confirmation: { type: string }
       last_request_id: { type: string }
       last_decision: { type: string }
       last_kr_id: { type: string }
