@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::company::RegisteredCompany;
 use super::matcher::name_chars;
 use crate::harness::product_gate::ProductAllowlist;
 
@@ -43,9 +44,12 @@ impl NameCatalog {
         catalog
     }
 
-    pub(crate) fn products_and_companies(allowlist: &ProductAllowlist) -> Self {
+    pub(crate) fn products_and_companies(
+        allowlist: &ProductAllowlist,
+        companies: &[RegisteredCompany],
+    ) -> Self {
         let mut catalog = Self::products(allowlist);
-        for company in allowlist.companies() {
+        for company in companies {
             catalog.push(
                 NameKind::Company,
                 &company.name,

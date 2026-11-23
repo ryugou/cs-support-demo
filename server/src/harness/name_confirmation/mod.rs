@@ -10,7 +10,8 @@ mod state;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 
-pub(crate) use flow::{NameConfirmation, PendingAnswer, Presentation};
+pub(crate) use flow::{rewritten_context, NameConfirmation, Presentation};
+pub(crate) use interpret::ReplyResolution;
 pub(crate) use screening::screen_product_references;
 
 /// Selects how `Harness::evaluate` identifies the catalog products that a customer message names.

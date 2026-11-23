@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use super::*;
 use crate::harness::name_confirmation::test_fixtures::{
-    catalog_of, company, f_name_and_org, f_p7, product_node,
+    catalog_of, company, f_p7, name_and_org_catalog, product_node,
 };
 use crate::harness::product_gate::ProductAllowlist;
 
@@ -23,7 +23,7 @@ fn typo_mentions_of(text: &str, catalog: &NameCatalog) -> Vec<NameMention> {
 
 #[test]
 fn single_typo_offers_only_the_name_one_edit_away() {
-    let catalog = catalog_of(&f_name_and_org());
+    let catalog = name_and_org_catalog();
     let cases = [
         ("ADV-VC729P", "ADV-VC729P", "ADC-VC729P"),
         ("ADC-VC729", "ADC-VC729", "ADC-VC729P"),
@@ -51,7 +51,7 @@ fn single_typo_offers_only_the_name_one_edit_away() {
 
 #[test]
 fn single_typo_shows_the_official_notation_of_the_matched_name() {
-    let catalog = catalog_of(&f_name_and_org());
+    let catalog = name_and_org_catalog();
     let mentions = typo_mentions_of("みまもりドーカムメラ", &catalog);
     assert_eq!(mentions[0].targets[0].display, "みまもりドームカメラ");
     let mentions = typo_mentions_of("ADV-VC729P", &catalog);
@@ -72,7 +72,7 @@ fn tied_typo_offers_every_name_one_edit_away() {
 
 #[test]
 fn registered_names_written_with_width_or_case_differences_match_exactly() {
-    let catalog = catalog_of(&f_name_and_org());
+    let catalog = name_and_org_catalog();
     let cases = [
         ("ADC-V724", "ADC-V724"),
         ("adc-v724x", "ADC-V724X"),
@@ -106,7 +106,7 @@ fn exact_name_suppresses_a_one_edit_neighbor() {
 
 #[test]
 fn short_fragments_and_similar_meanings_are_not_suggested() {
-    let catalog = catalog_of(&f_name_and_org());
+    let catalog = name_and_org_catalog();
     for written in [
         "ADC-VDB101の設定を教えてください",
         "QX-9000を使っているが録画されない",
@@ -166,7 +166,7 @@ fn names_separated_by_punctuation_are_found_one_by_one() {
 
 #[test]
 fn a_dropped_last_letter_keeps_the_particle_out_of_the_notation() {
-    let catalog = catalog_of(&f_name_and_org());
+    let catalog = name_and_org_catalog();
     let cases = [
         ("みまもりドームカメが録画されない", "みまもりドームカメ"),
         ("ADC-VC729の設定", "ADC-VC729"),
@@ -184,7 +184,7 @@ fn a_dropped_last_letter_keeps_the_particle_out_of_the_notation() {
 
 #[test]
 fn a_mistyped_last_letter_stays_in_the_notation() {
-    let catalog = catalog_of(&f_name_and_org());
+    let catalog = name_and_org_catalog();
     let cases = [
         (
             "ミドリノ警備保障株式会杜から購入しました",
@@ -202,7 +202,7 @@ fn a_mistyped_last_letter_stays_in_the_notation() {
 
 #[test]
 fn a_letter_of_another_script_is_still_a_typo_when_no_other_reading_exists() {
-    let catalog = catalog_of(&f_name_and_org());
+    let catalog = name_and_org_catalog();
     let mentions = typo_mentions_of("ミドリの警備保障株式会社", &catalog);
     assert_eq!(mentions.len(), 1);
     assert_eq!(mentions[0].surface, "ミドリの警備保障株式会社");
@@ -218,9 +218,11 @@ fn matching_depends_only_on_the_registered_names() {
         product_node("ZX-1000", "ZX-1000", &[]),
         product_node("ZX-1000W", "ZX-1000W", &[]),
         product_node("KT-1", "キッチンタイマー丸型", &[]),
-    ])
-    .with_companies(vec![company("midorino", "ミドリノ警備保障株式会社", &[])]);
-    let catalog = catalog_of(&allowlist);
+    ]);
+    let catalog = NameCatalog::products_and_companies(
+        &allowlist,
+        &[company("midorino", "ミドリノ警備保障株式会社", &[])],
+    );
     let cases = [
         ("ZY-1000", "ZX-1000"),
         ("キッチンタイマー丸形", "KT-1"),

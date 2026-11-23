@@ -142,3 +142,13 @@ async fn t5_a_typo_the_llm_calls_matched_is_not_identified_without_confirmation(
     assert_presented(&turn, "ADV-VC729P", &["ADC-VC729P"], &[]);
     assert!(turn.product_models.is_empty());
 }
+
+#[tokio::test]
+async fn t5_an_unknown_model_whose_only_candidate_is_written_beside_it_gets_the_out_of_scope_reply()
+{
+    let (h, turn) = first_turn("ADC-VC729PとADC-VC729の違いを教えてください", &[]).await;
+    assert_eq!(turn.reply_kind.as_deref(), Some("out_of_scope"));
+    assert_eq!(turn.reply_text, current_out_of_scope_reply("ADC-VC729"));
+    assert!(confirmation_requests(&turn).is_empty());
+    assert!(pending_of(&h, &turn.case_id).is_empty());
+}

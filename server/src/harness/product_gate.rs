@@ -207,7 +207,6 @@ pub struct ProductAllowlist {
     models: Vec<String>,
     names: HashMap<String, String>,
     aliases: HashMap<String, Vec<String>>,
-    companies: Vec<RegisteredCompany>,
 }
 
 impl ProductAllowlist {
@@ -247,7 +246,6 @@ impl ProductAllowlist {
             models: usable,
             names: HashMap::new(),
             aliases: HashMap::new(),
-            companies: Vec::new(),
         }
     }
 
@@ -341,16 +339,8 @@ impl ProductAllowlist {
         }
     }
 
-    pub(crate) fn with_companies(self, companies: Vec<RegisteredCompany>) -> Self {
-        Self { companies, ..self }
-    }
-
     pub(crate) fn aliases_of(&self, model: &str) -> &[String] {
         self.aliases.get(model).map_or(&[], Vec::as_slice)
-    }
-
-    pub(crate) fn companies(&self) -> &[RegisteredCompany] {
-        &self.companies
     }
 
     pub(crate) fn excluding_models(&self, excluded: &[String]) -> Self {
@@ -374,7 +364,6 @@ impl ProductAllowlist {
                 .filter(|(model, _)| kept(model))
                 .map(|(model, aliases)| (model.clone(), aliases.clone()))
                 .collect(),
-            companies: self.companies.clone(),
             ..Self::from_models(models)
         }
     }
@@ -758,6 +747,7 @@ struct CachedAllowlist {
 pub struct ProductGate {
     client: Arc<VegapunkClient>,
     cache: Mutex<HashMap<String, CachedAllowlist>>,
+    company_cache: Mutex<HashMap<String, CachedCompanies>>,
     ttl: Duration,
 }
 
@@ -770,6 +760,7 @@ impl ProductGate {
         Self {
             client,
             cache: Mutex::new(HashMap::new()),
+            company_cache: Mutex::new(HashMap::new()),
             ttl,
         }
     }
@@ -822,21 +813,68 @@ impl ProductGate {
     }
 
     async fn fetch(&self, schema: &str) -> Result<ProductAllowlist> {
-        let (nodes, company_nodes) = tokio::try_join!(
-            async {
-                self.client
-                    .query_nodes(schema, KIND_PRODUCT, Vec::new(), PRODUCT_QUERY_LIMIT)
-                    .await
-                    .context("query product allowlist (Product nodes) from vegapunk")
-            },
-            company::query_company_nodes(&self.client, schema),
-        )?;
+        let nodes = self
+            .client
+            .query_nodes(schema, KIND_PRODUCT, Vec::new(), PRODUCT_QUERY_LIMIT)
+            .await
+            .context("query product allowlist (Product nodes) from vegapunk")?;
         validate_product_nodes(&nodes, schema, PRODUCT_QUERY_LIMIT)?;
-        let allowlist = ProductAllowlist::from_nodes(nodes)
-            .with_companies(company::active_companies(company_nodes));
+        let allowlist = ProductAllowlist::from_nodes(nodes);
         validate_allowlist_not_empty(&allowlist, schema)?;
         Ok(allowlist)
     }
+
+    pub(crate) async fn companies(&self, schema: &str) -> Arc<Vec<RegisteredCompany>> {
+        if let Some(fresh) = self.cached_companies(schema, true) {
+            return fresh;
+        }
+        match company::query_company_nodes(&self.client, schema).await {
+            Ok(nodes) => {
+                let companies = Arc::new(company::active_companies(nodes));
+                self.company_cache
+                    .lock()
+                    .expect("company names cache poisoned")
+                    .insert(
+                        schema.to_string(),
+                        CachedCompanies {
+                            stored_at: Instant::now(),
+                            companies: companies.clone(),
+                        },
+                    );
+                companies
+            }
+            Err(err) => match self.cached_companies(schema, false) {
+                Some(stale) => {
+                    tracing::warn!(schema, error = ?err, "company names refresh failed; serving the stale cached company names");
+                    stale
+                }
+                None => {
+                    tracing::warn!(schema, error = ?err, "failed to read company names; confirming names without company names");
+                    Arc::new(Vec::new())
+                }
+            },
+        }
+    }
+
+    fn cached_companies(
+        &self,
+        schema: &str,
+        require_fresh: bool,
+    ) -> Option<Arc<Vec<RegisteredCompany>>> {
+        let guard = self
+            .company_cache
+            .lock()
+            .expect("company names cache poisoned");
+        guard
+            .get(schema)
+            .filter(|cached| !require_fresh || is_fresh(cached.stored_at.elapsed(), self.ttl))
+            .map(|cached| cached.companies.clone())
+    }
+}
+
+struct CachedCompanies {
+    stored_at: Instant,
+    companies: Arc<Vec<RegisteredCompany>>,
 }
 
 /// 製品マスタ（Product ノード）取得の問い合わせ上限。`ingest_urtect.rs` の同名の製品マスタ取得

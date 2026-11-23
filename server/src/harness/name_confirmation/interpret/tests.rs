@@ -1,6 +1,6 @@
 use super::*;
 use crate::harness::name_confirmation::test_fixtures::{
-    catalog_of, company_target, f_name_and_org, product,
+    company_target, name_and_org_catalog, product,
 };
 
 fn pending(surface: &str, suggestions: Vec<NameTarget>, asks: u8) -> PendingMention {
@@ -31,12 +31,7 @@ fn apply(
     classification: ReplyClassification,
     reply: &str,
 ) -> ReplyResolution {
-    apply_reply(
-        state,
-        &classification,
-        reply,
-        &catalog_of(&f_name_and_org()),
-    )
+    apply_reply(state, &classification, reply, &name_and_org_catalog())
 }
 
 #[test]
@@ -180,6 +175,24 @@ fn no_with_another_typo_asks_about_the_new_notation() {
     assert_eq!(state.pending()[0].surface, "ADC-VC827");
     assert_eq!(state.pending()[0].suggestions, vec![product("ADC-VC827P")]);
     assert_eq!(state.pending()[0].asks, 0);
+}
+
+#[test]
+fn a_retyped_notation_that_is_unsafe_to_show_is_not_asked_about() {
+    for correction in [
+        "いえ、ADC-VC8\u{200B}27です",
+        "いえ、みまもりドー\u{200B}カムメラです",
+    ] {
+        let mut state = state_with(vec![pending("ADV-VC729P", vec![product("ADC-VC729P")], 1)]);
+        let resolution = apply(&mut state, answer(Verdict::No), correction);
+        assert!(state.pending().is_empty(), "{correction}");
+        assert_eq!(
+            resolution.unresolved_surface.as_deref(),
+            Some("ADV-VC729P"),
+            "{correction}"
+        );
+        assert!(state.is_denied(&product("ADC-VC729P")), "{correction}");
+    }
 }
 
 #[test]

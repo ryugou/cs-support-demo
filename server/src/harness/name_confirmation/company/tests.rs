@@ -31,12 +31,15 @@ fn register(file: &str, existing: &[NodeResult]) -> (Vec<NodeResult>, CompanySyn
 }
 
 fn suggested_companies(stored_nodes: &[NodeResult], written: &str) -> Vec<String> {
-    let allowlist = f_p7().with_companies(active_companies(stored_nodes.to_vec()));
-    find_mentions(written, &NameCatalog::products_and_companies(&allowlist))
-        .into_iter()
-        .filter(|mention| mention.matched == MentionMatch::Typo)
-        .flat_map(|mention| mention.targets.into_iter().map(|target| target.id))
-        .collect()
+    let companies = active_companies(stored_nodes.to_vec());
+    find_mentions(
+        written,
+        &NameCatalog::products_and_companies(&f_p7(), &companies),
+    )
+    .into_iter()
+    .filter(|mention| mention.matched == MentionMatch::Typo)
+    .flat_map(|mention| mention.targets.into_iter().map(|target| target.id))
+    .collect()
 }
 
 #[test]

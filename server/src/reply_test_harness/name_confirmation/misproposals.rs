@@ -158,8 +158,27 @@ async fn t4_a_denied_candidate_is_not_offered_again() {
         vec!["ADC-VC729P".to_string()]
     );
     for request in hearing_requests(&denied) {
-        assert!(!request.user.contains("ADC-VC729P"), "{}", request.user);
+        let offered = request
+            .user
+            .lines()
+            .filter(|line| !line.starts_with("- 顧客が違うと答えた候補（返信に書かない）: "))
+            .any(|line| line.contains("ADC-VC729P"));
+        assert!(!offered, "{}", request.user);
         assert!(!request.system.contains("ADC-VC729P"), "{}", request.system);
+        assert!(
+            request
+                .user
+                .contains("- 顧客が違うと答えた候補（返信に書かない）: ADC-VC729P"),
+            "{}",
+            request.user
+        );
+        assert!(
+            request
+                .user
+                .contains("- 顧客がお知らせくださった表記: ADV-VC729P"),
+            "{}",
+            request.user
+        );
     }
     assert!(!denied.reply_text.contains("ADC-VC729P"));
 
@@ -289,4 +308,90 @@ async fn t4_an_unknown_model_asked_about_again_without_answering_gets_the_out_of
         again.reply_text,
         build_out_of_scope_reply("ADC-VC729", &f_p7_allowlist())
     );
+}
+
+#[tokio::test]
+async fn t4_a_correction_to_an_unknown_model_resolves_the_pending_candidate_first() {
+    let h = ReplyHarness::start(f_p7_fixture()).await;
+    h.llm().respond_classify(&[], true);
+    let mut conv = h.conversation();
+    conv.say(TYPO_MESSAGE).await;
+
+    answer_no(&h);
+    let corrected = conv.say("いえ、ADC-VDB101です").await;
+    log_turn("t4-correction-out-of-scope", &h, &corrected);
+    assert_eq!(corrected.reply_kind.as_deref(), Some("out_of_scope"));
+    assert_eq!(
+        corrected.reply_text,
+        build_out_of_scope_reply("ADC-VDB101", &f_p7_allowlist())
+    );
+    assert!(pending_of(&h, &corrected.case_id).is_empty());
+    assert_eq!(
+        denied_of(&h, &corrected.case_id),
+        vec!["ADC-VC729P".to_string()]
+    );
+
+    answer_yes(&h);
+    let later = conv.say("はい、わかりました").await;
+    log_turn("t4-correction-out-of-scope", &h, &later);
+    assert!(later
+        .llm_requests_of(LlmKind::NameConfirmationReply)
+        .is_empty());
+    assert!(later.product_models.is_empty());
+}
+
+#[tokio::test]
+async fn t4_a_retyped_notation_that_is_unsafe_to_show_is_not_asked_about() {
+    let cases = [
+        (f_p7_fixture(), "いいえ、ADC-VC8\u{200B}27です"),
+        (f_name_fixture(), "いいえ、みまもりドー\u{200B}カムメラです"),
+    ];
+    for (fixture, correction) in cases {
+        let h = ReplyHarness::start(fixture).await;
+        h.llm().respond_classify(&[], true);
+        let mut conv = h.conversation();
+        conv.say(TYPO_MESSAGE).await;
+        answer_no(&h);
+        let turn = conv.say(correction).await;
+        log_turn("t4-unsafe-retyped-notation", &h, &turn);
+        assert!(
+            pending_of(&h, &turn.case_id)
+                .iter()
+                .all(|(surface, _)| !surface.contains('\u{200B}')),
+            "{correction}"
+        );
+        assert!(!turn.reply_text.contains('\u{200B}'), "{correction}");
+        assert!(confirmation_requests(&turn).is_empty(), "{correction}");
+        assert_eq!(
+            denied_of(&h, &turn.case_id),
+            vec!["ADC-VC729P".to_string()],
+            "{correction}"
+        );
+    }
+    let h = ReplyHarness::start(f_p7_fixture()).await;
+    h.llm().respond_classify(&[], true);
+    let first = h
+        .conversation()
+        .say("ADV-VC7\u{200B}29Pを使っているが録画されない")
+        .await;
+    log_turn("t4-unsafe-first-notation", &h, &first);
+    assert_ne!(first.reply_kind.as_deref(), Some("name_confirm"));
+}
+
+#[tokio::test]
+async fn t4_a_case_switched_away_from_an_escalated_case_confirms_names_again() {
+    let h = ReplyHarness::start(f_p7_fixture()).await;
+    h.llm().respond_classify(&[], true);
+    let mut conv = h.conversation();
+    let escalated = conv.say("ADC-V724から焦げ臭いにおいがします").await;
+    log_turn("t4-switch-from-escalated", &h, &escalated);
+    assert_eq!(escalated.reply_kind.as_deref(), Some("escalation"));
+
+    let switched = conv
+        .say("ADC-V523とADV-VC729Pを使っているが録画されない")
+        .await;
+    log_turn("t4-switch-from-escalated", &h, &switched);
+    assert!(switched.case_reset);
+    assert_ne!(switched.case_id, escalated.case_id);
+    assert_presented(&switched, "ADV-VC729P", &["ADC-VC729P"], &[]);
 }

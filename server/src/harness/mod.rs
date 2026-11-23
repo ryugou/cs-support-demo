@@ -1138,6 +1138,16 @@ impl Harness {
         self.product_gate()?.allowlist(schema).await
     }
 
+    pub(crate) async fn registered_companies(
+        &self,
+        schema: &str,
+    ) -> Arc<Vec<name_confirmation::company::RegisteredCompany>> {
+        match self.product_gate.as_ref() {
+            Some(gate) => gate.companies(schema).await,
+            None => Arc::new(Vec::new()),
+        }
+    }
+
     /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
     pub fn store(&self) -> Result<&knowledge::KnowledgeStore> {
         self.knowledge()

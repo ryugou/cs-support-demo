@@ -1,7 +1,7 @@
 use super::*;
 use crate::harness::name_confirmation::catalog::NameTarget;
 use crate::harness::name_confirmation::test_fixtures::{
-    catalog_of, company_target, f_name_and_org, f_p7, product,
+    catalog_of, company_target, f_name, f_p7, name_and_org_catalog, product,
 };
 
 fn presented(surface: &str, suggestions: Vec<NameTarget>, reason: AskReason) -> PresentedMention {
@@ -102,8 +102,8 @@ fn the_customer_notation_may_be_an_unregistered_model() {
 
 #[test]
 fn the_fixed_text_always_passes_its_own_check() {
-    let allowlist = f_name_and_org();
-    let catalog = catalog_of(&allowlist);
+    let allowlist = f_name();
+    let catalog = name_and_org_catalog();
     let mentions = vec![
         first(
             "ADC-VC728P",

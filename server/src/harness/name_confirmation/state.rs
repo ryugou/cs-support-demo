@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::catalog::{NameKind, NameTarget};
+use crate::harness::product_gate::is_safe_to_reflect;
 
 pub(crate) const STATE_ATTRIBUTE: &str = "name_confirmation";
 pub(crate) const MAX_ASKS: u8 = 2;
@@ -132,10 +133,14 @@ impl ConfirmationState {
             .any(|denied| denied.kind == target.kind && denied.id == target.id)
     }
 
-    pub(crate) fn is_settled(&self, surface_key: &str) -> bool {
+    pub(crate) fn is_confirmed(&self, surface_key: &str) -> bool {
         self.confirmed
             .iter()
             .any(|confirmed| confirmed.surface_key == surface_key)
+    }
+
+    pub(crate) fn is_settled(&self, surface_key: &str) -> bool {
+        self.is_confirmed(surface_key)
             || self
                 .dismissed
                 .iter()
@@ -168,6 +173,7 @@ impl ConfirmationState {
         }
         let pending_valid = self.pending.iter().all(|pending| {
             !pending.surface.is_empty()
+                && is_safe_to_reflect(&pending.surface)
                 && !pending.surface_key.is_empty()
                 && (1..=MAX_SUGGESTIONS).contains(&pending.suggestions.len())
                 && pending.suggestions.iter().all(is_complete_target)

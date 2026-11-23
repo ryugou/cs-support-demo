@@ -67,12 +67,12 @@ pub(crate) fn f_org() -> Vec<RegisteredCompany> {
     ]
 }
 
-pub(crate) fn f_name_and_org() -> ProductAllowlist {
-    f_name().with_companies(f_org())
+pub(crate) fn catalog_of(allowlist: &ProductAllowlist) -> NameCatalog {
+    NameCatalog::products_and_companies(allowlist, &[])
 }
 
-pub(crate) fn catalog_of(allowlist: &ProductAllowlist) -> NameCatalog {
-    NameCatalog::products_and_companies(allowlist)
+pub(crate) fn name_and_org_catalog() -> NameCatalog {
+    NameCatalog::products_and_companies(&f_name(), &f_org())
 }
 
 pub(crate) fn product(model: &str) -> NameTarget {

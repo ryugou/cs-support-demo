@@ -6,6 +6,7 @@ use serde::Deserialize;
 use super::catalog::{NameCatalog, NameKind, NameTarget};
 use super::matcher::{find_mentions, name_key, MentionMatch, NameMention};
 use super::state::{capped_suggestions, AskReason, ConfirmationState, PendingMention, MAX_ASKS};
+use crate::harness::product_gate::is_safe_to_reflect;
 use crate::harness::prompt_input::{neutralize_delimiters, truncate_question};
 use crate::llm::{strip_markdown_fence, AnthropicClient};
 
@@ -284,14 +285,17 @@ fn correct(
             .filter(|target| !state.is_denied(target))
             .cloned()
             .collect();
-        (found.matched == MentionMatch::Typo && !live.is_empty() && !state.is_settled(&found.key))
-            .then(|| PendingMention {
-                surface: found.surface.clone(),
-                surface_key: found.key.clone(),
-                suggestions: capped_suggestions(live),
-                asks: 0,
-                reason: AskReason::First,
-            })
+        (found.matched == MentionMatch::Typo
+            && !live.is_empty()
+            && !state.is_settled(&found.key)
+            && is_safe_to_reflect(&found.surface))
+        .then(|| PendingMention {
+            surface: found.surface.clone(),
+            surface_key: found.key.clone(),
+            suggestions: capped_suggestions(live),
+            asks: 0,
+            reason: AskReason::First,
+        })
     });
     match retyped {
         Some(pending) => state.push_pending(pending),

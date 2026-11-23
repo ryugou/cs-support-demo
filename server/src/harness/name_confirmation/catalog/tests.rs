@@ -1,7 +1,5 @@
 use super::*;
-use crate::harness::name_confirmation::test_fixtures::{
-    company, f_name_and_org, f_p7, product_node,
-};
+use crate::harness::name_confirmation::test_fixtures::{company, f_name, f_p7, product_node};
 
 fn entries_of(catalog: &NameCatalog) -> Vec<(String, NameKind, String, String)> {
     catalog
@@ -32,7 +30,7 @@ fn a_name_equal_to_the_model_is_registered_once() {
 
 #[test]
 fn product_names_and_aliases_point_at_the_model_and_show_the_official_name() {
-    let catalog = NameCatalog::products(&f_name_and_org());
+    let catalog = NameCatalog::products(&f_name());
     let entries = entries_of(&catalog);
     assert!(entries.contains(&(
         "みまもりドームカメラ".to_string(),
@@ -57,13 +55,13 @@ fn companies_join_the_catalog_with_their_aliases() {
         "ZX-1000",
         "ZX-1000",
         &[],
-    )])
-    .with_companies(vec![company(
+    )]);
+    let companies = [company(
         "midorino",
         "ミドリノ警備保障株式会社",
         &["ミドリノ警備"],
-    )]);
-    let entries = entries_of(&NameCatalog::products_and_companies(&allowlist));
+    )];
+    let entries = entries_of(&NameCatalog::products_and_companies(&allowlist, &companies));
     assert!(entries.contains(&(
         "ミドリノ警備".to_string(),
         NameKind::Company,
@@ -75,7 +73,7 @@ fn companies_join_the_catalog_with_their_aliases() {
 
 #[test]
 fn product_only_catalog_leaves_companies_out() {
-    let catalog = NameCatalog::products(&f_name_and_org());
+    let catalog = NameCatalog::products(&f_name());
     assert!(catalog
         .entries()
         .iter()

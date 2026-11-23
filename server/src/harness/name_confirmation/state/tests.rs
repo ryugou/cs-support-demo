@@ -43,12 +43,14 @@ fn a_malformed_or_incomplete_state_is_rejected() {
     let unknown_kind = r#"{"pending":[],"confirmed":[{"surface_key":"x","target":{"kind":"vendor","id":"A","display":"A"}}],"denied":[],"dismissed":[]}"#;
     let unknown_field = r#"{"pending":[],"confirmed":[],"denied":[],"dismissed":[],"extra":1}"#;
     let missing_field = r#"{"pending":[],"confirmed":[],"denied":[]}"#;
+    let unsafe_surface = r#"{"pending":[{"surface":"x\u200by","surface_key":"xy","suggestions":[{"kind":"product","id":"A","display":"A"}],"asks":1,"reason":"first"}],"confirmed":[],"denied":[],"dismissed":[]}"#;
     for written in [
         "",
         "not json",
         incomplete_pending,
         no_suggestion,
         too_many_asks,
+        unsafe_surface,
         unknown_kind,
         unknown_field,
         missing_field,
