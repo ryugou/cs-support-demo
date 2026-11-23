@@ -30,13 +30,25 @@ pub(crate) enum LlmKind {
     TimePref,
     /// 顧客向け返信文の下書き。
     Reply,
+    /// 名称（型番・製品名・社名）の候補を確認する返信の下書き（Issue #153）。
+    NameConfirmation,
+    /// 名称の確認への顧客の返答の分類（Issue #153。JSON を返す）。
+    NameConfirmationReply,
     /// 上のどれにも当てはまらない呼び出し。
     Other,
 }
 
 impl LlmKind {
     fn detect(system: &str) -> Self {
-        let markers: [(&str, LlmKind); 7] = [
+        let markers: [(&str, LlmKind); 9] = [
+            (
+                "直前の返信で、顧客が書いた名称",
+                LlmKind::NameConfirmationReply,
+            ),
+            (
+                "登録名称のどれのことかを確認する返信を書きます",
+                LlmKind::NameConfirmation,
+            ),
             ("CS 問い合わせの分類器", LlmKind::Classify),
             ("製品への言及を抽出する担当", LlmKind::ProductReferences),
             (
@@ -230,8 +242,29 @@ pub(crate) fn default_responder(request: &LlmRequest) -> String {
         LlmKind::ProductIdentification => "（スタブ）製品を確認する返信です。".to_string(),
         LlmKind::EscalationAck => "（スタブ）受け止め文です。".to_string(),
         LlmKind::Reply => "（スタブ）返信文の下書きです。".to_string(),
+        LlmKind::NameConfirmation => confirmation_echo(request),
+        LlmKind::NameConfirmationReply => {
+            serde_json::json!({"reply_type": "unrelated", "answers": []}).to_string()
+        }
         LlmKind::Other => "（スタブ）".to_string(),
     }
+}
+
+/// 名称の確認の下書き要求（user の `<確認する名称>` の各行「n. 顧客の表記: X／候補: Y、Z（注記）」）
+/// から、顧客の表記と候補をそのまま並べた確認文を作る。本番の検査（表記と候補が一字一句含まれる
+/// こと）を通る下書きにするため。
+fn confirmation_echo(request: &LlmRequest) -> String {
+    let items: Vec<String> = request
+        .user
+        .lines()
+        .filter_map(|line| line.split_once("顧客の表記: "))
+        .filter_map(|(_, rest)| rest.split_once("／候補: "))
+        .map(|(surface, candidates)| {
+            let candidates = candidates.split('（').next().unwrap_or(candidates);
+            format!("{surface} は {candidates} のことでしょうか？")
+        })
+        .collect();
+    format!("（スタブ）{}", items.join(""))
 }
 
 fn normalize(text: &str) -> String {

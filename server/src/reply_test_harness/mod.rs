@@ -19,6 +19,7 @@
 pub(crate) mod fake_vegapunk;
 pub(crate) mod llm_stub;
 
+mod name_confirmation;
 mod tests;
 
 use self::fake_vegapunk::{FakeVegapunk, GraphStore, NodeRecord};
@@ -254,10 +255,24 @@ pub(crate) struct ReplyHarness {
     _dir: tempfile_dir::TempDir,
 }
 
+/// LLM の接続先。`Stub` はスタブ LLM（既定）、`Anthropic` は `config.cloudrun.toml` の
+/// `[llm] endpoint`（実 API。API キーは環境変数 `CS_SUPPORT_LLM_API_KEY` からだけ読む）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmBackend {
+    Stub,
+    Anthropic,
+}
+
 impl ReplyHarness {
     /// 代替を起動し、`fixture` を投入して、本番と同じ配線の `Harness` と `api_router` を作る。
     /// `#[tokio::test]` の中で呼ぶこと。
     pub(crate) async fn start(fixture: Fixture) -> Self {
+        Self::start_with(fixture, LlmBackend::Stub).await
+    }
+
+    /// [`ReplyHarness::start`] の LLM の接続先を選べる版。`LlmBackend::Anthropic` は実 LLM の確認
+    /// （`#[ignore]` のテスト）だけが使う。vegapunk は常に代替を使う。
+    pub(crate) async fn start_with(fixture: Fixture, backend: LlmBackend) -> Self {
         let store = GraphStore::default();
         fixture.seed(&store);
         let fake = FakeVegapunk::start(store).await;
@@ -274,8 +289,13 @@ impl ReplyHarness {
         )))
         .expect("parse config.cloudrun.toml");
         config.vegapunk_endpoint = fake.endpoint.clone();
-        config.llm.endpoint = llm.endpoint.clone();
-        config.llm.api_key_file = Some(api_key_file.to_string_lossy().to_string());
+        match backend {
+            LlmBackend::Stub => {
+                config.llm.endpoint = llm.endpoint.clone();
+                config.llm.api_key_file = Some(api_key_file.to_string_lossy().to_string());
+            }
+            LlmBackend::Anthropic => config.llm.api_key_file = None,
+        }
         config.harness.audit_log_path = audit_log_path.to_string_lossy().to_string();
         config.harness.search_improvement_queue_path =
             dir.path().join("queue.jsonl").to_string_lossy().to_string();
@@ -324,6 +344,13 @@ impl ReplyHarness {
     /// vegapunk 代替のグラフ。保存された状態の読み出しと、追加のデータ投入に使う。
     pub(crate) fn store(&self) -> &GraphStore {
         &self.fake.store
+    }
+
+    /// vegapunk 代替へ接続した本番の `VegapunkClient`。投入手順（CLI が使うライブラリ関数）を
+    /// 代替に対して実行するために使う。
+    pub(crate) fn vegapunk_client(&self) -> VegapunkClient {
+        VegapunkClient::connect_lazy_with_limits(&self.fake.endpoint, "", GrpcLimits::default())
+            .expect("lazy connect never touches the network")
     }
 
     /// 新しい会話（履歴なし・`case_id` なし）。
