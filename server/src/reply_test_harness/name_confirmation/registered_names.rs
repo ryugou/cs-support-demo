@@ -116,6 +116,23 @@ async fn t3_a_confirmed_company_name_does_not_identify_a_product() {
 }
 
 #[tokio::test]
+async fn t6_companies_registered_for_another_project_are_not_suggested() {
+    let h = ReplyHarness::start(f_name_fixture()).await;
+    let companies = parse_company_file(F_ORG_FILE).expect("the company file is valid");
+    sync_registered_companies(&h.vegapunk_client(), "other-project", &companies)
+        .await
+        .expect("the registration procedure writes to the fake vegapunk");
+    h.llm().respond_classify(&[], true);
+    let turn = h
+        .conversation()
+        .say("ミドリノ警備保証株式会社から購入したADC-V724が録画されません")
+        .await;
+    log_turn("t6-other-project", &h, &turn);
+    assert_ne!(turn.reply_kind.as_deref(), Some("name_confirm"));
+    assert!(confirmation_requests(&turn).is_empty());
+}
+
+#[tokio::test]
 async fn t6_companies_registered_by_the_procedure_change_when_the_file_changes() {
     let h = ReplyHarness::start(f_name_fixture()).await;
     register_companies(&h, F_ORG_FILE).await;

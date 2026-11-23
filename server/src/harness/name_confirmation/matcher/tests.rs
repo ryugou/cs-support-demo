@@ -123,6 +123,14 @@ fn short_fragments_and_similar_meanings_are_not_suggested() {
 }
 
 #[test]
+fn a_partial_model_number_is_neither_a_match_nor_a_typo() {
+    let catalog = catalog_of(&f_p7());
+    for written in ["V724が録画されない", "VC729Pの設定", "ADC-V7", "V724X"] {
+        assert_eq!(find_mentions(written, &catalog), Vec::new(), "{written}");
+    }
+}
+
+#[test]
 fn name_is_taken_out_of_a_sentence_with_the_customer_notation() {
     let catalog = catalog_of(&f_p7());
     let mentions = find_mentions("ADV-VC729Pをつかっているが、録画されなき", &catalog);

@@ -167,7 +167,8 @@ async fn assert_recovers(h: &ReplyHarness, existing_case: bool, case: &str) -> S
 async fn t2_a_conversation_without_a_case_picks_the_notation_from_the_history() {
     let h = ReplyHarness::start(f_p7_fixture()).await;
     h.llm().respond_classify(&[], true);
-    assert_recovers(&h, false, "t2-premise-b").await;
+    let case_id = assert_recovers(&h, false, "t2-premise-b").await;
+    assert_confirms_after_recovery(&h, &case_id, "t2-premise-b-c").await;
 }
 
 #[tokio::test]
@@ -175,9 +176,11 @@ async fn t2_an_existing_case_that_already_asked_recovers_and_confirms() {
     let h = ReplyHarness::start(f_p7_fixture()).await;
     h.llm().respond_classify(&[], true);
     let case_id = assert_recovers(&h, true, "t2-premise-a").await;
-    let case_id = case_id.as_str();
+    assert_confirms_after_recovery(&h, &case_id, "t2-premise-a-c").await;
+}
 
-    answer_yes(&h);
+async fn assert_confirms_after_recovery(h: &ReplyHarness, case_id: &str, case: &str) {
+    answer_yes(h);
     let mut body = serde_json::json!({"message": "はい", "case_id": case_id});
     body["history"] = serde_json::json!([
         {"role": "customer", "text": "ADV-VC729Pをつかっているが、録画されなき"},
@@ -186,14 +189,21 @@ async fn t2_an_existing_case_that_already_asked_recovers_and_confirms() {
         {"role": "assistant", "text": "ADV-VC729P とお知らせいただきましたが、ADC-VC729P のことでしょうか？"},
     ]);
     let (status, text) = h.post_reply(body).await;
+    let decision = h
+        .conversation_turns(case_id)
+        .last()
+        .and_then(|turn| turn.attr("audit_event_id"))
+        .and_then(|id| h.audit_decision(id));
     println!(
-        "L2 case=t2-c status={status} body={text} product_models={:?}",
+        "L2 case={case} status={status} body={text} reply_kind={:?} decision={decision:?} product_models={:?}",
+        last_turn_kind(h, case_id),
         h.product_models(case_id)
     );
     assert_eq!(status, StatusCode::OK, "{text}");
     assert_eq!(h.product_models(case_id), vec!["ADC-VC729P".to_string()]);
-    assert_ne!(last_turn_kind(&h, case_id).as_deref(), Some("name_confirm"));
-    assert!(pending_of(&h, case_id).is_empty());
+    assert_ne!(last_turn_kind(h, case_id).as_deref(), Some("name_confirm"));
+    assert_ne!(decision.as_deref(), Some(PRODUCT_UNIDENTIFIED));
+    assert!(pending_of(h, case_id).is_empty());
 }
 
 #[tokio::test]
