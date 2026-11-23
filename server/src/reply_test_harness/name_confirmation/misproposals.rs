@@ -423,3 +423,30 @@ async fn t4_a_case_switched_away_from_an_escalated_case_confirms_names_again() {
     assert_ne!(switched.case_id, escalated.case_id);
     assert_presented(&switched, "ADV-VC729P", &["ADC-VC729P"], &[]);
 }
+
+#[tokio::test]
+async fn t4_an_unknown_model_typo_after_an_escalated_case_gets_the_out_of_scope_reply_without_a_switch(
+) {
+    let message = "ADC-V523とADC-VC729を使っているが録画されない";
+    let h = ReplyHarness::start(f_p7_fixture()).await;
+    h.llm().respond_classify(&[], true);
+    let mut conv = h.conversation();
+    let escalated = conv.say("ADC-V724から焦げ臭いにおいがします").await;
+    log_turn("t4-unknown-typo-after-escalation", &h, &escalated);
+    assert_eq!(escalated.reply_kind.as_deref(), Some("escalation"));
+
+    let after = conv.say(message).await;
+    log_turn("t4-unknown-typo-after-escalation", &h, &after);
+    assert_eq!(after.reply_kind.as_deref(), Some("out_of_scope"));
+    assert_eq!(after.decision.as_deref(), Some("out_of_scope_product"));
+    assert!(!after.case_reset);
+    assert_eq!(after.case_id, escalated.case_id);
+    assert!(after
+        .reply_text
+        .contains("ADC-VC729 は当社では取り扱いがございません"));
+    assert!(confirmation_requests(&after).is_empty());
+
+    let fresh = h.conversation().say(message).await;
+    log_turn("t4-unknown-typo-after-escalation", &h, &fresh);
+    assert_presented(&fresh, "ADC-VC729", &["ADC-VC729P"], &[]);
+}
