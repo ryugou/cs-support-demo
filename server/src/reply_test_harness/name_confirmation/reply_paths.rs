@@ -68,29 +68,39 @@ async fn t5_safety_handoffs_are_not_delayed_by_a_name_confirmation() {
     }
 }
 
+fn current_out_of_scope_reply(model: &str) -> String {
+    build_out_of_scope_reply(
+        model,
+        &ProductAllowlist::from_models(
+            [
+                "ADC-V523",
+                "ADC-V523X",
+                "ADC-V724",
+                "ADC-V724X",
+                "ADC-VC729P",
+                "ADC-VC727P",
+                "ADC-VC827P",
+            ]
+            .map(ToString::to_string)
+            .to_vec(),
+        ),
+    )
+}
+
 #[tokio::test]
 async fn t5_an_unknown_model_without_a_candidate_keeps_the_current_reply() {
     let (_, turn) = first_turn("ADC-VDB101から煙が出ています", &[]).await;
     assert_eq!(turn.reply_kind.as_deref(), Some("out_of_scope"));
-    assert_eq!(
-        turn.reply_text,
-        build_out_of_scope_reply(
-            "ADC-VDB101",
-            &ProductAllowlist::from_models(
-                [
-                    "ADC-V523",
-                    "ADC-V523X",
-                    "ADC-V724",
-                    "ADC-V724X",
-                    "ADC-VC729P",
-                    "ADC-VC727P",
-                    "ADC-VC827P",
-                ]
-                .map(ToString::to_string)
-                .to_vec()
-            )
-        )
-    );
+    assert_eq!(turn.reply_text, current_out_of_scope_reply("ADC-VDB101"));
+}
+
+#[tokio::test]
+async fn t5_the_out_of_scope_reply_names_the_unknown_model_without_a_candidate() {
+    let (h, turn) = first_turn("ADC-VC729とADC-VDB101の違いを教えてください", &[]).await;
+    assert_eq!(turn.reply_kind.as_deref(), Some("out_of_scope"));
+    assert_eq!(turn.reply_text, current_out_of_scope_reply("ADC-VDB101"));
+    assert!(confirmation_requests(&turn).is_empty());
+    assert!(pending_of(&h, &turn.case_id).is_empty());
 }
 
 #[tokio::test]

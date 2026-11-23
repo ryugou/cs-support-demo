@@ -67,16 +67,18 @@ impl NameConfirmation {
         })
     }
 
-    pub(crate) fn defers_out_of_scope_reply(
+    pub(crate) fn out_of_scope_reply_model(
         &self,
         allowlist: &ProductAllowlist,
         message: &str,
-    ) -> bool {
-        let models = allowlist.out_of_scope_mentions(message);
-        !models.is_empty() && models.iter().all(|model| self.can_suggest_for(model))
+    ) -> Option<String> {
+        allowlist
+            .out_of_scope_mentions(message)
+            .into_iter()
+            .find(|model| !self.can_suggest_for(model))
     }
 
-    pub(crate) fn can_suggest_for(&self, written: &str) -> bool {
+    fn can_suggest_for(&self, written: &str) -> bool {
         self.enabled
             && find_mentions(written, &self.catalog)
                 .iter()
@@ -143,9 +145,7 @@ impl NameConfirmation {
         if !resolution.confirmed.is_empty() || !self.state.pending().is_empty() {
             return None;
         }
-        allowlist
-            .first_out_of_scope_token(message)
-            .filter(|_| !self.defers_out_of_scope_reply(allowlist, message))
+        self.out_of_scope_reply_model(allowlist, message)
             .or_else(|| {
                 resolution
                     .unresolved_surface

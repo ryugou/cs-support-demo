@@ -1770,10 +1770,7 @@ async fn reply_handler(
         Ok(names) => names,
         Err(err) => return name_confirmation_failed(&err, &request_id),
     };
-    if let Some(out_of_scope_model) = allowlist
-        .first_out_of_scope_token(&req.message)
-        .filter(|_| !names.defers_out_of_scope_reply(&allowlist, &req.message))
-    {
+    if let Some(out_of_scope_model) = names.out_of_scope_reply_model(&allowlist, &req.message) {
         let reply_text = product_gate::build_out_of_scope_reply(&out_of_scope_model, &allowlist);
         let (case_id, audit_event_id) = state
             .harness

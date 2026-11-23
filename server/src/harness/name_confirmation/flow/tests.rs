@@ -182,25 +182,40 @@ fn pending_names_come_first_and_the_list_is_capped() {
 }
 
 #[test]
-fn the_out_of_scope_reply_waits_only_when_every_unknown_model_has_a_suggestion() {
+fn the_out_of_scope_reply_names_the_first_unknown_model_without_a_suggestion() {
     let allowlist = f_p7();
     let names = names_with(&allowlist, ConfirmationState::default());
-    assert!(names.defers_out_of_scope_reply(&allowlist, "ADC-VC729の設定を教えてください"));
-    assert!(names.defers_out_of_scope_reply(&allowlist, "ADC-VC728Pが録画されない"));
-    assert!(!names.defers_out_of_scope_reply(&allowlist, "ADC-VDB101の設定を教えてください"));
-    assert!(!names.defers_out_of_scope_reply(&allowlist, "ADC-VC729とADC-VDB101"));
-    assert!(!names.defers_out_of_scope_reply(&allowlist, "ADC-V724の設定"));
+    let reply_model = |names: &NameConfirmation, message: &str| {
+        names.out_of_scope_reply_model(&allowlist, message)
+    };
+    assert_eq!(reply_model(&names, "ADC-VC729の設定を教えてください"), None);
+    assert_eq!(reply_model(&names, "ADC-VC728Pが録画されない"), None);
+    assert_eq!(reply_model(&names, "ADC-V724の設定"), None);
+    assert_eq!(
+        reply_model(&names, "ADC-VDB101の設定を教えてください").as_deref(),
+        Some("ADC-VDB101")
+    );
+    assert_eq!(
+        reply_model(&names, "ADC-VC729とADC-VDB101").as_deref(),
+        Some("ADC-VDB101")
+    );
 
     let mut denied = ConfirmationState::default();
     denied.deny(&[product("ADC-VC729P")]);
     let names = names_with(&allowlist, denied);
-    assert!(!names.defers_out_of_scope_reply(&allowlist, "いいえ、ADC-VC729です"));
+    assert_eq!(
+        reply_model(&names, "いいえ、ADC-VC729です").as_deref(),
+        Some("ADC-VC729")
+    );
 
     let disabled = NameConfirmation {
         enabled: false,
         ..names_with(&allowlist, ConfirmationState::default())
     };
-    assert!(!disabled.defers_out_of_scope_reply(&allowlist, "ADC-VC729の設定を教えてください"));
+    assert_eq!(
+        reply_model(&disabled, "ADC-VC729の設定を教えてください").as_deref(),
+        Some("ADC-VC729")
+    );
 }
 
 #[test]
