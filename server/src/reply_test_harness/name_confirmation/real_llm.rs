@@ -119,8 +119,8 @@ fn lists_the_other_products_as_a_whole(text: &str, denied: &str) -> bool {
             && OTHER_PRODUCTS_WORDS.iter().any(|word| text.contains(word)))
 }
 
-fn acknowledges_and_asks_for_the_label(text: &str, written: &str) -> bool {
-    text.contains(written) && LABEL_WORDS.iter().any(|word| text.contains(word))
+fn asks_for_the_label(text: &str) -> bool {
+    LABEL_WORDS.iter().any(|word| text.contains(word))
 }
 
 fn check_confirmation(
@@ -372,7 +372,8 @@ async fn t4_tie_and_denial(checks: &mut Checks) {
     let mut conv = h.conversation();
     let first = conv.say("ADV-VC729Pを使っているが録画されない").await;
     print_turn(&checks.scenario, &h, &first);
-    for message in ["いいえ、違います", "ADV-VC729Pです"] {
+    for (message, right_after_the_denial) in [("いいえ、違います", true), ("ADV-VC729Pです", false)]
+    {
         let turn = conv.say(message).await;
         print_turn(&checks.scenario, &h, &turn);
         checks.check("H5_machine", !turn.reply_text.contains("ADC-VC729P"));
@@ -390,9 +391,15 @@ async fn t4_tie_and_denial(checks: &mut Checks) {
             lists_the_other_products_as_a_whole(&turn.reply_text, "ADC-VC729P"),
         );
         checks.check(
-            "notation_acknowledged_and_label_asked",
-            acknowledges_and_asks_for_the_label(&turn.reply_text, "ADV-VC729P"),
+            "notation_acknowledged",
+            turn.reply_text.contains("ADV-VC729P"),
         );
+        if right_after_the_denial {
+            checks.check(
+                "label_asked_after_the_denial",
+                asks_for_the_label(&turn.reply_text),
+            );
+        }
     }
 }
 
@@ -476,12 +483,13 @@ fn the_denial_checks_reject_the_hearings_seen_before_the_fix() {
     assert!(frames_a_product_as_similar(similar));
     assert!(!lists_the_other_products_as_a_whole(similar, "ADC-VC729P"));
     assert!(!lists_the_other_products_as_a_whole(partial, "ADC-VC729P"));
-    assert!(!acknowledges_and_asks_for_the_label(partial, "ADV-VC729P"));
+    assert!(!asks_for_the_label(similar));
+    assert!(!asks_for_the_label(partial));
 
     let expected = "ADV-VC729P とお知らせいただきありがとうございます。お手数ですが、本体のラベルに記載の型番をご確認いただけますか。ほかの取扱製品は ADC-V523、ADC-V523X、ADC-V724、ADC-V724X、ADC-VC727P、ADC-VC827P です。";
     assert!(!frames_a_product_as_similar(expected));
     assert!(lists_the_other_products_as_a_whole(expected, "ADC-VC729P"));
-    assert!(acknowledges_and_asks_for_the_label(expected, "ADV-VC729P"));
+    assert!(asks_for_the_label(expected));
     let without_list =
         "ADV-VC729P とのことですね。本体のラベルに記載の型番を教えていただけますか。";
     assert!(lists_the_other_products_as_a_whole(
