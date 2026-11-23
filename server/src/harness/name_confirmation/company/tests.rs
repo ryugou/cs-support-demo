@@ -78,6 +78,23 @@ fn an_invalid_company_file_is_rejected() {
 }
 
 #[test]
+fn a_company_file_is_limited_to_what_one_query_reads_back() {
+    let file = |count: usize| {
+        let entries: Vec<String> = (0..count)
+            .map(|index| format!(r#"{{"key": "c{index}", "name": "社名{index}", "aliases": []}}"#))
+            .collect();
+        format!("[{}]", entries.join(","))
+    };
+    assert_eq!(
+        parse_company_file(&file(MAX_REGISTERED_COMPANIES))
+            .unwrap()
+            .len(),
+        MAX_REGISTERED_COMPANIES
+    );
+    assert!(parse_company_file(&file(MAX_REGISTERED_COMPANIES + 1)).is_err());
+}
+
+#[test]
 fn synchronization_writes_listed_companies_and_retires_the_rest() {
     let (first, summary) = register(F_ORG_FILE, &[]);
     assert_eq!(
@@ -97,9 +114,23 @@ fn synchronization_writes_listed_companies_and_retires_the_rest() {
         }
     );
     assert_eq!(
-        active_companies(second),
+        active_companies(second.clone()),
         vec![company("midorino", "ミドリノ警備株式会社", &[])]
     );
+
+    let (third, summary) = register(renamed, &second);
+    assert_eq!(
+        summary,
+        CompanySyncSummary {
+            active: 1,
+            retired: 0
+        }
+    );
+    let by_id = |mut nodes: Vec<NodeResult>| {
+        nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        nodes
+    };
+    assert_eq!(by_id(third), by_id(second));
 }
 
 #[test]
@@ -172,11 +203,14 @@ fn invalid_or_retired_company_nodes_are_left_out_of_the_catalog() {
 }
 
 #[test]
-fn a_registered_node_without_a_key_stops_the_synchronization() {
+fn an_active_node_without_a_key_stops_the_synchronization() {
     let broken = NodeResult {
         node_id: "urtect:gen1:Company:x".to_string(),
         node_type: KIND_COMPANY.to_string(),
-        attributes: HashMap::from([("name".to_string(), "X社".to_string())]),
+        attributes: HashMap::from([
+            ("name".to_string(), "X社".to_string()),
+            ("status".to_string(), "active".to_string()),
+        ]),
     };
     let companies = parse_company_file(F_ORG_FILE).unwrap();
     assert!(company_sync_nodes("urtect", &companies, &[broken]).is_err());

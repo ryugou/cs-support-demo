@@ -13,6 +13,7 @@ use crate::vegapunk::VegapunkClient;
 
 const MAX_COMPANY_KEY_CHARS: usize = 64;
 const COMPANY_QUERY_LIMIT: i32 = 1000;
+const MAX_REGISTERED_COMPANIES: usize = COMPANY_QUERY_LIMIT as usize - 1;
 const ACTIVE_STATUS: &str = "active";
 const RETIRED_STATUS: &str = "retired";
 const ALIAS_SEPARATOR: char = ',';
@@ -49,12 +50,19 @@ struct CompanyFileEntry {
 ///
 /// # Errors
 ///
-/// Returns an error when the content is not such an array, when a key is malformed or repeated,
-/// when a name or alias is blank, holds a control character or a comma, or is too long, or when
-/// two names or aliases normalize to the same notation.
+/// Returns an error when the content is not such an array, when it lists more companies than one
+/// query reads back, when a key is malformed or repeated, when a name or alias is blank, holds a
+/// control character or a comma, or is too long, or when two names or aliases normalize to the
+/// same notation.
 pub fn parse_company_file(content: &str) -> Result<Vec<RegisteredCompany>> {
     let entries: Vec<CompanyFileEntry> =
         serde_json::from_str(content).context("failed to parse companies file")?;
+    if entries.len() > MAX_REGISTERED_COMPANIES {
+        bail!(
+            "invalid companies file: it lists {} companies, more than {MAX_REGISTERED_COMPANIES}",
+            entries.len()
+        );
+    }
     let companies = entries
         .into_iter()
         .map(|entry| validated_company(entry.key, &entry.name, &entry.aliases))
@@ -63,13 +71,13 @@ pub fn parse_company_file(content: &str) -> Result<Vec<RegisteredCompany>> {
     Ok(companies)
 }
 
-/// Writes `companies` as the active company names of `schema` and writes every registered company
-/// that `companies` no longer lists as retired.
+/// Writes `companies` as the active company names of `schema` and writes every active company that
+/// `companies` no longer lists as retired.
 ///
 /// # Errors
 ///
-/// Returns an error when vegapunk rejects the query or the write, when a registered company node
-/// has no key, or when the schema holds as many company nodes as one query can return.
+/// Returns an error when vegapunk rejects the query or the write, when an active company node has
+/// no key, or when the schema holds as many active company nodes as one query can return.
 pub async fn sync_registered_companies(
     client: &VegapunkClient,
     schema: &str,
@@ -89,11 +97,16 @@ pub(crate) async fn query_company_nodes(
     schema: &str,
 ) -> Result<Vec<NodeResult>> {
     let nodes = client
-        .query_nodes(schema, KIND_COMPANY, Vec::new(), COMPANY_QUERY_LIMIT)
+        .query_nodes(
+            schema,
+            KIND_COMPANY,
+            vec![("status", "eq", ACTIVE_STATUS)],
+            COMPANY_QUERY_LIMIT,
+        )
         .await
         .context("failed to read company nodes")?;
     if nodes.len() >= COMPANY_QUERY_LIMIT as usize {
-        bail!("invalid company nodes: schema {schema} holds at least {COMPANY_QUERY_LIMIT} nodes, more than one query reads");
+        bail!("invalid company nodes: schema {schema} holds at least {COMPANY_QUERY_LIMIT} active nodes, more than one query reads");
     }
     Ok(nodes)
 }
@@ -214,6 +227,9 @@ fn company_sync_nodes(
         .collect();
     let mut retired = 0;
     for node in existing {
+        if node.attributes.get("status").map(String::as_str) != Some(ACTIVE_STATUS) {
+            continue;
+        }
         let key = node.attributes.get("company_key").ok_or_else(|| {
             anyhow!(
                 "invalid company node {}: company_key is missing",
