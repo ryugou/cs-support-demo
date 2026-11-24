@@ -307,6 +307,21 @@ pub fn decide(input: &DecisionInput) -> AnswerDecision {
     }
 }
 
+/// Returns true when a layer-1 mandatory rule or a layer-2 prohibited domain decided `decision`.
+pub fn hands_off_immediately(
+    decision: &AnswerDecision,
+    rules: &[EscalationRule],
+    signals: &SignalSet,
+) -> bool {
+    match decision {
+        AnswerDecision::Escalate { layer: 2, .. } => true,
+        AnswerDecision::Escalate { layer: 1, .. } => {
+            match_layer1_mandatory(rules, signals).is_some()
+        }
+        _ => false,
+    }
+}
+
 fn product_unidentified_escalate(input: &DecisionInput) -> AnswerDecision {
     AnswerDecision::Escalate {
         reason: EscalateReason::ProductUnidentified,

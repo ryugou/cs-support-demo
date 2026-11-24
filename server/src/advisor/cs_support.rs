@@ -243,6 +243,7 @@ pub async fn run_support_turn(
             // Issue #61: アドバイザー経路は製品切り替え検知を行わないので抽出済みの値は無い
             // （内部で抽出する）。
             None,
+            crate::harness::name_confirmation::ProductNameMatching::LlmReferencesOnly,
         )
         .await?;
 
@@ -1050,6 +1051,7 @@ mod tests {
             partial_answer: false,
             decision_basis: crate::harness::DecisionBasis::Accumulated,
             applicable_known_resolution: None,
+            immediate_handoff: false,
         }
     }
 

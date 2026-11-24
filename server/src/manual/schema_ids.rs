@@ -3,6 +3,8 @@ pub const KIND_SECTION: &str = "ManualSection";
 pub const KIND_PRODUCT: &str = "Product";
 /// Issue #8 v2: answers.alarm.com の概念クエリ・記事横断 join の拠り所。
 pub const KIND_CONCEPT: &str = "Concept";
+/// Node type that holds one company name registered for name confirmation.
+pub const KIND_COMPANY: &str = "Company";
 
 /// vegapunk read API は generation prefix でスコープする。新規スキーマは gen1 始まり。
 pub fn manual_node_id(schema: &str, kind: &str, key: &str) -> String {

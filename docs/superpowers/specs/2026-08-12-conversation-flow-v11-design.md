@@ -160,6 +160,8 @@ Hybrid で LLM が false を返したときは、語彙判定との OR を取ら
 - (b) 呼出元が明示した `product_key` が allowlist 内にある。
 - (c) Jev 用の直近顧客発話の窓（最大 6 件・合計 2,000 字。`build_jev_state` と規則を共有し、`[jev] enabled` に依存せず組み立てる）内に `Matched` がある。窓から外れた型番は根拠にならない。
 
+`/api/reply` では、(a)(c) の `Matched` を登録名称の照合で絞った製品参照とし（登録名称から 1 文字だけ違う表記への `matched` を除き、登録名称がそのまま書かれた製品を加える）、(b) には名称の確認で確定した製品を渡す（Issue #153。正本は `2026-11-23-name-typo-confirmation-design.md`）。
+
 判定に使う signal は `decide_signals`。通常はケース内の累積 signal で、取次済み（受付番号発行済み）のケースは今ターンの signal だけを使う（`decide_signals_for_policy`）。取次済みで未特定でも聞き返しは再開せず、`/api/reply` は `decide_reply_action` の規則で取次済みの応答（`EscalationReply`）を返す。
 
 判定の順序は変えない。第1層 mandatory → 第2層 → 第1層 advisory → 製品未特定のガード → 既知解決（KR）の Allowed → 第3層。KR が選定済みでも未特定なら聞き返し、特定済みで KR があれば KR の回答を返す。聞き返しの回数上限は既存の `clarify_max_turns` に従い、達したら取次に進む。
@@ -175,6 +177,12 @@ Hybrid で LLM が false を返したときは、語彙判定との OR を取ら
 
 型番トークンしか検出しない `out_of_scope_mentions` は、ベンダー名だけ（例: Aeotec）の言及を検出しない。この穴はプロンプトの制約で塞ぎ、実 LLM スモークで取扱外の製品名が出ないことを確認する。
 
+名称の確認（Issue #153）の確認文も LLM が生成し、同じ出口ゲートを通す。確認文は顧客の表記をそのまま示すため、カタログ外の型番の検査では、確認する顧客の表記だけを許す。
+確認文を LLM が作れなかった場合は `FALLBACK_CLARIFY_TEXT` ではなく、顧客の表記と候補から組み立てる固定の文型に倒す。これは上記の方針の例外で、2026-11-23 にユーザーが採用した。`FALLBACK_CLARIFY_TEXT` では型番を最初から尋ね直し、確認のループが失敗時に再発するため (Issue #153)。
+文型と確認文の検査の正本は `2026-11-23-name-typo-confirmation-design.md` §5.3。名称の確認を返さないターンの聞き返しは、把握済み事項に確定した名称、製品名で特定した製品の型番、顧客が違うと答えた候補（返信に書かない旨を添える）を加える。
+顧客が違うと答えた製品がある案件では、取扱製品カタログを渡さず、一覧を挙げないこと、似た製品を示さないこと、型番を本体のラベルや購入時の書類で確かめてもらうことを指示する（正本は `2026-11-23-name-typo-confirmation-design.md` §3 の 9）。
+否定で候補が残らなかったターンは、一致しなかった顧客の表記も把握済み事項に加え、その表記を含む直前の顧客発話と今回の発話を連ねて問い合わせとして渡し、顧客の表記を受け止めたうえで候補を絞る情報を尋ねさせる。それでも否定された製品を書いた文面は `FALLBACK_CLARIFY_TEXT` に倒す。
+
 MCP `evaluate_answerability` は履歴が無く窓 (c) は不成立。
 製品未特定の判定に限り、§1 の「MCP tool（`evaluate_answerability`）の入出力・挙動は変更しない」と
 §9 の「MCP 経路への聞き返し・時間帯フローの適用」（範囲外）の例外とする。
@@ -185,7 +193,7 @@ MCP `evaluate_answerability` は履歴が無く窓 (c) は不成立。
 今ターンの製品参照の抽出が空なら (a) は不成立。(b) か窓 (c) で特定済みになればそれで判定し、できなければ未特定（fail-closed）として聞き返す。
 warn は LLM 設定済みで抽出の呼び出しが失敗したときだけ出し、`request_id` を含む（LLM 未設定の空結果では出さない）。ただし取次済みと `/api/reply` の `LexiconFallback` は、未特定でも聞き返さない。
 
-LLM 無効の構成（`ExtractionMode::LexiconOnly`）は製品参照を採用しないため (a)(c) は不成立で、特定できるのは (b) の `product_key` だけ。
+LLM 無効の構成（`ExtractionMode::LexiconOnly`）は製品参照を採用しないため (a)(c) は不成立で、特定できるのは (b) の `product_key` だけ。ただし `/api/reply` では、今回の発話に登録名称がそのまま書かれていれば照合で (a) が成立する（Issue #153）。
 `product_key` の無い `/api/reply` では製品依存と判定されたターンは聞き返しになり、`clarify_max_turns` に達すると取次へ進む（fail-closed）。
 窓 (c) の抽出は今ターンの signal 抽出が `Hybrid` のときだけ行う。
 

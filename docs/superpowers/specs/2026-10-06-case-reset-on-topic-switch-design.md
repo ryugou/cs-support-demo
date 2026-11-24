@@ -28,6 +28,8 @@
 
 ターンごとに、`evaluate` が得た `product_references` のうち `resolution == Matched` の `matched_model` を集合に加えて書き戻す（既存の case 属性の read-merge-write と同じ経路）。`Foreign`（取扱外）と `Ambiguous` は加えない。
 
+`/api/reply` の `product_references` は登録名称の照合で絞った値で、名称の確認で製品が確定したターンは、確定した型番も確認状態の保存と同じ書き込みで加える（Issue #153。`2026-11-23-name-typo-confirmation-design.md` §3）。確定した型番は、§2.2 の今ターンの `Matched` には数えない。
+
 `matched_model` は LLM が添える文字列で、コードはこれまで検証していない（`product_gate.rs` の `ProductReference` の注記）。集合に加える値と、§2.2 の比較に使う値は、**取扱製品一覧（`ProductAllowlist`）の正規表記に解決した型番**に限る。解決は、型番トークンの正規化（`normalize_model_token`。大小文字・ハイフン・全半角の差を吸収する）が一覧の型番と一致するものを、一覧に書かれた表記で返す。解決できない `Matched`（`matched_model` が無い、空、一覧のどの型番にも正規化後に一致しない）は、集合に加えず、§2.2 の判定でも `Matched` として数えない（型番に触れない発話と同じ扱い）。理由: 大小文字や別表記の揺れが、同じ製品を別の型番として比較させ、切り替えでないターンで case をリセットするのを防ぐ。解決できなかった件数と値は `tracing::warn!` に出す（発話本文は出さない）。
 
 `ProductAllowlist` に `canonical_model(&str) -> Option<String>` を追加する。`from_models` で正規化形から一覧表記への対応を持つ。`is_product_switch` と `merge_product_models` は、呼び出し側が解決済みの型番を渡す形にするか、`ProductAllowlist` を引数に取る形にする（どちらでもよいが、解決は 1 か所で行い、2 つの関数が同じ入力を見ることを保証する）。

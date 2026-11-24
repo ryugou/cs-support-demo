@@ -26,7 +26,7 @@
 | `created_at` | string（RFC3339 UTC） | サーバ時刻 |
 | `question` | string | 顧客メッセージ（そのまま） |
 | `reply_text` | string | 実際に返した最終応答文（プレーンテキスト正規化後） |
-| `reply_kind` | string | `answer` / `clarify` / `escalation` / `out_of_scope` / `time_pref` / `fallback` |
+| `reply_kind` | string | `answer` / `clarify` / `escalation` / `out_of_scope` / `time_pref` / `fallback` / `name_confirm`（名称のタイポ候補の確認。Issue #153） |
 | `audit_event_id` | string | 監査との突合キー |
 
 辺: `case -HAS_TURN-> ConversationTurn`。case ノードに属性 `end_user_id`（任意、初回提供時に設定）と `turn_count`（int、直近発行 seq。ConversationTurn を書くたびに read-merge-write で加算。`query_nodes` の固定 limit=1000 に依存した旧採番方式は 1000 件超の会話で seq が重複する欠陥があり撤去した）を加算。書き込み順序は turn_count → ConversationTurn（逆順だと turn_count の書き戻し失敗時に同じ seq が再採番され重複しうるため、欠番の方を選ぶ）。

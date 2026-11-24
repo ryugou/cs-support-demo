@@ -14,12 +14,15 @@ pub mod knowledge;
 /// Judge that selects the known resolution applicable to a question from the signal-matched candidates.
 pub mod kr_applicability;
 mod kr_selection;
+/// Confirms the registered name meant by a customer notation that is one typo away from it.
+pub mod name_confirmation;
 pub mod product_gate;
 pub(crate) mod prompt_input;
 #[cfg(test)]
 mod real_llm_smoke;
 pub mod reply;
 pub mod rules;
+mod schema_cache;
 pub mod scope;
 pub mod signal;
 mod supplementary_search;
@@ -180,6 +183,8 @@ pub struct EvaluationOutcome {
     pub decision_basis: DecisionBasis,
     /// The known resolution the applicability judge selected this turn, if any.
     pub applicable_known_resolution: Option<rules::KnownResolution>,
+    /// Whether a layer-1 mandatory rule or a layer-2 prohibited domain decided this turn's escalation.
+    pub immediate_handoff: bool,
 }
 
 /// 参考情報として返す過去事例の最小ビュー（S1-1 取得段）。
@@ -282,7 +287,9 @@ impl CaseConvState {
 /// 欠落・parse 失敗は既定値（0 / false / None）に倒す。数値の parse 失敗を warn しないのは、
 /// `knowledge.rs` の `approval_count` / `rejection_count` 読み取りと同じ規律に合わせるため
 /// （読み取り側で毎回 warn すると、既存 case（この 4 属性を持たない）を読むたびに warn が出る）。
-fn conv_state_from_attrs(attrs: &std::collections::HashMap<String, String>) -> CaseConvState {
+pub(crate) fn conv_state_from_attrs(
+    attrs: &std::collections::HashMap<String, String>,
+) -> CaseConvState {
     let get = |key: &str| attrs.get(key).map(String::as_str).unwrap_or("");
     CaseConvState {
         clarify_turns: get("clarify_turns").parse().unwrap_or(0),
@@ -458,17 +465,29 @@ async fn window_matched_models(
     if turns.is_empty() {
         return Vec::new();
     }
+    let text = turns.join("\n");
     let refs = window
         .extractor
-        .extract(
-            &turns.join("\n"),
-            allowlist.display_list(),
-            window.request_id,
-        )
+        .extract(&text, allowlist.display_list(), window.request_id)
         .await;
     let (refs, _discarded) =
         adopt_product_references_for_extraction_mode(window.extraction_mode, refs);
+    let refs = match_product_names(window.product_name_matching, allowlist, &text, refs);
     case_switch::partition_matched_models(allowlist, &refs).0
+}
+
+fn match_product_names(
+    matching: name_confirmation::ProductNameMatching,
+    allowlist: &product_gate::ProductAllowlist,
+    text: &str,
+    refs: Vec<product_gate::ProductReference>,
+) -> Vec<product_gate::ProductReference> {
+    match matching {
+        name_confirmation::ProductNameMatching::LlmReferencesOnly => refs,
+        name_confirmation::ProductNameMatching::RegisteredNames => {
+            name_confirmation::screen_product_references(allowlist, text, refs)
+        }
+    }
 }
 
 struct PastTurnsWindow<'a> {
@@ -476,6 +495,7 @@ struct PastTurnsWindow<'a> {
     extraction_mode: extraction::ExtractionMode,
     history: &'a [reply::ReplyHistoryTurn],
     request_id: &'a str,
+    product_name_matching: name_confirmation::ProductNameMatching,
 }
 
 async fn identify_product(
@@ -1119,6 +1139,26 @@ impl Harness {
         self.product_gate()?.allowlist(schema).await
     }
 
+    pub(crate) async fn registered_companies(
+        &self,
+        schema: &str,
+    ) -> Arc<Vec<name_confirmation::company::RegisteredCompany>> {
+        let Some(gate) = self.product_gate.as_ref() else {
+            return Arc::default();
+        };
+        match gate.companies(schema).await {
+            Ok(companies) => companies,
+            Err(err) => {
+                tracing::warn!(
+                    schema,
+                    error = ?err,
+                    "failed to read company names; confirming names without company names"
+                );
+                Arc::default()
+            }
+        }
+    }
+
     /// tool handler から材料ストアへアクセスするための入口（判定は持たない）。
     pub fn store(&self) -> Result<&knowledge::KnowledgeStore> {
         self.knowledge()
@@ -1131,12 +1171,21 @@ impl Harness {
         ctx: &RequestContext,
         case_id: &str,
     ) -> Result<CaseConvState> {
-        let attrs = self
+        Ok(conv_state_from_attrs(
+            &self.load_case_attributes(ctx, case_id).await?,
+        ))
+    }
+
+    pub(crate) async fn load_case_attributes(
+        &self,
+        ctx: &RequestContext,
+        case_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        Ok(self
             .knowledge()?
             .load_case(&ctx.schema, case_id)
             .await?
-            .unwrap_or_default();
-        Ok(conv_state_from_attrs(&attrs))
+            .unwrap_or_default())
     }
 
     /// support_case の会話状態を保存する。read-merge-write で既存属性（`question` 等）を保ち、
@@ -1821,6 +1870,7 @@ impl Harness {
         // ここで 1 度だけ適用する（呼び出し元の切り替え判定は同じ関数を別のコピーに適用するだけで、
         // 渡す値は生のまま）。
         supplied_extraction: Option<extraction::TurnExtraction>,
+        product_name_matching: name_confirmation::ProductNameMatching,
     ) -> Result<EvaluationOutcome> {
         let knowledge = self.knowledge()?;
         // [取得] scope は ctx.schema として全検索に注入済み（tenant=schema）。
@@ -1890,6 +1940,12 @@ impl Harness {
         // （`adopt_product_references_for_extraction_mode` の doc を参照）。
         let (product_references, discarded_product_references) =
             adopt_product_references_for_extraction_mode(extraction_mode, product_references);
+        let product_references = match_product_names(
+            product_name_matching,
+            &allowlist,
+            question,
+            product_references,
+        );
         if discarded_product_references > 0 {
             tracing::warn!(
                 request_id = %ctx.request_id,
@@ -2084,6 +2140,7 @@ impl Harness {
                 extraction_mode,
                 history,
                 request_id: &ctx.request_id,
+                product_name_matching,
             };
             if identify_product(
                 &allowlist,
@@ -2159,6 +2216,8 @@ impl Harness {
         // clarification_allowed()（本ファイル冒頭のモジュールレベル関数）が契約として持つ。
         // ここでは呼ぶだけにする。
         let clarification_allowed = clarification_allowed(&decision_result);
+        let immediate_handoff =
+            decision::hands_off_immediately(&decision_result, &rules, decide_signals);
         // [記録] 判定結果を case に永続化する（record_answer_attempt の lineage 検証の根拠。
         // client の自己申告でなくサーバ側の記録と突合するため）。KR 由来の回答なら
         // その kr_id もサーバ記録として残す（outcome 記録が client 申告に依存しないため）。
@@ -2414,6 +2473,7 @@ impl Harness {
             partial_answer,
             decision_basis,
             applicable_known_resolution,
+            immediate_handoff,
         })
     }
 
@@ -5226,6 +5286,7 @@ mod tests {
             extraction_mode: hybrid,
             history: &empty,
             request_id: "req-test",
+            product_name_matching: name_confirmation::ProductNameMatching::LlmReferencesOnly,
         };
         assert!(!identify_product(&allowlist, &[], None, Some(&w1)).await);
         assert!(identify_product(&allowlist, &["ABC-100".to_string()], None, None).await);
@@ -5240,6 +5301,7 @@ mod tests {
             extraction_mode: hybrid,
             history: &h3,
             request_id: "req-test",
+            product_name_matching: name_confirmation::ProductNameMatching::LlmReferencesOnly,
         };
         assert!(identify_product(&allowlist, &[], None, Some(&w3)).await);
         assert!(!identify_product(&allowlist, &[], None, None).await);
@@ -5257,6 +5319,7 @@ mod tests {
             extraction_mode: extraction::ExtractionMode::Hybrid,
             history: &h,
             request_id: "req-test",
+            product_name_matching: name_confirmation::ProductNameMatching::LlmReferencesOnly,
         };
         assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
     }
@@ -5270,6 +5333,7 @@ mod tests {
             extraction_mode: extraction::ExtractionMode::Hybrid,
             history: &h,
             request_id: "req-test",
+            product_name_matching: name_confirmation::ProductNameMatching::LlmReferencesOnly,
         };
         assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
     }
@@ -5283,6 +5347,7 @@ mod tests {
             extraction_mode: extraction::ExtractionMode::LexiconFallback,
             history: &h,
             request_id: "req-test",
+            product_name_matching: name_confirmation::ProductNameMatching::LlmReferencesOnly,
         };
         assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
     }
@@ -5321,6 +5386,7 @@ mod tests {
                 extraction_mode: mode,
                 history: &h,
                 request_id: "req-test",
+                product_name_matching: name_confirmation::ProductNameMatching::LlmReferencesOnly,
             };
             assert!(!identify_product(&identified_allowlist(), &[], None, Some(&window)).await);
         }
@@ -5330,6 +5396,7 @@ mod tests {
             extraction_mode: extraction::ExtractionMode::Hybrid,
             history: &h,
             request_id: "req-test",
+            product_name_matching: name_confirmation::ProductNameMatching::LlmReferencesOnly,
         };
         identify_product(&identified_allowlist(), &[], None, Some(&window)).await;
         assert_eq!(counter.calls.load(std::sync::atomic::Ordering::SeqCst), 1);

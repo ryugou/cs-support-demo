@@ -14,10 +14,15 @@ use crate::harness::adopt_product_references_for_extraction_mode;
 use crate::harness::case_switch;
 use crate::harness::decision::{self, AnswerDecision};
 use crate::harness::extraction::{self, TurnExtraction};
+use crate::harness::name_confirmation::{
+    identified_product_models, rewritten_context, NameConfirmation, Presentation,
+    ProductNameMatching, ReplyResolution,
+};
 use crate::harness::product_gate;
 use crate::harness::reply::{select_customer_history_for_jev, ReplyHistoryRole, ReplyHistoryTurn};
 use crate::harness::{
-    clarify, escalation_reply, hours, time_pref, Harness, ReplyDraftPolicy, RequestContext,
+    clarify, conv_state_from_attrs, escalation_reply, hours, time_pref, Harness, ReplyDraftPolicy,
+    RequestContext,
 };
 use crate::mcp::ToolService;
 use crate::oauth::VerifiedIdentity;
@@ -1554,6 +1559,78 @@ fn second_stage_short_circuit(
     })
 }
 
+fn name_confirmation_failed(err: &anyhow::Error, request_id: &str) -> Response {
+    let (status, code) = classify_evaluate_error(err);
+    tracing::error!(
+        request_id = %request_id,
+        error = ?err,
+        "answer api: failed to read or write the name confirmation state"
+    );
+    error_response(
+        status,
+        code,
+        format!("failed to process the name confirmation (request_id={request_id}); please retry"),
+    )
+}
+
+async fn save_name_confirmation_reply(
+    state: &ApiState,
+    ctx: &RequestContext,
+    names: &NameConfirmation,
+    case_id: Option<&str>,
+    answered: Option<&ReplyResolution>,
+) -> Result<(), Response> {
+    let (Some(case_id), Some(resolution)) = (case_id, answered) else {
+        return Ok(());
+    };
+    names
+        .save_reply(&state.harness, ctx, case_id, resolution)
+        .await
+        .map_err(|err| name_confirmation_failed(&err, &ctx.request_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn present_name_confirmation(
+    state: &ApiState,
+    ctx: &RequestContext,
+    names: &mut NameConfirmation,
+    presentation: Presentation,
+    message: &str,
+    is_continuation: bool,
+    allowlist: &product_gate::ProductAllowlist,
+    (case_id, case_reset): (String, bool),
+    end_user_id: Option<&str>,
+) -> Response {
+    match names
+        .present(
+            &state.harness,
+            ctx,
+            &case_id,
+            presentation,
+            message,
+            is_continuation,
+            allowlist,
+        )
+        .await
+    {
+        Ok((reply_text, audit_event_id)) => {
+            ok_reply_response(
+                state,
+                ctx,
+                "name_confirm",
+                message,
+                &audit_event_id,
+                end_user_id,
+                reply_text,
+                case_id,
+                case_reset,
+            )
+            .await
+        }
+        Err(err) => name_confirmation_failed(&err, &ctx.request_id),
+    }
+}
+
 /// `POST /{project_id}/api/reply`（design doc §2〜§4。会話フロー v1.1 design doc §2・§5）。
 ///
 /// 処理順:
@@ -1658,7 +1735,34 @@ async fn reply_handler(
         Ok(allowlist) => allowlist,
         Err(err) => return product_allowlist_fetch_failed(&err, &request_id),
     };
-    if let Some(out_of_scope_model) = allowlist.first_out_of_scope_token(&req.message) {
+    let mut names = match NameConfirmation::load(
+        &state.harness,
+        &ctx,
+        req.case_id.as_deref(),
+        &allowlist,
+    )
+    .await
+    {
+        Ok(names) => names,
+        Err(err) => return name_confirmation_failed(&err, &request_id),
+    };
+    let answered = names
+        .interpret_reply(&state.harness, &ctx, &req.message, &history)
+        .await;
+    if let Some(out_of_scope_model) =
+        names.out_of_scope_reply_model(&allowlist, &req.message, &history, answered.as_ref())
+    {
+        if let Err(response) = save_name_confirmation_reply(
+            &state,
+            &ctx,
+            &names,
+            req.case_id.as_deref(),
+            answered.as_ref(),
+        )
+        .await
+        {
+            return response;
+        }
         let reply_text = product_gate::build_out_of_scope_reply(&out_of_scope_model, &allowlist);
         let (case_id, audit_event_id) = state
             .harness
@@ -1724,6 +1828,23 @@ async fn reply_handler(
     // リクエストの値）。以降の `evaluate()` と応答の記録は、すべてこの値を使う。
     let effective_end_user_id =
         end_user_id_for_turn(case_switch.as_ref(), req.end_user_id.as_deref());
+    let answered = if case_switch.is_some() {
+        names.start_new_case();
+        None
+    } else {
+        if let Err(response) = save_name_confirmation_reply(
+            &state,
+            &ctx,
+            &names,
+            req.case_id.as_deref(),
+            answered.as_ref(),
+        )
+        .await
+        {
+            return response;
+        }
+        answered
+    };
 
     // ステップ 5: 希望時間帯の受付（会話フロー v1.1 design doc §5）。
     // `evaluate()` を呼ぶ前にすべての state 変更・保存を完了させる。
@@ -1820,6 +1941,10 @@ async fn reply_handler(
         }
     }
 
+    let context_text = answered
+        .as_ref()
+        .and_then(|resolution| rewritten_context(&history, &req.message, resolution));
+
     // 「初回か継続か」の判定は決定論（コード）。文面の出し分けは `clarify.rs` /
     // `escalation_reply.rs` / `reply.rs`（回答下書き）側に `is_continuation` として渡すだけ
     // （design doc §3）。`evaluate()` の内部で回答下書き生成（`draft_customer_reply`）まで
@@ -1850,8 +1975,8 @@ async fn reply_handler(
         .evaluate(
             &ctx,
             &req.message,
-            &req.message,
-            None,
+            context_text.as_deref().unwrap_or(&req.message),
+            names.confirmed_product_model(),
             eval_case_id,
             &state.tools,
             eval_history,
@@ -1874,6 +1999,7 @@ async fn reply_handler(
             // 抽出結果（signal + 生の製品参照）を渡し、evaluate() 内部での再抽出を省く。採用規則
             // は evaluate() が 1 度だけ適用する。検知を行わなかったターンは None（内部で抽出）。
             supplied_extraction,
+            ProductNameMatching::RegisteredNames,
         )
         .await
     {
@@ -1895,10 +2021,14 @@ async fn reply_handler(
                     .await;
             }
             let case_reset = case_switch.is_some();
+            let second_stage =
+                if names.defers_second_stage(&outcome, &req.message, eval_history, &allowlist) {
+                    None
+                } else {
+                    second_stage_short_circuit(&outcome, &req.message, &allowlist, &request_id)
+                };
             // Issue #28 §3.1 二段目: evaluate()の結果より前に判定する。
-            if let Some(short_circuit) =
-                second_stage_short_circuit(&outcome, &req.message, &allowlist, &request_id)
-            {
+            if let Some(short_circuit) = second_stage {
                 // Issue #28 C1 是正: evaluate() は既にこの case へ signal 累積・
                 // last_decision(allowed/escalate)・last_kr_id/last_evidence_*・
                 // WORM 監査(allowed:*/escalate:*)を書き込み済みだが、顧客には二段目の取扱外
@@ -1936,11 +2066,30 @@ async fn reply_handler(
                 )
                 .await;
             }
+            if let Some(presentation) = names.plan(&outcome, &req.message, eval_history) {
+                return present_name_confirmation(
+                    &state,
+                    &ctx,
+                    &mut names,
+                    presentation,
+                    &req.message,
+                    is_continuation,
+                    &allowlist,
+                    (outcome.case_id, case_reset),
+                    effective_end_user_id,
+                )
+                .await;
+            }
 
-            let mut conv = match state.harness.load_conv_state(&ctx, &outcome.case_id).await {
-                Ok(conv) => conv,
+            let case_attributes = match state
+                .harness
+                .load_case_attributes(&ctx, &outcome.case_id)
+                .await
+            {
+                Ok(attributes) => attributes,
                 Err(err) => return conv_state_load_failed(&err, &request_id, &outcome.case_id),
             };
+            let mut conv = conv_state_from_attrs(&case_attributes);
 
             // Issue #28 §3.5: 応答側ゲート（決定論・最終防衛線）その 1/3。回答下書き。
             // `decide_reply_action`（下記）より前に判定する: `outcome.customer_reply_draft` を
@@ -2079,24 +2228,36 @@ async fn reply_handler(
                     };
                     // B1: 把握済み事項リスト（design doc §3 v1.2 追記）。聞き返しのたびに
                     // 既知の情報を再質問してしまう退行を防ぐ。
-                    let known_facts = build_known_facts(
-                        &state.harness.lexicon,
-                        &outcome.accumulated_signals,
-                        eval_history,
+                    let identified_models = identified_product_models(&case_attributes);
+                    let known_facts = names.with_name_facts(
+                        build_known_facts(
+                            &state.harness.lexicon,
+                            &outcome.accumulated_signals,
+                            eval_history,
+                        ),
+                        answered.as_ref(),
+                        &identified_models,
+                        &allowlist,
                     );
+                    let hearing_allowlist = names.hearing_allowlist(&allowlist);
                     // B4: 残り確認回数の可視化（design doc §3 v1.2 追記）。この分岐に入る時点で
                     // `decide_reply_action` の前提により `conv.clarify_turns < clarify_max_turns`
                     // は保証済み（`is_final_clarify_turn` の doc コメント参照）。
                     let is_final_clarify_turn = is_final_clarify_turn(&conv, &state.config.api);
+                    let hearing_question = NameConfirmation::hearing_question(
+                        &req.message,
+                        eval_history,
+                        answered.as_ref(),
+                    );
                     let reply_text = clarify::clarify_question_text(
                         state.harness.reply_drafter.as_ref(),
                         &state.harness.ng,
                         state.harness.reply_draft_max_tokens,
-                        &req.message,
+                        &hearing_question,
                         &missing_text,
                         &known_facts,
                         is_continuation,
-                        &allowlist,
+                        &hearing_allowlist,
                         outcome.decision.is_product_unidentified(),
                     )
                     .await;
@@ -2113,6 +2274,12 @@ async fn reply_handler(
                         "clarify question mentions an out-of-scope product model; falling \
                          back to FALLBACK_CLARIFY_TEXT",
                         || clarify::FALLBACK_CLARIFY_TEXT.to_string(),
+                    );
+                    let reply_text = names.withhold_denied_names(
+                        reply_text,
+                        clarify::FALLBACK_CLARIFY_TEXT,
+                        &request_id,
+                        &outcome.case_id,
                     );
                     // LLM 下書き経由・フォールバック定型文経由のどちらでも、残り確認回数の
                     // サフィックスは同じ関数を通す（定型文であり LLM 生成物ではないため
@@ -2707,6 +2874,7 @@ mod tests {
             partial_answer: false,
             decision_basis: crate::harness::DecisionBasis::Accumulated,
             applicable_known_resolution: None,
+            immediate_handoff: false,
         }
     }
 

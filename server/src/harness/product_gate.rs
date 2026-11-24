@@ -11,12 +11,15 @@
 //! 型番の allowlist（正本は vegapunk の `Product` ノード）はコードへハードコードしない。
 //! `ProductGate::allowlist` が schema 単位に TTL 10 分でキャッシュしつつ都度解決する。
 
+use crate::harness::knowledge::csv_list;
+use crate::harness::name_confirmation::company::{self, RegisteredCompany};
+use crate::harness::schema_cache::SchemaCache;
 use crate::manual::schema_ids::KIND_PRODUCT;
 use crate::vegapunk::VegapunkClient;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use unicode_normalization::UnicodeNormalization;
 
 /// 製品マスタ（Product ノード一覧）の TTL キャッシュ既定値（design doc §2）。
@@ -157,20 +160,37 @@ pub fn extract_model_tokens(text: &str) -> Vec<String> {
 /// 空文字の扱いは変わらない（多層防御）。
 const MIN_FRAGMENT_VETO_CHARS: usize = 3;
 
-const MAX_PRODUCT_NAME_CHARS: usize = 100;
+const MAX_CATALOG_NAME_CHARS: usize = 100;
 
-fn validated_product_name(name: &str) -> Result<&str, &'static str> {
+pub(crate) fn validated_catalog_name(name: &str) -> Result<&str, &'static str> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err("name is blank after trimming");
+        return Err("is blank after trimming");
     }
     if trimmed.chars().any(char::is_control) {
-        return Err("name contains a control character");
+        return Err("contains a control character");
     }
-    if trimmed.chars().count() > MAX_PRODUCT_NAME_CHARS {
-        return Err("name exceeds the maximum length");
+    if trimmed.chars().count() > MAX_CATALOG_NAME_CHARS {
+        return Err("exceeds the maximum length");
     }
     Ok(trimmed)
+}
+
+fn valid_product_aliases(node_id: &str, written: &str) -> Vec<String> {
+    csv_list(written)
+        .into_iter()
+        .filter_map(|alias| match validated_catalog_name(&alias) {
+            Ok(valid) => Some(valid.to_string()),
+            Err(reason) => {
+                tracing::warn!(
+                    node_id = %node_id,
+                    reason,
+                    "product node has an invalid alias; excluding the alias from the product catalog"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// 取扱製品の allowlist（1 schema 分のスナップショット）。
@@ -187,6 +207,8 @@ pub struct ProductAllowlist {
     display: String,
     models: Vec<String>,
     names: HashMap<String, String>,
+    aliases: HashMap<String, Vec<String>>,
+    withholds_models: bool,
 }
 
 impl ProductAllowlist {
@@ -225,6 +247,8 @@ impl ProductAllowlist {
             display,
             models: usable,
             names: HashMap::new(),
+            aliases: HashMap::new(),
+            withholds_models: false,
         }
     }
 
@@ -273,12 +297,13 @@ impl ProductAllowlist {
     /// 単純化のため撤去する。
     pub(crate) fn from_nodes(nodes: Vec<crate::proto::graphrag::NodeResult>) -> Self {
         let mut names = HashMap::new();
+        let mut aliases = HashMap::new();
         let models: Vec<String> = nodes
             .into_iter()
             .filter_map(|n| match n.attributes.get("model") {
                 Some(model) => {
                     if let Some(name) = n.attributes.get("name") {
-                        match validated_product_name(name) {
+                        match validated_catalog_name(name) {
                             Ok(valid) => {
                                 names.insert(model.trim().to_string(), valid.to_string());
                             }
@@ -290,6 +315,12 @@ impl ProductAllowlist {
                                      the name from the product catalog"
                                 );
                             }
+                        }
+                    }
+                    if let Some(written) = n.attributes.get("aliases") {
+                        let valid = valid_product_aliases(&n.node_id, written);
+                        if !valid.is_empty() {
+                            aliases.insert(model.trim().to_string(), valid);
                         }
                     }
                     Some(model.clone())
@@ -306,8 +337,43 @@ impl ProductAllowlist {
             .collect();
         Self {
             names,
+            aliases,
             ..Self::from_models(models)
         }
+    }
+
+    pub(crate) fn aliases_of(&self, model: &str) -> &[String] {
+        self.aliases.get(model).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn excluding_models(&self, excluded: &[String]) -> Self {
+        let kept = |model: &String| !excluded.contains(model);
+        let models: Vec<String> = self
+            .models
+            .iter()
+            .filter(|model| kept(model))
+            .cloned()
+            .collect();
+        Self {
+            withholds_models: self.withholds_models || models.len() < self.models.len(),
+            names: self
+                .names
+                .iter()
+                .filter(|(model, _)| kept(model))
+                .map(|(model, name)| (model.clone(), name.clone()))
+                .collect(),
+            aliases: self
+                .aliases
+                .iter()
+                .filter(|(model, _)| kept(model))
+                .map(|(model, aliases)| (model.clone(), aliases.clone()))
+                .collect(),
+            ..Self::from_models(models)
+        }
+    }
+
+    pub(crate) fn withholds_models(&self) -> bool {
+        self.withholds_models
     }
 
     /// 正規化済みトークンが allowlist 内か。
@@ -524,7 +590,7 @@ pub(crate) const MAX_REFLECTABLE_SURFACE_CHARS: usize = 64;
 /// との後方互換のために [`reflection_unsafe_char_regex`] のパターンへ直接追加して保持している。
 /// これ以外に旧列挙リストからの退行は無いことを reviewer が U+0000〜U+10FFFF 全スカラ値の
 /// スイープで確認済み。
-fn is_safe_to_reflect(surface: &str) -> bool {
+pub(crate) fn is_safe_to_reflect(surface: &str) -> bool {
     let char_count = surface.chars().count();
     char_count <= MAX_REFLECTABLE_SURFACE_CHARS && !reflection_unsafe_char_regex().is_match(surface)
 }
@@ -674,11 +740,6 @@ pub fn build_out_of_scope_reply(detected_model: &str, allowlist: &ProductAllowli
     )
 }
 
-struct CachedAllowlist {
-    stored_at: Instant,
-    allowlist: Arc<ProductAllowlist>,
-}
-
 /// 製品マスタ（Product ノード）から取扱 allowlist を取得し、schema 単位に TTL キャッシュする
 /// コンポーネント（design doc §2）。
 ///
@@ -688,8 +749,8 @@ struct CachedAllowlist {
 /// vegapunk 不達時は検索も成立しないため既存のエラー意味論と一致する）。
 pub struct ProductGate {
     client: Arc<VegapunkClient>,
-    cache: Mutex<HashMap<String, CachedAllowlist>>,
-    ttl: Duration,
+    allowlist_cache: SchemaCache<ProductAllowlist>,
+    company_cache: SchemaCache<Vec<RegisteredCompany>>,
 }
 
 impl ProductGate {
@@ -700,56 +761,15 @@ impl ProductGate {
     pub fn with_ttl(client: Arc<VegapunkClient>, ttl: Duration) -> Self {
         Self {
             client,
-            cache: Mutex::new(HashMap::new()),
-            ttl,
+            allowlist_cache: SchemaCache::new("product allowlist", ttl),
+            company_cache: SchemaCache::new("company names", ttl),
         }
     }
 
     pub async fn allowlist(&self, schema: &str) -> Result<Arc<ProductAllowlist>> {
-        if let Some(fresh) = self.cached(schema, true) {
-            return Ok(fresh);
-        }
-        match self.fetch(schema).await {
-            Ok(allowlist) => {
-                let allowlist = Arc::new(allowlist);
-                self.store(schema, allowlist.clone());
-                Ok(allowlist)
-            }
-            Err(err) => {
-                if let Some(stale) = self.cached(schema, false) {
-                    tracing::warn!(
-                        schema,
-                        error = ?err,
-                        "product allowlist refresh failed; serving the stale cached allowlist \
-                         instead of failing the request (product scope master may be out of \
-                         date until vegapunk recovers)"
-                    );
-                    return Ok(stale);
-                }
-                Err(err)
-            }
-        }
-    }
-
-    /// `require_fresh = true` なら TTL 内のエントリだけを返す。`false` なら年齢を問わず返す
-    /// （stale フォールバック用）。
-    fn cached(&self, schema: &str, require_fresh: bool) -> Option<Arc<ProductAllowlist>> {
-        let guard = self.cache.lock().expect("product allowlist cache poisoned");
-        guard
-            .get(schema)
-            .filter(|c| !require_fresh || is_fresh(c.stored_at.elapsed(), self.ttl))
-            .map(|c| c.allowlist.clone())
-    }
-
-    fn store(&self, schema: &str, allowlist: Arc<ProductAllowlist>) {
-        let mut guard = self.cache.lock().expect("product allowlist cache poisoned");
-        guard.insert(
-            schema.to_string(),
-            CachedAllowlist {
-                stored_at: Instant::now(),
-                allowlist,
-            },
-        );
+        self.allowlist_cache
+            .get_or_fetch(schema, || self.fetch(schema))
+            .await
     }
 
     async fn fetch(&self, schema: &str) -> Result<ProductAllowlist> {
@@ -762,6 +782,15 @@ impl ProductGate {
         let allowlist = ProductAllowlist::from_nodes(nodes);
         validate_allowlist_not_empty(&allowlist, schema)?;
         Ok(allowlist)
+    }
+
+    pub(crate) async fn companies(&self, schema: &str) -> Result<Arc<Vec<RegisteredCompany>>> {
+        self.company_cache
+            .get_or_fetch(schema, || async {
+                let nodes = company::query_company_nodes(&self.client, schema).await?;
+                Ok(company::active_companies(nodes))
+            })
+            .await
     }
 }
 
@@ -829,13 +858,12 @@ fn validate_allowlist_not_empty(allowlist: &ProductAllowlist, schema: &str) -> R
     Ok(())
 }
 
-/// TTL キャッシュの鮮度判定。境界（`age == ttl`）は stale 扱い（`corpus.rs::is_fresh` と同じ規律）。
-fn is_fresh(age: Duration, ttl: Duration) -> bool {
-    age < ttl
-}
-
 #[cfg(test)]
 impl ProductGate {
+    fn store(&self, schema: &str, allowlist: Arc<ProductAllowlist>) {
+        self.allowlist_cache.store(schema, allowlist);
+    }
+
     /// テスト専用: 実ネットワークに繋がず、`schema` に `allowlist` を新鮮なキャッシュとして
     /// 埋め込んだ状態で構築する。`harness::mod` のテスト（`draft_customer_reply_via_stub` 等、
     /// VegapunkClient の実接続を張れない同期/擬似テスト環境）が、`Harness::product_gate` を
@@ -2220,8 +2248,8 @@ mod tests {
 
     #[test]
     fn from_nodes_excludes_invalid_names_from_the_catalog_and_keeps_the_model() {
-        let at_limit = "あ".repeat(MAX_PRODUCT_NAME_CHARS);
-        let over_limit = "あ".repeat(MAX_PRODUCT_NAME_CHARS + 1);
+        let at_limit = "あ".repeat(MAX_CATALOG_NAME_CHARS);
+        let over_limit = "あ".repeat(MAX_CATALOG_NAME_CHARS + 1);
         let cases: Vec<(&str, String, bool)> = vec![
             ("newline", "屋外\nカメラ".to_string(), false),
             ("control character", "屋外\u{7}カメラ".to_string(), false),

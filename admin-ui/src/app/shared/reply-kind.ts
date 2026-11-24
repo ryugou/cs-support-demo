@@ -7,9 +7,9 @@ interface ReplyKindStyle {
   badgeClass: string;
 }
 
-/** design doc §4 / CLAUDE.md の CS 6値 + advisor 固有4値
+/** design doc §4 / CLAUDE.md の CS 7値 + advisor 固有4値
  * (`docs/superpowers/specs/2026-08-17-homesec-advisor-design.md` §3.3)を合わせた
- * 10値の日本語ラベル対応表。ラベルの和訳自体はこのタスクの裁量事項（オーケストレーターの
+ * 11値の日本語ラベル対応表。ラベルの和訳自体はこのタスクの裁量事項（オーケストレーターの
  * spec に例示あり）。CS と advisor は同じ reply_kind の文字列空間を共有するが、
  * answer / clarify / time_pref / fallback の4値以外は互いに排他的な値を使う。 */
 const REPLY_KIND_STYLES: Record<string, ReplyKindStyle> = {
@@ -19,6 +19,7 @@ const REPLY_KIND_STYLES: Record<string, ReplyKindStyle> = {
   out_of_scope: { label: '対象外', badgeClass: 'bg-slate-100 text-slate-600' },
   time_pref: { label: '時間帯希望', badgeClass: 'bg-violet-50 text-violet-700' },
   fallback: { label: 'フォールバック', badgeClass: 'bg-rose-50 text-rose-700' },
+  name_confirm: { label: '名称確認', badgeClass: 'bg-blue-50 text-blue-700' },
   // advisor 固有4値(design doc §3.3)。
   handoff: { label: '個別サポート案内', badgeClass: 'bg-indigo-50 text-indigo-700' },
   safety: { label: '緊急案内', badgeClass: 'bg-red-50 text-red-700' },

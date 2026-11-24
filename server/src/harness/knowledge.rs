@@ -604,7 +604,7 @@ const KIND_KNOWN_RESOLUTION: &str = "KnownResolution";
 
 /// ConversationTurn 1 件分のグラフ表現（ノード + `case -HAS_TURN-> turn` 辺）を組み立てる
 /// 純関数（Issue #31 design doc §2）。`record_conversation_turn` から network I/O を分離して
-/// あるのは、属性組み立て・6 種の reply_kind 分類を実 vegapunk 無しでテストするため
+/// あるのは、属性組み立て・7 種の reply_kind 分類を実 vegapunk 無しでテストするため
 /// （`build_known_resolution_graph` / `build_answer_evidence_graph` と同じ規律）。
 ///
 /// **検索非汚染（design doc §2 受け入れ条件）**: 戻り値は `GraphBuild`（nodes/edges のみ）で
@@ -1944,7 +1944,7 @@ mod tests {
         assert_eq!(attr(&build.nodes[0], "end_user_id"), Some("a1b2c3"));
     }
 
-    /// design doc §2 が列挙する 6 種の reply_kind のうち、実際に到達しうる 5 種（`fallback` は
+    /// design doc §2 が列挙する 7 種の reply_kind のうち、実際に到達しうる 6 種（`fallback` は
     /// api.rs のどの分岐からも到達しないため対象外。api.rs の doc コメント参照）が、すべて
     /// そのまま `reply_kind` 属性に載ることを固定する（属性組み立ての回帰）。
     #[test]
@@ -1955,6 +1955,7 @@ mod tests {
             "escalation",
             "out_of_scope",
             "time_pref",
+            "name_confirm",
         ] {
             let build = build_conversation_turn_graph(
                 "urtect",
@@ -2322,6 +2323,7 @@ mod tests {
             // Issue #61 design doc §2.3: 製品切り替え検知時に harness/mod.rs::
             // record_case_switch（try_record_case_switch）が新 case へ書き込む。
             "previous_case_id",
+            "name_confirmation",
         ]
         .into_iter()
         .map(str::to_string)

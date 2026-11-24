@@ -822,6 +822,37 @@ impl VegapunkClient {
     }
 }
 
+/// Reads the vegapunk bearer token for an ingest CLI from `token_file`, or from the environment
+/// variable `token_env` when the file is absent, unreadable, or blank.
+///
+/// # Errors
+///
+/// Returns an error when neither source holds a non-blank token.
+pub fn read_cli_bearer_token(
+    token_file: Option<&std::path::Path>,
+    token_env: &str,
+) -> Result<String> {
+    if let Some(path) = token_file {
+        match std::fs::read_to_string(path) {
+            Ok(body) if !body.trim().is_empty() => return Ok(body.trim().to_string()),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "token file is unreadable; reading the token environment variable instead"
+            ),
+        }
+    }
+    let token = std::env::var(token_env).with_context(|| {
+        format!("failed to read the vegapunk bearer token: env {token_env} is unset")
+    })?;
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("invalid vegapunk bearer token: env {token_env} is blank");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// offset ページングの終端判定: 1 ページで返った件数が要求 `page_size` 未満なら最終ページ。
 /// `<`（`<=` ではない）である点が重要 — ちょうど `page_size` 件返ったときはさらに次ページが
 /// 存在しうるため継続する。境界を誤ると早期終了（取りこぼし）か無限ループを招く。
