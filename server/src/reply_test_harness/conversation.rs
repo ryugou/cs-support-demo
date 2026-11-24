@@ -94,14 +94,16 @@ impl ReplyBody {
 
 pub(crate) struct Conversation<'h> {
     harness: &'h ReplyHarness,
+    project_id: String,
     case_id: Option<String>,
     history: VecDeque<(&'static str, String)>,
 }
 
 impl<'h> Conversation<'h> {
-    pub(crate) fn new(harness: &'h ReplyHarness) -> Self {
+    pub(crate) fn new(harness: &'h ReplyHarness, project_id: &str) -> Self {
         Self {
             harness,
+            project_id: project_id.to_string(),
             case_id: None,
             history: VecDeque::new(),
         }
@@ -110,7 +112,10 @@ impl<'h> Conversation<'h> {
     pub(crate) async fn say(&mut self, message: &str) -> Turn {
         let index = self.next_index();
         let llm_before = self.harness.llm().request_count();
-        let (status, text) = self.harness.post_reply(self.request_body(message)).await;
+        let (status, text) = self
+            .harness
+            .post_reply_to(&self.project_id, self.request_body(message))
+            .await;
         let llm_requests = self.harness.llm().requests()[llm_before..].to_vec();
         if status != StatusCode::OK {
             return Turn::failed(index, message, status, text, llm_requests);
@@ -160,7 +165,9 @@ impl<'h> Conversation<'h> {
         reply: ReplyBody,
         llm_requests: Vec<LlmRequest>,
     ) -> Turn {
-        let turns = self.harness.conversation_turns(&reply.case_id);
+        let turns = self
+            .harness
+            .conversation_turns_in(&self.project_id, &reply.case_id);
         let recorded = turns.last();
         let reply_kind = recorded
             .and_then(|t| t.attr("reply_kind"))
@@ -168,7 +175,9 @@ impl<'h> Conversation<'h> {
         let decision = recorded
             .and_then(|t| t.attr("audit_event_id"))
             .and_then(|id| self.harness.audit_decision(id));
-        let product_models = self.harness.product_models(&reply.case_id);
+        let product_models = self
+            .harness
+            .product_models_in(&self.project_id, &reply.case_id);
         Turn {
             index,
             message: message.to_string(),

@@ -27,12 +27,22 @@ struct BundledRules {
 }
 
 pub(crate) struct Fixture {
+    schema: String,
     graph: GraphBuild,
 }
 
 impl Fixture {
     pub(crate) fn new() -> Self {
+        Self::for_schema(PROJECT_ID)
+    }
+
+    pub(crate) fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    pub(crate) fn for_schema(schema: &str) -> Self {
         Self {
+            schema: schema.to_string(),
             graph: GraphBuild {
                 nodes: Vec::new(),
                 edges: Vec::new(),
@@ -42,7 +52,7 @@ impl Fixture {
 
     pub(crate) fn product(mut self, model: &str, name: &str, aliases: &[&str]) -> Self {
         self.graph.nodes.push(build_product_node(
-            PROJECT_ID,
+            &self.schema,
             &ManualProductInput {
                 model: model.to_string(),
                 name: name.to_string(),
@@ -73,7 +83,7 @@ impl Fixture {
 
     pub(crate) fn node(mut self, kind: &str, key: &str, attributes: &[(&str, &str)]) -> Self {
         self.graph.nodes.push(GraphNode {
-            id: manual_node_id(PROJECT_ID, kind, key),
+            id: manual_node_id(&self.schema, kind, key),
             node_type: kind.to_string(),
             attributes: attributes
                 .iter()
@@ -92,7 +102,7 @@ impl Fixture {
         signals: &[&str],
     ) -> Self {
         let doc = build_document_node(
-            PROJECT_ID,
+            &self.schema,
             MANUAL_DOC_KEY,
             "テスト用マニュアル",
             "https://example.invalid/manual",
@@ -116,7 +126,8 @@ impl Fixture {
             original_hash: None,
             concept_keys: Vec::new(),
         };
-        let build = build_section_graph(PROJECT_ID, MANUAL_DOC_KEY, &section, &content_hash(body));
+        let build =
+            build_section_graph(&self.schema, MANUAL_DOC_KEY, &section, &content_hash(body));
         self.graph.nodes.extend(build.nodes);
         self.graph.edges.extend(build.edges);
         self
@@ -131,7 +142,7 @@ impl Fixture {
         for rule in &rules.escalation_rules {
             let key = rule["rule_id"].as_str().expect("rule_id").to_string();
             self.graph.nodes.push(GraphNode {
-                id: harness_node_id(PROJECT_ID, "EscalationRule", &key),
+                id: harness_node_id(&self.schema, "EscalationRule", &key),
                 node_type: "EscalationRule".to_string(),
                 attributes: stored_rule_attributes(rule),
             });
@@ -139,7 +150,7 @@ impl Fixture {
         for domain in &rules.prohibited_domains {
             let key = domain["domain_id"].as_str().expect("domain_id").to_string();
             self.graph.nodes.push(GraphNode {
-                id: harness_node_id(PROJECT_ID, "ProhibitedDomain", &key),
+                id: harness_node_id(&self.schema, "ProhibitedDomain", &key),
                 node_type: "ProhibitedDomain".to_string(),
                 attributes: stored_rule_attributes(domain),
             });

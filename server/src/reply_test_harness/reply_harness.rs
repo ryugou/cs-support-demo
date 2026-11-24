@@ -12,7 +12,7 @@ use super::llm_stub::LlmStub;
 use super::temp_dir::TempDir;
 use super::PROJECT_ID;
 use crate::api::{api_router, ApiState};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ProjectConfig};
 use crate::harness::audit::WormAuditLog;
 use crate::harness::knowledge::{csv_list, harness_node_id};
 use crate::harness::{CaseConvState, Harness};
@@ -43,13 +43,25 @@ impl ReplyHarness {
     }
 
     pub(crate) async fn start_with(fixture: Fixture, backend: LlmBackend) -> Self {
+        Self::start_projects(fixture, Vec::new(), backend).await
+    }
+
+    pub(crate) async fn start_with_other_projects(fixture: Fixture, others: Vec<Fixture>) -> Self {
+        Self::start_projects(fixture, others, LlmBackend::Stub).await
+    }
+
+    async fn start_projects(fixture: Fixture, others: Vec<Fixture>, backend: LlmBackend) -> Self {
         let store = GraphStore::default();
         fixture.seed(&store);
+        for other in &others {
+            other.seed(&store);
+        }
         let fake = FakeVegapunk::start(store).await;
         let llm = LlmStub::start().await;
         let dir = TempDir::new();
         let audit_log_path = dir.path().join("audit.jsonl");
-        let config = harness_config(&fake, &llm, &dir, &audit_log_path, backend);
+        let mut config = harness_config(&fake, &llm, &dir, &audit_log_path, backend);
+        add_other_projects(&mut config, &others);
         let client = VegapunkClient::connect_lazy_with_limits(
             &config.vegapunk_endpoint,
             "",
@@ -103,13 +115,25 @@ impl ReplyHarness {
     }
 
     pub(crate) fn conversation(&self) -> Conversation<'_> {
-        Conversation::new(self)
+        self.conversation_in(PROJECT_ID)
+    }
+
+    pub(crate) fn conversation_in(&self, project_id: &str) -> Conversation<'_> {
+        Conversation::new(self, project_id)
     }
 
     pub(crate) async fn post_reply(&self, body: serde_json::Value) -> (StatusCode, String) {
+        self.post_reply_to(PROJECT_ID, body).await
+    }
+
+    pub(crate) async fn post_reply_to(
+        &self,
+        project_id: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, String) {
         let request = Request::builder()
             .method("POST")
-            .uri(format!("/{PROJECT_ID}/api/reply"))
+            .uri(format!("/{project_id}/api/reply"))
             .header("authorization", format!("Bearer {API_KEY}"))
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
@@ -126,13 +150,21 @@ impl ReplyHarness {
     }
 
     pub(crate) fn case_attributes(&self, case_id: &str) -> Option<NodeRecord> {
+        self.case_attributes_in(PROJECT_ID, case_id)
+    }
+
+    pub(crate) fn case_attributes_in(&self, schema: &str, case_id: &str) -> Option<NodeRecord> {
         self.fake
             .store
-            .node(&harness_node_id(PROJECT_ID, "support_case", case_id))
+            .node(&harness_node_id(schema, "support_case", case_id))
     }
 
     pub(crate) fn product_models(&self, case_id: &str) -> Vec<String> {
-        self.case_attributes(case_id)
+        self.product_models_in(PROJECT_ID, case_id)
+    }
+
+    pub(crate) fn product_models_in(&self, schema: &str, case_id: &str) -> Vec<String> {
+        self.case_attributes_in(schema, case_id)
             .and_then(|case| case.attr("product_models").map(csv_list))
             .unwrap_or_default()
     }
@@ -159,10 +191,14 @@ impl ReplyHarness {
     }
 
     pub(crate) fn conversation_turns(&self, case_id: &str) -> Vec<NodeRecord> {
+        self.conversation_turns_in(PROJECT_ID, case_id)
+    }
+
+    pub(crate) fn conversation_turns_in(&self, schema: &str, case_id: &str) -> Vec<NodeRecord> {
         let mut turns: Vec<NodeRecord> = self
             .fake
             .store
-            .nodes_of_type(PROJECT_ID, "ConversationTurn")
+            .nodes_of_type(schema, "ConversationTurn")
             .into_iter()
             .filter(|turn| turn.attr("case_id") == Some(case_id))
             .collect();
@@ -226,4 +262,21 @@ fn harness_config(
     );
     assert_eq!(config.projects[0].project_id, PROJECT_ID);
     config
+}
+
+fn add_other_projects(config: &mut AppConfig, others: &[Fixture]) {
+    let manual_schema = config.projects[0].manual_schema;
+    for other in others {
+        assert_ne!(
+            other.schema(),
+            PROJECT_ID,
+            "another project needs its own schema"
+        );
+        config.projects.push(ProjectConfig {
+            project_id: other.schema().to_string(),
+            schema: other.schema().to_string(),
+            bearer_token: None,
+            manual_schema,
+        });
+    }
 }

@@ -5,6 +5,7 @@ mod registered_names;
 mod regressions;
 mod reply_paths;
 mod reported_conversation;
+mod schema_isolation;
 
 use super::llm_stub::{LlmKind, LlmRequest};
 use super::{Fixture, ReplyHarness, Turn};
@@ -48,8 +49,12 @@ fn f_name_fixture() -> Fixture {
 }
 
 async fn register_companies(h: &ReplyHarness, file: &str) -> CompanySyncSummary {
+    register_companies_in(h, super::PROJECT_ID, file).await
+}
+
+async fn register_companies_in(h: &ReplyHarness, schema: &str, file: &str) -> CompanySyncSummary {
     let companies = parse_company_file(file).expect("the company file is valid");
-    sync_registered_companies(&h.vegapunk_client(), super::PROJECT_ID, &companies)
+    sync_registered_companies(&h.vegapunk_client(), schema, &companies)
         .await
         .expect("the registration procedure writes to the fake vegapunk")
 }
@@ -86,7 +91,11 @@ fn reply_type(h: &ReplyHarness, reply_type: &str) {
 }
 
 fn name_state(h: &ReplyHarness, case_id: &str) -> serde_json::Value {
-    h.case_attributes(case_id)
+    name_state_in(h, super::PROJECT_ID, case_id)
+}
+
+fn name_state_in(h: &ReplyHarness, schema: &str, case_id: &str) -> serde_json::Value {
+    h.case_attributes_in(schema, case_id)
         .and_then(|case| case.attr("name_confirmation").map(ToString::to_string))
         .map(|written| serde_json::from_str(&written).expect("the stored state is JSON"))
         .unwrap_or(serde_json::Value::Null)
@@ -119,7 +128,11 @@ fn pending_of(h: &ReplyHarness, case_id: &str) -> Vec<(String, Vec<String>)> {
 }
 
 fn confirmed_of(h: &ReplyHarness, case_id: &str) -> Vec<String> {
-    name_state(h, case_id)["confirmed"]
+    confirmed_in(&name_state(h, case_id))
+}
+
+fn confirmed_in(state: &serde_json::Value) -> Vec<String> {
+    state["confirmed"]
         .as_array()
         .map(|confirmed| {
             confirmed
